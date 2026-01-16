@@ -1,0 +1,54 @@
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+from uuid import UUID
+
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+
+class UserBase(BaseModel):
+    email: str  # Changed from EmailStr to str to allow .local domains for test orgs
+
+
+class UserCreate(UserBase):
+    password: str
+    org_id: UUID
+
+
+class UserUpdate(BaseModel):
+    email: Optional[str] = None  # Changed from EmailStr to str to allow .local domains
+    password: Optional[str] = None
+
+
+class UserPasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class UserSettingsUpdate(BaseModel):
+    """User settings including privacy and data preferences"""
+    email: Optional[str] = None  # Changed from EmailStr to str to allow .local domains
+    current_password: Optional[str] = None  # Required if changing password
+    new_password: Optional[str] = None
+    # Privacy settings
+    data_sharing_enabled: Optional[bool] = None
+    analytics_enabled: Optional[bool] = None
+
+
+class User(UserBase):
+    id: UUID
+    org_id: UUID
+    role: str
+    is_admin: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
