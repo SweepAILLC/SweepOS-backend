@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from typing import Optional
 from app.db.session import get_db
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.user_tab_permission import UserTabPermission
 from app.core.security import decode_access_token
@@ -108,12 +108,27 @@ def check_tab_access(
     Returns True if user has access, False otherwise.
     
     Logic:
-    1. Users in main org always have access to all tabs (including admin)
-    2. Check user-specific permissions first (overrides org permissions)
-    3. Check organization-level permissions
-    4. Default: all tabs enabled for new orgs
+    1. Role-based restrictions:
+       - 'owner' tab: Only OWNER role (and main org users)
+       - 'users' tab: Not accessible to MEMBER role
+    2. Users in main org always have access to all tabs (including owner)
+    3. Check user-specific permissions first (overrides org permissions)
+    4. Check organization-level permissions
+    5. Default: all tabs enabled for new orgs (except role-restricted tabs)
     """
-    # Main org users always have access (including admin tab)
+    # Role-based restrictions
+    # 'owner' tab: Only OWNER role can access (unless in main org)
+    if tab_name == 'owner':
+        if str(user.org_id) == str(MAIN_ORG_ID):
+            return True  # Main org users always have access
+        return user.role == UserRole.OWNER
+    
+    # 'users' tab: MEMBER role cannot access
+    if tab_name == 'users':
+        if user.role == UserRole.MEMBER:
+            return False
+    
+    # Main org users always have access to all other tabs
     if str(user.org_id) == str(MAIN_ORG_ID):
         return True
     

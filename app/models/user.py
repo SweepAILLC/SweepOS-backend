@@ -9,6 +9,7 @@ from app.db.session import Base
 class UserRole(str, enum.Enum):
     OWNER = "owner"
     ADMIN = "admin"
+    MEMBER = "member"
     # Future roles: COACH, VIEWER, CLIENT
 
 

@@ -4,6 +4,7 @@ Allows organization admins to manage users within their organization.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional
 from uuid import UUID
 import secrets
@@ -30,7 +31,9 @@ from app.schemas.permission import (
 router = APIRouter()
 
 # Available tabs
-AVAILABLE_TABS = ['brevo', 'clients', 'stripe', 'funnels', 'users']
+# Note: 'owner' tab is restricted to OWNER role only
+# 'users' tab is restricted from MEMBER role
+AVAILABLE_TABS = ['brevo', 'clients', 'stripe', 'funnels', 'users', 'owner']
 
 
 @router.get("", response_model=List[UserSchema])
@@ -98,13 +101,31 @@ def create_user(
         alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
         password = ''.join(secrets.choice(alphabet) for _ in range(12))
     
+    # Determine role for new user
+    user_role = UserRole.MEMBER  # Default to member
+    if hasattr(user_data, 'role') and user_data.role:
+        try:
+            user_role = UserRole(user_data.role.lower())
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid role: {user_data.role}. Must be one of: owner, admin, member"
+            )
+    
+    # Only OWNER can assign OWNER role
+    if user_role == UserRole.OWNER and current_user.role != UserRole.OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only owners can assign the owner role"
+        )
+    
     # Create user
     new_user = User(
         org_id=current_user.org_id,
         email=user_data.email,
         hashed_password=get_password_hash(password),
-        role=user_data.role if hasattr(user_data, 'role') and user_data.role else UserRole.ADMIN,
-        is_admin=False  # New users are not admins by default
+        role=user_role,
+        is_admin=(user_role in [UserRole.ADMIN, UserRole.OWNER])  # Set is_admin for backward compatibility
     )
     db.add(new_user)
     db.commit()
@@ -190,11 +211,42 @@ def update_user(
         )
     
     # Prevent users from modifying themselves (they should use /auth/me/settings)
-    if user.id == current_user.id:
+    # Exception: allow role changes (but with restrictions)
+    if user.id == current_user.id and user_update.role is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Use /auth/me/settings to update your own account"
         )
+    
+    # Role change restrictions
+    if user_update.role is not None:
+        new_role_str = user_update.role.lower()
+        try:
+            new_role = UserRole(new_role_str)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid role: {user_update.role}. Must be one of: owner, admin, member"
+            )
+        
+        # Only OWNER can assign OWNER role
+        if new_role == UserRole.OWNER and current_user.role != UserRole.OWNER:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only owners can assign the owner role"
+            )
+        
+        # Prevent demoting the last owner in an org
+        if user.role == UserRole.OWNER and new_role != UserRole.OWNER:
+            owner_count = db.query(func.count(User.id)).filter(
+                User.org_id == current_user.org_id,
+                User.role == UserRole.OWNER
+            ).scalar() or 0
+            if owner_count <= 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot demote the last owner in the organization"
+                )
     
     # Update email if provided
     if user_update.email is not None:
@@ -214,6 +266,20 @@ def update_user(
     # Update password if provided
     if user_update.password is not None:
         user.hashed_password = get_password_hash(user_update.password)
+    
+    # Update role if provided
+    if user_update.role is not None:
+        new_role_str = user_update.role.lower()
+        try:
+            new_role = UserRole(new_role_str)
+            user.role = new_role
+            # Update is_admin flag for backward compatibility
+            user.is_admin = (new_role in [UserRole.ADMIN, UserRole.OWNER])
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid role: {user_update.role}. Must be one of: owner, admin, member"
+            )
     
     db.commit()
     db.refresh(user)

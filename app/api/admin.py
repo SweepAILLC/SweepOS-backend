@@ -755,7 +755,7 @@ def update_organization_tab_permission(
     db: Session = Depends(get_db),
     admin_user: User = Depends(require_admin)
 ):
-    """Update tab permission for an organization"""
+    """Update tab permission for an organization (creates if doesn't exist)"""
     from app.schemas.permission import (
         OrganizationTabPermission as OrgTabPermissionSchema,
         OrganizationTabPermissionUpdate
@@ -774,14 +774,18 @@ def update_organization_tab_permission(
         OrganizationTabPermission.tab_name == tab_name
     ).first()
     
+    # If permission doesn't exist, create it
     if not permission:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Permission not found"
+        permission = OrganizationTabPermission(
+            org_id=org_id,
+            tab_name=tab_name,
+            enabled=permission_update.enabled if permission_update.enabled is not None else True
         )
-    
-    if permission_update.enabled is not None:
-        permission.enabled = permission_update.enabled
+        db.add(permission)
+    else:
+        # Update existing permission
+        if permission_update.enabled is not None:
+            permission.enabled = permission_update.enabled
     
     db.commit()
     db.refresh(permission)

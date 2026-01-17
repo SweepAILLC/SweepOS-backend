@@ -16,11 +16,13 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     password: str
     org_id: UUID
+    role: Optional[str] = None  # User role: 'owner', 'admin', or 'member'
 
 
 class UserUpdate(BaseModel):
     email: Optional[str] = None  # Changed from EmailStr to str to allow .local domains
     password: Optional[str] = None
+    role: Optional[str] = None  # User role: 'owner', 'admin', or 'member'
 
 
 class UserPasswordChange(BaseModel):
