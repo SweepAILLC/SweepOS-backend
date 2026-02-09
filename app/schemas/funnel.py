@@ -108,13 +108,15 @@ class FunnelHealth(BaseModel):
 
 class UTMSourceStats(BaseModel):
     source: str
-    count: int
+    count: int  # Event count (kept for backward compatibility)
+    unique_visitors: int  # Unique visitor count
     conversions: int
     revenue_cents: int = 0
 
 class ReferrerStats(BaseModel):
     referrer: str
-    count: int
+    count: int  # Event count (kept for backward compatibility)
+    unique_visitors: int  # Unique visitor count
     conversions: int
     revenue_cents: int = 0
 

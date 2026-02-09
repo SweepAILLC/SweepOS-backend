@@ -8,15 +8,25 @@ Features:
 - Buffer time to handle webhook delays
 - Never refetches full history after initial backfill
 """
-import stripe
+# Dynamic import for stripe (optional dependency)
+try:
+    import stripe
+    STRIPE_AVAILABLE = True
+except ImportError:
+    STRIPE_AVAILABLE = False
+    stripe = None
+
 from decimal import Decimal
 import json
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func as sa_func
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import OperationalError
+from psycopg2.errors import DeadlockDetected
 import uuid
 import httpx
+import time
 
 from app.core.config import settings
 from app.core.encryption import decrypt_token
@@ -29,9 +39,66 @@ from app.models.client import Client
 # Buffer time to account for webhook delays (5 minutes)
 SYNC_BUFFER_SECONDS = 300
 
+# Deadlock retry configuration
+MAX_DEADLOCK_RETRIES = 3
+DEADLOCK_RETRY_DELAY = 0.1  # Start with 100ms
+
+
+def handle_deadlock_retry(func):
+    """Decorator to retry database operations on deadlock"""
+    def wrapper(*args, **kwargs):
+        max_retries = MAX_DEADLOCK_RETRIES
+        retry_delay = DEADLOCK_RETRY_DELAY
+        
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except OperationalError as e:
+                # Check if it's a deadlock
+                if hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01':  # Deadlock detected
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                        print(f"[DEADLOCK] Deadlock detected, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                        # Rollback the session before retry
+                        if args and isinstance(args[0], Session):
+                            args[0].rollback()
+                        continue
+                    else:
+                        print(f"[DEADLOCK] Max retries reached, giving up")
+                        raise
+                else:
+                    # Not a deadlock, re-raise
+                    raise
+            except Exception as e:
+                # Check for deadlock in error message (fallback)
+                error_str = str(e).lower()
+                if 'deadlock' in error_str or 'deadlockdetected' in error_str:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
+                        print(f"[DEADLOCK] Deadlock detected (from message), retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(wait_time)
+                        if args and isinstance(args[0], Session):
+                            args[0].rollback()
+                        continue
+                    else:
+                        print(f"[DEADLOCK] Max retries reached, giving up")
+                        raise
+                else:
+                    raise
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def _check_stripe_available():
+    """Check if stripe library is available"""
+    if not STRIPE_AVAILABLE:
+        raise ImportError("stripe library is not installed. Install it with: pip install stripe")
+
 
 def get_stripe_api_key(db: Session, org_id: uuid.UUID) -> str:
     """Get and decrypt Stripe API key for org"""
+    _check_stripe_available()
     oauth_token = db.query(OAuthToken).filter(
         OAuthToken.provider == OAuthProvider.STRIPE,
         OAuthToken.org_id == org_id
@@ -89,6 +156,40 @@ def refresh_token_if_needed(db: Session, oauth_token: OAuthToken) -> bool:
     except Exception as e:
         db.rollback()
         raise Exception(f"Failed to refresh token: {str(e)}")
+
+
+def upsert_client_with_retry(db: Session, customer_data, org_id: uuid.UUID, max_retries: int = 3) -> Client:
+    """Upsert client with deadlock retry logic"""
+    for attempt in range(max_retries):
+        try:
+            return upsert_client(db, customer_data, org_id)
+        except OperationalError as e:
+            if hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01':  # Deadlock detected
+                if attempt < max_retries - 1:
+                    wait_time = 0.1 * (2 ** attempt)
+                    print(f"[UPSERT_CLIENT] Deadlock detected, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    db.rollback()
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"[UPSERT_CLIENT] Max retries reached for customer {customer_data.id}")
+                    raise
+            else:
+                raise
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'deadlock' in error_str:
+                if attempt < max_retries - 1:
+                    wait_time = 0.1 * (2 ** attempt)
+                    print(f"[UPSERT_CLIENT] Deadlock detected (from message), retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                    db.rollback()
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise
+            else:
+                raise
+    return upsert_client(db, customer_data, org_id)
 
 
 def upsert_client(db: Session, customer_data, org_id: uuid.UUID) -> Client:
@@ -179,13 +280,54 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
         else:
             status = 'pending'
     
-    # Get client
+    # Get client - try to find existing, or create if missing
     client = None
     if hasattr(payment_data, 'customer') and payment_data.customer:
+        customer_id = payment_data.customer
+        # First try to find existing client
         client = db.query(Client).filter(
-            Client.stripe_customer_id == payment_data.customer,
+            Client.stripe_customer_id == customer_id,
             Client.org_id == org_id
         ).first()
+        
+        # If client not found, try to fetch customer from Stripe and create client
+        if not client:
+            try:
+                print(f"[SYNC] Client not found for customer {customer_id}, fetching from Stripe...")
+                customer = stripe.Customer.retrieve(customer_id)
+                client = upsert_client_with_retry(db, customer, org_id)
+                print(f"[SYNC] Created/found client {client.id} for customer {customer_id}")
+            except Exception as e:
+                print(f"[SYNC] ⚠️  Failed to fetch customer {customer_id} from Stripe: {str(e)}")
+                # Try to create a minimal client from payment data if available
+                customer_email = getattr(payment_data, 'customer_email', None) or getattr(payment_data, 'receipt_email', None)
+                if customer_email:
+                    # Try to find by email
+                    client = db.query(Client).filter(
+                        Client.email == customer_email.lower(),
+                        Client.org_id == org_id
+                    ).first()
+                    if client:
+                        # Link stripe_customer_id to existing client
+                        if not client.stripe_customer_id:
+                            client.stripe_customer_id = customer_id
+                            db.flush()
+                        print(f"[SYNC] Linked existing client {client.id} to customer {customer_id} by email")
+                    else:
+                        # Create minimal client from email
+                        client = Client(
+                            org_id=org_id,
+                            stripe_customer_id=customer_id,
+                            email=customer_email,
+                            first_name="Stripe",
+                            last_name=f"Customer {customer_id[:8]}",
+                            lifecycle_state='active',
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow()
+                        )
+                        db.add(client)
+                        db.flush()
+                        print(f"[SYNC] Created minimal client {client.id} for customer {customer_id} from email")
     
     # Get subscription_id and invoice_id
     subscription_id = None
@@ -196,6 +338,38 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
         invoice_id = payment_id
         if hasattr(payment_data, 'subscription') and payment_data.subscription:
             subscription_id = payment_data.subscription
+        
+        # For invoices, also check customer_email if customer is not set
+        # This handles cases where invoice has email but customer was deleted
+        if not client and hasattr(payment_data, 'customer_email') and payment_data.customer_email:
+            customer_email = payment_data.customer_email
+            # Try to find existing client by email
+            client = db.query(Client).filter(
+                Client.email == customer_email.lower(),
+                Client.org_id == org_id
+            ).first()
+            if client:
+                print(f"[SYNC] Found client {client.id} for invoice {invoice_id} by email {customer_email}")
+                # If client has no stripe_customer_id, try to get it from invoice
+                if not client.stripe_customer_id and hasattr(payment_data, 'customer') and payment_data.customer:
+                    client.stripe_customer_id = payment_data.customer
+                    db.flush()
+            else:
+                # Create minimal client from invoice email
+                stripe_customer_id = getattr(payment_data, 'customer', None)
+                client = Client(
+                    org_id=org_id,
+                    stripe_customer_id=stripe_customer_id,
+                    email=customer_email,
+                    first_name="Stripe",
+                    last_name=f"Invoice Customer" if not stripe_customer_id else f"Customer {stripe_customer_id[:8] if stripe_customer_id else 'Unknown'}",
+                    lifecycle_state='active',
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.add(client)
+                db.flush()
+                print(f"[SYNC] Created client {client.id} for invoice {invoice_id} from email {customer_email}")
     elif hasattr(payment_data, 'subscription') and payment_data.subscription:
         subscription_id = payment_data.subscription
     elif hasattr(payment_data, 'invoice') and payment_data.invoice:
@@ -231,43 +405,48 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
     # 2. If this payment is linked to a subscription, check if we already have a payment for this subscription+invoice combo
     # Prefer charge records over invoice records to avoid double-counting
     
-    # Check for duplicate invoice payments
+    # DEDUPLICATION LOGIC: Track by invoice_id and subscription_id
     # IMPORTANT: Only deduplicate SUCCESSFUL payments. Failed payments (retry attempts) should all be stored.
-    if invoice_id and payment_type == 'invoice' and status == 'succeeded':
-        # Check if a SUCCESSFUL charge already exists for this invoice
-        existing_charge = db.query(StripePayment).filter(
-            StripePayment.invoice_id == invoice_id,
-            StripePayment.org_id == org_id,
-            StripePayment.type == 'charge',
-            StripePayment.status == 'succeeded'  # Only check for successful payments
-        ).first()
-        
-        if existing_charge:
-            # Successful charge already exists, skip creating invoice record to avoid duplicate
-            print(f"[SYNC] Skipping invoice {invoice_id} - charge {existing_charge.stripe_id} already exists")
-            return existing_charge
+    # Priority: subscription_id + invoice_id > invoice_id > stripe_id
     
-    # Check for duplicate subscription payments (same subscription_id + invoice_id)
-    # IMPORTANT: Only deduplicate SUCCESSFUL payments. Failed payments (retry attempts) should all be stored.
-    if subscription_id and invoice_id and status == 'succeeded':
-        # Check if we already have a SUCCESSFUL payment for this subscription+invoice combo
-        existing_sub_payment = db.query(StripePayment).filter(
-            StripePayment.subscription_id == subscription_id,
-            StripePayment.invoice_id == invoice_id,
-            StripePayment.org_id == org_id,
-            StripePayment.status == 'succeeded'  # Only check for successful payments
-        ).first()
+    if status == 'succeeded':
+        # First check: If we have both subscription_id and invoice_id, check for duplicates by that combo
+        if subscription_id and invoice_id:
+            existing_sub_invoice_payment = db.query(StripePayment).filter(
+                StripePayment.subscription_id == subscription_id,
+                StripePayment.invoice_id == invoice_id,
+                StripePayment.org_id == org_id,
+                StripePayment.status == 'succeeded'
+            ).first()
+            
+            if existing_sub_invoice_payment and existing_sub_invoice_payment.stripe_id != payment_id:
+                # Another successful payment already exists for this subscription+invoice combo
+                # Prefer charge over invoice, prefer payment_intent over invoice, prefer newer
+                existing_type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}.get(existing_sub_invoice_payment.type, 3)
+                new_type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}.get(payment_type, 3)
+                
+                if new_type_priority > existing_type_priority:
+                    # Existing payment is better type (charge > payment_intent > invoice)
+                    print(f"[SYNC] Skipping {payment_type} payment {payment_id} - {existing_sub_invoice_payment.type} {existing_sub_invoice_payment.stripe_id} already exists for subscription {subscription_id}, invoice {invoice_id}")
+                    return existing_sub_invoice_payment
+                elif new_type_priority < existing_type_priority:
+                    # New payment is better type, will replace via ON CONFLICT
+                    print(f"[SYNC] Replacing {existing_sub_invoice_payment.type} payment {existing_sub_invoice_payment.stripe_id} with {payment_type} {payment_id} for subscription {subscription_id}, invoice {invoice_id}")
         
-        if existing_sub_payment and existing_sub_payment.stripe_id != payment_id:
-            # Another successful payment already exists for this subscription+invoice combo
-            # Prefer charge over invoice, prefer newer over older
-            if payment_type == 'invoice' and existing_sub_payment.type == 'charge':
-                print(f"[SYNC] Skipping invoice payment {payment_id} - charge {existing_sub_payment.stripe_id} already exists for subscription {subscription_id}")
-                return existing_sub_payment
-            elif payment_type == 'charge' and existing_sub_payment.type == 'invoice':
-                # Update the existing invoice record to be a charge (better)
-                print(f"[SYNC] Replacing invoice payment {existing_sub_payment.stripe_id} with charge {payment_id} for subscription {subscription_id}")
-                # Will be handled by ON CONFLICT update below
+        # Second check: If we have invoice_id (with or without subscription_id), check for invoice duplicates
+        if invoice_id:
+            # Check if a charge or payment_intent already exists for this invoice
+            existing_invoice_payment = db.query(StripePayment).filter(
+                StripePayment.invoice_id == invoice_id,
+                StripePayment.org_id == org_id,
+                StripePayment.status == 'succeeded',
+                StripePayment.type.in_(['charge', 'payment_intent'])  # Prefer charge/payment_intent over invoice
+            ).first()
+            
+            if existing_invoice_payment and payment_type == 'invoice':
+                # A charge or payment_intent already exists for this invoice, skip the invoice record
+                print(f"[SYNC] Skipping invoice {invoice_id} - {existing_invoice_payment.type} {existing_invoice_payment.stripe_id} already exists")
+                return existing_invoice_payment
     
     # Use PostgreSQL ON CONFLICT for idempotent upsert
     # Fallback to manual upsert if constraint doesn't exist (migration not run yet)
@@ -324,17 +503,37 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
             existing_payment.raw_event = json.loads(json.dumps(payment_data, default=str))
             existing_payment.updated_at = datetime.utcnow()
         else:
-            # Check for duplicate invoice payments before creating
-            if invoice_id and payment_type == 'invoice':
-                existing_charge = db.query(StripePayment).filter(
-                    StripePayment.invoice_id == invoice_id,
-                    StripePayment.org_id == org_id,
-                    StripePayment.type == 'charge'
-                ).first()
+            # Check for duplicate invoice payments before creating (same logic as above)
+            if status == 'succeeded':
+                # Check subscription + invoice combo first
+                if subscription_id and invoice_id:
+                    existing_sub_invoice = db.query(StripePayment).filter(
+                        StripePayment.subscription_id == subscription_id,
+                        StripePayment.invoice_id == invoice_id,
+                        StripePayment.org_id == org_id,
+                        StripePayment.status == 'succeeded'
+                    ).first()
+                    
+                    if existing_sub_invoice and existing_sub_invoice.stripe_id != payment_id:
+                        existing_type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}.get(existing_sub_invoice.type, 3)
+                        new_type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}.get(payment_type, 3)
+                        
+                        if new_type_priority > existing_type_priority:
+                            print(f"[SYNC] Skipping {payment_type} payment {payment_id} - {existing_sub_invoice.type} {existing_sub_invoice.stripe_id} already exists for subscription {subscription_id}, invoice {invoice_id}")
+                            return existing_sub_invoice
                 
-                if existing_charge:
-                    print(f"[SYNC] Skipping invoice {invoice_id} - charge {existing_charge.stripe_id} already exists")
-                    return existing_charge
+                # Check invoice_id duplicates
+                if invoice_id and payment_type == 'invoice':
+                    existing_invoice = db.query(StripePayment).filter(
+                        StripePayment.invoice_id == invoice_id,
+                        StripePayment.org_id == org_id,
+                        StripePayment.status == 'succeeded',
+                        StripePayment.type.in_(['charge', 'payment_intent'])
+                    ).first()
+                    
+                    if existing_invoice:
+                        print(f"[SYNC] Skipping invoice {invoice_id} - {existing_invoice.type} {existing_invoice.stripe_id} already exists")
+                        return existing_invoice
             
             # Create new
             payment = StripePayment(
@@ -598,7 +797,181 @@ def upsert_subscription(db: Session, sub_data, org_id: uuid.UUID) -> StripeSubsc
     return subscription
 
 
+def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str) -> dict:
+    """
+    Repair existing payments that don't have clients linked.
+    This runs as part of sync to fix any payments that were created before client linking was improved.
+    
+    Returns:
+        dict with repair statistics
+    """
+    results = {
+        "payments_fixed": 0,
+        "clients_created": 0,
+        "clients_linked": 0,
+        "payments_skipped": 0,
+        "errors": 0
+    }
+    
+    print(f"[REPAIR] Starting repair of payments without clients for org {org_id}")
+    
+    # Find all payments without client_id for this org
+    payments_without_clients = db.query(StripePayment).filter(
+        StripePayment.org_id == org_id,
+        StripePayment.client_id.is_(None)
+    ).all()
+    
+    if not payments_without_clients:
+        print(f"[REPAIR] No payments without clients found")
+        return results
+    
+    print(f"[REPAIR] Found {len(payments_without_clients)} payments without clients")
+    
+    # Set API key for Stripe calls
+    original_key = stripe.api_key
+    stripe.api_key = api_key
+    
+    try:
+        for payment in payments_without_clients:
+            try:
+                customer_id = None
+                customer_email = None
+                
+                # Try to extract customer info from raw_event
+                if payment.raw_event:
+                    raw_data = payment.raw_event
+                    customer_id = raw_data.get('customer') if isinstance(raw_data, dict) else getattr(raw_data, 'customer', None)
+                    customer_email = raw_data.get('customer_email') if isinstance(raw_data, dict) else getattr(raw_data, 'customer_email', None)
+                    if not customer_email:
+                        customer_email = raw_data.get('receipt_email') if isinstance(raw_data, dict) else getattr(raw_data, 'receipt_email', None)
+                
+                # If no customer_id in raw_event, try to fetch from Stripe based on payment type
+                if not customer_id:
+                    try:
+                        # Determine payment type from stripe_id prefix if type is not set
+                        payment_type = payment.type
+                        if not payment_type:
+                            if payment.stripe_id.startswith('ch_'):
+                                payment_type = 'charge'
+                            elif payment.stripe_id.startswith('pi_'):
+                                payment_type = 'payment_intent'
+                            elif payment.stripe_id.startswith('in_'):
+                                payment_type = 'invoice'
+                        
+                        if payment_type == 'charge' and payment.stripe_id.startswith('ch_'):
+                            charge = stripe.Charge.retrieve(payment.stripe_id)
+                            customer_id = getattr(charge, 'customer', None)
+                            customer_email = getattr(charge, 'customer_email', None) or getattr(charge, 'receipt_email', None)
+                        elif payment_type == 'payment_intent' and payment.stripe_id.startswith('pi_'):
+                            pi = stripe.PaymentIntent.retrieve(payment.stripe_id)
+                            customer_id = getattr(pi, 'customer', None)
+                        elif payment_type == 'invoice' and payment.stripe_id.startswith('in_'):
+                            invoice = stripe.Invoice.retrieve(payment.stripe_id)
+                            customer_id = getattr(invoice, 'customer', None)
+                            customer_email = getattr(invoice, 'customer_email', None)
+                    except Exception as e:
+                        print(f"[REPAIR] ⚠️  Could not fetch {payment.type or 'unknown'} {payment.stripe_id} from Stripe: {str(e)}")
+                
+                # If we have customer_id, try to find or create client
+                if customer_id:
+                    # Try to find existing client
+                    client = db.query(Client).filter(
+                        Client.stripe_customer_id == customer_id,
+                        Client.org_id == org_id
+                    ).first()
+                    
+                    # If not found, try to fetch from Stripe and create
+                    if not client:
+                        try:
+                            customer = stripe.Customer.retrieve(customer_id)
+                            client = upsert_client_with_retry(db, customer, org_id)
+                            results["clients_created"] += 1
+                            print(f"[REPAIR] Created client {client.id} for customer {customer_id}")
+                        except Exception as e:
+                            print(f"[REPAIR] ⚠️  Could not fetch customer {customer_id} from Stripe: {str(e)}")
+                            # Try to create from email if available
+                            if customer_email:
+                                client = db.query(Client).filter(
+                                    Client.email == customer_email.lower(),
+                                    Client.org_id == org_id
+                                ).first()
+                                if client:
+                                    if not client.stripe_customer_id:
+                                        client.stripe_customer_id = customer_id
+                                        db.flush()
+                                    results["clients_linked"] += 1
+                                    print(f"[REPAIR] Linked existing client {client.id} to customer {customer_id} by email")
+                                else:
+                                    # Create minimal client from email
+                                    client = Client(
+                                        org_id=org_id,
+                                        stripe_customer_id=customer_id,
+                                        email=customer_email,
+                                        first_name="Stripe",
+                                        last_name=f"Customer {customer_id[:8] if customer_id else 'Unknown'}",
+                                        lifecycle_state='active',
+                                        created_at=datetime.utcnow(),
+                                        updated_at=datetime.utcnow()
+                                    )
+                                    db.add(client)
+                                    db.flush()
+                                    results["clients_created"] += 1
+                                    print(f"[REPAIR] Created minimal client {client.id} from email {customer_email}")
+                    
+                    # Link payment to client
+                    if client:
+                        payment.client_id = client.id
+                        payment.updated_at = datetime.utcnow()
+                        results["payments_fixed"] += 1
+                        print(f"[REPAIR] ✅ Linked payment {payment.stripe_id} to client {client.id}")
+                    else:
+                        results["payments_skipped"] += 1
+                        print(f"[REPAIR] ⚠️  Could not create/find client for payment {payment.stripe_id}")
+                
+                # If no customer_id but we have email, try to find client by email
+                elif customer_email:
+                    client = db.query(Client).filter(
+                        Client.email == customer_email.lower(),
+                        Client.org_id == org_id
+                    ).first()
+                    
+                    if client:
+                        payment.client_id = client.id
+                        payment.updated_at = datetime.utcnow()
+                        results["payments_fixed"] += 1
+                        results["clients_linked"] += 1
+                        print(f"[REPAIR] ✅ Linked payment {payment.stripe_id} to existing client {client.id} by email")
+                    else:
+                        results["payments_skipped"] += 1
+                        print(f"[REPAIR] ⚠️  No client found for payment {payment.stripe_id} (email: {customer_email})")
+                
+                else:
+                    results["payments_skipped"] += 1
+                    print(f"[REPAIR] ⚠️  No customer info found for payment {payment.stripe_id}")
+            
+            except Exception as e:
+                results["errors"] += 1
+                print(f"[REPAIR] ❌ Error repairing payment {payment.stripe_id}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # Commit all changes
+        if results["payments_fixed"] > 0:
+            db.commit()
+            print(f"[REPAIR] ✅ Committed {results['payments_fixed']} payment repairs")
+        
+    finally:
+        # Restore original API key
+        stripe.api_key = original_key
+    
+    print(f"[REPAIR] Repair complete: {results['payments_fixed']} fixed, {results['clients_created']} clients created, {results['clients_linked']} linked, {results['payments_skipped']} skipped, {results['errors']} errors")
+    return results
+
+
 def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = False) -> dict:
+    """Sync Stripe data incrementally"""
+    _check_stripe_available()
     """
     Incremental sync of Stripe data.
     
@@ -634,8 +1007,12 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
         print(f"[SYNC] Starting full historical sync for org {org_id}")
     else:
         # Incremental sync: fetch objects updated since last_sync minus buffer
-        sync_start = oauth_token.last_sync_at - timedelta(seconds=SYNC_BUFFER_SECONDS)
-        print(f"[SYNC] Starting incremental sync for org {org_id} since {sync_start}")
+        # Use a larger buffer (15 minutes) to catch payments that might have been delayed
+        # This ensures we don't miss payments that were created just before the last sync
+        extended_buffer = timedelta(minutes=15)  # 15 minutes instead of 5
+        sync_start = oauth_token.last_sync_at - extended_buffer
+        print(f"[SYNC] Starting incremental sync for org {org_id} since {sync_start} (last_sync: {oauth_token.last_sync_at})")
+        print(f"[SYNC] Using extended buffer of 15 minutes to catch delayed payments")
     
     results = {
         "customers_synced": 0,
@@ -658,13 +1035,26 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             customers = stripe.Customer.list(**customer_params)
             for customer in customers.auto_paging_iter():
                 try:
-                    client = upsert_client(db, customer, org_id)
+                    client = upsert_client_with_retry(db, customer, org_id)
                     if client.stripe_customer_id == customer.id:
                         results["customers_synced"] += 1
                     else:
                         results["customers_updated"] += 1
+                    
+                    # Commit periodically to avoid long transactions
+                    if results["customers_synced"] % 50 == 0:
+                        try:
+                            db.commit()
+                        except Exception as commit_err:
+                            print(f"[SYNC] Error committing during customer sync: {str(commit_err)}")
+                            db.rollback()
                 except Exception as e:
-                    print(f"[SYNC] Error upserting customer {customer.id}: {str(e)}")
+                    error_str = str(e).lower()
+                    if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
+                        print(f"[SYNC] Deadlock upserting customer {customer.id}, rolling back and continuing: {str(e)}")
+                        db.rollback()
+                    else:
+                        print(f"[SYNC] Error upserting customer {customer.id}: {str(e)}")
                     import traceback
                     traceback.print_exc()
                     continue
@@ -688,7 +1078,7 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                     if sub.customer:
                         try:
                             customer = stripe.Customer.retrieve(sub.customer)
-                            upsert_client(db, customer, org_id)
+                            upsert_client_with_retry(db, customer, org_id)
                         except:
                             pass
                     
@@ -708,26 +1098,39 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             traceback.print_exc()
             # Continue with other syncs
         
-        # Sync charges
-        print(f"[SYNC] Syncing charges...")
+        # Sync charges (legacy API)
+        # According to Stripe best practices: Sync both Charges and PaymentIntents
+        # - Charges: Legacy API, still used for some payment methods
+        # - PaymentIntents: Modern unified API (recommended by Stripe)
+        # IMPORTANT: Charges are created AFTER PaymentIntents are captured
+        # We sync both to ensure complete coverage of all payment types
+        print(f"[SYNC] Syncing charges (legacy API)...")
         charge_params = {"limit": 100}
         if sync_start:
             charge_params["created"] = {"gte": int(sync_start.timestamp())}
         
         try:
             charges = stripe.Charge.list(**charge_params)
+            charge_count = 0
             for charge in charges.auto_paging_iter():
+                charge_count += 1
                 try:
-                    # Ensure customer exists
+                    # Log charge details for debugging
+                    print(f"[SYNC] Processing Charge {charge.id}: status={getattr(charge, 'status', 'unknown')}, amount={getattr(charge, 'amount', 0)}, paid={getattr(charge, 'paid', False)}, created={getattr(charge, 'created', None)}")
+                    
+                    # Ensure customer exists (but upsert_payment will also handle this as fallback)
                     if charge.customer:
                         try:
                             customer = stripe.Customer.retrieve(charge.customer)
-                            upsert_client(db, customer, org_id)
-                        except:
-                            pass
+                            upsert_client_with_retry(db, customer, org_id)
+                        except Exception as e:
+                            print(f"[SYNC] ⚠️  Could not retrieve customer {charge.customer} for charge {charge.id}: {str(e)}")
+                            # Continue - upsert_payment will try to create client as fallback
                     
                     payment = upsert_payment(db, charge, org_id, 'charge')
                     if payment:
+                        print(f"[SYNC] Charge {charge.id} -> Payment record: stripe_id={payment.stripe_id}, status={payment.status}, created={payment.created_at}")
+                        
                         # Debug: Log failed charge payments to track retry attempts
                         if payment.status == 'failed' and payment.subscription_id:
                             print(f"[SYNC] Failed charge payment: charge_id={charge.id}, subscription_id={payment.subscription_id}, invoice_id={payment.invoice_id}, created={payment.created_at}")
@@ -735,11 +1138,26 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                             results["payments_synced"] += 1
                         else:
                             results["payments_updated"] += 1
+                    
+                    # Commit periodically to avoid long transactions and reduce deadlock risk
+                    if (results["payments_synced"] + results["payments_updated"]) % 50 == 0:
+                        try:
+                            db.commit()
+                        except Exception as commit_err:
+                            print(f"[SYNC] Error committing during charge sync: {str(commit_err)}")
+                            db.rollback()
                 except Exception as e:
-                    print(f"[SYNC] Error upserting charge {charge.id}: {str(e)}")
+                    error_str = str(e).lower()
+                    if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
+                        print(f"[SYNC] Deadlock upserting charge {charge.id}, rolling back and continuing: {str(e)}")
+                        db.rollback()
+                    else:
+                        print(f"[SYNC] Error upserting charge {charge.id}: {str(e)}")
                     import traceback
                     traceback.print_exc()
                     continue
+            
+            print(f"[SYNC] Processed {charge_count} charges")
         except Exception as e:
             print(f"[SYNC] Error listing charges: {str(e)}")
             import traceback
@@ -747,6 +1165,8 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             # Continue with other syncs
         
         # Sync payment intents
+        # IMPORTANT: PaymentIntents are created BEFORE charges, so we need to sync them
+        # even if they haven't been captured yet. This ensures we catch all payment attempts.
         print(f"[SYNC] Syncing payment intents...")
         pi_params = {"limit": 100}
         if sync_start:
@@ -754,29 +1174,53 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
         
         try:
             payment_intents = stripe.PaymentIntent.list(**pi_params)
+            pi_count = 0
             for pi in payment_intents.auto_paging_iter():
+                pi_count += 1
                 try:
+                    # Log payment intent details for debugging
+                    print(f"[SYNC] Processing PaymentIntent {pi.id}: status={getattr(pi, 'status', 'unknown')}, amount={getattr(pi, 'amount', 0)}, created={getattr(pi, 'created', None)}")
+                    
+                    # Ensure customer exists (but upsert_payment will also handle this as fallback)
                     if pi.customer:
                         try:
                             customer = stripe.Customer.retrieve(pi.customer)
-                            upsert_client(db, customer, org_id)
-                        except:
-                            pass
+                            upsert_client_with_retry(db, customer, org_id)
+                        except Exception as e:
+                            print(f"[SYNC] ⚠️  Could not retrieve customer {pi.customer} for payment intent {pi.id}: {str(e)}")
+                            # Continue - upsert_payment will try to create client as fallback
                     
                     payment = upsert_payment(db, pi, org_id, 'payment_intent')
                     if payment:
-                        # Debug: Log failed payment intent payments to track retry attempts
+                        # Debug: Log all payment intents, not just failed ones
+                        print(f"[SYNC] PaymentIntent {pi.id} -> Payment record: stripe_id={payment.stripe_id}, status={payment.status}, created={payment.created_at}")
+                        
                         if payment.status == 'failed' and payment.subscription_id:
                             print(f"[SYNC] Failed payment_intent payment: pi_id={pi.id}, subscription_id={payment.subscription_id}, invoice_id={payment.invoice_id}, created={payment.created_at}")
                         if not sync_start or (payment.created_at and payment.created_at >= sync_start):
                             results["payments_synced"] += 1
                         else:
                             results["payments_updated"] += 1
+                    
+                    # Commit periodically to avoid long transactions and reduce deadlock risk
+                    if (results["payments_synced"] + results["payments_updated"]) % 50 == 0:
+                        try:
+                            db.commit()
+                        except Exception as commit_err:
+                            print(f"[SYNC] Error committing during payment intent sync: {str(commit_err)}")
+                            db.rollback()
                 except Exception as e:
-                    print(f"[SYNC] Error upserting payment intent {pi.id}: {str(e)}")
+                    error_str = str(e).lower()
+                    if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
+                        print(f"[SYNC] Deadlock upserting payment intent {pi.id}, rolling back and continuing: {str(e)}")
+                        db.rollback()
+                    else:
+                        print(f"[SYNC] Error upserting payment intent {pi.id}: {str(e)}")
                     import traceback
                     traceback.print_exc()
                     continue
+            
+            print(f"[SYNC] Processed {pi_count} payment intents")
         except Exception as e:
             print(f"[SYNC] Error listing payment intents: {str(e)}")
             import traceback
@@ -784,8 +1228,11 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             # Continue with other syncs
         
         # Sync invoices
-        print(f"[SYNC] Syncing invoices...")
-        invoice_params = {"limit": 100}  # Remove "status": "all" - it's invalid
+        # According to Stripe best practices: Use Invoice.list(status='paid') for subscription payments
+        # This is more efficient and aligns with how Stripe's dashboard transactions table works.
+        # Failed invoices are already captured via PaymentIntents, so we only need paid invoices here.
+        print(f"[SYNC] Syncing paid invoices (for subscription payments)...")
+        invoice_params = {"limit": 100, "status": "paid"}
         if sync_start:
             invoice_params["created"] = {"gte": int(sync_start.timestamp())}
         
@@ -793,24 +1240,38 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             invoices = stripe.Invoice.list(**invoice_params)
             for invoice in invoices.auto_paging_iter():
                 try:
+                    # Ensure customer exists (but upsert_payment will also handle this as fallback)
                     if invoice.customer:
                         try:
                             customer = stripe.Customer.retrieve(invoice.customer)
-                            upsert_client(db, customer, org_id)
-                        except:
-                            pass
+                            upsert_client_with_retry(db, customer, org_id)
+                        except Exception as e:
+                            print(f"[SYNC] ⚠️  Could not retrieve customer {invoice.customer} for invoice {invoice.id}: {str(e)}")
+                            # Continue - upsert_payment will try to create client as fallback
                     
                     payment = upsert_payment(db, invoice, org_id, 'invoice')
                     if payment:
-                        # Debug: Log failed invoice payments to track retry attempts
-                        if payment.status == 'failed' and payment.subscription_id:
-                            print(f"[SYNC] Failed invoice payment: invoice_id={invoice.id}, subscription_id={payment.subscription_id}, stripe_id={payment.stripe_id}, created={payment.created_at}")
+                        # Since we're only syncing paid invoices, all should be succeeded
+                        # Failed invoices are captured via PaymentIntents
                         if not sync_start or (payment.created_at and payment.created_at >= sync_start):
                             results["payments_synced"] += 1
                         else:
                             results["payments_updated"] += 1
+                    
+                    # Commit periodically to avoid long transactions and reduce deadlock risk
+                    if (results["payments_synced"] + results["payments_updated"]) % 50 == 0:
+                        try:
+                            db.commit()
+                        except Exception as commit_err:
+                            print(f"[SYNC] Error committing during invoice sync: {str(commit_err)}")
+                            db.rollback()
                 except Exception as e:
-                    print(f"[SYNC] Error upserting invoice {invoice.id}: {str(e)}")
+                    error_str = str(e).lower()
+                    if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
+                        print(f"[SYNC] Deadlock upserting invoice {invoice.id}, rolling back and continuing: {str(e)}")
+                        db.rollback()
+                    else:
+                        print(f"[SYNC] Error upserting invoice {invoice.id}: {str(e)}")
                     import traceback
                     traceback.print_exc()
                     continue
@@ -820,17 +1281,69 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             traceback.print_exc()
             # Continue - don't fail entire sync if invoices fail
         
-        # Update last_sync_at
-        oauth_token.last_sync_at = datetime.utcnow()
-        db.commit()
+        # Repair existing payments without clients (runs every sync to fix any missing links)
+        print(f"[SYNC] Repairing payments without clients...")
+        try:
+            repair_results = repair_payments_without_clients(db, org_id, api_key)
+            results["repair"] = repair_results
+            print(f"[SYNC] Repair complete: {repair_results['payments_fixed']} payments fixed, {repair_results['clients_created']} clients created")
+        except Exception as e:
+            print(f"[SYNC] ⚠️  Repair failed (non-fatal): {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Don't fail sync if repair fails
+        
+        # Update last_sync_at with deadlock retry
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                oauth_token.last_sync_at = datetime.utcnow()
+                db.commit()
+                break
+            except OperationalError as e:
+                if hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01':  # Deadlock detected
+                    if attempt < max_retries - 1:
+                        wait_time = 0.1 * (2 ** attempt)
+                        print(f"[SYNC] Deadlock updating last_sync_at, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                        db.rollback()
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"[SYNC] ⚠️  Failed to update last_sync_at after {max_retries} attempts, but sync completed successfully")
+                        db.rollback()
+                else:
+                    raise
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'deadlock' in error_str:
+                    if attempt < max_retries - 1:
+                        wait_time = 0.1 * (2 ** attempt)
+                        print(f"[SYNC] Deadlock updating last_sync_at, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                        db.rollback()
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"[SYNC] ⚠️  Failed to update last_sync_at after {max_retries} attempts, but sync completed successfully")
+                        db.rollback()
+                else:
+                    raise
         
         print(f"[SYNC] ✅ Sync complete: {results}")
         return results
         
     except Exception as e:
-        db.rollback()
+        # Rollback on any error
+        try:
+            db.rollback()
+        except:
+            pass  # Ignore rollback errors if session is already invalid
+        
         import traceback
-        error_msg = f"Sync failed: {str(e)}"
+        error_str = str(e).lower()
+        if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
+            error_msg = f"Sync failed due to database deadlock. Please try again. Original error: {str(e)}"
+        else:
+            error_msg = f"Sync failed: {str(e)}"
         print(f"[SYNC] ❌ {error_msg}")
         print(traceback.format_exc())
         return {"error": error_msg, **results}

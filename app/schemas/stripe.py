@@ -168,6 +168,46 @@ class ChurnMonthData(BaseModel):
     active: int
 
 
+class DuplicatePaymentGroup(BaseModel):
+    """A group of duplicate payments"""
+    key: str  # Deduplication key (e.g., "subscription_invoice:sub_xxx:in_xxx" or "invoice:in_xxx")
+    payment_ids: List[str]  # List of payment UUIDs in this group
+    count: int  # Number of duplicates
+    total_amount_cents: int  # Sum of all amounts (to verify they match)
+    recommended_keep_id: str  # ID of payment to keep (best one based on type priority)
+    
+    class Config:
+        from_attributes = True
+
+
+class DuplicatePaymentsResponse(BaseModel):
+    """Response for duplicate payment detection"""
+    total_groups: int
+    total_duplicates: int  # Total number of duplicate payments (excluding the ones to keep)
+    groups: List[DuplicatePaymentGroup]
+    
+    class Config:
+        from_attributes = True
+
+
+class MergeDuplicatesRequest(BaseModel):
+    """Request to merge/delete duplicate payments"""
+    payment_ids: List[str]  # List of payment UUIDs to delete (keep the recommended one)
+    auto_reconcile: bool = True  # Automatically reconcile after deletion
+    
+    class Config:
+        from_attributes = True
+
+
+class MergeDuplicatesResponse(BaseModel):
+    """Response for merge/delete operation"""
+    deleted_count: int
+    reconciliation: Optional[dict] = None  # Reconciliation results if auto_reconcile=True
+    
+    class Config:
+        from_attributes = True
+
+
 class CohortMonthData(BaseModel):
     month: str  # YYYY-MM
     new_subscriptions: int

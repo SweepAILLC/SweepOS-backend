@@ -59,21 +59,50 @@ def update_client_lifecycle_state(db: Session, client: Client, force: bool = Fal
     current_state = client.lifecycle_state
     target_state = None
     
+    # Get current state as string for comparison (handles both enum and string)
+    current_state_str = current_state.value if hasattr(current_state, 'value') else str(current_state)
+    
+    # Debug logging
+    print(f"[CLIENT_AUTOMATION] Client {client.id} ({client.email}): progress={progress:.2f}%, current_state={current_state_str}")
+    
     if progress >= 100.0:
-        # Program expired - move to dead (unless already there or in a higher priority state)
-        if current_state == LifecycleState.OFFBOARDING:
+        # Program expired - move to dead (unless already there)
+        if current_state_str != 'dead':
             target_state = LifecycleState.DEAD
+            print(f"[CLIENT_AUTOMATION] Client {client.id} reached 100% - moving to DEAD")
     elif progress >= 75.0:
-        # 75% complete - move to offboarding (only if currently active)
-        if current_state == LifecycleState.ACTIVE:
+        # 75% complete - move to offboarding (from any state except dead or already offboarding)
+        # This handles clients in cold_lead, warm_lead, or active states
+        if current_state_str not in ['offboarding', 'dead']:
             target_state = LifecycleState.OFFBOARDING
-    # For progress < 75%, keep in active (unless manually moved)
+            print(f"[CLIENT_AUTOMATION] Client {client.id} reached 75% ({progress:.2f}%) - moving from {current_state_str} to OFFBOARDING")
+        else:
+            print(f"[CLIENT_AUTOMATION] Client {client.id} at 75% but already in {current_state_str}, skipping")
+    # For progress < 75%, keep current state (unless manually moved)
     
     # Update state if needed
-    if target_state and (force or current_state != target_state):
-        print(f"[CLIENT_AUTOMATION] Updating client {client.id} from {current_state.value} to {target_state.value} (progress: {progress:.1f}%)")
-        client.lifecycle_state = target_state
-        return True
+    if target_state:
+        target_state_str = target_state.value if hasattr(target_state, 'value') else str(target_state)
+        
+        # Always update if target_state is set and different from current
+        # The force parameter is for manual overrides, but we should always update based on progress
+        if current_state_str != target_state_str:
+            print(f"[CLIENT_AUTOMATION] ✅ Updating client {client.id} ({client.email}) from {current_state_str} to {target_state_str} (progress: {progress:.1f}%)")
+            client.lifecycle_state = target_state
+            # Force flush to ensure state is saved immediately
+            db.flush()
+            # Verify the update took effect
+            db.refresh(client)
+            updated_state_str = client.lifecycle_state.value if hasattr(client.lifecycle_state, 'value') else str(client.lifecycle_state)
+            if updated_state_str != target_state_str:
+                print(f"[CLIENT_AUTOMATION] ⚠️  WARNING: State update may have failed! Expected {target_state_str}, got {updated_state_str}")
+            else:
+                print(f"[CLIENT_AUTOMATION] ✅ Verified: Client state successfully updated to {updated_state_str}")
+            return True
+        else:
+            print(f"[CLIENT_AUTOMATION] ⚠️  Would update client {client.id} to {target_state_str}, but already in that state (force={force})")
+    else:
+        print(f"[CLIENT_AUTOMATION] No state change needed for client {client.id} (progress: {progress:.1f}%, state: {current_state_str})")
     
     return False
 

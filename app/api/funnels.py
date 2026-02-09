@@ -48,7 +48,10 @@ def list_funnels(
     current_user: User = Depends(get_current_user)
 ):
     """List all funnels for the current organization"""
-    query = db.query(Funnel).filter(Funnel.org_id == current_user.org_id)
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
+    query = db.query(Funnel).filter(Funnel.org_id == org_id)
     
     if client_id:
         query = query.filter(Funnel.client_id == client_id)
@@ -64,15 +67,18 @@ def create_funnel(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new funnel"""
-    # CRITICAL: Set org_id from current user
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
+    # CRITICAL: Set org_id from selected org (token)
     funnel_dict = funnel_data.model_dump()
-    funnel_dict['org_id'] = current_user.org_id
+    funnel_dict['org_id'] = org_id
     
     # Verify client_id belongs to org if provided
     if funnel_dict.get('client_id'):
         client = db.query(Client).filter(
             Client.id == funnel_dict['client_id'],
-            Client.org_id == current_user.org_id
+            Client.org_id == org_id
         ).first()
         if not client:
             raise HTTPException(
@@ -94,9 +100,12 @@ def get_funnel(
     current_user: User = Depends(get_current_user)
 ):
     """Get funnel details with steps"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     funnel = db.query(Funnel).filter(
         Funnel.id == funnel_id,
-        Funnel.org_id == current_user.org_id
+        Funnel.org_id == org_id
     ).first()
     
     if not funnel:
@@ -108,7 +117,7 @@ def get_funnel(
     # Load steps
     steps = db.query(FunnelStep).filter(
         FunnelStep.funnel_id == funnel_id,
-        FunnelStep.org_id == current_user.org_id
+        FunnelStep.org_id == org_id
     ).order_by(asc(FunnelStep.step_order)).all()
     
     funnel_dict = {
@@ -127,9 +136,12 @@ def update_funnel(
     current_user: User = Depends(get_current_user)
 ):
     """Update a funnel"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     funnel = db.query(Funnel).filter(
         Funnel.id == funnel_id,
-        Funnel.org_id == current_user.org_id
+        Funnel.org_id == org_id
     ).first()
     
     if not funnel:
@@ -144,7 +156,7 @@ def update_funnel(
     if 'client_id' in update_data and update_data['client_id']:
         client = db.query(Client).filter(
             Client.id == update_data['client_id'],
-            Client.org_id == current_user.org_id
+            Client.org_id == org_id
         ).first()
         if not client:
             raise HTTPException(
@@ -168,9 +180,12 @@ def delete_funnel(
     current_user: User = Depends(get_current_user)
 ):
     """Delete a funnel (cascades to steps)"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     funnel = db.query(Funnel).filter(
         Funnel.id == funnel_id,
-        Funnel.org_id == current_user.org_id
+        Funnel.org_id == org_id
     ).first()
     
     if not funnel:
@@ -193,10 +208,13 @@ def create_funnel_step(
     current_user: User = Depends(get_current_user)
 ):
     """Add a step to a funnel"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     # Verify funnel exists and belongs to org
     funnel = db.query(Funnel).filter(
         Funnel.id == funnel_id,
-        Funnel.org_id == current_user.org_id
+        Funnel.org_id == org_id
     ).first()
     
     if not funnel:
@@ -206,7 +224,7 @@ def create_funnel_step(
         )
     
     step_dict = step_data.model_dump()
-    step_dict['org_id'] = current_user.org_id
+    step_dict['org_id'] = org_id
     step_dict['funnel_id'] = funnel_id
     
     step = FunnelStep(**step_dict)
@@ -225,10 +243,13 @@ def update_funnel_step(
     current_user: User = Depends(get_current_user)
 ):
     """Update a funnel step"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     step = db.query(FunnelStep).filter(
         FunnelStep.id == step_id,
         FunnelStep.funnel_id == funnel_id,
-        FunnelStep.org_id == current_user.org_id
+        FunnelStep.org_id == org_id
     ).first()
     
     if not step:
@@ -255,10 +276,13 @@ def delete_funnel_step(
     current_user: User = Depends(get_current_user)
 ):
     """Delete a funnel step"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     step = db.query(FunnelStep).filter(
         FunnelStep.id == step_id,
         FunnelStep.funnel_id == funnel_id,
-        FunnelStep.org_id == current_user.org_id
+        FunnelStep.org_id == org_id
     ).first()
     
     if not step:
@@ -280,10 +304,13 @@ def reorder_funnel_steps(
     current_user: User = Depends(get_current_user)
 ):
     """Reorder funnel steps by updating step_order"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     # Verify funnel exists
     funnel = db.query(Funnel).filter(
         Funnel.id == funnel_id,
-        Funnel.org_id == current_user.org_id
+        Funnel.org_id == org_id
     ).first()
     
     if not funnel:
@@ -300,7 +327,7 @@ def reorder_funnel_steps(
         step = db.query(FunnelStep).filter(
             FunnelStep.id == step_id,
             FunnelStep.funnel_id == funnel_id,
-            FunnelStep.org_id == current_user.org_id
+            FunnelStep.org_id == org_id
         ).first()
         
         if step:
@@ -312,7 +339,7 @@ def reorder_funnel_steps(
     # Return updated steps
     steps = db.query(FunnelStep).filter(
         FunnelStep.funnel_id == funnel_id,
-        FunnelStep.org_id == current_user.org_id
+        FunnelStep.org_id == org_id
     ).order_by(asc(FunnelStep.step_order)).all()
     
     return [FunnelStepSchema.model_validate(step, from_attributes=True) for step in steps]
@@ -488,10 +515,13 @@ def get_funnel_health(
     current_user: User = Depends(get_current_user)
 ):
     """Get funnel health metrics"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     # Verify funnel exists
     funnel = db.query(Funnel).filter(
         Funnel.id == funnel_id,
-        Funnel.org_id == current_user.org_id
+        Funnel.org_id == org_id
     ).first()
     
     if not funnel:
@@ -504,7 +534,7 @@ def get_funnel_health(
     # This is more reliable than occurred_at which depends on client clock
     last_event = db.query(Event).filter(
         Event.funnel_id == funnel_id,
-        Event.org_id == current_user.org_id
+        Event.org_id == org_id
     ).order_by(desc(Event.received_at)).first()
     
     # Use received_at for last event time (when we actually received it)
@@ -534,7 +564,7 @@ def get_funnel_health(
     # Get events in the last hour using received_at
     events_in_last_hour = db.query(Event).filter(
         Event.funnel_id == funnel_id,
-        Event.org_id == current_user.org_id,
+        Event.org_id == org_id,
         Event.received_at >= one_hour_ago
     ).all()
     
@@ -597,7 +627,7 @@ def get_funnel_health(
     # Total events - count all events for this funnel
     total_events = db.query(func.count(Event.id)).filter(
         Event.funnel_id == funnel_id,
-        Event.org_id == current_user.org_id
+        Event.org_id == org_id
     ).scalar() or 0
     
     return FunnelHealth(
@@ -617,10 +647,13 @@ def get_funnel_analytics(
     current_user: User = Depends(get_current_user)
 ):
     """Get funnel analytics: step counts, conversion rates, bookings, revenue"""
+    # Get selected org_id from user object (set by get_current_user)
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
     # Verify funnel exists
     funnel = db.query(Funnel).filter(
         Funnel.id == funnel_id,
-        Funnel.org_id == current_user.org_id
+        Funnel.org_id == org_id
     ).first()
     
     if not funnel:
@@ -632,7 +665,7 @@ def get_funnel_analytics(
     # Get steps
     steps = db.query(FunnelStep).filter(
         FunnelStep.funnel_id == funnel_id,
-        FunnelStep.org_id == current_user.org_id
+        FunnelStep.org_id == org_id
     ).order_by(asc(FunnelStep.step_order)).all()
     
     if not steps:
@@ -660,7 +693,7 @@ def get_funnel_analytics(
     for step in steps:
         count = db.query(func.count(Event.id)).filter(
             Event.funnel_id == funnel_id,
-            Event.org_id == current_user.org_id,
+            Event.org_id == org_id,
             Event.event_name == step.event_name,
             Event.occurred_at >= start_date,
             Event.occurred_at <= end_date
@@ -687,7 +720,7 @@ def get_funnel_analytics(
     if first_step:
         total_visitors = db.query(func.count(func.distinct(Event.visitor_id))).filter(
             Event.funnel_id == funnel_id,
-            Event.org_id == current_user.org_id,
+            Event.org_id == org_id,
             Event.event_name == first_step.event_name,
             Event.occurred_at >= start_date,
             Event.occurred_at <= end_date,
@@ -700,7 +733,7 @@ def get_funnel_analytics(
         # Count unique visitors who converted (triggered last step)
         total_conversions = db.query(func.count(func.distinct(Event.visitor_id))).filter(
             Event.funnel_id == funnel_id,
-            Event.org_id == current_user.org_id,
+            Event.org_id == org_id,
             Event.event_name == last_step.event_name,
             Event.occurred_at >= start_date,
             Event.occurred_at <= end_date,
@@ -717,7 +750,7 @@ def get_funnel_analytics(
     # Get bookings and revenue from events with payment_succeeded
     bookings = db.query(func.count(Event.id)).filter(
         Event.funnel_id == funnel_id,
-        Event.org_id == current_user.org_id,
+        Event.org_id == org_id,
         Event.event_name == "payment_succeeded",
         Event.occurred_at >= start_date,
         Event.occurred_at <= end_date
@@ -726,7 +759,7 @@ def get_funnel_analytics(
     # Revenue from metadata (if stored)
     revenue_events = db.query(Event).filter(
         Event.funnel_id == funnel_id,
-        Event.org_id == current_user.org_id,
+        Event.org_id == org_id,
         Event.event_name == "payment_succeeded",
         Event.occurred_at >= start_date,
         Event.occurred_at <= end_date
@@ -747,7 +780,7 @@ def get_funnel_analytics(
         )
     ).filter(
         Event.funnel_id == funnel_id,
-        Event.org_id == current_user.org_id,
+        Event.org_id == org_id,
         Event.occurred_at >= start_date,
         Event.occurred_at <= end_date,
         Session.utm.isnot(None)
@@ -778,19 +811,21 @@ def get_funnel_analytics(
             if event.event_name == "payment_succeeded" and event.event_metadata and 'amount_cents' in event.event_metadata:
                 utm_source_stats[source]['revenue_cents'] += int(event.event_metadata['amount_cents'])
     
-    # Update conversions to use unique visitors
+    # Update conversions to use unique visitors and add unique visitor count
     for source in utm_source_stats:
         utm_source_stats[source]['conversions'] = len(utm_source_converted_visitors.get(source, set()))
+        utm_source_stats[source]['unique_visitors'] = len(utm_source_visitors.get(source, set()))
     
-    # Convert to list and sort by count
+    # Convert to list and sort by unique visitors
     top_utm_sources = [
         UTMSourceStats(
             source=source,
             count=stats['count'],
+            unique_visitors=stats['unique_visitors'],
             conversions=stats['conversions'],
             revenue_cents=stats['revenue_cents']
         )
-        for source, stats in sorted(utm_source_stats.items(), key=lambda x: x[1]['count'], reverse=True)[:10]
+        for source, stats in sorted(utm_source_stats.items(), key=lambda x: x[1]['unique_visitors'], reverse=True)[:10]
     ]
     
     # Aggregate referrers
@@ -802,7 +837,7 @@ def get_funnel_analytics(
         )
     ).filter(
         Event.funnel_id == funnel_id,
-        Event.org_id == current_user.org_id,
+        Event.org_id == org_id,
         Event.occurred_at >= start_date,
         Event.occurred_at <= end_date,
         Session.referrer.isnot(None)
@@ -837,19 +872,21 @@ def get_funnel_analytics(
             if event.event_name == "payment_succeeded" and event.event_metadata and 'amount_cents' in event.event_metadata:
                 referrer_stats[referrer]['revenue_cents'] += int(event.event_metadata['amount_cents'])
     
-    # Update conversions to use unique visitors
+    # Update conversions to use unique visitors and add unique visitor count
     for referrer in referrer_stats:
         referrer_stats[referrer]['conversions'] = len(referrer_converted_visitors.get(referrer, set()))
+        referrer_stats[referrer]['unique_visitors'] = len(referrer_visitors.get(referrer, set()))
     
-    # Convert to list and sort by count
+    # Convert to list and sort by unique visitors
     top_referrers = [
         ReferrerStats(
             referrer=ref,
             count=stats['count'],
+            unique_visitors=stats['unique_visitors'],
             conversions=stats['conversions'],
             revenue_cents=stats['revenue_cents']
         )
-        for ref, stats in sorted(referrer_stats.items(), key=lambda x: x[1]['count'], reverse=True)[:10]
+        for ref, stats in sorted(referrer_stats.items(), key=lambda x: x[1]['unique_visitors'], reverse=True)[:10]
     ]
     
     return FunnelAnalytics(
@@ -913,8 +950,11 @@ def explore_events(
                 detail=f"Invalid offset format: {offset_str}. Must be an integer."
             )
         
+        # Get selected org_id from user object (set by get_current_user)
+        org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+        
         # Build query
-        query = db.query(Event).filter(Event.org_id == current_user.org_id)
+        query = db.query(Event).filter(Event.org_id == org_id)
         
         # Convert funnel_id string to UUID if provided
         funnel_uuid = None

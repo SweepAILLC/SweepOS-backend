@@ -3,10 +3,11 @@ from sqlalchemy.orm import Session
 from urllib.parse import urlencode
 import os
 import uuid
+import httpx
 from app.db.session import get_db
 from app.core.config import settings
 from app.schemas.oauth import OAuthStartResponse, OAuthTokenResponse, DirectApiKeyRequest
-from app.api.deps import get_current_user, require_admin
+from app.api.deps import get_current_user, require_admin, require_admin_or_owner
 from app.models.user import User
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.models.organization import Organization
@@ -24,6 +25,15 @@ router = APIRouter()
 def start_stripe_oauth(
     current_user: User = Depends(get_current_user)
 ):
+    # TEMPORARILY DISABLED: OAuth is disabled for deployment testing
+    # Only API key authentication is available
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="OAuth authentication is temporarily disabled. Please use API key authentication instead."
+    )
+    
+    # Original OAuth code commented out:
+    """
     # For development: If test OAuth URL is set, use it directly
     # This allows using External test links without publishing the app
     if settings.STRIPE_TEST_OAUTH_URL:
@@ -86,6 +96,21 @@ def start_stripe_oauth(
 
 @router.get("/stripe/callback")
 def stripe_oauth_callback(
+    # TEMPORARILY DISABLED: OAuth is disabled for deployment testing
+    code: str = Query(None),
+    state: str = Query(None),
+    error: str = Query(None),
+    error_description: str = Query(None),
+    db: Session = Depends(get_db)
+):
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="OAuth authentication is temporarily disabled. Please use API key authentication instead."
+    )
+    
+    # Original OAuth callback code commented out:
+    """
+def stripe_oauth_callback_original(
     code: str = Query(None),
     state: str = Query(None),
     error: str = Query(None),
@@ -431,7 +456,7 @@ def connect_stripe_direct(
     5. Logs the connection event for audit
     
     Args:
-        request: Request body containing api_key (sk_test_... or sk_live_...)
+        request: Request body containing api_key (sk_test_..., sk_live_..., rk_test_..., or rk_live_...)
         http_request: HTTP request object for IP address and user agent
     
     Returns:
@@ -442,7 +467,14 @@ def connect_stripe_direct(
     from app.core.audit import log_security_event
     from app.models.audit_log import AuditEventType
     from datetime import datetime, timedelta
-    import stripe
+    # Dynamic import for stripe
+    try:
+        import stripe
+    except ImportError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Stripe library is not installed. Please install it with: pip install stripe"
+        )
     
     # Rate limiting: 3 attempts per 15 minutes per user
     _cleanup_old_entries()
@@ -491,10 +523,10 @@ def connect_stripe_direct(
     
     # Validate API key format
     api_key = api_key.strip()
-    if not api_key.startswith(('sk_test_', 'sk_live_')):
+    if not api_key.startswith(('sk_test_', 'sk_live_', 'rk_test_', 'rk_live_')):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid API key format. Must start with 'sk_test_' or 'sk_live_'"
+            detail="Invalid API key format. Must start with 'sk_test_', 'sk_live_', 'rk_test_', or 'rk_live_'"
         )
     
     try:
@@ -519,7 +551,7 @@ def connect_stripe_direct(
             details={
                 "account_id": account_id,
                 "api_key_prefix": api_key[:10] + "..." if len(api_key) > 10 else "***",
-                "mode": "test" if api_key.startswith("sk_test_") else "live"
+                "mode": "test" if api_key.startswith(("sk_test_", "rk_test_")) else "live"
             }
         )
         
@@ -554,13 +586,15 @@ def connect_stripe_direct(
         
         # Trigger initial historical data sync (full backfill) in background thread
         # This prevents the connection endpoint from timing out during large syncs
+        # Also syncs Treasury Transactions and triggers reconciliation
         import threading
         def sync_in_background():
             # Create a new database session for the background thread
             from app.db.session import SessionLocal
             bg_db = SessionLocal()
             try:
-                from app.services.stripe_sync_v2 import sync_stripe_incremental
+                # Step 1: Sync old payment system (customers, subscriptions, payments)
+                from app.services.stripe_sync_v2 import sync_stripe_incremental, reconcile_stripe_data
                 print(f"[DIRECT_CONNECT] Starting initial historical data sync (full backfill) for org {org_id}...")
                 sync_result = sync_stripe_incremental(bg_db, org_id=org_id, force_full=True)
                 if sync_result.get("error"):
@@ -570,9 +604,45 @@ def connect_stripe_direct(
                     print(f"   - Customers: {sync_result.get('customers_synced', 0)} new, {sync_result.get('customers_updated', 0)} updated")
                     print(f"   - Subscriptions: {sync_result.get('subscriptions_synced', 0)} new, {sync_result.get('subscriptions_updated', 0)} updated")
                     print(f"   - Payments: {sync_result.get('payments_synced', 0)} new, {sync_result.get('payments_updated', 0)} updated")
+                
+                # Step 2: Sync Treasury Transactions (new source of truth)
+                try:
+                    from app.services.stripe_treasury_sync import sync_treasury_transactions
+                    from datetime import timedelta
+                    created_since = datetime.utcnow() - timedelta(days=365)  # Sync last year
+                    print(f"[DIRECT_CONNECT] Starting Treasury Transactions sync for org {org_id}...")
+                    treasury_result = sync_treasury_transactions(
+                        db=bg_db,
+                        org_id=org_id,
+                        financial_account_id=None,
+                        limit=100,
+                        created_since=created_since
+                    )
+                    print(f"[DIRECT_CONNECT] ✅ Treasury Transactions sync complete for org {org_id}:")
+                    print(f"   - Transactions synced: {treasury_result.get('transactions_synced', 0)}")
+                    print(f"   - Transactions updated: {treasury_result.get('transactions_updated', 0)}")
+                    print(f"   - Clients created: {treasury_result.get('clients_created', 0)}")
+                    print(f"   - Clients updated: {treasury_result.get('clients_updated', 0)}")
+                except Exception as treasury_error:
+                    print(f"[DIRECT_CONNECT] ⚠️ Treasury sync failed (non-critical): {str(treasury_error)}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Step 3: Reconcile/recalculate derived metrics
+                try:
+                    print(f"[DIRECT_CONNECT] Starting reconciliation for org {org_id}...")
+                    reconcile_result = reconcile_stripe_data(bg_db, org_id=org_id)
+                    print(f"[DIRECT_CONNECT] ✅ Reconciliation complete for org {org_id}:")
+                    print(f"   - Clients reconciled: {reconcile_result.get('clients_reconciled', 0)}")
+                    print(f"   - Revenue recalculated: ${reconcile_result.get('revenue_recalculated', 0):.2f}")
+                except Exception as reconcile_error:
+                    print(f"[DIRECT_CONNECT] ⚠️ Reconciliation failed (non-critical): {str(reconcile_error)}")
+                    import traceback
+                    traceback.print_exc()
+                    
             except Exception as e:
                 import traceback
-                print(f"[DIRECT_CONNECT] ❌ Historical sync failed: {str(e)}")
+                print(f"[DIRECT_CONNECT] ❌ Background sync failed: {str(e)}")
                 traceback.print_exc()
             finally:
                 bg_db.close()
@@ -588,7 +658,7 @@ def connect_stripe_direct(
                 "message": "Stripe connected successfully using API key. Initial sync is running in the background.",
                 "account_id": account_id,
                 "org_id": str(org_id),
-                "mode": "test" if api_key.startswith("sk_test_") else "live",
+                "mode": "test" if api_key.startswith(("sk_test_", "rk_test_")) else "live",
                 "sync_in_progress": True
             }
         )
@@ -793,6 +863,14 @@ def stripe_oauth_callback_manual_get(
 def start_brevo_oauth(
     current_user: User = Depends(get_current_user)
 ):
+    # TEMPORARILY DISABLED: OAuth is disabled for deployment testing
+    # Only API key authentication is available
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="OAuth authentication is temporarily disabled. Please use API key authentication instead."
+    )
+    
+    # Original OAuth code commented out:
     """
     Start Brevo OAuth flow.
     Generates authorization URL that redirects users to Brevo's authentication page.
@@ -811,25 +889,33 @@ def start_brevo_oauth(
         )
     
     # Generate state parameter with org_id for multi-tenant support
+    # Use compact format to avoid HTTP 431 (Request Header Fields Too Large) errors
     import secrets
     import base64
     import json
     import time
     state_data = {
         "org_id": str(current_user.org_id),
-        "nonce": secrets.token_urlsafe(16),  # CSRF protection
-        "timestamp": int(time.time())  # Add timestamp to prevent browser caching
+        "nonce": secrets.token_urlsafe(8),  # Reduced from 16 to 8 bytes for smaller state
+        "ts": int(time.time())  # Shorter key name, timestamp for CSRF protection
     }
-    state = base64.urlsafe_b64encode(json.dumps(state_data).encode()).decode()
+    # Use compact JSON (no spaces) and base64 encode
+    state = base64.urlsafe_b64encode(json.dumps(state_data, separators=(',', ':')).encode()).decode()
     
     # Use custom BREVO_LOGIN_URL if provided, otherwise use standard Brevo OAuth URL
     # According to Brevo docs: https://auth.brevo.com/realms/apiv3/protocol/openid-connect/auth
-    # BREVO_LOGIN_URL should be the base URL without query parameters
+    # BREVO_LOGIN_URL should be the base URL WITHOUT query parameters
+    # If query parameters are included, they will be stripped and replaced with our own
     base_url = settings.BREVO_LOGIN_URL or "https://auth.brevo.com/realms/apiv3/protocol/openid-connect/auth"
     
     # Remove any existing query parameters from base_url if provided
+    # This ensures we always use our own parameters (including state)
     if "?" in base_url:
         base_url = base_url.split("?")[0]
+        print(f"[BREVO OAUTH] ⚠️  WARNING: BREVO_LOGIN_URL contained query parameters. They have been stripped.")
+        print(f"[BREVO OAUTH] ⚠️  BREVO_LOGIN_URL should only contain the base URL, e.g.:")
+        print(f"[BREVO OAUTH] ⚠️  BREVO_LOGIN_URL=https://auth.brevo.com/realms/apiv3/protocol/openid-connect/auth")
+        print(f"[BREVO OAUTH] ⚠️  Do NOT include query parameters like ?response_type=code&client_id=...")
     
     # Ensure redirect_uri matches exactly what's registered in Brevo
     # It must be URL-encoded in the query string, but the value itself should be the exact URI
@@ -865,14 +951,26 @@ def start_brevo_oauth(
     print(f"  - Org ID: {current_user.org_id}")
     print(f"{'='*80}\n")
     
+    # Build OAuth authorization URL according to Brevo documentation:
+    # https://auth.brevo.com/realms/apiv3/protocol/openid-connect/auth?response_type=code&client_id={{YOUR_CLIENT_ID}}&redirect_uri={{YOUR_CALLBACK_URL}}&scope=openid
+    # Note: We also include 'state' parameter for CSRF protection (standard OAuth 2.0 security practice)
     params = {
-        "response_type": "code",
-        "client_id": settings.BREVO_CLIENT_ID,
-        "redirect_uri": redirect_uri,  # urlencode will encode this properly
-        "scope": "openid",  # Required scope according to Brevo docs
-        "state": state,  # Contains org_id for multi-tenant support
+        "response_type": "code",  # Required: authorization code flow
+        "client_id": settings.BREVO_CLIENT_ID,  # Required: OAuth application identifier
+        "redirect_uri": redirect_uri,  # Required: callback URL (urlencode will encode this properly)
+        "scope": "openid",  # Required: according to Brevo docs
+        "state": state,  # Optional but recommended: CSRF protection and org_id tracking
     }
+    
+    # Build the OAuth URL with all parameters including state
     redirect_url = f"{base_url}?{urlencode(params)}"
+    
+    # Verify state parameter is in the URL (critical for security)
+    if "state=" not in redirect_url:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to include state parameter in OAuth URL. This is required for security."
+        )
     
     # Decode the redirect_uri from the generated URL to verify it's correct
     from urllib.parse import parse_qs, urlparse, unquote
@@ -889,6 +987,8 @@ def start_brevo_oauth(
     print(f"[BREVO OAUTH] Redirect URI length: {len(redirect_uri)} characters")
     print(f"[BREVO OAUTH] Redirect URI in generated URL: {redirect_uri_in_url}")
     print(f"[BREVO OAUTH] Match check: {'✅ MATCH' if redirect_uri == redirect_uri_in_url else '❌ MISMATCH'}")
+    print(f"[BREVO OAUTH] State parameter: {'✅ PRESENT' if state and 'state=' in redirect_url else '❌ MISSING'}")
+    print(f"[BREVO OAUTH] State length: {len(state) if state else 0} characters")
     print(f"[BREVO OAUTH] Full OAuth URL (first 400 chars):")
     print(f"  {redirect_url[:400]}...")
     print(f"[BREVO OAUTH] ==========================================\n")
@@ -941,24 +1041,24 @@ def brevo_oauth_callback(
     # Get frontend URL from settings
     frontend_url = settings.FRONTEND_URL
     
-    # Handle OAuth errors
+    # Handle OAuth errors - redirect to dashboard with brevo tab active
     if error:
         error_msg = error_description or error
         return RedirectResponse(
-            url=f"{frontend_url}/?brevo_error={error}&error_description={error_msg}",
+            url=f"{frontend_url}/?brevo_error={error}&error_description={error_msg}&tab=brevo",
             status_code=302
         )
     
     # Code is required if no error
     if not code:
         return RedirectResponse(
-            url=f"{frontend_url}/?brevo_error=no_code&error_description=No authorization code provided",
+            url=f"{frontend_url}/?brevo_error=no_code&error_description=No authorization code provided&tab=brevo",
             status_code=302
         )
     
     if not settings.BREVO_CLIENT_SECRET:
         return RedirectResponse(
-            url=f"{frontend_url}/?brevo_error=configuration_error&error_description=Brevo not configured",
+            url=f"{frontend_url}/?brevo_error=configuration_error&error_description=Brevo not configured&tab=brevo",
             status_code=302
         )
     
@@ -969,6 +1069,7 @@ def brevo_oauth_callback(
             import base64
             import json
             state_data = json.loads(base64.urlsafe_b64decode(state.encode()).decode())
+            # Support both old format (timestamp) and new format (ts)
             org_id = uuid.UUID(state_data.get("org_id", str(DEFAULT_ORG_ID)))
         except Exception as e:
             # If state parsing fails, log but continue with default
@@ -977,21 +1078,27 @@ def brevo_oauth_callback(
     try:
         # Exchange authorization code for access token
         # According to Brevo docs: POST to https://api.brevo.com/v3/token
-        # Using data= parameter automatically URL-encodes the form data
-        # This matches the curl --data-urlencode behavior in the documentation
+        # Using data= parameter automatically URL-encodes the form data (matches curl --data-urlencode)
+        # Required parameters per documentation:
+        # - grant_type: "authorization_code"
+        # - client_id: OAuth application identifier
+        # - client_secret: Secret token for authentication
+        # - code: Authorization code from callback (10-minute TTL per docs)
+        # - redirect_uri: Must match exactly the redirect_uri used in authorization URL
         token_exchange_data = {
-            "grant_type": "authorization_code",
-            "client_id": settings.BREVO_CLIENT_ID,
-            "client_secret": settings.BREVO_CLIENT_SECRET,
-            "code": code,
-            "redirect_uri": settings.BREVO_REDIRECT_URI  # Must match the redirect_uri used in authorization URL
+            "grant_type": "authorization_code",  # Required: OAuth grant type
+            "client_id": settings.BREVO_CLIENT_ID,  # Required: OAuth application identifier
+            "client_secret": settings.BREVO_CLIENT_SECRET,  # Required: Secret token
+            "code": code,  # Required: Authorization code (10-minute TTL per docs)
+            "redirect_uri": settings.BREVO_REDIRECT_URI  # Required: Must match authorization URL exactly
         }
         
-        print(f"[BREVO OAUTH] Exchanging code for token:")
+        print(f"[BREVO OAUTH] Exchanging code for token (per Brevo docs):")
         print(f"  - Token endpoint: https://api.brevo.com/v3/token")
         print(f"  - Client ID: {settings.BREVO_CLIENT_ID}")
         print(f"  - Redirect URI: {settings.BREVO_REDIRECT_URI}")
         print(f"  - Code length: {len(code) if code else 0} characters")
+        print(f"  - Note: Authorization code has 10-minute TTL (per Brevo docs)")
         
         response = httpx.post(
             "https://api.brevo.com/v3/token",
@@ -1006,26 +1113,42 @@ def brevo_oauth_callback(
             error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
             error_msg = error_data.get("error_description", f"HTTP {response.status_code}: {response.text}")
             return RedirectResponse(
-                url=f"{frontend_url}/?brevo_error=token_exchange_failed&error_description={error_msg}",
+                url=f"{frontend_url}/?brevo_error=token_exchange_failed&error_description={error_msg}&tab=brevo",
                 status_code=302
             )
         
         token_data = response.json()
+        
+        # Extract tokens according to Brevo documentation
+        # Response includes: access_token, expires_in, refresh_token, token_type, id_token, session_state, scope
         access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
-        expires_in = token_data.get("expires_in", 43200)  # Default 12 hours if not specified
+        expires_in = token_data.get("expires_in", 43200)  # Default 12 hours (43200 seconds) if not specified
+        token_type = token_data.get("token_type", "Bearer")  # Usually "Bearer"
+        id_token = token_data.get("id_token")  # JWT token with user info (optional)
+        session_state = token_data.get("session_state")  # Session state (optional)
+        scope = token_data.get("scope", "openid")  # Scopes granted
         
         if not access_token:
+            print(f"[BREVO OAUTH] ❌ ERROR: No access_token in response")
+            print(f"[BREVO OAUTH] Response keys: {list(token_data.keys())}")
             return RedirectResponse(
-                url=f"{frontend_url}/?brevo_error=no_access_token&error_description=No access token in response",
+                url=f"{frontend_url}/?brevo_error=no_access_token&error_description=No access token in response&tab=brevo",
                 status_code=302
             )
+        
+        print(f"[BREVO OAUTH] ✅ Token exchange successful:")
+        print(f"  - Token type: {token_type}")
+        print(f"  - Expires in: {expires_in} seconds ({expires_in / 3600:.1f} hours)")
+        print(f"  - Scope: {scope}")
+        print(f"  - Has refresh token: {bool(refresh_token)}")
+        print(f"  - Has ID token: {bool(id_token)}")
         
         # Encrypt tokens before storing
         encrypted_token = encrypt_token(access_token)
         encrypted_refresh = encrypt_token(refresh_token) if refresh_token else None
         
-        # Calculate expiration
+        # Calculate expiration timestamp
         expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
         
         # CRITICAL: Check if token exists for this provider AND org (multi-tenant isolation)
@@ -1038,7 +1161,8 @@ def brevo_oauth_callback(
             existing.access_token = encrypted_token
             existing.refresh_token = encrypted_refresh
             existing.expires_at = expires_at
-            existing.scope = token_data.get("scope")
+            existing.scope = scope  # Use extracted scope
+            print(f"[BREVO OAUTH] Updated existing token for org {org_id}")
         else:
             # Store token with org_id for multi-tenant isolation
             oauth_token = OAuthToken(
@@ -1047,22 +1171,24 @@ def brevo_oauth_callback(
                 access_token=encrypted_token,
                 refresh_token=encrypted_refresh,
                 expires_at=expires_at,
-                scope=token_data.get("scope")
+                scope=scope  # Use extracted scope
             )
             db.add(oauth_token)
+            print(f"[BREVO OAUTH] Created new token for org {org_id}")
         
         db.commit()
         
-        # Redirect to frontend with success message
+        # Redirect to frontend dashboard with success message and brevo tab active
+        # This ensures users are sent back to the OS dashboard with state updated
         return RedirectResponse(
-            url=f"{frontend_url}/?brevo_connected=true",
+            url=f"{frontend_url}/?brevo_connected=true&tab=brevo",
             status_code=302
         )
         
     except httpx.HTTPError as e:
         db.rollback()
         return RedirectResponse(
-            url=f"{frontend_url}/?brevo_error=network_error&error_description={str(e)}",
+            url=f"{frontend_url}/?brevo_error=network_error&error_description={str(e)}&tab=brevo",
             status_code=302
         )
     except Exception as e:
@@ -1070,15 +1196,201 @@ def brevo_oauth_callback(
         import traceback
         traceback.print_exc()
         return RedirectResponse(
-            url=f"{frontend_url}/?brevo_error=unknown_error&error_description={str(e)}",
+            url=f"{frontend_url}/?brevo_error=unknown_error&error_description={str(e)}&tab=brevo",
             status_code=302
+        )
+
+
+@router.post("/brevo/connect-direct")
+def connect_brevo_direct(
+    request: DirectApiKeyRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)  # Require admin role
+):
+    """
+    Connect Brevo directly using an API key (bypasses OAuth).
+    Use this when OAuth is not working or you prefer API key authentication.
+    
+    SECURITY: This endpoint requires admin role and is rate-limited.
+    Direct API keys have full account access.
+    
+    This endpoint:
+    1. Validates the API key by making a test call to Brevo API
+    2. Retrieves the account information
+    3. Stores the API key as an OAuth token (encrypted)
+    4. Logs the connection event for audit
+    
+    Args:
+        request: Request body containing api_key (Brevo API key)
+        http_request: HTTP request object for IP address and user agent
+    
+    Returns:
+        Success message with account email
+    """
+    from fastapi.responses import JSONResponse
+    from app.core.rate_limit import _rate_limit_store, _rate_limit_lock, _cleanup_old_entries
+    from app.core.audit import log_security_event
+    from app.models.audit_log import AuditEventType
+    from datetime import datetime, timedelta
+    import httpx
+    
+    # Rate limiting: 3 attempts per 15 minutes per user
+    _cleanup_old_entries()
+    identifier = f"brevo_direct_api_key_{current_user.id}_{current_user.org_id}"
+    now = datetime.utcnow()
+    window_start = now - timedelta(seconds=900)  # 15 minutes
+    
+    with _rate_limit_lock:
+        if identifier not in _rate_limit_store:
+            _rate_limit_store[identifier] = []
+        recent_requests = [
+            ts for ts, _ in _rate_limit_store[identifier]
+            if ts > window_start
+        ]
+        
+        if len(recent_requests) >= 3:
+            # Log rate limit event
+            log_security_event(
+                db=db,
+                event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
+                org_id=current_user.org_id,
+                user_id=current_user.id,
+                resource_type="api_endpoint",
+                resource_id="connect_brevo_direct",
+                ip_address=http_request.client.host if http_request.client else None,
+                user_agent=http_request.headers.get("user-agent"),
+                details={
+                    "endpoint": "connect_brevo_direct",
+                    "max_requests": 3,
+                    "window_seconds": 900,
+                    "recent_requests": len(recent_requests)
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded: 3 direct API key connections per 15 minutes. Please try again later or use OAuth instead."
+            )
+        
+        # Add current request
+        _rate_limit_store[identifier].append((now, 1))
+    
+    api_key = request.api_key
+    if not api_key or not api_key.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="API key is required"
+        )
+    
+    # Validate and test the API key by making a call to Brevo API
+    api_key = api_key.strip()
+    
+    try:
+        # Test the API key by calling Brevo account endpoint
+        # Brevo uses 'api-key' header, not 'Authorization: Bearer'
+        response = httpx.get(
+            "https://api.brevo.com/v3/account",
+            headers={
+                "api-key": api_key,
+                "accept": "application/json"
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code != 200:
+            error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            error_msg = error_data.get("message", f"HTTP {response.status_code}: {response.text}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Invalid API key: {error_msg}"
+            )
+        
+        account_data = response.json()
+        account_email = account_data.get("email")
+        account_id = account_email or "unknown"
+        
+        print(f"[BREVO DIRECT] Validated API key for account: {account_email}")
+        
+        # Log security event BEFORE storing (for audit trail)
+        org_id = current_user.org_id
+        log_security_event(
+            db=db,
+            event_type=AuditEventType.API_KEY_CONNECTED,
+            org_id=org_id,
+            user_id=current_user.id,
+            resource_type="brevo",
+            resource_id=account_id,
+            ip_address=http_request.client.host if http_request.client else None,
+            user_agent=http_request.headers.get("user-agent"),
+            details={
+                "account_email": account_email,
+                "api_key_prefix": api_key[:10] + "..." if len(api_key) > 10 else "***",
+                "method": "api_key"
+            }
+        )
+        
+        # Encrypt the API key before storing
+        encrypted_token = encrypt_token(api_key)
+        
+        # Check if token exists for this provider AND org
+        existing = db.query(OAuthToken).filter(
+            OAuthToken.provider == OAuthProvider.BREVO,
+            OAuthToken.org_id == org_id
+        ).first()
+        
+        if existing:
+            existing.access_token = encrypted_token
+            existing.refresh_token = None  # API keys don't have refresh tokens
+            existing.expires_at = None  # API keys don't expire
+            existing.scope = "api_key"  # Mark as API key method
+            existing.account_id = account_id
+            print(f"[BREVO DIRECT] Updated existing connection for org {org_id}")
+        else:
+            # Store API key as OAuth token (encrypted)
+            oauth_token = OAuthToken(
+                org_id=org_id,
+                provider=OAuthProvider.BREVO,
+                access_token=encrypted_token,
+                refresh_token=None,  # API keys don't have refresh tokens
+                expires_at=None,  # API keys don't expire
+                scope="api_key",  # Mark as API key method
+                account_id=account_id
+            )
+            db.add(oauth_token)
+            print(f"[BREVO DIRECT] Created new connection for org {org_id}")
+        
+        db.commit()
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "message": "Brevo connected successfully using API key.",
+                "account_email": account_email,
+                "org_id": str(org_id),
+                "method": "api_key"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Network error validating API key: {str(e)}"
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error connecting Brevo: {str(e)}"
         )
 
 
 @router.delete("/stripe/disconnect", status_code=status.HTTP_204_NO_CONTENT)
 def disconnect_stripe(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_admin_or_owner)
 ):
     """
     Disconnect Stripe OAuth for the current user's organization.
@@ -1111,12 +1423,13 @@ def debug_brevo_config(
     import time
     
     # Generate state parameter (same as in start_brevo_oauth)
+    # Use compact format to avoid HTTP 431 errors
     state_data = {
         "org_id": str(current_user.org_id),
-        "nonce": secrets.token_urlsafe(16),
-        "timestamp": int(time.time())
+        "nonce": secrets.token_urlsafe(8),  # Reduced for smaller state
+        "ts": int(time.time())  # Shorter key name
     }
-    state = base64.urlsafe_b64encode(json.dumps(state_data).encode()).decode()
+    state = base64.urlsafe_b64encode(json.dumps(state_data, separators=(',', ':')).encode()).decode()
     
     base_url = settings.BREVO_LOGIN_URL or "https://auth.brevo.com/realms/apiv3/protocol/openid-connect/auth"
     if "?" in base_url:
@@ -1184,7 +1497,7 @@ def debug_brevo_config(
 @router.delete("/brevo/disconnect", status_code=status.HTTP_204_NO_CONTENT)
 def disconnect_brevo(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(require_admin_or_owner)
 ):
     """
     Disconnect Brevo OAuth for the current user's organization.
@@ -1201,3 +1514,663 @@ def disconnect_brevo(
         db.commit()
     
     return None
+
+
+@router.post("/calcom/connect-direct")
+def connect_calcom_direct(
+    request: DirectApiKeyRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)  # Require admin role
+):
+    """
+    Connect Cal.com directly using an API key.
+    
+    SECURITY: This endpoint requires admin role and is rate-limited.
+    Direct API keys have full account access.
+    
+    This endpoint:
+    1. Validates the API key by making a test call to Cal.com API
+    2. Retrieves the account information
+    3. Stores the API key as an OAuth token (encrypted)
+    4. Logs the connection event for audit
+    
+    Args:
+        request: Request body containing api_key (Cal.com API key)
+        http_request: HTTP request object for IP address and user agent
+    
+    Returns:
+        Success message with account information
+    """
+    from fastapi.responses import JSONResponse
+    from app.core.rate_limit import _rate_limit_store, _rate_limit_lock, _cleanup_old_entries
+    from app.core.audit import log_security_event
+    from app.models.audit_log import AuditEventType
+    from datetime import datetime, timedelta
+    import httpx
+    
+    # Rate limiting: 3 attempts per 15 minutes per user
+    _cleanup_old_entries()
+    identifier = f"calcom_direct_api_key_{current_user.id}_{current_user.org_id}"
+    now = datetime.utcnow()
+    window_start = now - timedelta(seconds=900)  # 15 minutes
+    
+    with _rate_limit_lock:
+        if identifier not in _rate_limit_store:
+            _rate_limit_store[identifier] = []
+        recent_requests = [
+            ts for ts, _ in _rate_limit_store[identifier]
+            if ts > window_start
+        ]
+        
+        if len(recent_requests) >= 3:
+            # Log rate limit event
+            log_security_event(
+                db=db,
+                event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
+                org_id=current_user.org_id,
+                user_id=current_user.id,
+                resource_type="api_endpoint",
+                resource_id="connect_calcom_direct",
+                ip_address=http_request.client.host if http_request.client else None,
+                user_agent=http_request.headers.get("user-agent"),
+                details={
+                    "endpoint": "connect_calcom_direct",
+                    "max_requests": 3,
+                    "window_seconds": 900,
+                    "recent_requests": len(recent_requests)
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded: 3 direct API key connections per 15 minutes. Please try again later."
+            )
+        
+        # Add current request
+        _rate_limit_store[identifier].append((now, 1))
+    
+    api_key = request.api_key
+    if not api_key or not api_key.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="API key is required"
+        )
+    
+    api_key = api_key.strip()
+    org_id = current_user.org_id
+    
+    # VALIDATION: Check if Calendly is already connected
+    # Users should connect ONE calendar provider, not both
+    from sqlalchemy import text
+    calendly_result = db.execute(
+        text("""
+            SELECT id FROM oauth_tokens 
+            WHERE provider = 'calendly'::oauthprovider
+            AND org_id = :org_id 
+            LIMIT 1
+        """),
+        {"org_id": org_id}
+    ).first()
+    
+    if calendly_result:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Calendly is already connected. Please disconnect Calendly first before connecting Cal.com. You can only connect one calendar provider at a time."
+        )
+    
+    # Validate and test the API key by making a call to Cal.com API
+    
+    try:
+        # Test the API key by calling Cal.com API v2 user endpoint
+        # According to Cal.com API v2 docs: https://cal.com/docs/api-reference/v2/introduction
+        # Authentication: Authorization: Bearer {API_KEY}
+        # Endpoint: GET /me (under v2)
+        response = httpx.get(
+            "https://api.cal.com/v2/me",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code != 200:
+            error_data = {}
+            try:
+                if response.headers.get("content-type", "").startswith("application/json"):
+                    error_data = response.json()
+            except:
+                pass
+            
+            # Extract error message from Cal.com API response
+            error_msg = (
+                error_data.get("message") or 
+                error_data.get("error") or 
+                (error_data.get("details", {}).get("message") if isinstance(error_data.get("details"), dict) else None) or
+                f"HTTP {response.status_code}"
+            )
+            
+            # Format a user-friendly error message
+            if response.status_code == 401:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=f"Invalid Cal.com API key. Please check that your API key is correct and has not expired. Error: {error_msg}"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Cal.com API error: {error_msg}"
+                )
+        
+        account_data = response.json()
+        account_email = account_data.get("email") or account_data.get("username")
+        account_id = account_data.get("id") or account_email or "unknown"
+        account_name = account_data.get("name") or account_data.get("username")
+        
+        print(f"[CALCOM DIRECT] Validated API key for account: {account_email}")
+        
+        # Log security event BEFORE storing (for audit trail)
+        org_id = current_user.org_id
+        log_security_event(
+            db=db,
+            event_type=AuditEventType.API_KEY_CONNECTED,
+            org_id=org_id,
+            user_id=current_user.id,
+            resource_type="calcom",
+            resource_id=str(account_id),
+            ip_address=http_request.client.host if http_request.client else None,
+            user_agent=http_request.headers.get("user-agent"),
+            details={
+                "account_email": account_email,
+                "account_name": account_name,
+                "api_key_prefix": api_key[:10] + "..." if len(api_key) > 10 else "***",
+                "method": "api_key"
+            }
+        )
+        
+        # Encrypt the API key before storing
+        encrypted_token = encrypt_token(api_key)
+        
+        # Check if token exists for this provider AND org
+        # Use raw SQL to bypass SQLAlchemy's enum name conversion
+        from sqlalchemy import text
+        existing_result = db.execute(
+            text("""
+                SELECT id FROM oauth_tokens 
+                WHERE provider = 'calcom'::oauthprovider 
+                AND org_id = :org_id 
+                LIMIT 1
+            """),
+            {"org_id": org_id}
+        ).first()
+        
+        # Check if token exists and get its ID (don't load the object to avoid enum validation)
+        existing_id = None
+        if existing_result:
+            existing_id = existing_result[0]
+        
+        if existing_id:
+            # Use raw SQL UPDATE to bypass SQLAlchemy's enum validation
+            from sqlalchemy import text
+            db.execute(
+                text("""
+                    UPDATE oauth_tokens 
+                    SET access_token = :access_token,
+                        refresh_token = NULL,
+                        expires_at = NULL,
+                        scope = :scope,
+                        account_id = :account_id
+                    WHERE id = :id
+                """),
+                {
+                    "id": existing_id,
+                    "access_token": encrypted_token,
+                    "scope": "api_key",
+                    "account_id": str(account_id)
+                }
+            )
+            print(f"[CALCOM DIRECT] Updated existing connection for org {org_id}")
+            # Don't load the object - it will trigger enum validation
+            oauth_token = None
+        else:
+            # Store API key as OAuth token (encrypted)
+            # Use raw SQL insert to bypass SQLAlchemy's enum name conversion
+            # SQLAlchemy uses enum names (CALCOM) but database has lowercase value (calcom)
+            from sqlalchemy import text
+            import uuid as uuid_lib
+            token_id = uuid_lib.uuid4()
+            # Use bindparam with explicit type to bypass SQLAlchemy enum validation
+            from sqlalchemy import bindparam
+            db.execute(
+                text("""
+                    INSERT INTO oauth_tokens (id, org_id, provider, account_id, access_token, refresh_token, scope, expires_at, created_at)
+                    VALUES (:id, :org_id, CAST(:provider AS oauthprovider), :account_id, :access_token, NULL, :scope, NULL, NOW())
+                """),
+                {
+                    "id": token_id,
+                    "org_id": org_id,
+                    "provider": "calcom",  # Use string value directly
+                    "account_id": str(account_id),
+                    "access_token": encrypted_token,
+                    "scope": "api_key"
+                }
+            )
+            # Don't query back - just use the ID for response
+            oauth_token = None  # We don't need the object, just the ID
+            print(f"[CALCOM DIRECT] Created new connection for org {org_id}")
+        
+        db.commit()
+        
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "success": True,
+                "message": "Cal.com connected successfully using API key.",
+                "account_email": account_email,
+                "account_name": account_name,
+                "org_id": str(org_id),
+                "method": "api_key"
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Network error validating API key: {str(e)}"
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error connecting Cal.com: {str(e)}"
+        )
+
+
+@router.post("/calendly/connect-direct")
+def connect_calendly_direct(
+    request: DirectApiKeyRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin)  # Require admin role
+):
+    """
+    Connect Calendly directly using an API key.
+    
+    SECURITY: This endpoint requires admin role and is rate-limited.
+    Direct API keys have full account access.
+    
+    VALIDATION: Users can only connect ONE calendar provider (Cal.com OR Calendly, not both).
+    If Cal.com is already connected, this will return an error.
+    
+    This endpoint:
+    1. Validates that Cal.com is not already connected
+    2. Validates the API key by making a test call to Calendly API
+    3. Retrieves the account information
+    4. Stores the API key as an OAuth token (encrypted)
+    5. Logs the connection event for audit
+    
+    Args:
+        request: Request body containing api_key (Calendly Personal Access Token)
+        http_request: HTTP request object for IP address and user agent
+    
+    Returns:
+        Success message with account information
+    """
+    from fastapi.responses import JSONResponse
+    from app.core.rate_limit import _rate_limit_store, _rate_limit_lock, _cleanup_old_entries
+    from app.core.audit import log_security_event
+    from app.models.audit_log import AuditEventType
+    from datetime import datetime, timedelta
+    import httpx
+    
+    # Rate limiting: 3 attempts per 15 minutes per user
+    _cleanup_old_entries()
+    identifier = f"calendly_direct_api_key_{current_user.id}_{current_user.org_id}"
+    now = datetime.utcnow()
+    window_start = now - timedelta(seconds=900)  # 15 minutes
+    
+    with _rate_limit_lock:
+        if identifier not in _rate_limit_store:
+            _rate_limit_store[identifier] = []
+        recent_requests = [
+            ts for ts, _ in _rate_limit_store[identifier]
+            if ts > window_start
+        ]
+        
+        if len(recent_requests) >= 3:
+            log_security_event(
+                db=db,
+                event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
+                org_id=current_user.org_id,
+                user_id=current_user.id,
+                resource_type="api_endpoint",
+                resource_id="connect_calendly_direct",
+                ip_address=http_request.client.host if http_request.client else None,
+                user_agent=http_request.headers.get("user-agent"),
+                details={
+                    "endpoint": "connect_calendly_direct",
+                    "max_requests": 3,
+                    "window_seconds": 900,
+                    "recent_requests": len(recent_requests)
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded: 3 direct API key connections per 15 minutes. Please try again later."
+            )
+        
+        _rate_limit_store[identifier].append((now, 1))
+    
+    api_key = request.api_key
+    if not api_key or not api_key.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="API key is required"
+        )
+    
+    api_key = api_key.strip()
+    org_id = current_user.org_id
+    
+    # VALIDATION: Check if Cal.com is already connected
+    # Users should connect ONE calendar provider, not both
+    from sqlalchemy import text
+    calcom_result = db.execute(
+        text("""
+            SELECT id FROM oauth_tokens 
+            WHERE provider = 'calcom'::oauthprovider
+            AND org_id = :org_id 
+            LIMIT 1
+        """),
+        {"org_id": org_id}
+    ).first()
+    
+    if calcom_result:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cal.com is already connected. Please disconnect Cal.com first before connecting Calendly. You can only connect one calendar provider at a time."
+        )
+    
+    try:
+        # Test the API key by calling Calendly API user endpoint
+        # According to Calendly API docs: https://developer.calendly.com/api-docs/d7755e2f9e5fe-calendly-api
+        # Authentication: Authorization: Bearer {PERSONAL_ACCESS_TOKEN}
+        # Endpoint: GET /users/me
+        response = httpx.get(
+            "https://api.calendly.com/users/me",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            timeout=10.0
+        )
+        
+        if response.status_code != 200:
+            error_data = {}
+            try:
+                if response.headers.get("content-type", "").startswith("application/json"):
+                    error_data = response.json()
+            except:
+                pass
+            
+            error_msg = (
+                error_data.get("message") or 
+                error_data.get("title") or
+                f"HTTP {response.status_code}"
+            )
+            
+            if response.status_code == 401:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=f"Invalid Calendly API key. Please check that your Personal Access Token is correct and has not expired. Error: {error_msg}"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Calendly API error: {error_msg}"
+                )
+        
+        account_data = response.json()
+        resource = account_data.get("resource", {})
+        account_email = resource.get("email")
+        account_id = resource.get("uri") or account_email or "unknown"
+        account_name = resource.get("name") or resource.get("slug")
+        
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Calendly API request timed out. Please try again."
+        )
+    except httpx.NetworkError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Unable to connect to Calendly API. Please check your internet connection and try again. Error: {str(e)}"
+        )
+    except Exception as e:
+        import traceback
+        print(f"[CALENDLY DIRECT] Unexpected error: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unexpected error connecting to Calendly: {str(e)}"
+        )
+    
+    print(f"[CALENDLY DIRECT] Validated API key for account: {account_email}")
+    
+    # Log security event BEFORE storing (for audit trail)
+    log_security_event(
+        db=db,
+        event_type=AuditEventType.API_KEY_CONNECTED,
+        org_id=org_id,
+        user_id=current_user.id,
+        resource_type="calendly",
+        resource_id=str(account_id),
+        ip_address=http_request.client.host if http_request.client else None,
+        user_agent=http_request.headers.get("user-agent"),
+        details={
+            "account_email": account_email,
+            "account_name": account_name,
+            "api_key_prefix": api_key[:10] + "..." if len(api_key) > 10 else "***",
+            "method": "api_key"
+        }
+    )
+    
+    # Encrypt the API key before storing
+    encrypted_token = encrypt_token(api_key)
+    
+    # Check if token exists for this provider AND org
+    # Use raw SQL to bypass SQLAlchemy's enum name conversion
+    existing_result = db.execute(
+        text("""
+            SELECT id FROM oauth_tokens 
+            WHERE provider = 'calendly'::oauthprovider
+            AND org_id = :org_id 
+            LIMIT 1
+        """),
+        {"org_id": org_id}
+    ).first()
+    
+    existing_id = None
+    if existing_result:
+        existing_id = existing_result[0]
+    
+    if existing_id:
+        # Use raw SQL UPDATE to bypass SQLAlchemy's enum validation
+        db.execute(
+            text("""
+                UPDATE oauth_tokens 
+                SET access_token = :access_token,
+                    refresh_token = NULL,
+                    expires_at = NULL,
+                    scope = :scope,
+                    account_id = :account_id
+                WHERE id = :id
+            """),
+            {
+                "id": existing_id,
+                "access_token": encrypted_token,
+                "scope": "api_key",
+                "account_id": str(account_id)
+            }
+        )
+        print(f"[CALENDLY DIRECT] Updated existing connection for org {org_id}")
+    else:
+        # Store API key as OAuth token (encrypted)
+        import uuid as uuid_lib
+        token_id = uuid_lib.uuid4()
+        db.execute(
+            text("""
+                INSERT INTO oauth_tokens (id, org_id, provider, account_id, access_token, refresh_token, scope, expires_at, created_at)
+                VALUES (:id, :org_id, CAST(:provider AS oauthprovider), :account_id, :access_token, NULL, :scope, NULL, NOW())
+            """),
+            {
+                "id": token_id,
+                "org_id": org_id,
+                "provider": "calendly",
+                "account_id": str(account_id),
+                "access_token": encrypted_token,
+                "scope": "api_key"
+            }
+        )
+        print(f"[CALENDLY DIRECT] Created new connection for org {org_id}")
+    
+    db.commit()
+    
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "success": True,
+            "message": "Calendly connected successfully using API key.",
+            "account_email": account_email,
+            "account_name": account_name,
+            "org_id": str(org_id),
+            "method": "api_key"
+        }
+    )
+
+
+@router.delete("/calendly/disconnect", status_code=status.HTTP_204_NO_CONTENT)
+def disconnect_calendly(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner)
+):
+    """
+    Disconnect Calendly for the current user's organization.
+    This allows users to connect a different Calendly account or switch to Cal.com.
+    """
+    from sqlalchemy import text
+    
+    try:
+        result = db.execute(
+            text("""
+                SELECT id FROM oauth_tokens 
+                WHERE provider = 'calendly'::oauthprovider
+                AND org_id = :org_id 
+                LIMIT 1
+            """),
+            {"org_id": current_user.org_id}
+        ).first()
+        
+        if result:
+            token_id = result[0]
+            print(f"[CALENDLY DISCONNECT] Found token with id: {token_id}, deleting...")
+            
+            db.execute(
+                text("""
+                    DELETE FROM oauth_tokens 
+                    WHERE id = :token_id
+                """),
+                {"token_id": token_id}
+            )
+            db.commit()
+            
+            print(f"[CALENDLY DISCONNECT] Successfully deleted Calendly token")
+            
+            from app.core.audit import log_security_event
+            from app.models.audit_log import AuditEventType
+            log_security_event(
+                db=db,
+                event_type=AuditEventType.API_KEY_DISCONNECTED,
+                org_id=current_user.org_id,
+                user_id=current_user.id,
+                resource_type="calendly_token",
+                resource_id=str(token_id),
+                details={
+                    "provider": "calendly"
+                }
+            )
+    
+    except Exception as e:
+        print(f"[CALENDLY DISCONNECT] Error: {str(e)}")
+        db.rollback()
+    
+    return None
+
+
+@router.delete("/calcom/disconnect", status_code=status.HTTP_204_NO_CONTENT)
+def disconnect_calcom(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner)
+):
+    """
+    Disconnect Cal.com for the current user's organization.
+    This allows users to connect a different Cal.com account or switch to Calendly.
+    """
+    # Use raw SQL for both finding and deleting to bypass SQLAlchemy's enum validation
+    from sqlalchemy import text
+    
+    try:
+        # First, check if token exists
+        result = db.execute(
+            text("""
+                SELECT id FROM oauth_tokens 
+                WHERE provider = CAST('calcom' AS oauthprovider)
+                AND org_id = :org_id 
+                LIMIT 1
+            """),
+            {"org_id": current_user.org_id}
+        ).first()
+        
+        if result:
+            token_id = result[0]
+            print(f"[CALCOM DISCONNECT] Found token with id: {token_id}, deleting...")
+            
+            # Delete using raw SQL to avoid loading the OAuthToken object
+            db.execute(
+                text("""
+                    DELETE FROM oauth_tokens 
+                    WHERE id = :token_id
+                """),
+                {"token_id": token_id}
+            )
+            db.commit()
+            
+            print(f"[CALCOM DISCONNECT] Successfully deleted Cal.com token")
+            
+            # Log the security event
+            from app.core.audit import log_security_event
+            from app.models.audit_log import AuditEventType
+            log_security_event(
+                db=db,
+                event_type=AuditEventType.API_KEY_DISCONNECTED,
+                org_id=current_user.org_id,
+                user_id=current_user.id,
+                resource_type="calcom_token",
+                resource_id=str(token_id),
+                details={"provider": "calcom"}
+            )
+        else:
+            print(f"[CALCOM DISCONNECT] No Cal.com token found for org {current_user.org_id}")
+        
+        return None
+        
+    except Exception as e:
+        db.rollback()
+        print(f"[CALCOM DISCONNECT] Error disconnecting Cal.com: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error disconnecting Cal.com: {str(e)}"
+        )

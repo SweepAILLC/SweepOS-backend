@@ -2,10 +2,10 @@
 Admin API endpoints for managing organizations, permissions, and global settings.
 Only accessible to admin/owner users.
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc
-from typing import List
+from sqlalchemy import func, desc, asc, and_
+from typing import List, Optional
 from uuid import UUID
 
 from app.db.session import get_db
@@ -13,23 +13,26 @@ from app.api.deps import get_current_user, require_admin, MAIN_ORG_ID
 from app.models.user import User
 from app.models.organization import Organization
 from app.models.client import Client
-from app.models.funnel import Funnel
+from app.models.funnel import Funnel, FunnelStep
 from app.models.event import Event
 from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
+from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.models.client import LifecycleState
 from app.schemas.organization import (
     Organization as OrganizationSchema,
-    OrganizationCreate,
     OrganizationUpdate,
     OrganizationWithStats,
-    OrganizationCreateResponse
 )
+from app.schemas.invitation import InviteOrgAdminRequest, InvitationResponse
+from app.models.organization_invitation import OrganizationInvitation
 from app.schemas.admin import (
     OrganizationDashboardSummary,
     OrganizationFunnelCreate,
-    OrganizationFunnelUpdate
+    OrganizationFunnelUpdate,
+    FunnelConversionMetric,
+    FunnelStepConversion,
 )
 from app.schemas.funnel import Funnel as FunnelSchema
 from app.schemas.permission import (
@@ -39,6 +42,7 @@ from app.schemas.permission import (
 )
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.core.config import settings
+from app.core.rate_limit import rate_limit
 from datetime import datetime
 import uuid
 from datetime import datetime, timedelta
@@ -78,77 +82,97 @@ def list_organizations(
     return result
 
 
-@router.post("/organizations", response_model=OrganizationCreateResponse, status_code=status.HTTP_201_CREATED)
-def create_organization(
-    org_data: OrganizationCreate,
+# Invitation-based org onboarding (only way to create new orgs; uses BREVO_API_KEY)
+@router.post("/organizations/invite", response_model=dict, status_code=status.HTTP_201_CREATED)
+@rate_limit(max_requests=10, window_seconds=900)  # 10 org invites per 15 min per admin
+def invite_organization(
+    body: InviteOrgAdminRequest,
+    request: Request,
     db: Session = Depends(get_db),
-    admin_user: User = Depends(require_admin)
+    admin_user: User = Depends(require_admin),
 ):
     """
-    Create a new organization and automatically create an admin user for it.
-    The user will have ADMIN role and be scoped only to this organization.
+    Create a new organization and send an invitation email to the org admin.
+    They set their own password via the invitation link. No user is created until they accept.
     """
-    from app.models.user import User, UserRole
-    from app.core.security import get_password_hash
     import secrets
-    import string
-    
-    # Create the organization
-    org = Organization(name=org_data.name)
+    from datetime import datetime, timedelta
+    from app.services.onboarding_email import send_org_admin_invitation_email, INVITATION_EXPIRES_DAYS
+
+    name = (body.name or "").strip()
+    admin_email = (body.admin_email or "").strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="Organization name is required")
+    if not admin_email:
+        raise HTTPException(status_code=400, detail="Admin email is required")
+
+    org = Organization(name=name)
     db.add(org)
-    db.flush()  # Flush to get the org.id without committing
-    
-    # Generate default email and password if not provided
-    if org_data.admin_email:
-        admin_email = org_data.admin_email
-    else:
-        # Generate email based on org name: lowercase, replace spaces with dots, add @org.local
-        org_slug = org_data.name.lower().replace(' ', '.').replace('_', '.').replace('-', '.')
-        # Remove special characters
-        org_slug = ''.join(c for c in org_slug if c.isalnum() or c == '.')
-        admin_email = f"admin@{org_slug}.local"
-    
-    if org_data.admin_password:
-        admin_password = org_data.admin_password
-    else:
-        # Generate a random password: 12 characters, alphanumeric + special
-        alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-        admin_password = ''.join(secrets.choice(alphabet) for _ in range(12))
-    
-    # Check if email already exists in this org (shouldn't, but safety check)
-    existing_user = db.query(User).filter(
-        User.email == admin_email,
-        User.org_id == org.id
-    ).first()
-    
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"User with email {admin_email} already exists in this organization"
-        )
-    
-    # Create admin user for the new organization
-    admin_user_for_org = User(
+    db.flush()
+
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(days=INVITATION_EXPIRES_DAYS)
+    inv = OrganizationInvitation(
         org_id=org.id,
-        email=admin_email,
-        hashed_password=get_password_hash(admin_password),
-        role=UserRole.ADMIN,  # Regular admin, not owner
-        is_admin=True
+        invitee_email=admin_email,
+        invitation_type="ORG_ADMIN",
+        role="admin",
+        token=token,
+        expires_at=expires_at,
+        created_by=admin_user.id,
     )
-    db.add(admin_user_for_org)
-    
-    # Commit both org and user
+    db.add(inv)
     db.commit()
     db.refresh(org)
-    
-    # Return organization with admin user credentials
-    # Note: In production, you might want to send these via email or secure channel
-    org_dict = OrganizationSchema.model_validate(org, from_attributes=True).model_dump()
-    return OrganizationCreateResponse(
-        **org_dict,
-        admin_email=admin_email,
-        admin_password=admin_password
+    db.refresh(inv)
+
+    frontend_url = getattr(settings, "FRONTEND_URL", "") or "http://localhost:3002"
+    link = f"{frontend_url.rstrip('/')}/invite/accept?token={token}"
+    send_org_admin_invitation_email(to_email=admin_email, org_name=org.name, invitation_link=link)
+
+    return {
+        "organization": OrganizationSchema.model_validate(org),
+        "invitation": InvitationResponse(
+            id=inv.id,
+            org_id=inv.org_id,
+            invitee_email=inv.invitee_email,
+            invitation_type=inv.invitation_type,
+            role=inv.role,
+            expires_at=inv.expires_at,
+            used_at=inv.used_at,
+            created_at=inv.created_at,
+        ),
+    }
+
+
+@router.get("/organizations/invitations", response_model=List[InvitationResponse])
+def list_all_invitations(
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """List all pending invitations across all organizations (system owner only)."""
+    invs = (
+        db.query(OrganizationInvitation)
+        .filter(
+            OrganizationInvitation.used_at.is_(None),
+            OrganizationInvitation.expires_at > datetime.utcnow(),
+        )
+        .order_by(OrganizationInvitation.created_at.desc())
+        .all()
     )
+    return [
+        InvitationResponse(
+            id=i.id,
+            org_id=i.org_id,
+            invitee_email=i.invitee_email,
+            invitation_type=i.invitation_type,
+            role=i.role,
+            expires_at=i.expires_at,
+            used_at=i.used_at,
+            created_at=i.created_at,
+        )
+        for i in invs
+    ]
 
 
 @router.get("/organizations/{org_id}", response_model=OrganizationWithStats)
@@ -201,7 +225,14 @@ def update_organization(
     
     if org_data.name is not None:
         org.name = org_data.name
-    
+    if org_data.max_user_seats is not None:
+        if org_data.max_user_seats < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="max_user_seats must be 0 or greater",
+            )
+        org.max_user_seats = org_data.max_user_seats
+
     db.commit()
     db.refresh(org)
     return org
@@ -358,19 +389,44 @@ def get_organization_dashboard(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Organization not found"
         )
-    
-    # Client stats
-    total_clients = db.query(func.count(Client.id)).filter(
-        Client.org_id == org_id
-    ).scalar() or 0
-    
-    clients_by_status = {}
-    for state in LifecycleState:
-        count = db.query(func.count(Client.id)).filter(
-            Client.org_id == org_id,
-            Client.lifecycle_state == state
-        ).scalar() or 0
-        clients_by_status[state.value] = count
+
+    total_users = db.query(func.count(User.id)).filter(User.org_id == org_id).scalar() or 0
+
+    # Client stats: group by normalized email (same as frontend merge); count one per group; status = priority state in group
+    import re
+    all_org_clients = db.query(Client).filter(Client.org_id == org_id).all()
+    # Group by normalized email (empty email -> each client its own group by id)
+    email_to_clients: dict = {}
+    for c in all_org_clients:
+        if c.email:
+            normalized = re.sub(r"\s+", "", (c.email or "").lower().strip())
+            key = normalized or str(c.id)
+        else:
+            key = str(c.id)
+        if key not in email_to_clients:
+            email_to_clients[key] = []
+        email_to_clients[key].append(c)
+    # Priority for merged state (match frontend: active > warm_lead > cold_lead > offboarding > dead)
+    state_priority = {
+        LifecycleState.ACTIVE: 5,
+        LifecycleState.WARM_LEAD: 4,
+        LifecycleState.COLD_LEAD: 3,
+        LifecycleState.OFFBOARDING: 2,
+        LifecycleState.DEAD: 1,
+    }
+    total_clients = len(email_to_clients)
+    clients_by_status = {s.value: 0 for s in LifecycleState}
+    for group in email_to_clients.values():
+        merged_state = max(
+            (c.lifecycle_state for c in group if c.lifecycle_state is not None),
+            key=lambda s: state_priority.get(s, 0),
+            default=LifecycleState.COLD_LEAD,
+        )
+        st = merged_state.value
+        if st in clients_by_status:
+            clients_by_status[st] += 1
+        else:
+            clients_by_status[st] = 1
     
     # Funnel stats
     total_funnels = db.query(func.count(Funnel.id)).filter(
@@ -394,33 +450,41 @@ def get_organization_dashboard(
         Event.visitor_id.isnot(None)
     ).scalar() or 0
     
-    # Stripe stats
-    total_mrr = db.query(func.sum(StripeSubscription.mrr)).filter(
+    # Stripe stats (align with Stripe dashboard: active + trialing for MRR/subs; revenue from Treasury or Payment)
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    total_mrr_result = db.query(func.sum(StripeSubscription.mrr)).filter(
         StripeSubscription.org_id == org_id,
-        StripeSubscription.status == 'active'
-    ).scalar() or 0
-    if total_mrr:
-        total_mrr = float(total_mrr) / 100.0  # Convert cents to dollars
-    
+        StripeSubscription.status.in_(["active", "trialing"])
+    ).scalar()
+    total_mrr = float(total_mrr_result) if total_mrr_result else 0.0
     total_arr = total_mrr * 12
-    
     active_subscriptions = db.query(func.count(StripeSubscription.id)).filter(
         StripeSubscription.org_id == org_id,
-        StripeSubscription.status == 'active'
+        StripeSubscription.status.in_(["active", "trialing"])
     ).scalar() or 0
-    
     total_payments = db.query(func.count(StripePayment.id)).filter(
         StripePayment.org_id == org_id
     ).scalar() or 0
-    
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    last_30_days_revenue = db.query(func.sum(StripePayment.amount_cents)).filter(
-        StripePayment.org_id == org_id,
-        StripePayment.status == 'succeeded',
-        StripePayment.created_at >= thirty_days_ago
-    ).scalar() or 0
-    if last_30_days_revenue:
-        last_30_days_revenue = float(last_30_days_revenue) / 100.0  # Convert cents to dollars
+    # Last 30 days revenue: use Treasury if org uses it, else StripePayment (match Stripe dashboard)
+    treasury_count = db.query(StripeTreasuryTransaction.id).filter(
+        StripeTreasuryTransaction.org_id == org_id
+    ).limit(1).first()
+    if treasury_count:
+        last_30_days_revenue = db.query(func.sum(StripeTreasuryTransaction.amount)).filter(
+            StripeTreasuryTransaction.org_id == org_id,
+            StripeTreasuryTransaction.status == TreasuryTransactionStatus.POSTED,
+            StripeTreasuryTransaction.amount > 0,
+            StripeTreasuryTransaction.posted_at >= thirty_days_ago,
+            StripeTreasuryTransaction.posted_at <= datetime.utcnow()
+        ).scalar() or 0
+        last_30_days_revenue = float(last_30_days_revenue) / 100.0  # cents to dollars
+    else:
+        rev_result = db.query(func.sum(StripePayment.amount_cents)).filter(
+            StripePayment.org_id == org_id,
+            StripePayment.status == "succeeded",
+            StripePayment.created_at >= thirty_days_ago
+        ).scalar() or 0
+        last_30_days_revenue = float(rev_result) / 100.0  # cents to dollars
     
     # Brevo connection status
     brevo_token = db.query(OAuthToken).filter(
@@ -429,42 +493,10 @@ def get_organization_dashboard(
     ).first()
     brevo_connected = brevo_token is not None
     
-    # Recent clients (last 5)
-    recent_clients = db.query(Client).filter(
-        Client.org_id == org_id
-    ).order_by(desc(Client.created_at)).limit(5).all()
-    
-    recent_clients_data = [
-        {
-            "id": str(c.id),
-            "name": f"{c.first_name or ''} {c.last_name or ''}".strip() or "Unnamed",
-            "email": c.email,
-            "status": c.lifecycle_state.value if c.lifecycle_state else "unknown",
-            "created_at": c.created_at.isoformat() if c.created_at else None
-        }
-        for c in recent_clients
-    ]
-    
-    # Recent funnels (last 5)
-    recent_funnels = db.query(Funnel).filter(
-        Funnel.org_id == org_id
-    ).order_by(desc(Funnel.created_at)).limit(5).all()
-    
-    recent_funnels_data = [
-        {
-            "id": str(f.id),
-            "name": f.name,
-            "domain": f.domain,
-            "created_at": f.created_at.isoformat() if f.created_at else None
-        }
-        for f in recent_funnels
-    ]
-    
-    # Get all funnels for the organization (not just recent)
+    # Get all funnels for the organization
     all_funnels = db.query(Funnel).filter(
         Funnel.org_id == org_id
     ).order_by(desc(Funnel.created_at)).all()
-    
     all_funnels_data = [
         {
             "id": str(f.id),
@@ -475,10 +507,81 @@ def get_organization_dashboard(
         }
         for f in all_funnels
     ]
-    
+
+    # Funnel conversion metrics (last 30 days, same logic as funnel analytics)
+    funnel_conversion_metrics: List[FunnelConversionMetric] = []
+    range_days = 30
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=range_days)
+    for funnel in all_funnels:
+        steps = db.query(FunnelStep).filter(
+            FunnelStep.funnel_id == funnel.id,
+            FunnelStep.org_id == org_id
+        ).order_by(asc(FunnelStep.step_order)).all()
+        if not steps:
+            funnel_conversion_metrics.append(FunnelConversionMetric(
+                funnel_id=funnel.id,
+                funnel_name=funnel.name or "Unnamed",
+                total_visitors=0,
+                total_conversions=0,
+                overall_conversion_rate=0.0,
+                step_counts=[]
+            ))
+            continue
+        step_counts_list: List[FunnelStepConversion] = []
+        previous_count: Optional[int] = None
+        for step in steps:
+            count = db.query(func.count(Event.id)).filter(
+                Event.funnel_id == funnel.id,
+                Event.org_id == org_id,
+                Event.event_name == step.event_name,
+                Event.occurred_at >= start_date,
+                Event.occurred_at <= end_date
+            ).scalar() or 0
+            conversion_rate = None
+            if previous_count is not None and previous_count > 0:
+                conversion_rate = (count / previous_count) * 100.0
+            step_counts_list.append(FunnelStepConversion(
+                step_order=step.step_order,
+                label=step.label,
+                event_name=step.event_name,
+                count=count,
+                conversion_rate=conversion_rate
+            ))
+            previous_count = count
+        first_step = steps[0]
+        total_visitors = db.query(func.count(func.distinct(Event.visitor_id))).filter(
+            Event.funnel_id == funnel.id,
+            Event.org_id == org_id,
+            Event.event_name == first_step.event_name,
+            Event.occurred_at >= start_date,
+            Event.occurred_at <= end_date,
+            Event.visitor_id.isnot(None)
+        ).scalar() or 0
+        last_step = steps[-1]
+        total_conversions = db.query(func.count(func.distinct(Event.visitor_id))).filter(
+            Event.funnel_id == funnel.id,
+            Event.org_id == org_id,
+            Event.event_name == last_step.event_name,
+            Event.occurred_at >= start_date,
+            Event.occurred_at <= end_date,
+            Event.visitor_id.isnot(None)
+        ).scalar() or 0
+        overall_conversion_rate = (total_conversions / total_visitors * 100.0) if total_visitors > 0 else 0.0
+        funnel_conversion_metrics.append(FunnelConversionMetric(
+            funnel_id=funnel.id,
+            funnel_name=funnel.name or "Unnamed",
+            total_visitors=total_visitors,
+            total_conversions=total_conversions,
+            overall_conversion_rate=overall_conversion_rate,
+            step_counts=step_counts_list
+        ))
+
     return OrganizationDashboardSummary(
         organization_id=org_id,
         organization_name=org.name,
+        total_users=total_users,
+        max_user_seats=getattr(org, "max_user_seats", None),
         total_clients=total_clients,
         clients_by_status=clients_by_status,
         total_funnels=total_funnels,
@@ -491,8 +594,8 @@ def get_organization_dashboard(
         total_payments=total_payments,
         last_30_days_revenue=last_30_days_revenue,
         brevo_connected=brevo_connected,
-        recent_clients=recent_clients_data,
-        recent_funnels=all_funnels_data  # Return all funnels, not just recent
+        funnel_conversion_metrics=funnel_conversion_metrics,
+        recent_funnels=all_funnels_data
     )
 
 

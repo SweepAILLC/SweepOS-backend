@@ -30,6 +30,7 @@ def get_current_user(
         )
     email: str = payload.get("sub")
     org_id_from_token: Optional[str] = payload.get("org_id")
+    user_id_from_token: Optional[str] = payload.get("user_id")
     
     if email is None:
         raise HTTPException(
@@ -37,30 +38,158 @@ def get_current_user(
             detail="Invalid authentication credentials",
         )
     
-    user = db.query(User).filter(User.email == email).first()
-    if user is None:
+    # Use raw SQL to read user to avoid enum conversion issues.
+    # Prefer user_id from token so we get the correct user row when same email has multiple rows (e.g. admin in one org, member in another).
+    from sqlalchemy import text
+    if user_id_from_token:
+        try:
+            user_id_uuid = uuid.UUID(user_id_from_token)
+            user_row = db.execute(
+                text("""
+                    SELECT id, org_id, email, hashed_password, role, is_admin, created_at
+                    FROM users
+                    WHERE id = :user_id
+                """),
+                {"user_id": str(user_id_uuid)}
+            ).fetchone()
+        except (ValueError, TypeError):
+            user_row = None
+    else:
+        user_row = None
+    if user_row is None:
+        user_row = db.execute(
+            text("""
+                SELECT id, org_id, email, hashed_password, role, is_admin, created_at
+                FROM users
+                WHERE email = :email
+            """),
+            {"email": email}
+        ).fetchone()
+    
+    if user_row is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
         )
     
-    # Verify org_id matches (if present in token)
+    # Create a User-like object from the raw SQL result
+    # We need to avoid SQLAlchemy enum conversion, so we'll create a proxy object
+    class UserProxy:
+        def __init__(self, user_id, org_id, email, hashed_password, role, is_admin, created_at):
+            self.id = user_id
+            self.org_id = org_id
+            self.email = email
+            self.hashed_password = hashed_password
+            self.role_str = role  # Store raw role string to avoid enum conversion
+            self.is_admin = is_admin
+            self.created_at = created_at
+            # Create a role property that returns a UserRole enum when accessed
+            # Map database enum value to Python enum
+            role_lower = role.lower() if role else "admin"
+            if role == "member" or role == "MEMBER":
+                role_lower = "member"
+            elif role == "OWNER":
+                role_lower = "owner"
+            elif role == "ADMIN":
+                role_lower = "admin"
+            try:
+                from app.models.user import UserRole
+                self.role = UserRole(role_lower)
+            except ValueError:
+                # Fallback to ADMIN if role doesn't match
+                self.role = UserRole.ADMIN
+    
+    user = UserProxy(
+        user_row[0],  # id
+        user_row[1],  # org_id
+        user_row[2],  # email
+        user_row[3],  # hashed_password
+        user_row[4],  # role
+        user_row[5],  # is_admin
+        user_row[6]   # created_at
+    )
+    
+    # Verify org_id matches (if present in token) and set selected_org_id attribute
+    selected_org_id = user.org_id  # Default to user's primary org
     if org_id_from_token:
-        if str(user.org_id) != org_id_from_token:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User organization mismatch",
-            )
+        # Convert org_id_from_token to UUID for proper comparison
+        try:
+            org_id_uuid = uuid.UUID(org_id_from_token)
+        except (ValueError, TypeError) as e:
+            # Invalid UUID format in token - log and use primary org
+            print(f"[AUTH] Invalid org_id format in token: {org_id_from_token}, error: {e}")
+            org_id_uuid = None
+        
+        if org_id_uuid:
+            # Check if user has access to this org via UserOrganization table
+            from app.models.user_organization import UserOrganization
+            user_org = db.query(UserOrganization).filter(
+                UserOrganization.user_id == user.id,
+                UserOrganization.org_id == org_id_uuid
+            ).first()
+            
+            # Also check if user.org_id matches (backward compatibility)
+            if not user_org and user.org_id != org_id_uuid:
+                print(f"[AUTH] User {user.id} does not have access to org {org_id_uuid}. User's primary org: {user.org_id}")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User does not have access to this organization",
+                )
+            
+            # User has access - use the selected org from token
+            selected_org_id = org_id_uuid
+            print(f"[AUTH] User {user.id} accessing org {selected_org_id} (primary org: {user.org_id})")
+    
+    # Set selected_org_id as an attribute on the user object
+    # This allows endpoints to access the selected org without needing a separate dependency
+    user.selected_org_id = selected_org_id
     
     return user
 
 
-def require_org_access(user: User = Depends(get_current_user)) -> uuid.UUID:
+def get_selected_org_id(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> uuid.UUID:
     """
-    Dependency to extract and return org_id from current user.
-    Use this in endpoints that need to filter by org_id.
+    Get the selected org_id from the token (the org the user selected at login).
+    Falls back to user.org_id if token doesn't have org_id.
+    Use this in endpoints that need to filter by the selected org.
     """
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    if payload:
+        org_id_from_token = payload.get("org_id")
+        if org_id_from_token:
+            try:
+                selected_org_id = uuid.UUID(org_id_from_token)
+                # Verify user has access to this org
+                from app.models.user_organization import UserOrganization
+                user_org = db.query(UserOrganization).filter(
+                    UserOrganization.user_id == user.id,
+                    UserOrganization.org_id == selected_org_id
+                ).first()
+                if user_org or str(user.org_id) == str(selected_org_id):
+                    return selected_org_id
+            except (ValueError, TypeError):
+                pass
+    
+    # Fall back to user's org_id
     return user.org_id
+
+
+def require_org_access(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> uuid.UUID:
+    """
+    Dependency to extract and return org_id from token (selected org).
+    Use this in endpoints that need to filter by org_id.
+    Falls back to user.org_id if token doesn't have org_id.
+    """
+    return get_selected_org_id(credentials, user)
 
 
 # Main org ID (default org created in migration)
@@ -95,6 +224,34 @@ def require_admin(
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Admin access required"
+    )
+
+
+def require_admin_or_owner(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> User:
+    """
+    Dependency to ensure user is an admin or owner (for org-level permissions).
+    This is less restrictive than require_admin - it allows admins/owners in any org,
+    not just the main org. Use this for org-scoped operations like managing integrations.
+    """
+    from app.core.config import settings
+    from app.models.user import UserRole
+    
+    # Check if user is the sudo admin (always allowed)
+    if user.email == settings.SUDO_ADMIN_EMAIL:
+        return user
+    
+    # Check if user has admin or owner role (or is_admin flag)
+    # Handle both enum and string role values
+    role_value = user.role.value if hasattr(user.role, 'value') else str(user.role)
+    if role_value in ['admin', 'owner'] or user.is_admin or user.role == UserRole.ADMIN or user.role == UserRole.OWNER:
+        return user
+    
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Admin or owner access required. Members cannot manage integrations."
     )
 
 

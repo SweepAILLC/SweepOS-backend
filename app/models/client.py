@@ -24,6 +24,7 @@ class Client(Base):
     last_name = Column(String, nullable=True)
     email = Column(String, index=True, nullable=True)
     phone = Column(String, nullable=True)
+    instagram = Column(String, nullable=True)
     lifecycle_state = Column(SQLEnum(LifecycleState), default=LifecycleState.COLD_LEAD, nullable=False)
     last_activity_at = Column(DateTime, nullable=True)
     stripe_customer_id = Column(String, nullable=True, index=True)
@@ -67,9 +68,20 @@ class Client(Base):
         return min(100.0, max(0.0, progress))
     
     def update_program_dates(self):
-        """Update program_end_date when start_date or duration changes."""
-        if self.program_start_date and self.program_duration_days:
+        """Update program dates based on start_date and end_date or duration."""
+        if self.program_start_date and self.program_end_date:
+            # Calculate duration from start and end dates
+            duration = (self.program_end_date - self.program_start_date).days
+            if duration > 0:
+                self.program_duration_days = duration
+            else:
+                self.program_duration_days = None
+                self.program_end_date = None
+        elif self.program_start_date and self.program_duration_days:
+            # Calculate end date from start date and duration
             self.program_end_date = self.program_start_date + timedelta(days=self.program_duration_days)
         else:
             self.program_end_date = None
+            if not self.program_start_date:
+                self.program_duration_days = None
 

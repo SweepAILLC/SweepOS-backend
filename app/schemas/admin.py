@@ -4,6 +4,23 @@ from datetime import datetime
 from uuid import UUID
 
 
+class FunnelStepConversion(BaseModel):
+    step_order: int
+    label: Optional[str] = None
+    event_name: str
+    count: int
+    conversion_rate: Optional[float] = None  # % from previous step
+
+
+class FunnelConversionMetric(BaseModel):
+    funnel_id: UUID
+    funnel_name: str
+    total_visitors: int
+    total_conversions: int
+    overall_conversion_rate: float
+    step_counts: List[FunnelStepConversion] = []
+
+
 class OrganizationFunnelCreate(BaseModel):
     """Schema for creating a funnel in an organization (admin only)"""
     name: str
@@ -26,7 +43,11 @@ class OrganizationDashboardSummary(BaseModel):
     """Summary of an organization's dashboard data"""
     organization_id: UUID
     organization_name: str
-    
+
+    # User seats (for system owner to limit org)
+    total_users: int = 0
+    max_user_seats: Optional[int] = None  # null = unlimited
+
     # Client stats
     total_clients: int
     clients_by_status: Dict[str, int]  # e.g., {"lead": 5, "active": 10}
@@ -46,8 +67,10 @@ class OrganizationDashboardSummary(BaseModel):
     
     # Brevo stats
     brevo_connected: bool
-    
-    # Recent activity
-    recent_clients: List[Dict[str, Any]]
-    recent_funnels: List[Dict[str, Any]]  # All funnels for the org
+
+    # Funnel conversion metrics (per-funnel analytics for last 30 days)
+    funnel_conversion_metrics: List[FunnelConversionMetric] = []
+
+    # All funnels for the org (for management UI)
+    recent_funnels: List[Dict[str, Any]]
 

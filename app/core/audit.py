@@ -35,17 +35,33 @@ def log_security_event(
     import json
     
     try:
-        audit_log = AuditLog(
-            org_id=org_id,
-            user_id=user_id,
-            event_type=event_type,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            details=json.dumps(details) if details else None
+        # Use enum value string to avoid SQLAlchemy using enum name instead of value
+        # SQLAlchemy with native PostgreSQL enums uses enum names, but database has lowercase values
+        event_type_value = event_type.value if hasattr(event_type, 'value') else str(event_type)
+        
+        # Use raw SQL insert to bypass SQLAlchemy's enum name conversion
+        from sqlalchemy import text
+        import uuid as uuid_lib
+        audit_id = uuid_lib.uuid4()
+        
+        # Use CAST in SQL to convert string to enum type, avoiding parameter name conflict
+        db.execute(
+            text("""
+                INSERT INTO audit_logs (id, org_id, user_id, event_type, resource_type, resource_id, ip_address, user_agent, details, created_at)
+                VALUES (:id, :org_id, :user_id, CAST(:event_type AS auditeventtype), :resource_type, :resource_id, :ip_address, :user_agent, :details, NOW())
+            """),
+            {
+                "id": audit_id,
+                "org_id": org_id,
+                "user_id": user_id,
+                "event_type": event_type_value,  # Use lowercase value like "api_key_connected"
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+                "details": json.dumps(details) if details else None
+            }
         )
-        db.add(audit_log)
         db.commit()
     except Exception as e:
         # Don't fail the request if audit logging fails

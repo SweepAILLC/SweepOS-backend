@@ -20,7 +20,7 @@ class User(Base):
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     email = Column(String, nullable=False, index=True)  # Remove unique - emails can be reused across orgs
     hashed_password = Column(String, nullable=False)
-    role = Column(SQLEnum(UserRole), default=UserRole.ADMIN, nullable=False)
+    role = Column(SQLEnum(UserRole, native_enum=False), default=UserRole.ADMIN, nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)  # Keep for backward compatibility
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     

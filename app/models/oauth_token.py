@@ -9,6 +9,8 @@ from app.db.session import Base
 class OAuthProvider(str, enum.Enum):
     STRIPE = "stripe"
     BREVO = "brevo"
+    CALCOM = "calcom"
+    CALENDLY = "calendly"
 
 
 class OAuthToken(Base):

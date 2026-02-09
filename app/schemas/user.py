@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from uuid import UUID
 
@@ -7,6 +7,7 @@ from uuid import UUID
 class UserLogin(BaseModel):
     email: str
     password: str
+    org_id: Optional[UUID] = None  # Optional organization ID for multi-org users
 
 
 class UserBase(BaseModel):
@@ -14,8 +15,8 @@ class UserBase(BaseModel):
 
 
 class UserCreate(UserBase):
-    password: str
-    org_id: UUID
+    password: Optional[str] = None  # Optional - will be auto-generated if not provided
+    org_id: Optional[UUID] = None  # Optional - will be set from current user's org
     role: Optional[str] = None  # User role: 'owner', 'admin', or 'member'
 
 
@@ -54,3 +55,11 @@ class User(UserBase):
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+
+class LoginResponse(BaseModel):
+    """Response from login - either token or org selection required"""
+    requires_org_selection: bool = False
+    access_token: Optional[str] = None
+    token_type: Optional[str] = None
+    organizations: Optional[List[Dict[str, Any]]] = None  # List of organizations if selection required

@@ -11,6 +11,7 @@ class ClientBase(BaseModel):
     last_name: Optional[str] = None
     email: Optional[str] = None  # Changed from EmailStr to str to avoid validation issues with None/invalid emails
     phone: Optional[str] = None
+    instagram: Optional[str] = None
     lifecycle_state: LifecycleState = LifecycleState.COLD_LEAD
     stripe_customer_id: Optional[str] = None
     estimated_mrr: Optional[Union[float, Decimal]] = 0.0
@@ -18,6 +19,7 @@ class ClientBase(BaseModel):
     # Program tracking fields
     program_start_date: Optional[datetime] = None
     program_duration_days: Optional[int] = None
+    program_end_date: Optional[datetime] = None
     
     @field_validator('estimated_mrr', mode='before')
     @classmethod
@@ -34,6 +36,27 @@ class ClientBase(BaseModel):
         # Just return the string as-is - no validation
         # This allows test emails that EmailStr would reject
         return str(v) if v is not None else None
+    
+    @field_validator('program_start_date', 'program_end_date', mode='before')
+    @classmethod
+    def parse_program_date(cls, v):
+        """Parse program dates from string or datetime"""
+        if v is None or v == '':
+            return None
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, str):
+            try:
+                # Handle ISO format strings
+                if v.endswith('Z'):
+                    v = v.replace('Z', '+00:00')
+                # Handle date-only strings (YYYY-MM-DD)
+                if 'T' not in v and len(v) == 10:
+                    v = v + 'T00:00:00'
+                return datetime.fromisoformat(v)
+            except Exception as e:
+                raise ValueError(f"Invalid datetime format: {v}")
+        return v
 
 
 class ClientCreate(ClientBase):
@@ -45,6 +68,7 @@ class ClientUpdate(BaseModel):
     last_name: Optional[str] = None
     email: Optional[str] = None  # Changed from EmailStr to str
     phone: Optional[str] = None
+    instagram: Optional[str] = None
     lifecycle_state: Optional[LifecycleState] = None
     stripe_customer_id: Optional[str] = None
     estimated_mrr: Optional[float] = None
@@ -52,6 +76,8 @@ class ClientUpdate(BaseModel):
     # Program tracking fields
     program_start_date: Optional[datetime] = None
     program_duration_days: Optional[int] = None
+    program_end_date: Optional[datetime] = None
+    program_progress_percent: Optional[float] = None
     
     @field_validator('program_start_date', mode='before')
     @classmethod
