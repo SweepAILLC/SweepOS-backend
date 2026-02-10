@@ -1039,21 +1039,38 @@ def get_stripe_summary(
         )
     ).scalar() or 0
     
-    # Calculate average client LTV (average total spend of all customers)
-    # Get all customers with revenue data
+    # Calculate average client LTV using same dedup as assign modal / TopRevenueContributors:
+    # one "customer" per normalized email, else per stripe_customer_id, else per client id.
     customers_with_revenue = db.query(Client).filter(
         and_(
             Client.org_id == org_id,
             Client.stripe_customer_id.isnot(None)
         )
     ).all()
-    
-    if customers_with_revenue:
-        total_lifetime_revenue = sum(
-            (client.lifetime_revenue_cents or 0) / 100.0 
-            for client in customers_with_revenue
+
+    def _normalize_email(email: Optional[str]) -> Optional[str]:
+        if not email:
+            return None
+        s = email.replace(" ", "").lower().strip()
+        return s if s else None
+
+    # Group by same key as frontend: email > stripe_customer_id > client id; sum revenue per group
+    _group_revenue_cents: dict[str, int] = {}
+    for client in customers_with_revenue:
+        norm_email = _normalize_email(client.email)
+        key = (
+            f"email:{norm_email}"
+            if norm_email
+            else f"stripe:{client.stripe_customer_id}"
+            if client.stripe_customer_id
+            else f"id:{client.id}"
         )
-        average_client_ltv = total_lifetime_revenue / len(customers_with_revenue)
+        _group_revenue_cents[key] = _group_revenue_cents.get(key, 0) + (client.lifetime_revenue_cents or 0)
+
+    if _group_revenue_cents:
+        total_lifetime_revenue = sum(cents / 100.0 for cents in _group_revenue_cents.values())
+        num_unique_customers = len(_group_revenue_cents)
+        average_client_ltv = total_lifetime_revenue / num_unique_customers
     else:
         average_client_ltv = 0.0
     
