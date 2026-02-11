@@ -34,6 +34,7 @@ from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
 from app.models.client import Client
+from app.utils.stripe_ids import normalize_stripe_id_for_dedup
 
 
 # Buffer time to account for webhook delays (5 minutes)
@@ -401,24 +402,53 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
     created_at = datetime.fromtimestamp(created_ts) if created_ts else datetime.utcnow()
     
     # Check for duplicate payments before inserting
+    # 0. Same normalized stripe_id (py_/pi_/ch_/in_ same suffix) = same payment -> store only one
     # 1. If this payment is linked to an invoice, check if we already have a charge for this invoice
     # 2. If this payment is linked to a subscription, check if we already have a payment for this subscription+invoice combo
     # Prefer charge records over invoice records to avoid double-counting
-    
+
+    norm_new = normalize_stripe_id_for_dedup(payment_id)
+    if norm_new and status == 'succeeded':
+        candidates = db.query(StripePayment).filter(
+            StripePayment.org_id == org_id,
+            StripePayment.status == 'succeeded'
+        ).order_by(StripePayment.created_at.desc()).limit(2000).all()
+        existing_same_norm = next(
+            (p for p in candidates if normalize_stripe_id_for_dedup(p.stripe_id or "") == norm_new and p.stripe_id != payment_id),
+            None
+        )
+        if existing_same_norm:
+            type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}
+            ex_pri = type_priority.get(existing_same_norm.type, 3)
+            new_pri = type_priority.get(payment_type, 3)
+            if new_pri >= ex_pri:
+                print(f"[SYNC] Skipping {payment_type} {payment_id} - same normalized id as {existing_same_norm.type} {existing_same_norm.stripe_id}")
+                return existing_same_norm
+            # New is better (e.g. charge vs payment_intent): remove old row so we can insert the better one
+            db.delete(existing_same_norm)
+            db.flush()
+            print(f"[SYNC] Replacing {existing_same_norm.stripe_id} with better type {payment_type} {payment_id} (same normalized id)")
+
     # DEDUPLICATION LOGIC: Track by invoice_id and subscription_id
     # IMPORTANT: Only deduplicate SUCCESSFUL payments. Failed payments (retry attempts) should all be stored.
     # Priority: subscription_id + invoice_id > invoice_id > stripe_id
-    
+
     if status == 'succeeded':
-        # First check: If we have both subscription_id and invoice_id, check for duplicates by that combo
         if subscription_id and invoice_id:
-            existing_sub_invoice_payment = db.query(StripePayment).filter(
-                StripePayment.subscription_id == subscription_id,
-                StripePayment.invoice_id == invoice_id,
+            norm_sub = normalize_stripe_id_for_dedup(subscription_id)
+            norm_inv = normalize_stripe_id_for_dedup(invoice_id)
+            candidates = db.query(StripePayment).filter(
                 StripePayment.org_id == org_id,
-                StripePayment.status == 'succeeded'
-            ).first()
-            
+                StripePayment.status == 'succeeded',
+                or_(
+                    StripePayment.invoice_id == invoice_id,
+                    StripePayment.subscription_id == subscription_id
+                )
+            ).all()
+            existing_sub_invoice_payment = next(
+                (p for p in candidates if normalize_stripe_id_for_dedup(p.subscription_id or "") == norm_sub and normalize_stripe_id_for_dedup(p.invoice_id or "") == norm_inv),
+                None
+            )
             if existing_sub_invoice_payment and existing_sub_invoice_payment.stripe_id != payment_id:
                 # Another successful payment already exists for this subscription+invoice combo
                 # Prefer charge over invoice, prefer payment_intent over invoice, prefer newer
@@ -433,16 +463,13 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
                     # New payment is better type, will replace via ON CONFLICT
                     print(f"[SYNC] Replacing {existing_sub_invoice_payment.type} payment {existing_sub_invoice_payment.stripe_id} with {payment_type} {payment_id} for subscription {subscription_id}, invoice {invoice_id}")
         
-        # Second check: If we have invoice_id (with or without subscription_id), check for invoice duplicates
         if invoice_id:
-            # Check if a charge or payment_intent already exists for this invoice
             existing_invoice_payment = db.query(StripePayment).filter(
                 StripePayment.invoice_id == invoice_id,
                 StripePayment.org_id == org_id,
                 StripePayment.status == 'succeeded',
-                StripePayment.type.in_(['charge', 'payment_intent'])  # Prefer charge/payment_intent over invoice
+                StripePayment.type.in_(['charge', 'payment_intent'])
             ).first()
-            
             if existing_invoice_payment and payment_type == 'invoice':
                 # A charge or payment_intent already exists for this invoice, skip the invoice record
                 print(f"[SYNC] Skipping invoice {invoice_id} - {existing_invoice_payment.type} {existing_invoice_payment.stripe_id} already exists")
@@ -503,17 +530,22 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
             existing_payment.raw_event = json.loads(json.dumps(payment_data, default=str))
             existing_payment.updated_at = datetime.utcnow()
         else:
-            # Check for duplicate invoice payments before creating (same logic as above)
             if status == 'succeeded':
-                # Check subscription + invoice combo first
                 if subscription_id and invoice_id:
-                    existing_sub_invoice = db.query(StripePayment).filter(
-                        StripePayment.subscription_id == subscription_id,
-                        StripePayment.invoice_id == invoice_id,
+                    norm_sub = normalize_stripe_id_for_dedup(subscription_id)
+                    norm_inv = normalize_stripe_id_for_dedup(invoice_id)
+                    fallback_candidates = db.query(StripePayment).filter(
                         StripePayment.org_id == org_id,
-                        StripePayment.status == 'succeeded'
-                    ).first()
-                    
+                        StripePayment.status == 'succeeded',
+                        or_(
+                            StripePayment.invoice_id == invoice_id,
+                            StripePayment.subscription_id == subscription_id
+                        )
+                    ).all()
+                    existing_sub_invoice = next(
+                        (p for p in fallback_candidates if normalize_stripe_id_for_dedup(p.subscription_id or "") == norm_sub and normalize_stripe_id_for_dedup(p.invoice_id or "") == norm_inv),
+                        None
+                    )
                     if existing_sub_invoice and existing_sub_invoice.stripe_id != payment_id:
                         existing_type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}.get(existing_sub_invoice.type, 3)
                         new_type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}.get(payment_type, 3)
@@ -1386,12 +1418,11 @@ def reconcile_stripe_data(db: Session, org_id: uuid.UUID) -> dict:
         
         for payment in all_payments:
             if payment.subscription_id and payment.invoice_id:
-                key = (payment.subscription_id, payment.invoice_id)
+                key = (normalize_stripe_id_for_dedup(payment.subscription_id), normalize_stripe_id_for_dedup(payment.invoice_id))
             elif payment.invoice_id:
-                key = (None, payment.invoice_id)
+                key = (None, normalize_stripe_id_for_dedup(payment.invoice_id))
             else:
-                key = payment.stripe_id
-            
+                key = normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id
             if key not in seen:
                 seen.add(key)
                 deduplicated_payments.append(payment)

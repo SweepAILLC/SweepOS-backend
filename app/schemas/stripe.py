@@ -168,14 +168,27 @@ class ChurnMonthData(BaseModel):
     active: int
 
 
+class DuplicatePaymentEntry(BaseModel):
+    """Single payment in a duplicate group, with full id and suffix for debugging"""
+    payment_id: str  # Our DB UUID
+    stripe_id: str  # Full Stripe id (e.g. py_3Su1qPJQ..., pi_3Su1qPJQ...)
+    suffix: str  # Part after first underscore (normalized id used for grouping)
+    type: Optional[str] = None  # charge, payment_intent, invoice
+    amount_cents: int = 0
+
+    class Config:
+        from_attributes = True
+
+
 class DuplicatePaymentGroup(BaseModel):
-    """A group of duplicate payments"""
-    key: str  # Deduplication key (e.g., "subscription_invoice:sub_xxx:in_xxx" or "invoice:in_xxx")
+    """A group of duplicate payments (same normalized stripe_id = same suffix)"""
+    key: str  # The shared suffix (normalized id) used to group these as duplicates
     payment_ids: List[str]  # List of payment UUIDs in this group
-    count: int  # Number of duplicates
-    total_amount_cents: int  # Sum of all amounts (to verify they match)
-    recommended_keep_id: str  # ID of payment to keep (best one based on type priority)
-    
+    payments_detail: List[DuplicatePaymentEntry]  # Full stripe_id and suffix per payment (for testing/debug)
+    count: int
+    total_amount_cents: int
+    recommended_keep_id: str
+
     class Config:
         from_attributes = True
 

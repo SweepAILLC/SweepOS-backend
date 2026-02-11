@@ -21,6 +21,7 @@ from app.models.stripe_subscription import StripeSubscription
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
 from app.models.client import Client
 from app.models.recommendation import Recommendation, RecommendationStatus
+from app.utils.stripe_ids import normalize_stripe_id, normalize_stripe_id_for_dedup
 from app.schemas.stripe import (
     StripeSummaryResponse,
     StripeConnectionStatus,
@@ -37,6 +38,7 @@ from app.schemas.stripe import (
     MRRTrendPoint,
     DuplicatePaymentsResponse,
     DuplicatePaymentGroup,
+    DuplicatePaymentEntry,
     MergeDuplicatesRequest,
     MergeDuplicatesResponse,
 )
@@ -718,16 +720,12 @@ def get_stripe_summary(
                 StripeTreasuryTransaction.created <= end_date
             ).all()
             
-            # Group by flow_id to count unique failures (same flow = same payment attempt)
             unique_failures = set()
             for transaction in failed_transaction_records:
-                # Use flow_id if available, otherwise use transaction_id
-                group_key = transaction.flow_id or transaction.stripe_transaction_id
+                group_key = normalize_stripe_id_for_dedup(transaction.flow_id or transaction.stripe_transaction_id) or (transaction.flow_id or transaction.stripe_transaction_id)
                 unique_failures.add(group_key)
-            
             failed_payments = len(unique_failures)
         else:
-            # Fall back to old payment system
             print(f"[FAILED PAYMENTS COUNT] No Treasury Transactions, using StripePayment")
             failed_payment_records = db.query(StripePayment).filter(
                 and_(
@@ -737,17 +735,12 @@ def get_stripe_summary(
                     StripePayment.created_at <= end_date
                 )
             ).all()
-            
-            # Group by subscription_id + client_id to count unique failures
             unique_failures = set()
             for payment in failed_payment_records:
-                # Use subscription_id if available, otherwise use client_id only
-                group_key = (payment.subscription_id, payment.client_id)
+                group_key = (normalize_stripe_id_for_dedup(payment.subscription_id) if payment.subscription_id else None, payment.client_id)
                 unique_failures.add(group_key)
-            
             failed_payments = len(unique_failures)
     except Exception as e:
-        # If query fails, rollback and fall back to old payment system
         db.rollback()
         print(f"[FAILED PAYMENTS COUNT] Error querying failed transactions: {str(e)}, falling back to StripePayment")
         try:
@@ -759,11 +752,9 @@ def get_stripe_summary(
                     StripePayment.created_at <= end_date
                 )
             ).all()
-            
-            # Group by subscription_id + client_id to count unique failures
             unique_failures = set()
             for payment in failed_payment_records:
-                group_key = (payment.subscription_id, payment.client_id)
+                group_key = (normalize_stripe_id_for_dedup(payment.subscription_id) if payment.subscription_id else None, payment.client_id)
                 unique_failures.add(group_key)
             
             failed_payments = len(unique_failures)
@@ -787,45 +778,35 @@ def get_stripe_summary(
             -(p.created_at.timestamp() if p.created_at else 0)  # Most recent first
         ))
         
-        # Track invoice_ids that have been seen with subscription_id
-        # If we see an invoice_id with subscription_id, we should skip it if we see it again without subscription_id
+        # Track invoice_ids (normalized) that have been seen with subscription_id
         invoice_ids_with_sub = set()
         
         # Track payments without invoice/subscription by (amount, client_id, time_window)
-        # to catch payment_intent/charge duplicates
-        standalone_payments_seen = {}  # key: (amount_cents, client_id, time_bucket) -> stripe_id
+        # Use normalized stripe_id so pi_xxx and ch_xxx for same payment match
+        standalone_payments_seen = {}  # key: (amount_cents, client_id, time_bucket) -> normalized stripe_id
         
         for payment in payments_list:
-            # Create deduplication key - same logic as recent payments
+            # Create deduplication key using normalized IDs (first 17 chars of suffix for dedup)
             if payment.subscription_id and payment.invoice_id:
-                key = (payment.subscription_id, payment.invoice_id)
-                # Mark this invoice_id as having a subscription_id
-                invoice_ids_with_sub.add(payment.invoice_id)
+                key = (normalize_stripe_id_for_dedup(payment.subscription_id), normalize_stripe_id_for_dedup(payment.invoice_id))
+                invoice_ids_with_sub.add(normalize_stripe_id_for_dedup(payment.invoice_id))
             elif payment.invoice_id:
-                # If this invoice_id was already seen with a subscription_id, skip this one
-                if payment.invoice_id in invoice_ids_with_sub:
+                norm_inv = normalize_stripe_id_for_dedup(payment.invoice_id)
+                if norm_inv in invoice_ids_with_sub:
                     print(f"[DEBUG] Skipping payment {payment.stripe_id} with invoice_id {payment.invoice_id} (already have one with subscription_id)")
                     continue
-                key = (None, payment.invoice_id)
+                key = (None, norm_inv)
             else:
-                # No subscription or invoice - need to check for payment_intent/charge duplicates
-                # Group by amount, client_id, and time window (within 30 seconds)
                 if payment.created_at:
-                    # Round to nearest 30 seconds to group nearby payments
                     time_bucket = int(payment.created_at.timestamp() / 30) * 30
                     standalone_key = (payment.amount_cents, payment.client_id, time_bucket)
-                    
-                    # Check if we've seen a payment with same amount, client, and time window
+                    norm_stripe = normalize_stripe_id_for_dedup(payment.stripe_id)
                     if standalone_key in standalone_payments_seen:
                         existing_id = standalone_payments_seen[standalone_key]
                         print(f"[DEBUG] Skipping duplicate standalone payment {payment.stripe_id} (type: {payment.type}) - matches {existing_id} (same amount ${payment.amount_cents/100:.2f}, client, time window)")
                         continue
-                    
-                    # Mark this payment as seen
-                    standalone_payments_seen[standalone_key] = payment.stripe_id
-                
-                # Use stripe_id as key for payments without invoice/subscription
-                key = payment.stripe_id
+                    standalone_payments_seen[standalone_key] = norm_stripe
+                key = normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id
             
             if key not in seen:
                 seen.add(key)
@@ -885,18 +866,19 @@ def get_stripe_summary(
         all_succeeded_transactions.sort(key=lambda t: (t.posted_at or t.created).timestamp() if (t.posted_at or t.created) else 0, reverse=True)
         
         for transaction in all_succeeded_transactions:
-            # First check for exact duplicate by transaction_id
-            if transaction.stripe_transaction_id in seen_transaction_ids:
-                print(f"[REVENUE] Skipping duplicate transaction {transaction.stripe_transaction_id} (exact duplicate)")
+            norm_txn = normalize_stripe_id_for_dedup(transaction.stripe_transaction_id)
+            if norm_txn and norm_txn in seen_transaction_ids:
+                print(f"[REVENUE] Skipping duplicate transaction {transaction.stripe_transaction_id} (same normalized id)")
                 continue
-            seen_transaction_ids.add(transaction.stripe_transaction_id)
+            if norm_txn:
+                seen_transaction_ids.add(norm_txn)
             
-            # Then check for duplicate by flow_id (same payment flow)
-            if transaction.flow_id:
-                if transaction.flow_id in seen_flows:
+            norm_flow = normalize_stripe_id_for_dedup(transaction.flow_id) if transaction.flow_id else None
+            if norm_flow:
+                if norm_flow in seen_flows:
                     print(f"[REVENUE] Skipping duplicate transaction {transaction.stripe_transaction_id} (same flow_id: {transaction.flow_id})")
                     continue
-                seen_flows.add(transaction.flow_id)
+                seen_flows.add(norm_flow)
             
             deduplicated_all_transactions.append(transaction)
         
@@ -1250,23 +1232,21 @@ def get_revenue_timeline(
         
         for payment in payments_list:
             if payment.subscription_id and payment.invoice_id:
-                key = (payment.subscription_id, payment.invoice_id)
-                invoice_ids_with_sub.add(payment.invoice_id)
+                key = (normalize_stripe_id_for_dedup(payment.subscription_id), normalize_stripe_id_for_dedup(payment.invoice_id))
+                invoice_ids_with_sub.add(normalize_stripe_id_for_dedup(payment.invoice_id))
             elif payment.invoice_id:
-                if payment.invoice_id in invoice_ids_with_sub:
+                norm_inv = normalize_stripe_id_for_dedup(payment.invoice_id)
+                if norm_inv in invoice_ids_with_sub:
                     continue
-                key = (None, payment.invoice_id)
+                key = (None, norm_inv)
             else:
                 if payment.created_at:
                     time_bucket = int(payment.created_at.timestamp() / 30) * 30
                     standalone_key = (payment.amount_cents, payment.client_id, time_bucket)
-                    
                     if standalone_key in standalone_payments_seen:
                         continue
-                    
-                    standalone_payments_seen[standalone_key] = payment.stripe_id
-                
-                key = payment.stripe_id
+                    standalone_payments_seen[standalone_key] = normalize_stripe_id_for_dedup(payment.stripe_id)
+                key = normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id
             
             if key not in seen:
                 seen.add(key)
@@ -1457,36 +1437,31 @@ def get_payments(
         
         # Get all transactions, then deduplicate
         all_transactions = query.order_by(desc(StripeTreasuryTransaction.posted_at or StripeTreasuryTransaction.created)).all()
-        
-        # Deduplicate by stripe_transaction_id (exact duplicates) and flow_id (same payment flow)
-        seen_transaction_ids = set()
-        seen_flows = set()
-        deduplicated = []
-        
-        # Sort by posted_at (most recent first)
-        all_transactions.sort(key=lambda t: (t.posted_at or t.created).timestamp() if (t.posted_at or t.created) else 0, reverse=True)
-        
-        for transaction in all_transactions:
-            # Only include inbound transactions (positive amounts = money coming in)
-            if transaction.amount <= 0:
-                continue
-            
-            # First check for exact duplicate by transaction_id
-            if transaction.stripe_transaction_id in seen_transaction_ids:
-                print(f"[PAYMENTS] Skipping duplicate transaction {transaction.stripe_transaction_id} (exact duplicate)")
-                continue
-            seen_transaction_ids.add(transaction.stripe_transaction_id)
-            
-            # Then check for duplicate by flow_id (same payment flow)
-            if transaction.flow_id:
-                if transaction.flow_id in seen_flows:
-                    print(f"[PAYMENTS] Skipping duplicate transaction {transaction.stripe_transaction_id} (same flow_id: {transaction.flow_id})")
-                    continue
-                seen_flows.add(transaction.flow_id)
-            
-            deduplicated.append(transaction)
-        
-        # Sort deduplicated transactions by date (most recent first) before pagination
+
+        # Only inbound (positive amount)
+        inbound = [t for t in all_transactions if t.amount > 0]
+
+        # First pass: one transaction per normalized id (same as StripePayment path).
+        # Canonical id = normalized flow_id when present, else normalized stripe_transaction_id,
+        # so trxn_xxx / ic_xxx / obt_xxx with same suffix collapse to one.
+        def canonical_id(t):
+            n_flow = normalize_stripe_id_for_dedup(t.flow_id) if t.flow_id else None
+            n_txn = normalize_stripe_id_for_dedup(t.stripe_transaction_id) if t.stripe_transaction_id else None
+            return n_flow or n_txn or ("_no_id_%s" % t.id)
+
+        by_canonical = {}
+        for t in inbound:
+            cid = canonical_id(t)
+            if cid not in by_canonical:
+                by_canonical[cid] = t
+            else:
+                existing = by_canonical[cid]
+                ex_ts = (existing.posted_at or existing.created).timestamp() if (existing.posted_at or existing.created) else 0
+                new_ts = (t.posted_at or t.created).timestamp() if (t.posted_at or t.created) else 0
+                if new_ts > ex_ts:
+                    by_canonical[cid] = t
+
+        deduplicated = list(by_canonical.values())
         deduplicated.sort(key=lambda t: (t.posted_at or t.created).timestamp() if (t.posted_at or t.created) else 0, reverse=True)
         
         # Apply pagination after deduplication
@@ -1510,7 +1485,7 @@ def get_payments(
                 stripe_id=transaction.stripe_transaction_id,
                 client_id=str(transaction.client_id) if transaction.client_id else None,
                 client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-                client_email=client.email if client.email else transaction.customer_email,
+                client_email=(client.email if client else None) or transaction.customer_email,
                 amount_cents=abs(transaction.amount),  # Use absolute value for display
                 currency=transaction.currency or "usd",
                 status="succeeded" if str(transaction.status) == "posted" else str(transaction.status),
@@ -1544,60 +1519,61 @@ def get_payments(
     # Get all payments, then deduplicate
     all_payments = query.order_by(desc(StripePayment.created_at)).all()
     
-    # Deduplicate: group by (subscription_id, invoice_id), invoice_id, or stripe_id (in that priority)
-    # According to Stripe best practices: Each invoice payment should be shown separately
-    # Priority: (subscription_id, invoice_id) > invoice_id > subscription_id > stripe_id (standalone, no dedup)
-    # Within each group, prefer: charge > payment_intent > invoice
-    # This ensures multiple invoices for the same subscription are all shown (not deduplicated incorrectly)
-    seen_stripe_ids = set()  # Track exact duplicates by stripe_id
+    # First pass: one payment per normalized stripe_id (first 17 chars of suffix for dedup)
+    type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}
+    by_norm_id = {}
+    no_stripe_id = []
+    for p in all_payments:
+        norm = normalize_stripe_id_for_dedup(p.stripe_id) if p.stripe_id else None
+        if not norm:
+            no_stripe_id.append(p)
+            continue
+        if norm not in by_norm_id:
+            by_norm_id[norm] = p
+        else:
+            existing = by_norm_id[norm]
+            ex_pri = type_priority.get(existing.type, 3)
+            new_pri = type_priority.get(p.type, 3)
+            ex_ts = existing.created_at.timestamp() if existing.created_at else 0.0
+            new_ts = p.created_at.timestamp() if p.created_at else 0.0
+            if new_pri < ex_pri or (new_pri == ex_pri and new_ts > ex_ts):
+                by_norm_id[norm] = p
+    all_payments = list(by_norm_id.values()) + no_stripe_id
+
+    seen_stripe_ids = set()
     deduplicated = []
-    payment_map = {}  # Track best payment for each key
-    
-    # Sort: prefer charge over payment_intent over invoice, then by created_at (most recent first)
+    payment_map = {}
+
     all_payments.sort(key=lambda p: (
         {'charge': 0, 'payment_intent': 1, 'invoice': 2}.get(p.type, 3),
         -(p.created_at.timestamp() if p.created_at else 0)
     ))
-    
+
     for payment in all_payments:
-        # First check for exact duplicate by stripe_id
-        if payment.stripe_id in seen_stripe_ids:
-            print(f"[PAYMENTS] Skipping exact duplicate payment {payment.stripe_id} (same stripe_id)")
+        norm_stripe = normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else None
+        if norm_stripe and norm_stripe in seen_stripe_ids:
             continue
-        seen_stripe_ids.add(payment.stripe_id)
-        
-        # Only deduplicate successful payments - keep all failed payments
+        if norm_stripe:
+            seen_stripe_ids.add(norm_stripe)
+
         if payment.status != 'succeeded':
             deduplicated.append(payment)
             continue
-        
-        # Create deduplication key based on what will be displayed in subscription column
-        # According to Stripe best practices: Deduplicate by (subscription_id, invoice_id) or invoice_id
-        # This ensures each invoice payment is shown separately, even for the same subscription
-        # Priority: (subscription_id, invoice_id) > invoice_id > stripe_id (standalone, no dedup)
+
         if payment.subscription_id and payment.invoice_id:
-            # Group by subscription_id + invoice_id - payments for same subscription+invoice are duplicates
-            # This correctly handles multiple invoices for the same subscription
-            key = ('subscription_invoice', payment.subscription_id, payment.invoice_id)
+            key = ('subscription_invoice', normalize_stripe_id_for_dedup(payment.subscription_id), normalize_stripe_id_for_dedup(payment.invoice_id))
         elif payment.invoice_id:
-            # Group by invoice_id - all payments for same invoice are duplicates
-            key = ('invoice', payment.invoice_id)
+            key = ('invoice', normalize_stripe_id_for_dedup(payment.invoice_id))
         elif payment.subscription_id:
-            # Subscription payment without invoice_id (shouldn't happen, but handle gracefully)
-            # Group by subscription_id only as fallback
-            key = ('subscription', payment.subscription_id)
+            key = ('subscription', normalize_stripe_id_for_dedup(payment.subscription_id))
         else:
-            # Standalone payment (no subscription or invoice) - keep all (no deduplication)
             deduplicated.append(payment)
             continue
-        
-        # Check if we've seen this key before
+
         if key not in payment_map:
-            # First payment with this key - keep it
             payment_map[key] = payment
             deduplicated.append(payment)
         else:
-            # Duplicate key - we already have a better payment (due to sorting)
             existing_payment = payment_map[key]
             print(f"[PAYMENTS] Skipping duplicate payment {payment.stripe_id} (type: {payment.type}) - keeping {existing_payment.stripe_id} (type: {existing_payment.type}) for {key[0]} {key[1]}")
     
@@ -1696,13 +1672,12 @@ def get_failed_payments(
         grouped_transactions = {}
         
         for transaction in all_failed_transactions:
-            # Create grouping key
             if transaction.flow_id:
-                group_key = transaction.flow_id
+                group_key = normalize_stripe_id_for_dedup(transaction.flow_id)
             elif transaction.customer_email:
                 group_key = f"email_{transaction.customer_email}"
             else:
-                group_key = transaction.stripe_transaction_id
+                group_key = normalize_stripe_id_for_dedup(transaction.stripe_transaction_id) or transaction.stripe_transaction_id
             
             if group_key not in grouped_transactions:
                 grouped_transactions[group_key] = {
@@ -1833,22 +1808,15 @@ def get_failed_payments(
     grouped_payments = {}
     
     for payment in all_failed_payments:
-        # Create grouping key for retry attempts
-        # For subscription payments, group all retries together regardless of invoice_id
-        # Use subscription_id as the primary grouping key - all retries for same subscription should group
+        # Group using normalized IDs (first 17 chars of suffix for dedup)
         if payment.subscription_id:
-            # Group by subscription_id only (not client_id) since retries for same subscription should group
-            # even if client_id is different or None
-            group_key = (payment.subscription_id,)
+            group_key = ('sub', normalize_stripe_id_for_dedup(payment.subscription_id))
         elif payment.invoice_id:
-            # For non-subscription payments with invoice, group by invoice to catch retries
-            group_key = (None, payment.invoice_id)
+            group_key = (None, normalize_stripe_id_for_dedup(payment.invoice_id))
         elif payment.client_id:
-            # For standalone payments without subscription or invoice, group by client only
             group_key = (None, payment.client_id)
         else:
-            # No subscription, invoice, or client - use stripe_id as unique key
-            group_key = (payment.stripe_id,)
+            group_key = ('stripe', normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id)
         
         if group_key not in grouped_payments:
             grouped_payments[group_key] = {
@@ -1879,36 +1847,27 @@ def get_failed_payments(
         #   - (None, client_id) - 2-tuple for client payments
         #   - (stripe_id,) - 1-tuple for unique payments
         
+        representative_payment = min(group_data['payments'], key=lambda p: p.created_at)
+        attempt_count = len(group_data['payments'])
+        
         subscription_id = None
         client_id = None
         invoice_id = None
         
-        if len(group_key) == 1:
-            # Single value tuple: (subscription_id,) or (stripe_id,)
-            value = group_key[0]
-            if value and value.startswith('sub_'):
-                subscription_id = value
-            else:
-                # Skip unique payments (stripe_id) - no grouping needed
-                continue
+        if len(group_key) == 2 and group_key[0] == 'sub':
+            subscription_id = representative_payment.subscription_id
+        elif len(group_key) == 2 and group_key[0] == 'stripe':
+            continue
         elif len(group_key) == 2:
-            # Two value tuple: (None, invoice_id) or (None, client_id)
             first, second = group_key
             if first is None:
-                if second and second.startswith('in_'):
-                    invoice_id = second
-                else:
+                if isinstance(second, uuid.UUID):
                     client_id = second
+                else:
+                    invoice_id = representative_payment.invoice_id
         
-        # Use the FIRST payment (earliest) as the representative to show initial date
-        representative_payment = min(group_data['payments'], key=lambda p: p.created_at)
-        attempt_count = len(group_data['payments'])
-        
-        # Get client_id from representative payment if not already set
         if not client_id:
             client_id = representative_payment.client_id
-        
-        # Get subscription_id from representative payment if not already set
         if not subscription_id:
             subscription_id = representative_payment.subscription_id
         
@@ -2567,83 +2526,98 @@ def get_mrr_trend(
     )
 
 
+def _build_duplicate_group(key: str, payments: list, recommended_keep) -> DuplicatePaymentGroup:
+    total_amount = sum(p.amount_cents for p in payments)
+    payments_detail = [
+        DuplicatePaymentEntry(
+            payment_id=str(p.id),
+            stripe_id=p.stripe_id or "",
+            suffix=normalize_stripe_id(p.stripe_id) if p.stripe_id else "",
+            type=p.type,
+            amount_cents=p.amount_cents or 0
+        )
+        for p in payments
+    ]
+    return DuplicatePaymentGroup(
+        key=key,
+        payment_ids=[str(p.id) for p in payments],
+        payments_detail=payments_detail,
+        count=len(payments),
+        total_amount_cents=total_amount,
+        recommended_keep_id=str(recommended_keep.id)
+    )
+
+
 @router.get("/payments/duplicates", response_model=DuplicatePaymentsResponse)
 def find_duplicate_payments(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Find duplicate payments in the database.
-    
-    Duplicates are identified by:
-    - Same (subscription_id, invoice_id) pair
-    - Same invoice_id
-    - Same stripe_id (exact duplicates)
-    
-    Returns groups of duplicate payments with recommendations on which to keep.
+    Find duplicate payments using: (1) same normalized stripe_id suffix, (2) same subscription+invoice, (3) same invoice.
+    Returns groups with full stripe_id and suffix per payment. Full ids shown (no ellipsis) for debugging.
     """
-    # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
+
     if not check_stripe_connected(db, org_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Stripe not connected."
         )
-    
-    # Get all succeeded payments for this org
+
     all_payments = db.query(StripePayment).filter(
         StripePayment.org_id == org_id,
-        StripePayment.status == 'succeeded'  # Only check succeeded payments for duplicates
+        StripePayment.status == 'succeeded'
     ).all()
-    
-    # Group payments by deduplication key
-    payment_groups = defaultdict(list)
-    
-    for payment in all_payments:
-        # Create deduplication key (same logic as payments endpoint)
-        if payment.subscription_id and payment.invoice_id:
-            key = f"subscription_invoice:{payment.subscription_id}:{payment.invoice_id}"
-        elif payment.invoice_id:
-            key = f"invoice:{payment.invoice_id}"
-        else:
-            # Standalone payments - group by stripe_id to catch exact duplicates
-            key = f"stripe_id:{payment.stripe_id}"
-        
-        payment_groups[key].append(payment)
-    
-    # Filter to only groups with duplicates (more than 1 payment)
-    duplicate_groups = {k: v for k, v in payment_groups.items() if len(v) > 1}
-    
-    # Build response
+
+    seen_payment_sets = set()  # frozenset of payment ids, so we don't show the same duplicate set twice
     groups = []
     total_duplicates = 0
-    
-    for key, payments in duplicate_groups.items():
-        # Sort payments: prefer charge > payment_intent > invoice, then by updated_at (most recent first)
+
+    def add_group(key: str, payments: list):
+        if len(payments) <= 1:
+            return
+        ids_set = frozenset(str(p.id) for p in payments)
+        if ids_set in seen_payment_sets:
+            return
+        seen_payment_sets.add(ids_set)
         payments.sort(key=lambda p: (
             {'charge': 0, 'payment_intent': 1, 'invoice': 2}.get(p.type, 3),
             -(p.updated_at.timestamp() if p.updated_at else 0)
         ))
-        
-        # The first payment is the one to keep
-        recommended_keep = payments[0]
-        duplicates_to_delete = payments[1:]
-        
-        # Verify all amounts match (they should for true duplicates)
-        amounts = [p.amount_cents for p in payments]
-        total_amount = sum(amounts)
-        
-        groups.append(DuplicatePaymentGroup(
-            key=key,
-            payment_ids=[str(p.id) for p in payments],
-            count=len(payments),
-            total_amount_cents=total_amount,
-            recommended_keep_id=str(recommended_keep.id)
-        ))
-        
-        total_duplicates += len(duplicates_to_delete)
-    
+        groups.append(_build_duplicate_group(key, list(payments), payments[0]))
+        nonlocal total_duplicates
+        total_duplicates += len(payments) - 1
+
+    # (1) Group by normalized stripe_id for dedup (first 17 chars of suffix)
+    by_suffix = defaultdict(list)
+    for p in all_payments:
+        if p.stripe_id:
+            s = normalize_stripe_id_for_dedup(p.stripe_id)
+            if s:
+                by_suffix[s].append(p)
+    for suffix_key, payments in by_suffix.items():
+        add_group(f"suffix:{suffix_key}", payments)
+
+    # (2) Group by (subscription_id, invoice_id) normalized for dedup
+    by_sub_inv = defaultdict(list)
+    for p in all_payments:
+        if p.subscription_id and p.invoice_id:
+            k = (normalize_stripe_id_for_dedup(p.subscription_id), normalize_stripe_id_for_dedup(p.invoice_id))
+            by_sub_inv[k].append(p)
+    for (ns, ni), payments in by_sub_inv.items():
+        add_group(f"subscription_invoice:{ns}:{ni}", payments)
+
+    # (3) Group by invoice_id normalized for dedup
+    by_inv = defaultdict(list)
+    for p in all_payments:
+        if p.invoice_id:
+            k = normalize_stripe_id_for_dedup(p.invoice_id)
+            if k:
+                by_inv[k].append(p)
+    for inv_key, payments in by_inv.items():
+        add_group(f"invoice:{inv_key}", payments)
+
     return DuplicatePaymentsResponse(
         total_groups=len(groups),
         total_duplicates=total_duplicates,
@@ -2757,7 +2731,8 @@ def assign_payment_to_client(
     """
     Assign a payment to a specific client.
     
-    This is useful for payments that have "Unknown" customers and need to be manually linked.
+    Accepts either StripePayment.id or StripeTreasuryTransaction.id so that assigning
+    works when the Recent payments list is sourced from Treasury (e.g. time range view).
     After assignment, optionally runs reconciliation to update client lifetime revenue.
     """
     # Get selected org_id from user object (set by get_current_user)
@@ -2770,18 +2745,23 @@ def assign_payment_to_client(
         )
     
     try:
-        # Validate payment exists and belongs to this org
         payment_uuid = uuid.UUID(payment_id)
         payment = db.query(StripePayment).filter(
             StripePayment.id == payment_uuid,
             StripePayment.org_id == org_id
         ).first()
-        
+        transaction = None
         if not payment:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Payment with ID {payment_id} not found or doesn't belong to your organization."
-            )
+            # Recent payments list may be from Treasury when use_treasury=True (e.g. 30-day view)
+            transaction = db.query(StripeTreasuryTransaction).filter(
+                StripeTreasuryTransaction.id == payment_uuid,
+                StripeTreasuryTransaction.org_id == org_id
+            ).first()
+            if not transaction:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Payment with ID {payment_id} not found or doesn't belong to your organization."
+                )
         
         # Validate client exists and belongs to this org
         client_uuid = uuid.UUID(client_id)
@@ -2796,14 +2776,16 @@ def assign_payment_to_client(
                 detail=f"Client with ID {client_id} not found or doesn't belong to your organization."
             )
         
-        # Update payment client_id
-        old_client_id = payment.client_id
-        payment.client_id = client_uuid
-        payment.updated_at = datetime.utcnow()
-        
-        db.commit()
-        
-        print(f"[ASSIGN] Assigned payment {payment.stripe_id} (ID: {payment_id}) to client {client.email or client.id} (ID: {client_id})")
+        if payment:
+            payment.client_id = client_uuid
+            payment.updated_at = datetime.utcnow()
+            db.commit()
+            print(f"[ASSIGN] Assigned StripePayment {payment.stripe_id} (ID: {payment_id}) to client {client.email or client.id} (ID: {client_id})")
+        else:
+            transaction.client_id = client_uuid
+            transaction.updated_at = datetime.utcnow()
+            db.commit()
+            print(f"[ASSIGN] Assigned Treasury transaction {transaction.stripe_transaction_id} (ID: {payment_id}) to client {client.email or client.id} (ID: {client_id})")
         
         # Run reconciliation if requested
         reconciliation_result = None

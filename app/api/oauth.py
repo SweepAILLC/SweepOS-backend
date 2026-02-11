@@ -11,6 +11,10 @@ from app.api.deps import get_current_user, require_admin, require_admin_or_owner
 from app.models.user import User
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.models.organization import Organization
+from app.models.stripe_payment import StripePayment
+from app.models.stripe_subscription import StripeSubscription
+from app.models.stripe_treasury_transaction import StripeTreasuryTransaction
+from app.models.stripe_event import StripeEvent
 from app.core.encryption import encrypt_token
 from datetime import datetime, timedelta
 
@@ -1393,19 +1397,28 @@ def disconnect_stripe(
     current_user: User = Depends(require_admin_or_owner)
 ):
     """
-    Disconnect Stripe OAuth for the current user's organization.
-    This allows users to connect a different Stripe account.
+    Disconnect Stripe (OAuth or API key) for the current user's organization.
+    Removes the connection token and all stored Stripe data for this org so that
+    reconnecting (e.g. with a different account or API key) starts with a clean slate
+    and avoids duplicate payments from previous connection data.
     """
-    # Find and delete the OAuth token for this org
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+
+    # Delete stored Stripe data for this org so reconnect + resync doesn't mix with old data
+    db.query(StripePayment).filter(StripePayment.org_id == org_id).delete(synchronize_session=False)
+    db.query(StripeTreasuryTransaction).filter(StripeTreasuryTransaction.org_id == org_id).delete(synchronize_session=False)
+    db.query(StripeSubscription).filter(StripeSubscription.org_id == org_id).delete(synchronize_session=False)
+    db.query(StripeEvent).filter(StripeEvent.org_id == org_id).delete(synchronize_session=False)
+
+    # Remove the connection token (OAuth or API key)
     oauth_token = db.query(OAuthToken).filter(
         OAuthToken.provider == OAuthProvider.STRIPE,
-        OAuthToken.org_id == current_user.org_id
+        OAuthToken.org_id == org_id
     ).first()
-    
     if oauth_token:
         db.delete(oauth_token)
-        db.commit()
-    
+
+    db.commit()
     return None
 
 

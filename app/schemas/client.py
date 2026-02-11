@@ -1,6 +1,6 @@
 from pydantic import BaseModel, field_validator
 from datetime import datetime
-from typing import Optional, Union
+from typing import List, Optional, Union
 from decimal import Decimal
 import uuid
 from app.models.client import LifecycleState
@@ -63,6 +63,11 @@ class ClientCreate(ClientBase):
     pass
 
 
+class MergeClientsRequest(BaseModel):
+    """Request to merge multiple client records into one (e.g. same email)."""
+    client_ids: List[uuid.UUID]
+
+
 class ClientUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -116,4 +121,31 @@ class Client(ClientBase):
         json_encoders = {
             Decimal: lambda v: float(v) if v is not None else 0.0
         }
+
+
+# Terminal dashboard summary (cash, MRR, top contributors) - precomputed to avoid N+1
+class TerminalCashCollected(BaseModel):
+    today: float = 0.0
+    last_7_days: float = 0.0
+    last_30_days: float = 0.0
+
+
+class TerminalMRR(BaseModel):
+    current_mrr: float = 0.0
+    arr: float = 0.0
+
+
+class TerminalTopContributor(BaseModel):
+    client_id: str
+    display_name: str
+    revenue: float
+    last_payment_date: Optional[str] = None
+    merged_client_ids: Optional[List[str]] = None
+
+
+class TerminalSummaryResponse(BaseModel):
+    cash_collected: TerminalCashCollected
+    mrr: TerminalMRR
+    top_contributors_30d: List[TerminalTopContributor]
+    top_contributors_90d: List[TerminalTopContributor]
 

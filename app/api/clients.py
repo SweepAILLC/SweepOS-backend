@@ -1,19 +1,31 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from sqlalchemy.orm import Session
+import re
 from sqlalchemy import desc, func, or_, and_
 from typing import List, Optional
 from uuid import UUID
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from app.db.session import get_db
 from app.models.client import Client, LifecycleState
 from app.models.stripe_payment import StripePayment
+from app.models.stripe_subscription import StripeSubscription
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
 from app.models.manual_payment import ManualPayment
 from app.models.client_checkin import ClientCheckIn
-from app.schemas.client import Client as ClientSchema, ClientCreate, ClientUpdate
+from app.schemas.client import (
+    Client as ClientSchema,
+    ClientCreate,
+    ClientUpdate,
+    MergeClientsRequest,
+    TerminalSummaryResponse,
+    TerminalCashCollected,
+    TerminalMRR,
+    TerminalTopContributor,
+)
 from app.api.deps import get_current_user, get_selected_org_id
 from app.models.user import User
+from app.utils.stripe_ids import normalize_stripe_id_for_dedup
 from app.services.client_automation import update_client_progress, update_client_lifecycle_state, process_client_automation
 
 router = APIRouter()
@@ -169,6 +181,238 @@ def get_client(
                 print(f"[CLIENT_API] ✅ State change confirmed: {old_state} → {new_state}")
     
     return client
+
+
+def _normalize_email(email: str | None) -> str | None:
+    if not email:
+        return None
+    return re.sub(r"\s+", "", email.lower().strip()) or None
+
+
+@router.get("/terminal-summary", response_model=TerminalSummaryResponse)
+def get_terminal_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Precomputed terminal dashboard summary: cash collected (today/7d/30d), MRR/ARR,
+    and top 5 revenue contributors for 30d and 90d. One query instead of N+1.
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+
+    now = datetime.utcnow()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    seven_days_ago = today_start - timedelta(days=7)
+    thirty_days_ago = today_start - timedelta(days=30)
+
+    # --- Cash collected: Stripe (succeeded, dedupe by stripe_id) + Manual ---
+    stripe_payments = (
+        db.query(StripePayment)
+        .filter(
+            StripePayment.org_id == org_id,
+            StripePayment.status == "succeeded",
+        )
+        .all()
+    )
+    seen_stripe_ids = set()
+    today_cash = 0.0
+    last_7_cash = 0.0
+    last_30_cash = 0.0
+    for p in stripe_payments:
+        if p.stripe_id and p.stripe_id in seen_stripe_ids:
+            continue
+        if p.stripe_id:
+            seen_stripe_ids.add(p.stripe_id)
+        ts = p.created_at
+        if not ts:
+            continue
+        amount = (p.amount_cents or 0) / 100.0
+        if ts >= today_start:
+            today_cash += amount
+        if ts >= seven_days_ago:
+            last_7_cash += amount
+        if ts >= thirty_days_ago:
+            last_30_cash += amount
+
+    manual_payments = (
+        db.query(ManualPayment)
+        .filter(ManualPayment.org_id == org_id)
+        .all()
+    )
+    for p in manual_payments:
+        ts = p.payment_date or p.created_at
+        if not ts:
+            continue
+        if getattr(ts, "tzinfo", None):
+            ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+        amount = (p.amount_cents or 0) / 100.0
+        if ts >= today_start:
+            today_cash += amount
+        if ts >= seven_days_ago:
+            last_7_cash += amount
+        if ts >= thirty_days_ago:
+            last_30_cash += amount
+
+    cash_collected = TerminalCashCollected(
+        today=today_cash,
+        last_7_days=last_7_cash,
+        last_30_days=last_30_cash,
+    )
+
+    # --- MRR/ARR: from Stripe subscriptions (active/trialing) or fallback to client estimated_mrr ---
+    current_mrr = 0.0
+    mrr_result = (
+        db.query(func.coalesce(func.sum(StripeSubscription.mrr), 0))
+        .filter(
+            StripeSubscription.org_id == org_id,
+            StripeSubscription.status.in_(["active", "trialing"]),
+        )
+        .scalar()
+    )
+    if mrr_result is not None:
+        try:
+            current_mrr = float(mrr_result)
+        except (TypeError, ValueError):
+            pass
+    if current_mrr == 0.0:
+        clients = db.query(Client).filter(Client.org_id == org_id).all()
+        grouped = {}
+        processed = set()
+        for c in clients:
+            if c.id in processed:
+                continue
+            key = _normalize_email(c.email) if c.email else (f"stripe:{c.stripe_customer_id}" if c.stripe_customer_id else str(c.id))
+            if key not in grouped:
+                grouped[key] = []
+            same = [x for x in clients if (x.id not in processed and (
+                (_normalize_email(x.email) == _normalize_email(c.email) and c.email) or
+                (x.stripe_customer_id == c.stripe_customer_id and c.stripe_customer_id and not c.email) or
+                (x.id == c.id)
+            ))]
+            for x in same:
+                grouped[key].append(x)
+                processed.add(x.id)
+        for group in grouped.values():
+            max_mrr = max((float(c.estimated_mrr or 0) for c in group), default=0)
+            current_mrr += max_mrr
+    mrr = TerminalMRR(current_mrr=current_mrr, arr=current_mrr * 12)
+
+    # --- Top contributors: revenue by client (then merge by email), 30d and 90d ---
+    ninety_days_ago = today_start - timedelta(days=90)
+
+    def _revenue_by_client(since: datetime):
+        rev = {}
+        stripe_q = (
+            db.query(StripePayment.client_id, func.sum(StripePayment.amount_cents).label("total"))
+            .filter(
+                StripePayment.org_id == org_id,
+                StripePayment.status == "succeeded",
+                StripePayment.client_id.isnot(None),
+                StripePayment.created_at >= since,
+            )
+            .group_by(StripePayment.client_id)
+        )
+        for row in stripe_q.all():
+            cid = str(row.client_id)
+            rev[cid] = rev.get(cid, 0) + (row.total or 0)
+        manual_q = (
+            db.query(ManualPayment.client_id, func.sum(ManualPayment.amount_cents).label("total"))
+            .filter(
+                ManualPayment.org_id == org_id,
+                ManualPayment.payment_date >= since,
+            )
+            .group_by(ManualPayment.client_id)
+        )
+        for row in manual_q.all():
+            cid = str(row.client_id)
+            rev[cid] = rev.get(cid, 0) + (row.total or 0)
+        return rev
+
+    rev_30 = _revenue_by_client(thirty_days_ago)
+    rev_90 = _revenue_by_client(ninety_days_ago)
+
+    all_clients = db.query(Client).filter(Client.org_id == org_id).all()
+    all_client_ids = [c.id for c in all_clients]
+
+    last_stripe = (
+        db.query(StripePayment.client_id, func.max(StripePayment.created_at).label("last_at"))
+        .filter(
+            StripePayment.org_id == org_id,
+            StripePayment.client_id.in_(all_client_ids),
+            StripePayment.status == "succeeded",
+        )
+        .group_by(StripePayment.client_id)
+    ).all()
+    last_manual = (
+        db.query(ManualPayment.client_id, func.max(ManualPayment.payment_date).label("last_at"))
+        .filter(ManualPayment.org_id == org_id, ManualPayment.client_id.in_(all_client_ids))
+        .group_by(ManualPayment.client_id)
+    ).all()
+    last_payment_by_client = {}
+    for row in last_stripe:
+        last_payment_by_client[str(row.client_id)] = row.last_at
+    for row in last_manual:
+        k = str(row.client_id)
+        dt = row.last_at
+        if dt and getattr(dt, "replace", None):
+            dt = dt.replace(tzinfo=None) if dt.tzinfo else dt
+        if k not in last_payment_by_client or (dt and (not last_payment_by_client[k] or dt > last_payment_by_client[k])):
+            last_payment_by_client[k] = dt
+
+    def _build_top(rev_by_client, limit=5):
+        grouped = {}
+        processed = set()
+        for c in all_clients:
+            if str(c.id) in processed:
+                continue
+            norm = _normalize_email(c.email)
+            if norm:
+                key = f"email:{norm}"
+                same = [x for x in all_clients if str(x.id) not in processed and _normalize_email(x.email) == norm]
+            elif c.stripe_customer_id:
+                key = f"stripe:{c.stripe_customer_id}"
+                same = [x for x in all_clients if str(x.id) not in processed and x.stripe_customer_id == c.stripe_customer_id]
+            else:
+                key = str(c.id)
+                same = [c]
+            for x in same:
+                processed.add(str(x.id))
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].extend(same)
+        contributors = []
+        for group in grouped.values():
+            total_revenue_cents = sum(rev_by_client.get(str(c.id), 0) for c in group)
+            if total_revenue_cents <= 0:
+                continue
+            primary = min(group, key=lambda c: (c.created_at or datetime.min).timestamp())
+            names = set()
+            for c in group:
+                n = " ".join(filter(None, [c.first_name, c.last_name])).strip()
+                if n:
+                    names.add(n)
+            display_name = " / ".join(sorted(names)) if names else (primary.email or "Unknown")
+            last_dates = [last_payment_by_client.get(str(c.id)) for c in group if last_payment_by_client.get(str(c.id))]
+            last_payment = max(last_dates, key=lambda d: d or datetime.min) if last_dates else None
+            contributors.append({
+                "client_id": str(primary.id),
+                "display_name": display_name,
+                "revenue": total_revenue_cents / 100.0,
+                "last_payment_date": last_payment.isoformat() if last_payment else None,
+                "merged_client_ids": [str(c.id) for c in group] if len(group) > 1 else None,
+            })
+        contributors.sort(key=lambda x: -x["revenue"])
+        return [TerminalTopContributor(**c) for c in contributors[:limit]]
+
+    top_30 = _build_top(rev_30)
+    top_90 = _build_top(rev_90)
+
+    return TerminalSummaryResponse(
+        cash_collected=cash_collected,
+        mrr=mrr,
+        top_contributors_30d=top_30,
+        top_contributors_90d=top_90,
+    )
 
 
 @router.get("/{client_id}/payments")
@@ -413,32 +657,26 @@ def get_client_payments(
                     deduplicated.append(payment)
                 continue
             
-            # First check for exact duplicate by stripe_id (matches recent payments logic)
-            if stripe_id and stripe_id in seen_stripe_ids:
-                print(f"[CLIENT_PAYMENTS] Skipping exact duplicate payment {stripe_id} (same stripe_id)")
+            norm_stripe = normalize_stripe_id_for_dedup(stripe_id) if stripe_id else None
+            if norm_stripe and norm_stripe in seen_stripe_ids:
+                print(f"[CLIENT_PAYMENTS] Skipping exact duplicate payment {stripe_id} (same normalized id)")
                 continue
-            if stripe_id:
-                seen_stripe_ids.add(stripe_id)
+            if norm_stripe:
+                seen_stripe_ids.add(norm_stripe)
             
-            # Only deduplicate successful payments - keep all failed payments (matches recent payments)
             if payment_status != 'succeeded':
                 deduplicated.append(payment)
                 continue
             
-            # Create deduplication key - EXACT same logic as recent payments table
             subscription_id = getattr(payment, 'subscription_id', None)
             invoice_id = getattr(payment, 'invoice_id', None)
             
-            # Priority: (subscription_id, invoice_id) > invoice_id > subscription_id > stripe_id (standalone, no dedup)
             if subscription_id and invoice_id:
-                # Group by subscription_id + invoice_id - payments for same subscription+invoice are duplicates
-                key = ('subscription_invoice', subscription_id, invoice_id)
+                key = ('subscription_invoice', normalize_stripe_id_for_dedup(subscription_id), normalize_stripe_id_for_dedup(invoice_id))
             elif invoice_id:
-                # Group by invoice_id - all payments for same invoice are duplicates
-                key = ('invoice', invoice_id)
+                key = ('invoice', normalize_stripe_id_for_dedup(invoice_id))
             elif subscription_id:
-                # Subscription payment without invoice_id (shouldn't happen, but handle gracefully)
-                key = ('subscription', subscription_id)
+                key = ('subscription', normalize_stripe_id_for_dedup(subscription_id))
             else:
                 # Standalone payment (no subscription or invoice) - keep all (no deduplication)
                 deduplicated.append(payment)
@@ -770,6 +1008,124 @@ def update_client(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error updating client: {str(e)}"
         )
+
+
+@router.post("/merge", response_model=ClientSchema)
+def merge_clients(
+    body: MergeClientsRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Merge multiple client records into one. Keeps the oldest client (by created_at),
+    merges fields from the others, reassigns all related records to the kept client, then deletes the others.
+    Call this to persist a single client profile per person (e.g. same email) instead of merging in memory on each load.
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    if len(body.client_ids) < 2:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least 2 client IDs required to merge")
+
+    # Load all clients, same org only
+    clients = db.query(Client).filter(
+        Client.id.in_(body.client_ids),
+        Client.org_id == org_id,
+    ).order_by(Client.created_at.asc()).all()
+
+    if len(clients) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Fewer than 2 clients found for the given IDs in this organization",
+        )
+
+    keep = clients[0]
+    to_remove = clients[1:]
+    keep_id = keep.id
+    remove_ids = [c.id for c in to_remove]
+
+    # Merge fields into keep (prefer non-empty / best value)
+    state_priority = {
+        LifecycleState.ACTIVE: 5,
+        LifecycleState.WARM_LEAD: 4,
+        LifecycleState.COLD_LEAD: 3,
+        LifecycleState.OFFBOARDING: 2,
+        LifecycleState.DEAD: 1,
+    }
+    best_state = keep
+    for c in to_remove:
+        if state_priority.get(c.lifecycle_state, 0) > state_priority.get(best_state.lifecycle_state, 0):
+            best_state = c
+    keep.lifecycle_state = best_state.lifecycle_state
+
+    for c in to_remove:
+        if c.first_name and (not keep.first_name or not keep.first_name.strip()):
+            keep.first_name = c.first_name
+        if c.last_name and (not keep.last_name or not keep.last_name.strip()):
+            keep.last_name = c.last_name
+        if c.phone and (not keep.phone or not keep.phone.strip()):
+            keep.phone = c.phone
+        if c.instagram and (not keep.instagram or not keep.instagram.strip()):
+            keep.instagram = c.instagram
+        if c.stripe_customer_id and (not keep.stripe_customer_id or not keep.stripe_customer_id.strip()):
+            keep.stripe_customer_id = c.stripe_customer_id
+        keep.estimated_mrr = max((keep.estimated_mrr or 0), (c.estimated_mrr or 0))
+        keep.lifetime_revenue_cents = max((keep.lifetime_revenue_cents or 0), (c.lifetime_revenue_cents or 0))
+        if c.notes and c.notes.strip():
+            keep.notes = (keep.notes or "").rstrip() + "\n" + c.notes.strip() if keep.notes else c.notes.strip()
+    # Program: prefer client with highest progress among keep + to_remove
+    all_for_program = [keep] + to_remove
+    best_program = max(all_for_program, key=lambda x: (x.program_progress_percent or 0))
+    if best_program.program_progress_percent is not None:
+        keep.program_start_date = best_program.program_start_date
+        keep.program_duration_days = best_program.program_duration_days
+        keep.program_end_date = best_program.program_end_date
+        keep.program_progress_percent = best_program.program_progress_percent
+
+    # Reassign related records from to_remove to keep
+    from app.models.stripe_subscription import StripeSubscription
+    from app.models.event import Event
+    from app.models.funnel import Funnel
+    from app.models.recommendation import Recommendation
+
+    for rid in remove_ids:
+        db.query(StripePayment).filter(
+            StripePayment.client_id == rid,
+            StripePayment.org_id == org_id,
+        ).update({StripePayment.client_id: keep_id}, synchronize_session=False)
+        db.query(StripeSubscription).filter(
+            StripeSubscription.client_id == rid,
+            StripeSubscription.org_id == org_id,
+        ).update({StripeSubscription.client_id: keep_id}, synchronize_session=False)
+        db.query(Event).filter(
+            Event.client_id == rid,
+            Event.org_id == org_id,
+        ).update({Event.client_id: keep_id}, synchronize_session=False)
+        db.query(Funnel).filter(
+            Funnel.client_id == rid,
+            Funnel.org_id == org_id,
+        ).update({Funnel.client_id: keep_id}, synchronize_session=False)
+        db.query(Recommendation).filter(
+            Recommendation.client_id == rid,
+            Recommendation.org_id == org_id,
+        ).update({Recommendation.client_id: keep_id}, synchronize_session=False)
+        db.query(ManualPayment).filter(
+            ManualPayment.client_id == rid,
+            ManualPayment.org_id == org_id,
+        ).update({ManualPayment.client_id: keep_id}, synchronize_session=False)
+        db.query(ClientCheckIn).filter(
+            ClientCheckIn.client_id == rid,
+            ClientCheckIn.org_id == org_id,
+        ).update({ClientCheckIn.client_id: keep_id}, synchronize_session=False)
+        db.query(StripeTreasuryTransaction).filter(
+            StripeTreasuryTransaction.client_id == rid,
+            StripeTreasuryTransaction.org_id == org_id,
+        ).update({StripeTreasuryTransaction.client_id: keep_id}, synchronize_session=False)
+
+    for c in to_remove:
+        db.delete(c)
+
+    db.commit()
+    db.refresh(keep)
+    return ClientSchema.model_validate(keep, from_attributes=True)
 
 
 @router.delete("/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
