@@ -601,21 +601,53 @@ def get_stripe_summary(
     # Calculate ARR
     arr = current_mrr * 12
     
-    # Count new subscriptions in period
-    new_subscriptions = db.query(func.count(StripeSubscription.id)).filter(
+    # Count new customers in period (first successful payment in period, any type: subscription, invoice, one-off)
+    # First payment date per client from StripePayment (succeeded)
+    payment_first = db.query(
+        StripePayment.client_id,
+        func.min(StripePayment.created_at).label("first_ts"),
+    ).filter(
         and_(
-            StripeSubscription.org_id == org_id,
-            StripeSubscription.created_at >= start_date,
-            StripeSubscription.created_at <= end_date
+            StripePayment.org_id == org_id,
+            StripePayment.status == "succeeded",
+            StripePayment.client_id.isnot(None),
         )
-    ).scalar() or 0
+    ).group_by(StripePayment.client_id).all()
+    first_by_client = {}
+    for (cid, ts) in payment_first:
+        if cid and ts:
+            first_by_client[cid] = min(first_by_client.get(cid, ts), ts) if cid in first_by_client else ts
+    # First payment date per client from Treasury (posted, inbound)
+    try:
+        from sqlalchemy import text
+        treasury_first = db.query(
+            StripeTreasuryTransaction.client_id,
+            func.min(
+                func.coalesce(StripeTreasuryTransaction.posted_at, StripeTreasuryTransaction.created)
+            ).label("first_ts"),
+        ).filter(
+            and_(
+                StripeTreasuryTransaction.org_id == org_id,
+                StripeTreasuryTransaction.client_id.isnot(None),
+                StripeTreasuryTransaction.amount > 0,
+            )
+        ).filter(
+            text("stripe_treasury_transactions.status = 'posted'::treasurytransactionstatus")
+        ).group_by(StripeTreasuryTransaction.client_id).all()
+        for (cid, ts) in treasury_first:
+            if cid and ts:
+                first_by_client[cid] = min(first_by_client.get(cid, ts), ts) if cid in first_by_client else ts
+    except Exception:
+        pass
+    new_customers = sum(
+        1 for _, first_ts in first_by_client.items()
+        if start_date <= first_ts <= end_date
+    )
     
     # Count churned clients in period (client-based churn, not subscription-based)
     # Churn = unique clients who churned in this period
     # - Subscription churn: immediate when subscription period ends
     # - One-off payment churn: 30-day grace period after last payment
-    from app.models.stripe_payment import StripePayment
-    
     churned_client_ids = set()
     
     # 1. SUBSCRIPTION CHURN: Clients whose subscription ended in this period
@@ -1143,7 +1175,7 @@ def get_stripe_summary(
         "total_arr": arr,
         "mrr_change": mrr_change,
         "mrr_change_percent": mrr_change_percent,
-        "new_subscriptions": new_subscriptions,
+        "new_customers": new_customers,
         "churned_subscriptions": churned_subscriptions,
         "failed_payments": failed_payments,
         # Use period-filtered revenue (deduplicated payments within date range)
@@ -1184,7 +1216,7 @@ def get_stripe_kpis(
         mrr=summary.total_mrr,
         mrr_change=summary.mrr_change,
         mrr_change_percent=summary.mrr_change_percent,
-        new_subscriptions=summary.new_subscriptions,
+        new_customers=summary.new_customers,
         churned_subscriptions=summary.churned_subscriptions,
         failed_payments=summary.failed_payments,
         revenue=summary.last_30_days_revenue
@@ -2050,8 +2082,42 @@ def get_churn_analytics(
     cohort_data = []
     
     # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
-    from app.models.client import Client
-    from app.models.stripe_payment import StripePayment
+    # First payment date per client (any type) for new-customers-per-month
+    payment_first_all = db.query(
+        StripePayment.client_id,
+        func.min(StripePayment.created_at).label("first_ts"),
+    ).filter(
+        and_(
+            StripePayment.org_id == org_id,
+            StripePayment.status == "succeeded",
+            StripePayment.client_id.isnot(None),
+        )
+    ).group_by(StripePayment.client_id).all()
+    first_by_client_churn = {}
+    for (cid, ts) in payment_first_all:
+        if cid and ts:
+            first_by_client_churn[cid] = min(first_by_client_churn.get(cid, ts), ts) if cid in first_by_client_churn else ts
+    try:
+        from sqlalchemy import text
+        treasury_first_all = db.query(
+            StripeTreasuryTransaction.client_id,
+            func.min(
+                func.coalesce(StripeTreasuryTransaction.posted_at, StripeTreasuryTransaction.created)
+            ).label("first_ts"),
+        ).filter(
+            and_(
+                StripeTreasuryTransaction.org_id == org_id,
+                StripeTreasuryTransaction.client_id.isnot(None),
+                StripeTreasuryTransaction.amount > 0,
+            )
+        ).filter(
+            text("stripe_treasury_transactions.status = 'posted'::treasurytransactionstatus")
+        ).group_by(StripeTreasuryTransaction.client_id).all()
+        for (cid, ts) in treasury_first_all:
+            if cid and ts:
+                first_by_client_churn[cid] = min(first_by_client_churn.get(cid, ts), ts) if cid in first_by_client_churn else ts
+    except Exception:
+        pass
     
     # Track clients who have churned (to prevent double-counting in same lifecycle)
     # Key: client_id, Value: (churn_date, lifecycle_start_date)
@@ -2225,14 +2291,11 @@ def get_churn_analytics(
         # We'll use subscription count as primary metric for now
         active = active_subscription_clients
         
-        # Count new subscriptions in this month
-        new_subs = db.query(func.count(StripeSubscription.id)).filter(
-            and_(
-                StripeSubscription.org_id == org_id,
-                StripeSubscription.created_at >= month_start,
-                StripeSubscription.created_at <= month_end
-            )
-        ).scalar() or 0
+        # Count new customers in this month (first payment in month, any type)
+        new_customers_month = sum(
+            1 for _, first_ts in first_by_client_churn.items()
+            if month_start <= first_ts <= month_end
+        )
         
         churn_rate = (canceled / active * 100) if active > 0 else 0
         
@@ -2246,7 +2309,7 @@ def get_churn_analytics(
         
         cohort_data.append({
             "month": month_start.strftime("%Y-%m"),
-            "new_subscriptions": new_subs,
+            "new_customers": new_customers_month,
             "churned": canceled  # Unique clients who churned in this month
         })
     

@@ -51,7 +51,7 @@ class StripeSummaryResponse(BaseModel):
     total_arr: float  # Annual Recurring Revenue
     mrr_change: float  # Change vs previous period
     mrr_change_percent: float  # Percent change
-    new_subscriptions: int  # New subscriptions in period
+    new_customers: int  # New customers in period (first payment in period, any type: subscription, invoice, etc.)
     churned_subscriptions: int  # Churned subscriptions in period
     failed_payments: int  # Failed payments in period
     active_subscriptions: int
@@ -80,7 +80,7 @@ class StripeKPIsResponse(BaseModel):
     mrr: float
     mrr_change: float
     mrr_change_percent: float
-    new_subscriptions: int
+    new_customers: int
     churned_subscriptions: int
     failed_payments: int
     revenue: float
@@ -223,7 +223,7 @@ class MergeDuplicatesResponse(BaseModel):
 
 class CohortMonthData(BaseModel):
     month: str  # YYYY-MM
-    new_subscriptions: int
+    new_customers: int
     churned: int
 
 
