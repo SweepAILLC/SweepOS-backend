@@ -83,6 +83,26 @@ class EventResponse(BaseModel):
     status: str = "accepted"
 
 
+# Lead capture: create/update client from funnel (lead forms, quiz funnels)
+class FunnelLeadIn(BaseModel):
+    """Payload for creating or updating a client from a funnel lead capture form or quiz."""
+    funnel_id: UUID
+    email: Optional[str] = None
+    name: Optional[str] = Field(None, description="Full name; used if first_name/last_name not provided")
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: Optional[str] = None
+    instagram: Optional[str] = Field(None, description="Instagram handle (e.g. @username)")
+    notes: Optional[str] = None
+
+
+class FunnelLeadResponse(BaseModel):
+    """Response after submitting a funnel lead."""
+    client_id: UUID
+    created: bool = True  # True if new client, False if existing client was updated
+    message: str = "ok"
+
+
 # Analytics schemas
 class StepCount(BaseModel):
     step_order: int

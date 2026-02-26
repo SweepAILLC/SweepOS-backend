@@ -25,6 +25,9 @@ class OAuthToken(Base):
     scope = Column(String, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     last_sync_at = Column(DateTime, nullable=True)  # Last successful incremental sync timestamp
+    webhook_secret = Column(String(255), nullable=True)  # Stripe webhook signing secret (encrypted)
+    webhook_endpoint_id = Column(String(64), nullable=True)  # Stripe we_xxx for deletion on disconnect
+    last_webhook_processed_at = Column(DateTime, nullable=True)  # Set when a webhook is processed; terminal refetches only if this changed
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     
     # Composite unique constraint: one token per provider per org

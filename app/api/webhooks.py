@@ -34,6 +34,109 @@ if STRIPE_AVAILABLE:
         pass
 
 
+# Per-org webhook route (used when connecting via API key - each org has its own webhook endpoint)
+@router.post("/stripe/org/{org_id}")
+async def stripe_webhook_per_org(
+    org_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    stripe_signature: Optional[str] = Header(None, alias="stripe-signature"),
+):
+    """
+    Handle Stripe webhook events for a specific org (per-org webhook created on API key connect).
+    Verifies signature using org-specific webhook secret.
+    """
+    if not STRIPE_AVAILABLE or stripe is None:
+        return Response(status_code=200, content="Stripe library not available")
+
+    try:
+        org_uuid = uuid.UUID(org_id)
+    except ValueError:
+        print(f"[WEBHOOK] Invalid org_id in path: {org_id}")
+        return Response(status_code=200, content="Invalid org")
+
+    oauth_token = db.query(OAuthToken).filter(
+        OAuthToken.provider == OAuthProvider.STRIPE,
+        OAuthToken.org_id == org_uuid,
+        OAuthToken.webhook_secret.isnot(None),
+    ).first()
+
+    if not oauth_token or not oauth_token.webhook_secret:
+        print(f"[WEBHOOK] No webhook secret for org {org_id}")
+        return Response(status_code=200, content="Webhook not configured for org")
+
+    from app.core.encryption import decrypt_token
+    webhook_secret = decrypt_token(oauth_token.webhook_secret)
+
+    body = await request.body()
+    if not stripe_signature:
+        print(f"[WEBHOOK] Missing Stripe-Signature header for org {org_id}")
+        return Response(status_code=200, content="Missing signature")
+
+    try:
+        event = stripe.Webhook.construct_event(body, stripe_signature, webhook_secret)
+    except ValueError as e:
+        print(f"[WEBHOOK] Invalid payload for org {org_id}: {e}")
+        return Response(status_code=200, content="Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        print(f"[WEBHOOK] Signature verification failed for org {org_id}: {e}")
+        return Response(status_code=200, content="Invalid signature")
+
+    return _process_stripe_event_internal(db, event, org_uuid)
+
+
+def _process_stripe_event_internal(db: Session, event: dict, org_id: uuid.UUID):
+    """Shared logic for processing Stripe webhook events (sync for now)."""
+    import asyncio
+    # Run sync DB code in executor to avoid blocking
+    try:
+        # Check idempotency
+        existing_event = db.query(StripeEvent).filter(
+            StripeEvent.stripe_event_id == event["id"],
+            StripeEvent.org_id == org_id
+        ).first()
+
+        if existing_event:
+            return Response(status_code=200, content="Event already processed")
+
+        stripe_event = StripeEvent(
+            org_id=org_id,
+            stripe_event_id=event["id"],
+            type=event["type"],
+            payload=event,
+            processed=False,
+            received_at=datetime.utcnow()
+        )
+        db.add(stripe_event)
+        db.commit()
+
+        from app.services.stripe_processor import process_stripe_event
+        print(f"[WEBHOOK] Processing Stripe event: {event.get('type')} (ID: {event.get('id')}) for org {org_id}")
+        process_stripe_event(db, event, org_id)
+        stripe_event.processed = True
+        stripe_event.processed_at = datetime.utcnow()
+        # Mark org's Stripe data as updated so terminal tab can refetch only when webhook fired
+        token = db.query(OAuthToken).filter(
+            OAuthToken.provider == OAuthProvider.STRIPE,
+            OAuthToken.org_id == org_id,
+        ).first()
+        if token:
+            token.last_webhook_processed_at = datetime.utcnow()
+        db.commit()
+        print(f"[WEBHOOK] ✅ Processed event {event.get('id')} ({event.get('type')})")
+    except Exception as e:
+        import traceback
+        print(f"[WEBHOOK] ❌ ERROR processing event: {e}")
+        print(traceback.format_exc())
+        try:
+            stripe_event.processed = False
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    return Response(status_code=200, content="Webhook received")
+
+
 @router.post("/stripe")
 async def stripe_webhook(
     request: Request,
@@ -128,62 +231,7 @@ async def stripe_webhook(
                 org_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
                 print(f"[WEBHOOK] WARNING: No Stripe connection found, using default org {org_id}")
         
-        # Check if event already processed (idempotency) - check by org_id too
-        existing_event = db.query(StripeEvent).filter(
-            StripeEvent.stripe_event_id == event["id"],
-            StripeEvent.org_id == org_id
-        ).first()
-        
-        if existing_event:
-            # Event already processed, return 200
-            return Response(status_code=200, content="Event already processed")
-        
-        # Store raw event in database with org_id
-        stripe_event = StripeEvent(
-            org_id=org_id,
-            stripe_event_id=event["id"],
-            type=event["type"],
-            payload=event,
-            processed=False,
-            received_at=datetime.utcnow()
-        )
-        db.add(stripe_event)
-        db.commit()
-        
-        # Trigger background processing (for now, we'll process synchronously in a simple way)
-        # In production, use a proper job queue (Celery, RQ, etc.)
-        try:
-            from app.services.stripe_processor import process_stripe_event
-            print(f"[WEBHOOK] Processing Stripe event: {event.get('type')} (ID: {event.get('id')}) for org {org_id}")
-            print(f"[WEBHOOK] Event structure: type={event.get('type')}, has_data={bool(event.get('data'))}")
-            
-            # Process the event (this may modify the database) - pass org_id
-            process_stripe_event(db, event, org_id)
-            
-            # Mark as processed
-            stripe_event.processed = True
-            stripe_event.processed_at = datetime.utcnow()
-            db.commit()
-            print(f"[WEBHOOK] ✅ Successfully processed and committed event {event.get('id')} ({event.get('type')})")
-        except ImportError as e:
-            # Service not available, log and continue
-            print(f"[WEBHOOK] ❌ ERROR: Stripe processor not available: {str(e)}")
-            import traceback
-            print(traceback.format_exc())
-            db.rollback()
-        except Exception as e:
-            # Log error but don't fail webhook - we'll retry later
-            # In production, use proper error handling and retry logic
-            import traceback
-            print(f"[WEBHOOK] ❌ ERROR processing Stripe event {event.get('id')} ({event.get('type')}): {str(e)}")
-            print(f"[WEBHOOK] Full traceback:")
-            print(traceback.format_exc())
-            # Don't rollback the event storage, just mark it as unprocessed
-            stripe_event.processed = False
-            db.commit()  # Commit the event record even if processing failed
-        
-        # Always return 200 to Stripe (even if processing failed, we'll retry)
-        return Response(status_code=200, content="Webhook received")
+        return _process_stripe_event_internal(db, event, org_id)
     except Exception as e:
         # Catch any unexpected errors and still return 200 to prevent websocket closure
         import traceback

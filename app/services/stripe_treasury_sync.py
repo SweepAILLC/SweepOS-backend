@@ -170,13 +170,11 @@ def upsert_client_from_treasury_transaction(
     
     if not customer_email:
         return None
-    
-    # Try to find existing client by email
-    client = db.query(Client).filter(
-        Client.email == customer_email.lower(),
-        Client.org_id == org_id
-    ).first()
-    
+
+    # Try to find existing client by email (primary or emails list)
+    from app.models.client import find_client_by_email
+    client = find_client_by_email(db, org_id, customer_email)
+
     if client:
         # Update existing client
         if not client.stripe_customer_id and flow_data and isinstance(flow_data, dict):

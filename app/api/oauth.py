@@ -574,6 +574,7 @@ def connect_stripe_direct(
             existing.account_id = account_id
             existing.expires_at = None  # API keys don't expire
             existing.scope = "direct_api_key"  # Mark as direct connection
+            oauth_token = existing
         else:
             oauth_token = OAuthToken(
                 org_id=org_id,
@@ -585,9 +586,45 @@ def connect_stripe_direct(
                 scope="direct_api_key"  # Mark as direct connection
             )
             db.add(oauth_token)
-        
+
         db.commit()
-        
+
+        # Create per-org webhook endpoint so Stripe pushes events (eliminates need for manual sync)
+        from app.core.config import settings
+        base_url = (settings.BACKEND_PUBLIC_URL or "").strip().rstrip("/")
+        if base_url:
+            webhook_url = f"{base_url}/webhooks/stripe/org/{org_id}"
+            try:
+                we = stripe.WebhookEndpoint.create(
+                    url=webhook_url,
+                    enabled_events=[
+                        "invoice.payment_succeeded",
+                        "invoice.payment_failed",
+                        "invoice.paid",
+                        "charge.succeeded",
+                        "charge.failed",
+                        "charge.refunded",
+                        "payment_intent.succeeded",
+                        "payment_intent.payment_failed",
+                        "customer.subscription.created",
+                        "customer.subscription.updated",
+                        "customer.subscription.deleted",
+                        "customer.created",
+                        "customer.updated",
+                    ],
+                    description=f"SweepOS org {org_id}",
+                    api_version="2024-06-20",
+                )
+                oauth_token.webhook_secret = encrypt_token(we.secret)
+                oauth_token.webhook_endpoint_id = we.id
+                db.commit()
+                print(f"[DIRECT_CONNECT] Created webhook endpoint {we.id} for org {org_id}")
+            except Exception as we_err:
+                print(f"[DIRECT_CONNECT] Webhook creation failed (non-critical): {we_err}")
+                # Don't fail the connect - webhook is optional, manual sync still works
+        else:
+            print(f"[DIRECT_CONNECT] BACKEND_PUBLIC_URL not set - skipping webhook creation")
+
         # Trigger initial historical data sync (full backfill) in background thread
         # This prevents the connection endpoint from timing out during large syncs
         # Also syncs Treasury Transactions and triggers reconciliation
@@ -1410,11 +1447,22 @@ def disconnect_stripe(
     db.query(StripeSubscription).filter(StripeSubscription.org_id == org_id).delete(synchronize_session=False)
     db.query(StripeEvent).filter(StripeEvent.org_id == org_id).delete(synchronize_session=False)
 
-    # Remove the connection token (OAuth or API key)
     oauth_token = db.query(OAuthToken).filter(
         OAuthToken.provider == OAuthProvider.STRIPE,
         OAuthToken.org_id == org_id
     ).first()
+
+    # Delete per-org webhook endpoint if we created one (API key connect)
+    if oauth_token and oauth_token.webhook_endpoint_id:
+        try:
+            import stripe
+            from app.core.encryption import decrypt_token
+            stripe.api_key = decrypt_token(oauth_token.access_token)
+            stripe.WebhookEndpoint.delete(oauth_token.webhook_endpoint_id)
+            print(f"[DISCONNECT] Deleted Stripe webhook endpoint {oauth_token.webhook_endpoint_id}")
+        except Exception as e:
+            print(f"[DISCONNECT] Failed to delete webhook endpoint (non-critical): {e}")
+
     if oauth_token:
         db.delete(oauth_token)
 

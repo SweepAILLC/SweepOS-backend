@@ -33,7 +33,7 @@ from app.core.encryption import decrypt_token
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
-from app.models.client import Client
+from app.models.client import Client, find_client_by_email
 from app.utils.stripe_ids import normalize_stripe_id_for_dedup
 
 
@@ -204,12 +204,9 @@ def upsert_client(db: Session, customer_data, org_id: uuid.UUID) -> Client:
         Client.org_id == org_id
     ).first()
     
-    # If not found, try by email
+    # If not found, try by email (primary or emails list)
     if not client and customer_email:
-        client = db.query(Client).filter(
-            Client.email == customer_email,
-            Client.org_id == org_id
-        ).first()
+        client = find_client_by_email(db, org_id, customer_email)
         
         # Link stripe_customer_id to existing client
         if client and not client.stripe_customer_id:
@@ -303,11 +300,8 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
                 # Try to create a minimal client from payment data if available
                 customer_email = getattr(payment_data, 'customer_email', None) or getattr(payment_data, 'receipt_email', None)
                 if customer_email:
-                    # Try to find by email
-                    client = db.query(Client).filter(
-                        Client.email == customer_email.lower(),
-                        Client.org_id == org_id
-                    ).first()
+                    # Try to find by email (primary or emails list)
+                    client = find_client_by_email(db, org_id, customer_email)
                     if client:
                         # Link stripe_customer_id to existing client
                         if not client.stripe_customer_id:
@@ -344,11 +338,8 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
         # This handles cases where invoice has email but customer was deleted
         if not client and hasattr(payment_data, 'customer_email') and payment_data.customer_email:
             customer_email = payment_data.customer_email
-            # Try to find existing client by email
-            client = db.query(Client).filter(
-                Client.email == customer_email.lower(),
-                Client.org_id == org_id
-            ).first()
+            # Try to find existing client by email (primary or emails list)
+            client = find_client_by_email(db, org_id, customer_email)
             if client:
                 print(f"[SYNC] Found client {client.id} for invoice {invoice_id} by email {customer_email}")
                 # If client has no stripe_customer_id, try to get it from invoice
@@ -923,10 +914,7 @@ def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str
                             print(f"[REPAIR] ⚠️  Could not fetch customer {customer_id} from Stripe: {str(e)}")
                             # Try to create from email if available
                             if customer_email:
-                                client = db.query(Client).filter(
-                                    Client.email == customer_email.lower(),
-                                    Client.org_id == org_id
-                                ).first()
+                                client = find_client_by_email(db, org_id, customer_email)
                                 if client:
                                     if not client.stripe_customer_id:
                                         client.stripe_customer_id = customer_id
@@ -962,10 +950,7 @@ def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str
                 
                 # If no customer_id but we have email, try to find client by email
                 elif customer_email:
-                    client = db.query(Client).filter(
-                        Client.email == customer_email.lower(),
-                        Client.org_id == org_id
-                    ).first()
+                    client = find_client_by_email(db, org_id, customer_email)
                     
                     if client:
                         payment.client_id = client.id

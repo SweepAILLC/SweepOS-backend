@@ -30,12 +30,16 @@ from app.schemas.funnel import (
     FunnelStepUpdate,
     EventIn,
     EventResponse,
+    FunnelLeadIn,
+    FunnelLeadResponse,
     FunnelHealth,
     FunnelAnalytics,
     StepCount,
     UTMSourceStats,
     ReferrerStats,
 )
+from app.models.client import find_client_by_email
+from app.models.client import LifecycleState
 
 router = APIRouter()
 
@@ -444,6 +448,80 @@ def ingest_event(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error processing event: {str(e)}"
         )
+
+
+# Lead capture - Public endpoint: create/update client from funnel (lead forms, quiz funnels)
+@router.post("/leads", response_model=FunnelLeadResponse, status_code=status.HTTP_201_CREATED)
+def create_lead_from_funnel(
+    lead_data: FunnelLeadIn,
+    db: Session = Depends(get_db)
+):
+    """
+    Create or update a client from a funnel lead capture form or quiz.
+    No authentication required - org_id is determined from funnel_id.
+    Clients appear on the Client Board in Sweep OS.
+    """
+    funnel = db.query(Funnel).filter(Funnel.id == lead_data.funnel_id).first()
+    if not funnel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Funnel not found"
+        )
+    org_id = funnel.org_id
+
+    # Normalize name: use 'name' or first_name/last_name
+    first_name = lead_data.first_name
+    last_name = lead_data.last_name
+    if lead_data.name and isinstance(lead_data.name, str) and lead_data.name.strip():
+        parts = lead_data.name.strip().split(None, 1)
+        first_name = first_name or parts[0]
+        last_name = last_name if last_name is not None else (parts[1] if len(parts) > 1 else None)
+    email = (lead_data.email or "").strip() or None
+    phone = (lead_data.phone or "").strip() or None
+    instagram = (lead_data.instagram or "").strip() or None
+    notes = (lead_data.notes or "").strip() or None
+
+    client = None
+    if email:
+        client = find_client_by_email(db, org_id, email)
+
+    if client:
+        # Update existing client with provided fields
+        if first_name is not None and first_name:
+            client.first_name = first_name
+        if last_name is not None:
+            client.last_name = last_name
+        if phone is not None and phone:
+            client.phone = phone
+        if instagram is not None and instagram:
+            client.instagram = instagram
+        if notes is not None and notes:
+            client.notes = (client.notes or "").strip() + ("\n\n" + notes if (client.notes or "").strip() else notes)
+        client.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(client)
+        return FunnelLeadResponse(client_id=client.id, created=False, message="Client updated")
+    else:
+        # Create new client (require at least email or name for a useful record)
+        if not email and not first_name and not last_name and not phone and not instagram:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="At least one of email, name, phone, or instagram is required"
+            )
+        client = Client(
+            org_id=org_id,
+            email=email or None,
+            first_name=first_name or None,
+            last_name=last_name or None,
+            phone=phone or None,
+            instagram=instagram or None,
+            notes=notes or None,
+            lifecycle_state=LifecycleState.COLD_LEAD,
+        )
+        db.add(client)
+        db.commit()
+        db.refresh(client)
+        return FunnelLeadResponse(client_id=client.id, created=True, message="Client created")
 
 
 def _enrich_and_process_event(db: Session, event: Event, org_id: UUID):

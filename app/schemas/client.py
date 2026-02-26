@@ -9,7 +9,8 @@ from app.models.client import LifecycleState
 class ClientBase(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    email: Optional[str] = None  # Changed from EmailStr to str to avoid validation issues with None/invalid emails
+    email: Optional[str] = None  # Primary email (backward compat)
+    emails: Optional[List[str]] = None  # Additional emails; client can have multiple
     phone: Optional[str] = None
     instagram: Optional[str] = None
     lifecycle_state: LifecycleState = LifecycleState.COLD_LEAD
@@ -71,7 +72,8 @@ class MergeClientsRequest(BaseModel):
 class ClientUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    email: Optional[str] = None  # Changed from EmailStr to str
+    email: Optional[str] = None
+    emails: Optional[List[str]] = None
     phone: Optional[str] = None
     instagram: Optional[str] = None
     lifecycle_state: Optional[LifecycleState] = None

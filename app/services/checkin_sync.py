@@ -8,7 +8,7 @@ from typing import List, Optional, Dict, Any
 import uuid
 import json
 import re
-from app.models.client import Client
+from app.models.client import Client, LifecycleState
 from app.models.client_checkin import ClientCheckIn
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.core.encryption import decrypt_token
@@ -21,6 +21,41 @@ def normalize_email(email: str) -> str:
     if not email:
         return ""
     return re.sub(r'\s+', '', email.lower().strip())
+
+
+def ensure_client_for_booking_attendee(
+    db: Session, org_id: uuid.UUID, email: str, name: Optional[str] = None
+) -> Optional[Client]:
+    """
+    Find a client by attendee email (normalized; checks primary email and emails list).
+    If none exists, create a new client as warm_lead so booking data can populate the client board.
+    """
+    from app.models.client import find_client_by_email
+    existing = find_client_by_email(db, org_id, email)
+    if existing:
+        return existing
+    if not email or not str(email).strip():
+        return None
+    normalized = normalize_email(email)
+    if not normalized:
+        return None
+    first_name, last_name = None, None
+    if name and isinstance(name, str) and name.strip():
+        parts = name.strip().split(None, 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else None
+    client = Client(
+        org_id=org_id,
+        email=email.strip(),
+        first_name=first_name,
+        last_name=last_name,
+        lifecycle_state=LifecycleState.WARM_LEAD,
+        notes="Created from calendar booking (attendee)",
+    )
+    db.add(client)
+    db.flush()
+    print(f"[CHECKIN SYNC] Created new warm lead client for booking attendee: {email}")
+    return client
 
 
 def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> int:
@@ -122,7 +157,7 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
             params = {
                 "take": take,
                 "skip": skip,
-                "status": "upcoming,past"  # Get both past and upcoming bookings
+                "status": "upcoming,past,cancelled"  # Include cancelled so they appear in check-in history
             }
             print(f"[CHECKIN SYNC] [CALCOM] Request params: {params}")
             response = httpx.get(
@@ -357,10 +392,12 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                                 break
                     
                     if not matching_client:
+                        matching_client = ensure_client_for_booking_attendee(
+                            db, org_id, attendee_email, attendee_name
+                        )
+                    if not matching_client:
                         bookings_without_matching_clients += 1
-                        print(f"[CHECKIN SYNC] [CALCOM] ❌ No matching client found for attendee: {attendee_name or 'Unknown'} ({attendee_email})")
-                        print(f"[CHECKIN SYNC] [CALCOM] This booking will be skipped - the attendee is not a client in this organization")
-                        print(f"[CHECKIN SYNC] [CALCOM] Searched through {len(all_clients)} clients in org {org_id}")
+                        print(f"[CHECKIN SYNC] [CALCOM] ❌ Could not find or create client for attendee: {attendee_email}")
                         continue
                     
                     # Check if check-in already exists
@@ -372,10 +409,14 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         )
                     ).first()
                     
-                    # Determine if completed (past event)
+                    # Determine if completed (past event), cancelled, no-show
                     now = datetime.now(timezone.utc)
                     completed = start_time < now
                     cancelled = booking.get("status") == "cancelled" or booking.get("cancelled", False)
+                    absent_host = booking.get("absentHost", False)
+                    attendees = booking.get("attendees") or []
+                    attendee_absent = any(a.get("absent") for a in attendees if isinstance(a, dict))
+                    no_show = bool(absent_host or attendee_absent)
                     
                     if existing_checkin:
                         # Update existing check-in
@@ -386,6 +427,7 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         existing_checkin.meeting_url = meeting_url
                         existing_checkin.completed = completed
                         existing_checkin.cancelled = cancelled
+                        existing_checkin.no_show = no_show
                         existing_checkin.updated_at = datetime.now(timezone.utc)
                         synced_count += 1
                     else:
@@ -404,6 +446,7 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                             attendee_name=attendee_name,
                             completed=completed,
                             cancelled=cancelled,
+                            no_show=no_show,
                             raw_event_data=json.dumps(booking)
                         )
                         db.add(checkin)
@@ -617,8 +660,12 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                             break
                     
                     if not matching_client:
+                        matching_client = ensure_client_for_booking_attendee(
+                            db, org_id, invitee_email, invitee_name
+                        )
+                    if not matching_client:
                         events_without_matching_clients += 1
-                        print(f"[CHECKIN SYNC] ❌ No matching client found for email: {invitee_email}")
+                        print(f"[CHECKIN SYNC] ❌ Could not find or create client for invitee: {invitee_email}")
                         continue
                     
                     # Check if check-in already exists
@@ -630,10 +677,11 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         )
                     ).first()
                     
-                    # Determine if completed (past event)
+                    # Determine if completed (past event), cancelled; no_show not available from Calendly event
                     now = datetime.now(timezone.utc)
                     completed = start_time < now
                     cancelled = status == "canceled"
+                    no_show = False  # Calendly event-level API does not expose invitee no-show here
                     
                     if existing_checkin:
                         # Update existing check-in
@@ -644,6 +692,7 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         existing_checkin.meeting_url = meeting_url
                         existing_checkin.completed = completed
                         existing_checkin.cancelled = cancelled
+                        existing_checkin.no_show = no_show
                         existing_checkin.updated_at = datetime.now(timezone.utc)
                         synced_count += 1
                     else:
@@ -663,6 +712,7 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                             attendee_name=invitee_name,
                             completed=completed,
                             cancelled=cancelled,
+                            no_show=no_show,
                             raw_event_data=json.dumps(event)
                         )
                         db.add(checkin)

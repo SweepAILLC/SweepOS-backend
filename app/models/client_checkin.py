@@ -34,6 +34,7 @@ class ClientCheckIn(Base):
     # Status
     completed = Column(Boolean, default=False, nullable=False)  # True if meeting has passed
     cancelled = Column(Boolean, default=False, nullable=False)  # True if event was cancelled
+    no_show = Column(Boolean, default=False, nullable=False)  # True if attendee/host was marked no-show
     
     # Metadata
     raw_event_data = Column(Text, nullable=True)  # JSON string of full event data for reference

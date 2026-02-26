@@ -223,6 +223,25 @@ def sync_treasury_transactions(
         )
 
 
+@router.get("/last-updated")
+def get_stripe_last_updated(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Lightweight: return when Stripe data was last updated by a webhook for this org.
+    Terminal tab uses this to refetch only when a webhook has fired (faster tab switch).
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    token = db.query(OAuthToken).filter(
+        OAuthToken.provider == OAuthProvider.STRIPE,
+        OAuthToken.org_id == org_id,
+    ).first()
+    if not token or not token.last_webhook_processed_at:
+        return {"last_updated": None}
+    return {"last_updated": token.last_webhook_processed_at.isoformat() + "Z"}
+
+
 @router.post("/sync", status_code=status.HTTP_200_OK)
 def sync_stripe_data(
     force_full: bool = Query(False, description="Force full historical sync (only needed on first connect)"),
@@ -320,6 +339,89 @@ def sync_stripe_data(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=error_detail
+        )
+
+
+@router.post("/sync-and-reconcile", status_code=status.HTTP_200_OK)
+def sync_and_reconcile_stripe_data(
+    force_full: bool = Query(False, description="Force full historical sync"),
+    sync_recent: bool = Query(False, description="Sync payments from last 24 hours"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Single endpoint: sync from Stripe then reconcile derived metrics.
+    One round-trip for performance; reconciliation runs immediately after sync in the same request.
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    if not check_stripe_connected(db, org_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Stripe not connected."
+        )
+
+    from app.services.stripe_sync_v2 import sync_stripe_incremental, reconcile_stripe_data
+    from app.models.oauth_token import OAuthToken, OAuthProvider
+
+    original_last_sync = None
+    try:
+        # 1. Sync (same logic as /sync)
+        if sync_recent:
+            oauth_token = db.query(OAuthToken).filter(
+                OAuthToken.provider == OAuthProvider.STRIPE,
+                OAuthToken.org_id == org_id
+            ).first()
+            if oauth_token:
+                original_last_sync = oauth_token.last_sync_at
+                oauth_token.last_sync_at = datetime.utcnow() - timedelta(hours=24)
+                db.commit()
+
+        sync_result = sync_stripe_incremental(db, org_id=org_id, force_full=force_full)
+
+        if sync_recent and original_last_sync is not None:
+            oauth_token = db.query(OAuthToken).filter(
+                OAuthToken.provider == OAuthProvider.STRIPE,
+                OAuthToken.org_id == org_id
+            ).first()
+            if oauth_token:
+                oauth_token.last_sync_at = original_last_sync
+                db.commit()
+
+        if sync_result.get("error"):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=sync_result.get("error")
+            )
+
+        # 2. Reconcile immediately (same DB session)
+        reconcile_result = reconcile_stripe_data(db, org_id=org_id)
+
+        return {
+            "success": True,
+            "message": "Sync and reconciliation complete",
+            "is_full_sync": sync_result.get("is_full_sync", False),
+            "sync": {
+                "customers_synced": sync_result.get("customers_synced", 0),
+                "customers_updated": sync_result.get("customers_updated", 0),
+                "subscriptions_synced": sync_result.get("subscriptions_synced", 0),
+                "subscriptions_updated": sync_result.get("subscriptions_updated", 0),
+                "payments_synced": sync_result.get("payments_synced", 0),
+                "payments_updated": sync_result.get("payments_updated", 0),
+            },
+            "reconciliation": {
+                "clients_reconciled": reconcile_result.get("clients_reconciled", 0),
+                "revenue_recalculated": reconcile_result.get("revenue_recalculated", 0),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[API] ❌ Sync-and-reconcile error: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
 
 

@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     
     # Frontend
     FRONTEND_URL: str = "http://localhost:3002"  # Frontend URL for OAuth redirects
+
+    # Backend public URL for webhook endpoints (required for per-org Stripe webhooks)
+    # e.g. https://api.sweepai.site or http://localhost:8000 for local dev
+    BACKEND_PUBLIC_URL: Optional[str] = None
     
     # Admin
     SUDO_ADMIN_EMAIL: str = "admin@sweepos.local"

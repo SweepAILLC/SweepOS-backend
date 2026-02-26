@@ -158,12 +158,10 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
                     customer_data = stripe.Customer.retrieve(customer_id)
                     customer_email = getattr(customer_data, 'email', None)
                     
-                    # Try to find existing client by email to avoid duplicates
+                    # Try to find existing client by email (primary or emails list) to avoid duplicates
                     if customer_email:
-                        client = db.query(Client).filter(
-                            Client.email == customer_email,
-                            Client.org_id == org_id
-                        ).first()
+                        from app.models.client import find_client_by_email
+                        client = find_client_by_email(db, org_id, customer_email)
                         
                         if client:
                             # Link the stripe_customer_id to the existing client
@@ -558,12 +556,10 @@ def _process_customer_created(db: Session, data: Dict[str, Any], org_id: uuid.UU
         Client.org_id == org_id
     ).first()
     
-    # If not found by stripe_customer_id, try to find by email to avoid duplicates
+    # If not found by stripe_customer_id, try to find by email (primary or emails list) to avoid duplicates
     if not client and customer_email:
-        client = db.query(Client).filter(
-            Client.email == customer_email,
-            Client.org_id == org_id
-        ).first()
+        from app.models.client import find_client_by_email
+        client = find_client_by_email(db, org_id, customer_email)
         
         # If found by email, link the stripe_customer_id
         if client:

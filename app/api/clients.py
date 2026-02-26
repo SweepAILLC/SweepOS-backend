@@ -516,13 +516,11 @@ def get_client_payments(
     all_payments.extend(payments_by_client_id)
     
     # 2. Fetch payments by email matching (for payments not yet linked to client)
-    # Collect all emails from all merged clients
+    # Collect all emails from all merged clients (primary email + emails list)
     import re
     all_merged_emails = set()
     for merged_client in merged_clients_list:
-        if merged_client.email:
-            normalized_email = re.sub(r'\s+', '', merged_client.email.lower().strip())
-            all_merged_emails.add(normalized_email)
+        all_merged_emails |= merged_client.get_all_emails_normalized()
     
     if all_merged_emails:
         print(f"[CLIENT_PAYMENTS] Checking payments for {len(all_merged_emails)} unique emails from merged clients: {list(all_merged_emails)}")
@@ -1071,6 +1069,14 @@ def merge_clients(
         keep.lifetime_revenue_cents = max((keep.lifetime_revenue_cents or 0), (c.lifetime_revenue_cents or 0))
         if c.notes and c.notes.strip():
             keep.notes = (keep.notes or "").rstrip() + "\n" + c.notes.strip() if keep.notes else c.notes.strip()
+    # Merge emails: collect all emails from keep + to_remove, dedupe, set primary and emails list
+    all_emails_set = keep.get_all_emails_normalized()
+    for c in to_remove:
+        all_emails_set |= c.get_all_emails_normalized()
+    if all_emails_set:
+        emails_list = sorted(all_emails_set)
+        keep.email = emails_list[0] if emails_list else keep.email
+        keep.emails = emails_list[1:] if len(emails_list) > 1 else (keep.emails or [])
     # Program: prefer client with highest progress among keep + to_remove
     all_for_program = [keep] + to_remove
     best_program = max(all_for_program, key=lambda x: (x.program_progress_percent or 0))
@@ -1222,6 +1228,12 @@ def delete_client(
                 Recommendation.org_id == current_user.org_id
             ).update({Recommendation.client_id: None}, synchronize_session=False)
             
+            # Client check-ins (client_id is NOT NULL; delete rows instead of nullifying)
+            db.query(ClientCheckIn).filter(
+                ClientCheckIn.client_id == client_uuid,
+                ClientCheckIn.org_id == current_user.org_id
+            ).delete(synchronize_session=False)
+            
             # Now delete the client
             db.delete(client_to_delete)
             deleted_count += 1
@@ -1372,6 +1384,7 @@ def get_client_check_ins(
             "attendee_name": checkin.attendee_name,
             "completed": checkin.completed,
             "cancelled": checkin.cancelled,
+            "no_show": getattr(checkin, "no_show", False),
             "created_at": checkin.created_at.isoformat() if checkin.created_at else None,
         }
         for checkin in check_ins
@@ -1383,12 +1396,13 @@ def update_check_in(
     check_in_id: str,
     completed: Optional[bool] = Body(None),
     cancelled: Optional[bool] = Body(None),
+    no_show: Optional[bool] = Body(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Update a check-in (mark as completed/cancelled or update other fields).
-    Accepts JSON body with optional 'completed' and 'cancelled' boolean fields.
+    Update a check-in (mark as completed/cancelled/no-show or update other fields).
+    Accepts JSON body with optional 'completed', 'cancelled', and 'no_show' boolean fields.
     """
     try:
         check_in_uuid = UUID(check_in_id)
@@ -1417,6 +1431,8 @@ def update_check_in(
         check_in.completed = completed
     if cancelled is not None:
         check_in.cancelled = cancelled
+    if no_show is not None:
+        check_in.no_show = no_show
     
     check_in.updated_at = datetime.now(timezone.utc)
     
@@ -1438,6 +1454,7 @@ def update_check_in(
             "attendee_name": check_in.attendee_name,
             "completed": check_in.completed,
             "cancelled": check_in.cancelled,
+            "no_show": getattr(check_in, "no_show", False),
             "created_at": check_in.created_at.isoformat() if check_in.created_at else None,
         }
     except Exception as e:
@@ -1497,11 +1514,15 @@ def create_manual_check_in(
     title: str = Body(...),
     start_time: str = Body(...),
     end_time: Optional[str] = Body(None),
+    completed: Optional[bool] = Body(False),
+    cancelled: Optional[bool] = Body(False),
+    no_show: Optional[bool] = Body(False),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     Create a manual check-in for a client (for days without calendar bookings).
+    Optional status: completed, cancelled, no_show (all default False).
     """
     try:
         client_uuid = UUID(client_id)
@@ -1544,8 +1565,9 @@ def create_manual_check_in(
         end_time=end_datetime,
         attendee_email=client.email or "",
         attendee_name=f"{client.first_name} {client.last_name}".strip(),
-        completed=False,
-        cancelled=False
+        completed=completed or False,
+        cancelled=cancelled or False,
+        no_show=no_show or False,
     )
     
     try:
@@ -1567,6 +1589,7 @@ def create_manual_check_in(
             "attendee_name": manual_check_in.attendee_name,
             "completed": manual_check_in.completed,
             "cancelled": manual_check_in.cancelled,
+            "no_show": getattr(manual_check_in, "no_show", False),
             "created_at": manual_check_in.created_at.isoformat() if manual_check_in.created_at else None,
         }
     except Exception as e:
@@ -1607,13 +1630,14 @@ def get_next_check_in(
             detail="Client not found"
         )
     
-    # Get next upcoming check-in (not completed, not cancelled, in the future)
+    # Get next upcoming check-in (not completed, not cancelled, not no-show, in the future)
     now = datetime.now(timezone.utc)
     next_checkin = db.query(ClientCheckIn).filter(
         ClientCheckIn.client_id == client_uuid,
         ClientCheckIn.org_id == current_user.org_id,
         ClientCheckIn.completed == False,
         ClientCheckIn.cancelled == False,
+        ClientCheckIn.no_show == False,
         ClientCheckIn.start_time > now
     ).order_by(ClientCheckIn.start_time).first()
     

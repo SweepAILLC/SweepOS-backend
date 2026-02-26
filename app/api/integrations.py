@@ -648,15 +648,17 @@ def get_calcom_bookings(
     
     try:
         # Cal.com API v2: GET /bookings
-        # Query parameters: take (not limit), skip (not offset)
-        # According to docs: https://cal.com/docs/api-reference/v2/bookings/get-all-bookings
+        # Query parameters: take (not limit), skip (not offset), status (upcoming, past, cancelled, etc.)
+        # Include cancelled so we can show cancellation status in the calendar tab.
+        # Docs: https://cal.com/docs/api-reference/v2/bookings/get-all-bookings
         print(f"[CALCOM BOOKINGS] Making request to Cal.com API with take={take}, skip={skip}")
         response = httpx.get(
             "https://api.cal.com/v2/bookings",
             headers=headers,
             params={
                 "take": take,
-                "skip": skip
+                "skip": skip,
+                "status": "upcoming,past,cancelled",  # Include cancelled events so status shows in calendar
             },
             timeout=30.0
         )
@@ -2828,6 +2830,7 @@ def get_calendar_upcoming_summary(
             last_month_count=0,
             last_week_percentage_change=None,
             last_month_percentage_change=None,
+            show_up_rate=None,
             most_upcoming=None,
             provider=None,
             connected=False
@@ -2868,7 +2871,7 @@ def get_calendar_upcoming_summary(
                     response = httpx.get(
                         "https://api.cal.com/v2/bookings",
                         headers=headers,
-                        params={"take": take, "skip": skip},
+                        params={"take": take, "skip": skip, "status": "upcoming,past,cancelled"},
                         timeout=10.0  # Restored original timeout
                     )
                 except httpx.TimeoutException:
@@ -2914,7 +2917,9 @@ def get_calendar_upcoming_summary(
                             "link": f"https://cal.com/bookings/{booking.get('uid', booking.get('id'))}",
                             "attendees": booking.get("attendees", []),
                             "location": booking.get("location"),
-                            "start_datetime": start_time  # Store parsed datetime for filtering
+                            "start_datetime": start_time,  # Store parsed datetime for filtering
+                            "status": booking.get("status"),  # accepted | cancelled | rejected | pending (for show-up rate)
+                            "absentHost": booking.get("absentHost"),  # No-show: host absent
                         })
                     except Exception as e:
                         print(f"[CALENDAR SUMMARY] Error parsing Cal.com booking: {e}")
@@ -3016,7 +3021,8 @@ def get_calendar_upcoming_summary(
                             "link": event_uri,
                             "attendees": [],  # Would need separate API call for invitees
                             "location": event.get("location", {}).get("location") if isinstance(event.get("location"), dict) else event.get("location"),
-                            "start_datetime": start_time  # Store parsed datetime for filtering
+                            "start_datetime": start_time,  # Store parsed datetime for filtering
+                            "status": event.get("status"),  # active | canceled (for show-up rate)
                         })
                     except Exception as e:
                         print(f"[CALENDAR SUMMARY] Error parsing Calendly event: {e}")
@@ -3032,15 +3038,18 @@ def get_calendar_upcoming_summary(
             
             print(f"[CALENDAR SUMMARY] Total Calendly events fetched: {len(all_bookings)}")
         
-        # Fetch manual check-ins from database and add to all_bookings
+        # Fetch only manual check-ins from database (exclude calcom/calendly - those are already
+        # in all_bookings from the API; including them would show duplicates)
         from app.models.client_checkin import ClientCheckIn
         from sqlalchemy.orm import joinedload
         manual_check_ins = db.query(ClientCheckIn).options(
             joinedload(ClientCheckIn.client)
         ).filter(
             ClientCheckIn.org_id == org_id,
+            ClientCheckIn.provider == "manual",
             ClientCheckIn.completed == False,
-            ClientCheckIn.cancelled == False
+            ClientCheckIn.cancelled == False,
+            ClientCheckIn.no_show == False
         ).order_by(ClientCheckIn.start_time).all()
         
         print(f"[CALENDAR SUMMARY] Found {len(manual_check_ins)} manual check-ins")
@@ -3157,18 +3166,41 @@ def get_calendar_upcoming_summary(
         elif len(last_month_bookings) > 0:
             last_month_change = 100.0  # 100% increase (from 0)
         
+        # Show-up rate: % of past appointments (last 30 days) that were not cancelled and not no-show
+        show_up_rate = None
+        if last_month_bookings:
+            showed_up = 0
+            for b in last_month_bookings:
+                if b.get("provider") == "manual":
+                    continue  # Manual check-ins: exclude from rate or count as showed; skip for consistency
+                if provider == "calcom":
+                    if b.get("status") != "accepted":
+                        continue
+                    if b.get("absentHost"):
+                        continue
+                    attendees = b.get("attendees") or []
+                    if any(a.get("absent") for a in attendees):
+                        continue
+                    showed_up += 1
+                else:  # calendly
+                    if b.get("status") == "active":
+                        showed_up += 1
+            total_past = len([b for b in last_month_bookings if b.get("provider") != "manual"])
+            if total_past > 0:
+                show_up_rate = round((showed_up / total_past) * 100, 1)
+        
         # Sort all upcoming bookings by start_time
         upcoming_bookings.sort(key=lambda b: b.get("start_datetime") or datetime.fromisoformat(b["start_time"].replace('Z', '+00:00')))
         
-        # Find most upcoming appointment and get up to 3 upcoming appointments
+        # Find most upcoming appointment and get up to 2 upcoming appointments
         most_upcoming = None
         upcoming_appointments_list = []
         
         if upcoming_bookings:
-            # Get up to 3 upcoming appointments
-            top_3_upcoming = upcoming_bookings[:3]
+            # Get up to 2 upcoming appointments
+            top_upcoming = upcoming_bookings[:2]
             
-            for booking in top_3_upcoming:
+            for booking in top_upcoming:
                 appointment = CalendarUpcomingAppointment(
                     id=booking.get("id"),
                     title=booking.get("title", "Untitled Event"),
@@ -3191,6 +3223,7 @@ def get_calendar_upcoming_summary(
             last_month_count=len(last_month_bookings),
             last_week_percentage_change=last_week_change,
             last_month_percentage_change=last_month_change,
+            show_up_rate=show_up_rate,
             most_upcoming=most_upcoming,
             upcoming_appointments=upcoming_appointments_list if upcoming_appointments_list else None,
             provider=provider,

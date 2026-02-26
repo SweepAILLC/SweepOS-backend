@@ -248,6 +248,7 @@ class CalendarNotificationsSummary(BaseModel):
     last_month_count: int  # Number of appointments in the last 30 days
     last_week_percentage_change: Optional[float] = None  # Percentage change vs last week
     last_month_percentage_change: Optional[float] = None  # Percentage change vs last month
+    show_up_rate: Optional[float] = None  # % of past appointments (last 30 days) that showed up (not cancelled, not no-show); 0-100
     most_upcoming: Optional[CalendarUpcomingAppointment] = None  # The closest upcoming appointment
     upcoming_appointments: Optional[List[CalendarUpcomingAppointment]] = None  # Up to 3 upcoming appointments (including manual check-ins)
     provider: Optional[str] = None  # "calcom" or "calendly" or None if not connected

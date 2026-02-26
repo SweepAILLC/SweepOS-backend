@@ -1,7 +1,10 @@
-from sqlalchemy import Column, String, DateTime, Numeric, JSON, Integer, Enum as SQLEnum, Text, ForeignKey, Index
+from sqlalchemy import Column, String, DateTime, Numeric, JSON, Integer, Enum as SQLEnum, Text, ForeignKey, Index, or_
+from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
+import re
 from datetime import datetime, timedelta
+from typing import Optional
 import enum
 from app.db.session import Base
 
@@ -22,7 +25,8 @@ class Client(Base):
     tenant_id = Column(UUID(as_uuid=True), nullable=True)  # Deprecated: use org_id instead, kept for backward compatibility
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
-    email = Column(String, index=True, nullable=True)
+    email = Column(String, index=True, nullable=True)  # Primary email (backward compat)
+    emails = Column(JSON, nullable=True)  # Additional emails: list of strings, e.g. ["a@x.com", "b@x.com"]
     phone = Column(String, nullable=True)
     instagram = Column(String, nullable=True)
     lifecycle_state = Column(SQLEnum(LifecycleState), default=LifecycleState.COLD_LEAD, nullable=False)
@@ -84,4 +88,30 @@ class Client(Base):
             self.program_end_date = None
             if not self.program_start_date:
                 self.program_duration_days = None
+
+    def get_all_emails_normalized(self) -> set:
+        """Return set of normalized (lowercase, no whitespace) emails for this client: primary email + emails list."""
+        out = set()
+        if self.email:
+            out.add(re.sub(r'\s+', '', self.email.lower().strip()))
+        if self.emails and isinstance(self.emails, list):
+            for e in self.emails:
+                if e and isinstance(e, str):
+                    out.add(re.sub(r'\s+', '', e.lower().strip()))
+        return out
+
+
+def find_client_by_email(db: Session, org_id: uuid.UUID, email: str) -> Optional[Client]:
+    """Find a client in the org by any of their emails (primary or emails list)."""
+    if not email:
+        return None
+    normalized = re.sub(r'\s+', '', email.lower().strip())
+    candidates = db.query(Client).filter(
+        Client.org_id == org_id,
+        or_(Client.email.isnot(None), Client.emails.isnot(None))
+    ).all()
+    for c in candidates:
+        if normalized in c.get_all_emails_normalized():
+            return c
+    return None
 
