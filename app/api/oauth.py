@@ -541,8 +541,9 @@ def connect_stripe_direct(
         
         print(f"[DIRECT_CONNECT] Validated API key for account: {account_id}")
         
+        # Use same org resolution as Stripe summary/status so token is stored for the org the user is viewing
+        org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
         # Log security event BEFORE storing (for audit trail)
-        org_id = current_user.org_id
         log_security_event(
             db=db,
             event_type=AuditEventType.API_KEY_CONNECTED,
