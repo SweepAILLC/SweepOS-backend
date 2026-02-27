@@ -80,6 +80,7 @@ class ClientUpdate(BaseModel):
     stripe_customer_id: Optional[str] = None
     estimated_mrr: Optional[float] = None
     notes: Optional[str] = None
+    meta: Optional[dict] = None  # e.g. sort_orders: { cold_lead: 0, warm_lead: 1 } for column ordering
     # Program tracking fields
     program_start_date: Optional[datetime] = None
     program_duration_days: Optional[int] = None
