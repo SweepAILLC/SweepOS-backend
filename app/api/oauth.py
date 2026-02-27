@@ -705,8 +705,9 @@ def connect_stripe_direct(
         )
         
     except stripe.error.AuthenticationError as e:
+        # Use 400 (not 401) so the frontend does not treat this as session expiry and redirect to login
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid API key: {str(e)}"
         )
     except stripe.error.StripeError as e:
