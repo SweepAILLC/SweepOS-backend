@@ -44,6 +44,10 @@ def ensure_client_for_booking_attendee(
         parts = name.strip().split(None, 1)
         first_name = parts[0]
         last_name = parts[1] if len(parts) > 1 else None
+    # Do not create an unnamed client card (email-only with no name)
+    if not first_name and not last_name:
+        print(f"[CHECKIN SYNC] Skipping client creation for unnamed attendee: {email}")
+        return None
     client = Client(
         org_id=org_id,
         email=email.strip(),

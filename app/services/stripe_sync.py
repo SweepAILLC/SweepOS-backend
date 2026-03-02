@@ -311,24 +311,25 @@ def sync_stripe_historical_data(db: Session, org_id: uuid.UUID = None, backgroun
                             customers_updated += 1
                             print(f"[SYNC] Linked existing client {client.id} to Stripe customer {customer_id} by email {customer_email}")
                 
-                # If still not found, create a new client
+                # If still not found, create only when Stripe provided a real name (do not create unnamed clients)
                 if not client:
-                    name = getattr(customer, 'name', None) or ""
-                    first_name = name.split()[0] if name else "Stripe"
-                    last_name = " ".join(name.split()[1:]) if name and len(name.split()) > 1 else "Customer"
-                    email = customer_email or f"{customer_id}@stripe.test"
-                    
-                    # Use org_id from oauth_token for multi-tenant support
-                    client = Client(
-                        org_id=oauth_token.org_id,
-                        first_name=first_name,
-                        last_name=last_name,
-                        email=email,
-                        stripe_customer_id=customer_id
-                    )
-                    db.add(client)
-                    customers_synced += 1
-                    print(f"[SYNC] ✅ Created new client for Stripe customer {customer_id} ({email})")
+                    name = (getattr(customer, 'name', None) or "").strip()
+                    if not name:
+                        print(f"[SYNC] Skipping unnamed client for Stripe customer {customer_id}")
+                    else:
+                        first_name = name.split()[0] if name.split() else None
+                        last_name = " ".join(name.split()[1:]) if len(name.split()) > 1 else None
+                        email = customer_email or f"{customer_id}@stripe.test"
+                        client = Client(
+                            org_id=oauth_token.org_id,
+                            first_name=first_name,
+                            last_name=last_name,
+                            email=email,
+                            stripe_customer_id=customer_id
+                        )
+                        db.add(client)
+                        customers_synced += 1
+                        print(f"[SYNC] ✅ Created new client for Stripe customer {customer_id} ({email})")
                 else:
                     # Update existing client with latest info from Stripe
                     updated = False
@@ -479,40 +480,31 @@ def sync_stripe_historical_data(db: Session, org_id: uuid.UUID = None, backgroun
                                 client.stripe_customer_id = customer_id
                                 print(f"[SYNC] Linked existing client {client.id} to Stripe customer {customer_id} by email {customer_email}")
                     
-                    # If still not found, create new client
+                    # If still not found, create only when we have a real name (do not create unnamed clients)
                     if not client:
-                        name = getattr(customer_data, 'name', None) or ""
-                        first_name = name.split()[0] if name else "Stripe"
-                        last_name = " ".join(name.split()[1:]) if name and len(name.split()) > 1 else "Customer"
-                        email = customer_email or f"{customer_id}@stripe.test"
-                        
-                        client = Client(
-                            org_id=org_id,
-                            first_name=first_name,
-                            last_name=last_name,
-                            email=email,
-                            stripe_customer_id=customer_id
-                        )
-                        db.add(client)
-                        customers_synced += 1  # Count this as a synced customer
-                        db.flush()
-                        print(f"[SYNC] ✅ Created new client from subscription customer {customer_id} ({email})")
+                        name = (getattr(customer_data, 'name', None) or "").strip()
+                        if not name:
+                            print(f"[SYNC] Skipping unnamed client for subscription customer {customer_id}")
+                        else:
+                            first_name = name.split()[0] if name.split() else None
+                            last_name = " ".join(name.split()[1:]) if len(name.split()) > 1 else None
+                            email = customer_email or f"{customer_id}@stripe.test"
+                            client = Client(
+                                org_id=org_id,
+                                first_name=first_name,
+                                last_name=last_name,
+                                email=email,
+                                stripe_customer_id=customer_id
+                            )
+                            db.add(client)
+                            customers_synced += 1
+                            db.flush()
+                            print(f"[SYNC] ✅ Created new client from subscription customer {customer_id} ({email})")
                 except Exception as e:
                     import traceback
                     print(f"[SYNC] Error retrieving customer {sub_data.customer} from Stripe: {e}")
                     print(traceback.format_exc())
-                    # Create a placeholder client so the subscription can be linked
-                    client = Client(
-                        org_id=org_id,
-                        first_name="Stripe",
-                        last_name=f"Customer {sub_data.customer[:8]}",
-                        email=f"{sub_data.customer}@stripe.test",
-                        stripe_customer_id=sub_data.customer
-                    )
-                    db.add(client)
-                    customers_synced += 1  # Count this as a synced customer
-                    db.flush()
-                    print(f"[SYNC] ✅ Created placeholder client for subscription customer: {sub_data.customer}")
+                    # Do not create placeholder unnamed client; subscription may have client_id=None
             
             # Calculate MRR from subscription items
             mrr = Decimal(0)
@@ -592,7 +584,7 @@ def sync_stripe_historical_data(db: Session, org_id: uuid.UUID = None, backgroun
                 subscription = StripeSubscription(
                     org_id=org_id,
                     stripe_subscription_id=sub_data.id,
-                    client_id=client.id,
+                    client_id=client.id if client else None,
                     status=sub_data.status,
                     current_period_start=datetime.fromtimestamp(sub_data.current_period_start),
                     current_period_end=datetime.fromtimestamp(sub_data.current_period_end) if sub_data.current_period_end else None,

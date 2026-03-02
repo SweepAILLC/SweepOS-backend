@@ -932,6 +932,7 @@ def get_calendly_status(
     Get Calendly connection status and account information.
     Fetches real account data from Calendly API if connected.
     """
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
     try:
         # Use raw SQL to bypass SQLAlchemy's enum name conversion
         from sqlalchemy import text

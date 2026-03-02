@@ -221,13 +221,20 @@ def upsert_client(db: Session, customer_data, org_id: uuid.UUID) -> Client:
             client.stripe_customer_id = customer_id
         client.updated_at = datetime.utcnow()
     else:
-        # Create new
+        # Create new only when Stripe provided a real name (do not create unnamed clients)
+        customer_name = getattr(customer_data, 'name', None) or ''
+        customer_name = (customer_name or '').strip()
+        if not customer_name:
+            print(f"[SYNC] Skipping unnamed client for Stripe customer {customer_id}")
+            return None
+        first_name = customer_name.split()[0] if customer_name.split() else None
+        last_name = ' '.join(customer_name.split()[1:]) if len(customer_name.split()) > 1 else None
         client = Client(
             org_id=org_id,
             stripe_customer_id=customer_id,
             email=customer_email,
-            first_name=getattr(customer_data, 'name', '').split()[0] if getattr(customer_data, 'name', None) else None,
-            last_name=' '.join(getattr(customer_data, 'name', '').split()[1:]) if getattr(customer_data, 'name', None) and len(getattr(customer_data, 'name', '').split()) > 1 else None,
+            first_name=first_name,
+            last_name=last_name,
             lifecycle_state='active',
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
@@ -309,20 +316,8 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
                             db.flush()
                         print(f"[SYNC] Linked existing client {client.id} to customer {customer_id} by email")
                     else:
-                        # Create minimal client from email
-                        client = Client(
-                            org_id=org_id,
-                            stripe_customer_id=customer_id,
-                            email=customer_email,
-                            first_name="Stripe",
-                            last_name=f"Customer {customer_id[:8]}",
-                            lifecycle_state='active',
-                            created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow()
-                        )
-                        db.add(client)
-                        db.flush()
-                        print(f"[SYNC] Created minimal client {client.id} for customer {customer_id} from email")
+                        # Do not create unnamed client (email-only); payment will have client_id=None
+                        print(f"[SYNC] Skipping unnamed client for customer {customer_id} (email-only)")
     
     # Get subscription_id and invoice_id
     subscription_id = None
@@ -347,21 +342,8 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
                     client.stripe_customer_id = payment_data.customer
                     db.flush()
             else:
-                # Create minimal client from invoice email
-                stripe_customer_id = getattr(payment_data, 'customer', None)
-                client = Client(
-                    org_id=org_id,
-                    stripe_customer_id=stripe_customer_id,
-                    email=customer_email,
-                    first_name="Stripe",
-                    last_name=f"Invoice Customer" if not stripe_customer_id else f"Customer {stripe_customer_id[:8] if stripe_customer_id else 'Unknown'}",
-                    lifecycle_state='active',
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow()
-                )
-                db.add(client)
-                db.flush()
-                print(f"[SYNC] Created client {client.id} for invoice {invoice_id} from email {customer_email}")
+                # Do not create unnamed client from invoice email only
+                print(f"[SYNC] Skipping unnamed client for invoice {invoice_id} (email-only)")
     elif hasattr(payment_data, 'subscription') and payment_data.subscription:
         subscription_id = payment_data.subscription
     elif hasattr(payment_data, 'invoice') and payment_data.invoice:
@@ -592,8 +574,8 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
     return payment
 
 
-def upsert_subscription(db: Session, sub_data, org_id: uuid.UUID) -> StripeSubscription:
-    """Idempotently upsert a subscription."""
+def upsert_subscription(db: Session, sub_data, org_id: uuid.UUID):
+    """Idempotently upsert a subscription. Returns (subscription, was_update: bool)."""
     sub_id = sub_data.id
     
     # Check for duplicate subscription BEFORE processing
@@ -742,7 +724,7 @@ def upsert_subscription(db: Session, sub_data, org_id: uuid.UUID) -> StripeSubsc
             existing_sub.client_id = client.id
         print(f"[SYNC] Updated existing subscription {sub_id}: status={subscription_status}, mrr={mrr}")
         db.flush()
-        return existing_sub
+        return existing_sub, True
     
     # Create new subscription
     stmt = insert(StripeSubscription).values(
@@ -792,6 +774,8 @@ def upsert_subscription(db: Session, sub_data, org_id: uuid.UUID) -> StripeSubsc
             if client and not existing.client_id:
                 existing.client_id = client.id
             print(f"[SYNC] Updated existing subscription {sub_id} via manual upsert: status={subscription_status}, mrr={mrr}")
+            db.flush()
+            return existing, True
         else:
             subscription = StripeSubscription(
                 org_id=org_id,
@@ -807,7 +791,8 @@ def upsert_subscription(db: Session, sub_data, org_id: uuid.UUID) -> StripeSubsc
             )
             db.add(subscription)
             print(f"[SYNC] Created new subscription {sub_id}: status={subscription_status}, mrr={mrr}")
-        db.flush()  # Flush to ensure subscription is available for query
+            db.flush()
+            return subscription, False
     
     subscription = db.query(StripeSubscription).filter(
         StripeSubscription.stripe_subscription_id == sub_id,
@@ -816,8 +801,7 @@ def upsert_subscription(db: Session, sub_data, org_id: uuid.UUID) -> StripeSubsc
     
     if not subscription:
         raise Exception(f"Failed to retrieve subscription {sub_id} after upsert")
-    
-    return subscription
+    return subscription, True  # ON_CONFLICT path: treat as update for counting
 
 
 def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str) -> dict:
@@ -922,21 +906,8 @@ def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str
                                     results["clients_linked"] += 1
                                     print(f"[REPAIR] Linked existing client {client.id} to customer {customer_id} by email")
                                 else:
-                                    # Create minimal client from email
-                                    client = Client(
-                                        org_id=org_id,
-                                        stripe_customer_id=customer_id,
-                                        email=customer_email,
-                                        first_name="Stripe",
-                                        last_name=f"Customer {customer_id[:8] if customer_id else 'Unknown'}",
-                                        lifecycle_state='active',
-                                        created_at=datetime.utcnow(),
-                                        updated_at=datetime.utcnow()
-                                    )
-                                    db.add(client)
-                                    db.flush()
-                                    results["clients_created"] += 1
-                                    print(f"[REPAIR] Created minimal client {client.id} from email {customer_email}")
+                                    # Do not create unnamed client (email-only)
+                                    print(f"[REPAIR] Skipping unnamed client for customer {customer_id} (email-only)")
                     
                     # Link payment to client
                     if client:
@@ -1081,12 +1052,10 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             traceback.print_exc()
             # Continue with other syncs even if customers fail
         
-        # Sync subscriptions
+        # Sync subscriptions: always list all so status (active/trialing/canceled) stays accurate.
+        # Incremental created filter would miss status updates on existing subscriptions.
         print(f"[SYNC] Syncing subscriptions...")
         sub_params = {"limit": 100, "status": "all"}
-        if sync_start:
-            sub_params["created"] = {"gte": int(sync_start.timestamp())}
-        
         try:
             subscriptions = stripe.Subscription.list(**sub_params)
             for sub in subscriptions.auto_paging_iter():
@@ -1099,11 +1068,11 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                         except:
                             pass
                     
-                    subscription = upsert_subscription(db, sub, org_id)
-                    if not sync_start or (subscription.created_at and subscription.created_at >= sync_start):
-                        results["subscriptions_synced"] += 1
-                    else:
+                    subscription, was_update = upsert_subscription(db, sub, org_id)
+                    if was_update:
                         results["subscriptions_updated"] += 1
+                    else:
+                        results["subscriptions_synced"] += 1
                 except Exception as e:
                     print(f"[SYNC] Error upserting subscription {sub.id}: {str(e)}")
                     import traceback

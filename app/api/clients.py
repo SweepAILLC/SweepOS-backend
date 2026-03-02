@@ -22,13 +22,66 @@ from app.schemas.client import (
     TerminalCashCollected,
     TerminalMRR,
     TerminalTopContributor,
+    ClientHealthScoreResponse,
+    ClientHealthFactor,
 )
 from app.api.deps import get_current_user, get_selected_org_id
 from app.models.user import User
 from app.utils.stripe_ids import normalize_stripe_id_for_dedup
 from app.services.client_automation import update_client_progress, update_client_lifecycle_state, process_client_automation
+from app.services.client_health_score import get_health_score
 
 router = APIRouter()
+
+
+def _fetch_brevo_open_rate_for_email(db: Session, org_id: uuid.UUID, user_id: uuid.UUID, email: str) -> Optional[float]:
+    """Fetch Brevo campaign stats for a contact by email; return open rate (0-100) or None."""
+    import httpx
+    from urllib.parse import quote
+    from app.models.oauth_token import OAuthToken, OAuthProvider
+    from app.core.encryption import decrypt_token
+
+    brevo_token = db.query(OAuthToken).filter(
+        OAuthToken.provider == OAuthProvider.BREVO,
+        OAuthToken.org_id == org_id,
+    ).first()
+    if not brevo_token:
+        return None
+    try:
+        access_token = decrypt_token(
+            brevo_token.access_token,
+            audit_context={"db": db, "org_id": org_id, "user_id": user_id, "resource_type": "brevo_token", "resource_id": str(brevo_token.id)},
+        )
+    except Exception:
+        return None
+    headers = {"accept": "application/json", "content-type": "application/json"}
+    if getattr(brevo_token, "scope", None) == "api_key":
+        headers["api-key"] = access_token
+    else:
+        headers["Authorization"] = f"Bearer {access_token}"
+
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=90)
+    params = {"startDate": start_date.strftime("%Y-%m-%d"), "endDate": end_date.strftime("%Y-%m-%d")}
+    encoded_email = quote(email, safe="")
+    url = f"https://api.brevo.com/v3/contacts/{encoded_email}/campaignStats"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r = client.get(url, headers=headers, params=params)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        # Brevo campaignStats: object with messagesSent (array of events), opened (array of { count, ... })
+        if not isinstance(data, dict):
+            return None
+        messages_sent = len(data.get("messagesSent") or [])
+        opened_list = data.get("opened") or []
+        messages_opened = sum(int(item.get("count", 0) or 0) for item in opened_list if isinstance(item, dict))
+        if messages_sent > 0:
+            return (messages_opened / messages_sent) * 100.0
+        return None
+    except Exception:
+        return None
 
 
 @router.get("", response_model=List[ClientSchema])
@@ -148,6 +201,37 @@ def create_client(
     return client
 
 
+@router.get("/health-scores")
+def get_clients_health_scores(
+    client_ids: str = Query(..., description="Comma-separated client IDs"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Batch health scores for board tags. Returns { client_id: { score, grade } }.
+    Does not fetch Brevo (no per-email API calls) for performance.
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    ids_str = [x.strip() for x in client_ids.split(",") if x.strip()]
+    if not ids_str:
+        return {}
+    uuids = []
+    for i in ids_str:
+        try:
+            uuids.append(UUID(i))
+        except ValueError:
+            continue
+    if not uuids:
+        return {}
+    clients = db.query(Client).filter(Client.id.in_(uuids), Client.org_id == org_id).all()
+    out = {}
+    for c in clients:
+        result = get_health_score(db, c.id, org_id, email_open_rate=None)
+        if result:
+            out[str(c.id)] = {"score": result["score"], "grade": result["grade"]}
+    return out
+
+
 @router.get("/{client_id}", response_model=ClientSchema)
 def get_client(
     client_id: str,
@@ -181,6 +265,64 @@ def get_client(
                 print(f"[CLIENT_API] ✅ State change confirmed: {old_state} → {new_state}")
     
     return client
+
+
+@router.get("/{client_id}/health-score", response_model=ClientHealthScoreResponse)
+def get_client_health_score(
+    client_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get logic-based client/lead health score (0–100) and factors.
+    Architecture is AI-ready: factors include key, label, value, raw, unit, description
+    for future referral/testimonial/retention/upsell recommendations.
+    Factors: show rate, email open rate (Brevo), failed payments, program timeline/tenure, days since last contact.
+    """
+    try:
+        client_uuid = UUID(client_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid client ID format")
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    client = db.query(Client).filter(Client.id == client_uuid, Client.org_id == org_id).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+
+    email_open_rate = None
+    emails_to_try = [client.email] if getattr(client, "email", None) else []
+    if getattr(client, "emails", None) and isinstance(client.emails, list):
+        emails_to_try = list(emails_to_try) + [e for e in client.emails if e and str(e).strip()]
+    for email in emails_to_try:
+        email = str(email).strip().lower()
+        if not email:
+            continue
+        email_open_rate = _fetch_brevo_open_rate_for_email(db, org_id, current_user.id, email)
+        if email_open_rate is not None:
+            break
+
+    result = get_health_score(db, client_uuid, org_id, email_open_rate=email_open_rate)
+    if not result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+
+    factors_out = [
+        ClientHealthFactor(
+            key=f.get("key"),
+            label=f.get("label", ""),
+            value=f.get("value"),
+            raw=f.get("raw"),
+            unit=f.get("unit"),
+            description=f.get("description"),
+        )
+        for f in result.get("factors", [])
+    ]
+    return ClientHealthScoreResponse(
+        client_id=result["client_id"],
+        score=result["score"],
+        grade=result["grade"],
+        factors=factors_out,
+        computed_at=result.get("computed_at"),
+    )
 
 
 def _normalize_email(email: str | None) -> str | None:

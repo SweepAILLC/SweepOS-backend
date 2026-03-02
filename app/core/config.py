@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     
     # Auth
     SECRET_KEY: str = "supersecret_jwt_key_change_in_production"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours; reduce logout frequency
     
     # Stripe
     STRIPE_CLIENT_ID: Optional[str] = None

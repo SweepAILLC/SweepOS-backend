@@ -152,3 +152,21 @@ class TerminalSummaryResponse(BaseModel):
     top_contributors_30d: List[TerminalTopContributor]
     top_contributors_90d: List[TerminalTopContributor]
 
+
+# Client health score (logic-based; AI-ready factors for future referral/testimonial/retention/upsell)
+class ClientHealthFactor(BaseModel):
+    key: str
+    label: str
+    value: Optional[Union[float, int]] = None
+    raw: Optional[dict] = None
+    unit: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ClientHealthScoreResponse(BaseModel):
+    client_id: str
+    score: float
+    grade: str
+    factors: List[ClientHealthFactor]
+    computed_at: Optional[str] = None
+

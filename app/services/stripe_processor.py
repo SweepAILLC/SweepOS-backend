@@ -174,19 +174,8 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
             print(f"[WEBHOOK] Error matching customer by email: {e}")
     
     if not client:
-        print(f"Warning: No client found for Stripe customer {customer_id}. Creating client...")
-        # Create a client for this Stripe customer (for test data)
-        # Client model has first_name, last_name, email (not name)
-        client = Client(
-            org_id=org_id,
-            first_name=f"Stripe",
-            last_name=f"Customer {customer_id[:8]}",
-            email=f"customer_{customer_id[:8]}@stripe.test",
-            stripe_customer_id=customer_id
-        )
-        db.add(client)
-        db.flush()  # Flush to get the client ID
-        print(f"Created client {client.id} for Stripe customer {customer_id}")
+        # Do not auto-create unnamed placeholder clients; payment will have client_id=None
+        print(f"[WEBHOOK] No client found for Stripe customer {customer_id}; skipping unnamed client creation")
     
     # If subscription_id is still None, try to find active subscription for this client
     if not subscription_id and client:
@@ -405,13 +394,11 @@ def _process_subscription_event(db: Session, data: Dict[str, Any], event_type: s
             )
         ).first()
     
-    # Determine status
-    status_map = {
-        "customer.subscription.created": "active",
-        "customer.subscription.updated": data.get("status", "active"),
-        "customer.subscription.deleted": "canceled",
-    }
-    subscription_status = status_map.get(event_type, data.get("status", "active"))
+    # Use actual status from Stripe so active/trialing/canceled/past_due are accurate
+    if event_type == "customer.subscription.deleted":
+        subscription_status = "canceled"
+    else:
+        subscription_status = data.get("status", "active")
     
     # Calculate MRR from subscription items
     mrr = Decimal(0)
@@ -501,14 +488,13 @@ def _process_subscription_event(db: Session, data: Dict[str, Any], event_type: s
         db.add(subscription)
         print(f"Created subscription: {subscription_id}, mrr: ${float(mrr):.2f}, status: {subscription_status}, created_at: {subscription.created_at}")
     
-    # Update client estimated MRR
+    # Update client estimated MRR (include active and trialing to match dashboard)
     if client:
-        # Sum all active subscriptions for this client (filter by org_id)
         total_mrr = db.query(StripeSubscription).filter(
             and_(
                 StripeSubscription.org_id == org_id,
                 StripeSubscription.client_id == client.id,
-                StripeSubscription.status == "active"
+                StripeSubscription.status.in_(["active", "trialing"])
             )
         ).with_entities(
             db.func.sum(StripeSubscription.mrr)
@@ -519,9 +505,9 @@ def _process_subscription_event(db: Session, data: Dict[str, Any], event_type: s
     
     try:
         db.commit()
-        print(f"✅ Successfully processed {event_type} event - failed payment {payment_id} committed")
+        print(f"✅ Successfully processed {event_type} event - subscription {subscription_id} committed")
     except Exception as commit_error:
-        print(f"❌ ERROR committing failed payment {payment_id}: {str(commit_error)}")
+        print(f"❌ ERROR committing subscription {subscription_id}: {str(commit_error)}")
         db.rollback()
         raise
 
@@ -567,19 +553,22 @@ def _process_customer_created(db: Session, data: Dict[str, Any], org_id: uuid.UU
                 client.stripe_customer_id = customer_id
                 print(f"[WEBHOOK] customer.created: Linked existing client {client.id} to Stripe customer {customer_id} by email {customer_email}")
     
-    # If still not found, create a new client
+    # If still not found, create only when Stripe provided a real name (do not create unnamed clients)
     if not client:
-        client = Client(
-            org_id=org_id,
-            first_name=first_name,
-            last_name=last_name,
-            email=email,
-            stripe_customer_id=customer_id,
-            lifecycle_state="cold_lead"  # New customers start as cold leads
-        )
-        db.add(client)
-        db.flush()  # Flush to get the client ID
-        print(f"[WEBHOOK] customer.created: ✅ Created new client {client.id} for Stripe customer {customer_id} ({email})")
+        if not customer_name or not str(customer_name).strip():
+            print(f"[WEBHOOK] customer.created: Skipping unnamed client for Stripe customer {customer_id}")
+        else:
+            client = Client(
+                org_id=org_id,
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+                stripe_customer_id=customer_id,
+                lifecycle_state="cold_lead"  # New customers start as cold leads
+            )
+            db.add(client)
+            db.flush()  # Flush to get the client ID
+            print(f"[WEBHOOK] customer.created: ✅ Created new client {client.id} for Stripe customer {customer_id} ({email})")
     else:
         # Update existing client with latest info from Stripe
         updated = False

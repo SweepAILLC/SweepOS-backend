@@ -184,17 +184,20 @@ def upsert_client_from_treasury_transaction(
         client.updated_at = datetime.utcnow()
         return client
     
-    # Create new client
-    # Try to extract name from description (e.g., "Jane Austen (6789)")
+    # Create new client only when we have a name (do not create unnamed clients)
     name_match = re.match(r'^([^(]+)', description) if description else None
     name = name_match.group(1).strip() if name_match else None
     
     first_name = None
     last_name = None
-    if name:
-        name_parts = name.split()
+    if name and name.strip():
+        name_parts = name.strip().split()
         first_name = name_parts[0] if name_parts else None
         last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else None
+    
+    if not first_name and not last_name:
+        print(f"[TREASURY SYNC] Skipping unnamed client for transaction (email: {customer_email})")
+        return None
     
     client = Client(
         org_id=org_id,
@@ -206,7 +209,6 @@ def upsert_client_from_treasury_transaction(
         updated_at=datetime.utcnow()
     )
     
-    # Set stripe_customer_id if available
     if flow_data and isinstance(flow_data, dict):
         customer_id = flow_data.get("customer") or flow_data.get("customer_id")
         if customer_id:
@@ -214,7 +216,6 @@ def upsert_client_from_treasury_transaction(
     
     db.add(client)
     db.flush()
-    
     print(f"[TREASURY SYNC] Created client {client.id} from transaction {transaction.get('id')} (email: {customer_email})")
     return client
 

@@ -443,7 +443,7 @@ def connect_stripe_direct(
     request: DirectApiKeyRequest,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)  # Require admin role
+    current_user: User = Depends(require_admin_or_owner)  # Org admin/owner can connect
 ):
     """
     Connect Stripe directly using an API key (bypasses OAuth).
@@ -1249,7 +1249,7 @@ def connect_brevo_direct(
     request: DirectApiKeyRequest,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)  # Require admin role
+    current_user: User = Depends(require_admin_or_owner)  # Org admin/owner can connect
 ):
     """
     Connect Brevo directly using an API key (bypasses OAuth).
@@ -1584,7 +1584,7 @@ def connect_calcom_direct(
     request: DirectApiKeyRequest,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)  # Require admin role
+    current_user: User = Depends(require_admin_or_owner)  # Org admin/owner can connect
 ):
     """
     Connect Cal.com directly using an API key.
@@ -1856,7 +1856,7 @@ def connect_calendly_direct(
     request: DirectApiKeyRequest,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_admin)  # Require admin role
+    current_user: User = Depends(require_admin_or_owner)  # Org admin/owner can connect
 ):
     """
     Connect Calendly directly using an API key.
