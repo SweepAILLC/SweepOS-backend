@@ -157,13 +157,17 @@ def _factor_days_since_last_contact(
     }
 
 
-def _score_from_factors(factors: List[Dict[str, Any]], email_open_rate: Optional[float]) -> float:
+def _score_from_factors(
+    factors: List[Dict[str, Any]],
+    campaign_open_rate: Optional[float],
+    emails_sent: Optional[int] = None,
+) -> float:
     """
     Combine factors into a 0–100 health score. Logic-based; tuned so AI can override later.
     - show_rate: higher is better (weight ~25)
-    - email_open_rate: higher is better (weight ~20, if available)
+    - email (campaign) open rate: higher is better (weight ~20); only applied when emails were sent.
     - failed_payments: lower is better (weight ~25)
-    - program_timeline: used for context, not penalizing (no direct score impact for tenure)
+    - program_timeline: used for context, not penalizing
     - days_since_last_contact: lower is better (weight ~30)
     """
     score = 50.0  # baseline
@@ -174,7 +178,6 @@ def _score_from_factors(factors: List[Dict[str, Any]], email_open_rate: Optional
         raw = f.get("raw") or {}
 
         if key == "show_rate" and value is not None:
-            # 0% -> -25, 100% -> +25
             score += (value / 100.0 - 0.5) * 50
         if key == "failed_payments":
             count = raw.get("count", 0) or 0
@@ -192,9 +195,8 @@ def _score_from_factors(factors: List[Dict[str, Any]], email_open_rate: Optional
             else:
                 score -= 20
 
-    if email_open_rate is not None:
-        # 0% -> -10, 50% -> +5, 100% -> +20
-        score += (email_open_rate / 100.0 - 0.25) * 40
+    if campaign_open_rate is not None and (emails_sent is None or emails_sent > 0):
+        score += (campaign_open_rate / 100.0 - 0.25) * 40
 
     return max(0.0, min(100.0, round(score, 1)))
 
@@ -216,11 +218,12 @@ def get_health_score(
     db: Session,
     client_id: uuid.UUID,
     org_id: uuid.UUID,
-    email_open_rate: Optional[float] = None,
+    brevo_email_stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Full health score for a client. Returns score (0–100), grade, and factors list.
-    AI-ready: factors have key, label, value, raw, unit, description.
+    brevo_email_stats: optional dict with campaign_open_rate, campaign_click_rate, messages_sent,
+                       trans_open_rate, trans_click_rate (from Brevo).
     """
     client = db.query(Client).filter(
         Client.id == client_id,
@@ -229,8 +232,11 @@ def get_health_score(
     if not client:
         return {}
 
+    campaign_open = brevo_email_stats.get("campaign_open_rate") if brevo_email_stats else None
+    emails_sent = brevo_email_stats.get("messages_sent") if brevo_email_stats else None
+
     factors = compute_health_factors(db, client, org_id)
-    score = _score_from_factors(factors, email_open_rate)
+    score = _score_from_factors(factors, campaign_open, emails_sent)
 
     # Letter grade for quick scan
     if score >= 80:
@@ -244,15 +250,41 @@ def get_health_score(
     else:
         grade = "F"
 
-    # Add email_open_rate factor if provided (e.g. from Brevo)
-    if email_open_rate is not None:
+    # Add email engagement factor (campaign + transactional) whenever we have Brevo data
+    if brevo_email_stats is not None:
+        messages_sent = brevo_email_stats.get("messages_sent", 0)
+        campaign_open = brevo_email_stats.get("campaign_open_rate")
+        campaign_click = brevo_email_stats.get("campaign_click_rate")
+        trans_open = brevo_email_stats.get("trans_open_rate")
+        trans_click = brevo_email_stats.get("trans_click_rate")
+
+        parts = []
+        if messages_sent > 0 and campaign_open is not None:
+            open_str = f"{campaign_open:.0f}% open"
+            click_str = f"{campaign_click:.0f}% click" if campaign_click is not None else "—% click"
+            parts.append(f"Campaign: {open_str}, {click_str} ({messages_sent} sent)")
+        elif messages_sent == 0:
+            parts.append("Campaign: no emails sent (not used in score)")
+        if trans_open is not None or trans_click is not None:
+            to = f"{trans_open:.0f}% open" if trans_open is not None else "—% open"
+            tc = f"{trans_click:.0f}% click" if trans_click is not None else "—% click"
+            parts.append(f"Transactional: {to}, {tc}")
+        description = "Brevo, last 90 days. " + "; ".join(parts) if parts else "No Brevo data"
+
+        value_for_display = round(campaign_open, 1) if campaign_open is not None and messages_sent > 0 else None
         factors.append({
             "key": "email_open_rate",
-            "label": "Email campaign open rate",
-            "value": round(email_open_rate, 1),
-            "raw": {"open_rate": email_open_rate},
+            "label": "Email engagement (Brevo)",
+            "value": value_for_display,
+            "raw": {
+                "campaign_open_rate": campaign_open,
+                "campaign_click_rate": campaign_click,
+                "emails_sent": messages_sent,
+                "trans_open_rate": trans_open,
+                "trans_click_rate": trans_click,
+            },
             "unit": "percent",
-            "description": f"{email_open_rate:.0f}% open rate (Brevo, last 90 days)",
+            "description": description,
         })
 
     return {

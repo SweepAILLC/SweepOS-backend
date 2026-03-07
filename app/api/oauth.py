@@ -1278,9 +1278,11 @@ def connect_brevo_direct(
     from datetime import datetime, timedelta
     import httpx
     
-    # Rate limiting: 3 attempts per 15 minutes per user
+    # Use selected org (e.g. when system owner is acting as another org) so Brevo stays org-specific
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    # Rate limiting: 3 attempts per 15 minutes per user per org
     _cleanup_old_entries()
-    identifier = f"brevo_direct_api_key_{current_user.id}_{current_user.org_id}"
+    identifier = f"brevo_direct_api_key_{current_user.id}_{org_id}"
     now = datetime.utcnow()
     window_start = now - timedelta(seconds=900)  # 15 minutes
     
@@ -1297,7 +1299,7 @@ def connect_brevo_direct(
             log_security_event(
                 db=db,
                 event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
-                org_id=current_user.org_id,
+                org_id=org_id,
                 user_id=current_user.id,
                 resource_type="api_endpoint",
                 resource_id="connect_brevo_direct",
@@ -1352,10 +1354,9 @@ def connect_brevo_direct(
         account_email = account_data.get("email")
         account_id = account_email or "unknown"
         
-        print(f"[BREVO DIRECT] Validated API key for account: {account_email}")
+        print(f"[BREVO DIRECT] Validated API key for account: {account_email} (org {org_id})")
         
         # Log security event BEFORE storing (for audit trail)
-        org_id = current_user.org_id
         log_security_event(
             db=db,
             event_type=AuditEventType.API_KEY_CONNECTED,
@@ -1563,13 +1564,13 @@ def disconnect_brevo(
     current_user: User = Depends(require_admin_or_owner)
 ):
     """
-    Disconnect Brevo OAuth for the current user's organization.
-    This allows users to connect a different Brevo account.
+    Disconnect Brevo for the currently selected organization.
+    Uses selected_org_id so system owner disconnecting from Org B only removes Org B's token.
     """
-    # Find and delete the OAuth token for this org
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
     oauth_token = db.query(OAuthToken).filter(
         OAuthToken.provider == OAuthProvider.BREVO,
-        OAuthToken.org_id == current_user.org_id
+        OAuthToken.org_id == org_id
     ).first()
     
     if oauth_token:

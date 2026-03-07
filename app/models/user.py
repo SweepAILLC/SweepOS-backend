@@ -23,6 +23,7 @@ class User(Base):
     role = Column(SQLEnum(UserRole, native_enum=False), default=UserRole.ADMIN, nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)  # Keep for backward compatibility
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    fathom_api_key = Column(String, nullable=True)  # Fathom API key for call summaries/transcripts (intelligence)
     
     # Composite unique constraint: email must be unique per org
     __table_args__ = (

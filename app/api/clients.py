@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from sqlalchemy.orm import Session
 import re
 from sqlalchemy import desc, func, or_, and_
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from uuid import UUID
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -34,26 +34,76 @@ from app.services.client_health_score import get_health_score
 router = APIRouter()
 
 
-def _fetch_brevo_open_rate_for_email(db: Session, org_id: uuid.UUID, user_id: uuid.UUID, email: str) -> Optional[float]:
-    """Fetch Brevo campaign stats for a contact by email; return open rate (0-100) or None."""
+def _fetch_brevo_transactional_stats_for_email(
+    headers: dict, email: str, days: int = 90
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Fetch per-contact transactional email open/click rates from Brevo using the events API.
+    GET /v3/smtp/statistics/events with email filter; date range cannot exceed 90 days.
+    Returns (open_rate, click_rate) or (None, None).
+    """
+    import httpx
+    try:
+        params = {"email": email, "days": min(days, 90), "limit": 2500}
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(
+                "https://api.brevo.com/v3/smtp/statistics/events",
+                headers=headers,
+                params=params,
+            )
+        if r.status_code != 200:
+            return (None, None)
+        data = r.json()
+        if not isinstance(data, dict):
+            return (None, None)
+        events = data.get("events") or []
+        if not events:
+            return (None, None)
+        requests_count = sum(1 for e in events if isinstance(e, dict) and e.get("event") == "requests")
+        opened_count = sum(1 for e in events if isinstance(e, dict) and e.get("event") == "opened")
+        clicks_count = sum(1 for e in events if isinstance(e, dict) and e.get("event") == "clicks")
+        if requests_count <= 0:
+            return (None, None)
+        open_rate = (opened_count / requests_count) * 100.0
+        click_rate = (clicks_count / requests_count) * 100.0
+        return (open_rate, click_rate)
+    except Exception:
+        return (None, None)
+
+
+def _fetch_brevo_email_stats(
+    db: Session, org_id: uuid.UUID, user_id: uuid.UUID, email: str
+) -> dict:
+    """
+    Fetch Brevo campaign stats for a contact and account-level transactional stats.
+    Returns dict: campaign_open_rate, campaign_click_rate, messages_sent,
+                  trans_open_rate, trans_click_rate (optional, account-level).
+    """
     import httpx
     from urllib.parse import quote
     from app.models.oauth_token import OAuthToken, OAuthProvider
     from app.core.encryption import decrypt_token
 
+    out = {
+        "campaign_open_rate": None,
+        "campaign_click_rate": None,
+        "messages_sent": 0,
+        "trans_open_rate": None,
+        "trans_click_rate": None,
+    }
     brevo_token = db.query(OAuthToken).filter(
         OAuthToken.provider == OAuthProvider.BREVO,
         OAuthToken.org_id == org_id,
     ).first()
     if not brevo_token:
-        return None
+        return out
     try:
         access_token = decrypt_token(
             brevo_token.access_token,
             audit_context={"db": db, "org_id": org_id, "user_id": user_id, "resource_type": "brevo_token", "resource_id": str(brevo_token.id)},
         )
     except Exception:
-        return None
+        return out
     headers = {"accept": "application/json", "content-type": "application/json"}
     if getattr(brevo_token, "scope", None) == "api_key":
         headers["api-key"] = access_token
@@ -69,19 +119,34 @@ def _fetch_brevo_open_rate_for_email(db: Session, org_id: uuid.UUID, user_id: uu
         with httpx.Client(timeout=10.0) as client:
             r = client.get(url, headers=headers, params=params)
         if r.status_code != 200:
-            return None
+            trans_open, trans_click = _fetch_brevo_transactional_stats_for_email(headers, email, days=90)
+            out["trans_open_rate"] = trans_open
+            out["trans_click_rate"] = trans_click
+            return out
         data = r.json()
-        # Brevo campaignStats: object with messagesSent (array of events), opened (array of { count, ... })
         if not isinstance(data, dict):
-            return None
+            trans_open, trans_click = _fetch_brevo_transactional_stats_for_email(headers, email, days=90)
+            out["trans_open_rate"] = trans_open
+            out["trans_click_rate"] = trans_click
+            return out
         messages_sent = len(data.get("messagesSent") or [])
+        out["messages_sent"] = messages_sent
+
         opened_list = data.get("opened") or []
         messages_opened = sum(int(item.get("count", 0) or 0) for item in opened_list if isinstance(item, dict))
+        clicked_list = data.get("clicked") or []
+        messages_clicked = sum(int(item.get("count", 0) or 0) for item in clicked_list if isinstance(item, dict))
+
         if messages_sent > 0:
-            return (messages_opened / messages_sent) * 100.0
-        return None
+            out["campaign_open_rate"] = (messages_opened / messages_sent) * 100.0
+            out["campaign_click_rate"] = (messages_clicked / messages_sent) * 100.0
     except Exception:
-        return None
+        pass
+
+    trans_open, trans_click = _fetch_brevo_transactional_stats_for_email(headers, email, days=90)
+    out["trans_open_rate"] = trans_open
+    out["trans_click_rate"] = trans_click
+    return out
 
 
 @router.get("", response_model=List[ClientSchema])
@@ -226,7 +291,7 @@ def get_clients_health_scores(
     clients = db.query(Client).filter(Client.id.in_(uuids), Client.org_id == org_id).all()
     out = {}
     for c in clients:
-        result = get_health_score(db, c.id, org_id, email_open_rate=None)
+        result = get_health_score(db, c.id, org_id, brevo_email_stats=None)
         if result:
             out[str(c.id)] = {"score": result["score"], "grade": result["grade"]}
     return out
@@ -289,7 +354,7 @@ def get_client_health_score(
     if not client:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 
-    email_open_rate = None
+    brevo_stats = None
     emails_to_try = [client.email] if getattr(client, "email", None) else []
     if getattr(client, "emails", None) and isinstance(client.emails, list):
         emails_to_try = list(emails_to_try) + [e for e in client.emails if e and str(e).strip()]
@@ -297,11 +362,13 @@ def get_client_health_score(
         email = str(email).strip().lower()
         if not email:
             continue
-        email_open_rate = _fetch_brevo_open_rate_for_email(db, org_id, current_user.id, email)
-        if email_open_rate is not None:
-            break
+        brevo_stats = _fetch_brevo_email_stats(db, org_id, current_user.id, email)
+        break
 
-    result = get_health_score(db, client_uuid, org_id, email_open_rate=email_open_rate)
+    result = get_health_score(
+        db, client_uuid, org_id,
+        brevo_email_stats=brevo_stats,
+    )
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 

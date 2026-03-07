@@ -39,6 +39,8 @@ class UserSettingsUpdate(BaseModel):
     # Privacy settings
     data_sharing_enabled: Optional[bool] = None
     analytics_enabled: Optional[bool] = None
+    # Intelligence: Fathom API key for call summaries/transcripts
+    fathom_api_key: Optional[str] = None
 
 
 class User(UserBase):

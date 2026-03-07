@@ -295,6 +295,9 @@ def update_user_settings(
             )
         user_row.hashed_password = get_password_hash(settings_data.new_password)
     
+    if settings_data.fathom_api_key is not None:
+        user_row.fathom_api_key = settings_data.fathom_api_key if settings_data.fathom_api_key else None
+    
     db.commit()
     db.refresh(user_row)
     
@@ -322,7 +325,8 @@ def get_user_settings(current_user: User = Depends(get_current_user)):
         "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
         # Default privacy settings (can be stored in DB later)
         "data_sharing_enabled": True,
-        "analytics_enabled": True
+        "analytics_enabled": True,
+        "fathom_api_key": getattr(current_user, "fathom_api_key", None) or None,
     }
 
 
