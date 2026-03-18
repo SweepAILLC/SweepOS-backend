@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import uuid
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from app.models.client import Client
 from app.models.client_checkin import ClientCheckIn
@@ -21,7 +21,10 @@ def _factor_show_rate(db: Session, client_id: uuid.UUID, org_id: uuid.UUID) -> D
     Show rate / check-in rate: of past scheduled (non-cancelled) check-ins, what share were attended (completed, not no-show).
     """
     now = datetime.now(timezone.utc)
-    past = db.query(ClientCheckIn).filter(
+    past = db.query(ClientCheckIn).options(
+        defer(ClientCheckIn.is_sales_call),
+        defer(ClientCheckIn.sale_closed),
+    ).filter(
         ClientCheckIn.client_id == client_id,
         ClientCheckIn.org_id == org_id,
         ClientCheckIn.cancelled == False,
@@ -115,6 +118,10 @@ def _factor_days_since_last_contact(
     # Latest completed check-in
     latest_checkin = (
         db.query(ClientCheckIn)
+        .options(
+            defer(ClientCheckIn.is_sales_call),
+            defer(ClientCheckIn.sale_closed),
+        )
         .filter(
             ClientCheckIn.client_id == client_id,
             ClientCheckIn.org_id == org_id,

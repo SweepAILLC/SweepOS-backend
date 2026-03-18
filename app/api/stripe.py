@@ -252,6 +252,10 @@ def sync_stripe_data(
     """
     Unified sync endpoint: Incremental cursor-based sync with idempotent upserts.
     
+    Financial data persists in the DB; when opening the app after a while we only
+    run incremental sync (no force_full) so existing data is kept and only new
+    or updated records are applied. Use force_full only on first connect.
+    
     Features:
     - Initial historical backfill on first connect (force_full=True)
     - Incremental sync: Only fetches objects updated since last sync (minus buffer)
@@ -262,7 +266,8 @@ def sync_stripe_data(
     Args:
         force_full: If True, performs full historical sync (only needed on first connect)
     """
-    if not check_stripe_connected(db, current_user.org_id):
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    if not check_stripe_connected(db, org_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Stripe not connected. Please connect Stripe via OAuth first."
@@ -271,7 +276,7 @@ def sync_stripe_data(
     from app.services.stripe_sync_v2 import sync_stripe_incremental
     
     try:
-        print(f"[API] Sync requested by user {current_user.id} for org {current_user.org_id} (force_full={force_full}, sync_recent={sync_recent})")
+        print(f"[API] Sync requested by user {current_user.id} for org {org_id} (force_full={force_full}, sync_recent={sync_recent})")
         
         # If sync_recent is True, temporarily modify last_sync_at to look back 24 hours
         if sync_recent:
@@ -279,7 +284,7 @@ def sync_stripe_data(
             from datetime import timedelta
             oauth_token = db.query(OAuthToken).filter(
                 OAuthToken.provider == OAuthProvider.STRIPE,
-                OAuthToken.org_id == current_user.org_id
+                OAuthToken.org_id == org_id
             ).first()
             
             if oauth_token:
@@ -289,13 +294,13 @@ def sync_stripe_data(
                 db.commit()
                 print(f"[API] Temporarily set last_sync_at to {oauth_token.last_sync_at} to sync recent payments")
         
-        sync_result = sync_stripe_incremental(db, org_id=current_user.org_id, force_full=force_full)
+        sync_result = sync_stripe_incremental(db, org_id=org_id, force_full=force_full)
         
         # Restore original last_sync_at if we modified it
         if sync_recent and 'original_last_sync' in locals() and original_last_sync is not None:
             oauth_token = db.query(OAuthToken).filter(
                 OAuthToken.provider == OAuthProvider.STRIPE,
-                OAuthToken.org_id == current_user.org_id
+                OAuthToken.org_id == org_id
             ).first()
             if oauth_token:
                 oauth_token.last_sync_at = original_last_sync

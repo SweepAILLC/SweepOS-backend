@@ -219,6 +219,27 @@ def login(
     )
 
 
+@router.post("/refresh", response_model=Token)
+def refresh_session(current_user: User = Depends(get_current_user)):
+    """
+    Issue a new access token with extended expiry (sliding window).
+    Call this when the same tab/browser is active to avoid re-login.
+    Does not invalidate the previous token; use for keep-alive only.
+    """
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    access_token = create_access_token(
+        data={
+            "sub": current_user.email,
+            "org_id": str(org_id),
+            "user_id": str(current_user.id),
+            "role": current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+        },
+        expires_delta=access_token_expires,
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
 @router.get("/me", response_model=UserSchema)
 def get_current_user_info(current_user: User = Depends(get_current_user)):
     """Get current user info with proper enum serialization"""

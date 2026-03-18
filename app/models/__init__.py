@@ -19,6 +19,7 @@ from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.user_tab_permission import UserTabPermission
 from app.models.user_organization import UserOrganization
 from app.models.audit_log import AuditLog, AuditEventType
+from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -26,6 +27,7 @@ __all__ = [
     "ManualPayment", "ClientCheckIn", "Organization", "Feature",
     "Funnel", "FunnelStep", "Session", "EventError",
     "OrganizationTabPermission", "UserTabPermission", "UserOrganization",
-    "AuditLog", "AuditEventType"
+    "AuditLog", "AuditEventType",
+    "CalendarBookingSales", "EventTypeSalesCall"
 ]
 

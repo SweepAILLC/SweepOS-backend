@@ -2,7 +2,7 @@
 Service to sync calendar events (Cal.com/Calendly) with clients by email matching.
 """
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, text
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 import uuid
@@ -10,6 +10,7 @@ import json
 import re
 from app.models.client import Client, LifecycleState
 from app.models.client_checkin import ClientCheckIn
+from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.core.encryption import decrypt_token
 import httpx
@@ -21,6 +22,28 @@ def normalize_email(email: str) -> str:
     if not email:
         return ""
     return re.sub(r'\s+', '', email.lower().strip())
+
+
+def get_sales_call_flags(
+    db: Session, org_id: uuid.UUID, provider: str, event_id: str, event_type_id: Optional[str] = None
+) -> tuple:
+    """Return (is_sales_call, sale_closed) from CalendarBookingSales or EventTypeSalesCall."""
+    row = db.query(CalendarBookingSales).filter(
+        CalendarBookingSales.org_id == org_id,
+        CalendarBookingSales.provider == provider,
+        CalendarBookingSales.event_id == event_id,
+    ).first()
+    if row:
+        return (row.is_sales_call, row.sale_closed)
+    if event_type_id:
+        et = db.query(EventTypeSalesCall).filter(
+            EventTypeSalesCall.org_id == org_id,
+            EventTypeSalesCall.provider == provider,
+            EventTypeSalesCall.event_type_id == event_type_id,
+        ).first()
+        if et:
+            return (True, None)
+    return (False, None)
 
 
 def ensure_client_for_booking_attendee(
@@ -421,6 +444,10 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                     attendees = booking.get("attendees") or []
                     attendee_absent = any(a.get("absent") for a in attendees if isinstance(a, dict))
                     no_show = bool(absent_host or attendee_absent)
+                    # Sales call flags from calendar_booking_sales or event_type_sales_calls
+                    et = booking.get("eventType") or {}
+                    event_type_id = str(et.get("id") or booking.get("eventTypeId") or "")
+                    is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calcom", event_id, event_type_id or None)
                     
                     if existing_checkin:
                         # Update existing check-in
@@ -432,6 +459,8 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         existing_checkin.completed = completed
                         existing_checkin.cancelled = cancelled
                         existing_checkin.no_show = no_show
+                        existing_checkin.is_sales_call = is_sales_call
+                        existing_checkin.sale_closed = sale_closed
                         existing_checkin.updated_at = datetime.now(timezone.utc)
                         synced_count += 1
                     else:
@@ -451,6 +480,8 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                             completed=completed,
                             cancelled=cancelled,
                             no_show=no_show,
+                            is_sales_call=is_sales_call,
+                            sale_closed=sale_closed,
                             raw_event_data=json.dumps(booking)
                         )
                         db.add(checkin)
@@ -686,6 +717,10 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                     completed = start_time < now
                     cancelled = status == "canceled"
                     no_show = False  # Calendly event-level API does not expose invitee no-show here
+                    event_type_uri = event.get("event_type") or ""
+                    if isinstance(event_type_uri, dict):
+                        event_type_uri = event_type_uri.get("uri") or ""
+                    is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calendly", event_uuid, event_type_uri or None)
                     
                     if existing_checkin:
                         # Update existing check-in
@@ -697,6 +732,8 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         existing_checkin.completed = completed
                         existing_checkin.cancelled = cancelled
                         existing_checkin.no_show = no_show
+                        existing_checkin.is_sales_call = is_sales_call
+                        existing_checkin.sale_closed = sale_closed
                         existing_checkin.updated_at = datetime.now(timezone.utc)
                         synced_count += 1
                     else:
@@ -717,6 +754,8 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                             completed=completed,
                             cancelled=cancelled,
                             no_show=no_show,
+                            is_sales_call=is_sales_call,
+                            sale_closed=sale_closed,
                             raw_event_data=json.dumps(event)
                         )
                         db.add(checkin)
@@ -739,6 +778,80 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
         return 0
 
 
+def _ensure_client_check_ins_table(db: Session) -> None:
+    """Create client_check_ins table and add optional columns if missing (fallback when migrations not run)."""
+    try:
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS client_check_ins (
+                id UUID PRIMARY KEY,
+                org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+                event_id VARCHAR NOT NULL,
+                event_uri VARCHAR,
+                provider VARCHAR NOT NULL,
+                title VARCHAR,
+                start_time TIMESTAMPTZ NOT NULL,
+                end_time TIMESTAMPTZ,
+                location VARCHAR,
+                meeting_url VARCHAR,
+                attendee_email VARCHAR NOT NULL,
+                attendee_name VARCHAR,
+                completed BOOLEAN NOT NULL DEFAULT false,
+                cancelled BOOLEAN NOT NULL DEFAULT false,
+                raw_event_data TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+        """))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[CHECKIN SYNC] ensure client_check_ins create: {e}")
+        raise
+    # Add columns from later migrations if missing
+    for col_sql in (
+        "ALTER TABLE client_check_ins ADD COLUMN IF NOT EXISTS no_show BOOLEAN NOT NULL DEFAULT false",
+        "ALTER TABLE client_check_ins ADD COLUMN IF NOT EXISTS is_sales_call BOOLEAN NOT NULL DEFAULT false",
+        "ALTER TABLE client_check_ins ADD COLUMN IF NOT EXISTS sale_closed BOOLEAN",
+    ):
+        try:
+            db.execute(text(col_sql))
+            db.commit()
+        except Exception as alt_e:
+            db.rollback()
+            print(f"[CHECKIN SYNC] ensure client_check_ins column: {alt_e}")
+    # Create indexes if not exist (idempotent)
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS ix_client_check_ins_org_id ON client_check_ins (org_id)",
+        "CREATE INDEX IF NOT EXISTS ix_client_check_ins_client_id ON client_check_ins (client_id)",
+        "CREATE INDEX IF NOT EXISTS ix_client_check_ins_event_id ON client_check_ins (event_id)",
+        "CREATE INDEX IF NOT EXISTS ix_client_check_ins_start_time ON client_check_ins (start_time)",
+        "CREATE INDEX IF NOT EXISTS ix_client_check_ins_attendee_email ON client_check_ins (attendee_email)",
+    ):
+        try:
+            db.execute(text(idx_sql))
+            db.commit()
+        except Exception as idx_e:
+            db.rollback()
+            print(f"[CHECKIN SYNC] ensure client_check_ins index: {idx_e}")
+    # Unique constraint (one check-in per event per org) - skip if already exists
+    try:
+        db.execute(text("""
+            DO $$ BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'uq_client_check_ins_event_org'
+                ) THEN
+                    ALTER TABLE client_check_ins
+                    ADD CONSTRAINT uq_client_check_ins_event_org UNIQUE (event_id, org_id);
+                END IF;
+            END $$
+        """))
+        db.commit()
+    except Exception as uq_e:
+        db.rollback()
+        print(f"[CHECKIN SYNC] ensure client_check_ins unique: {uq_e}")
+
+
 def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dict[str, int]:
     """Sync check-ins from all connected calendar providers"""
     print(f"[CHECKIN SYNC] ===== STARTING SYNC ======")
@@ -751,21 +864,11 @@ def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dic
     }
     
     try:
-        # Check if table exists by trying a simple query
-        print(f"[CHECKIN SYNC] Checking if client_check_ins table exists...")
-        try:
-            db.query(ClientCheckIn).limit(1).all()
-            print(f"[CHECKIN SYNC] ✅ Table exists")
-        except Exception as e:
-            error_msg = str(e)
-            print(f"[CHECKIN SYNC] ❌ Table check failed: {error_msg}")
-            if "does not exist" in error_msg or "relation" in error_msg.lower():
-                raise Exception(
-                    "client_check_ins table does not exist. Please run database migration 018: "
-                    "`make migrate-up` or `alembic upgrade head`"
-                )
-            raise
-    
+        # Ensure table (and optional columns) exist so sync works even if migrations weren't run
+        print(f"[CHECKIN SYNC] Ensuring client_check_ins table exists...")
+        _ensure_client_check_ins_table(db)
+        print(f"[CHECKIN SYNC] ✅ Table ready")
+        
         print(f"[CHECKIN SYNC] Syncing Cal.com bookings...")
         results["calcom"] = sync_calcom_bookings(db, org_id, user_id)
         print(f"[CHECKIN SYNC] Cal.com sync complete: {results['calcom']} check-ins")

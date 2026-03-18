@@ -11,6 +11,7 @@ from app.models.recommendation import Recommendation
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, Any
+import re
 import uuid
 
 
@@ -282,10 +283,106 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
             except Exception as automation_error:
                 # Don't fail payment processing if automation fails
                 print(f"[CLIENT_AUTOMATION] ⚠️  Error in automation: {str(automation_error)}")
+            # Mark most recent sales call as closed when this client pays (close-rate automation)
+            try:
+                _mark_latest_sales_call_closed(db, org_id, client)
+            except Exception as sales_err:
+                print(f"[SALES_CLOSE] ⚠️  Error marking sales call closed: {str(sales_err)}")
     except Exception as commit_error:
         print(f"❌ ERROR committing payment {payment_id}: {str(commit_error)}")
         db.rollback()
         raise
+
+
+def _mark_latest_sales_call_closed(db: Session, org_id: uuid.UUID, client: Client) -> None:
+    """
+    Mark the single most recent open sales call for this client as closed (payment succeeded).
+    Uses only client_id (client card) so 'paid' is tied to the associated client, not email.
+    Clients can have multiple emails; we do not match by email for closing.
+    """
+    from app.models.client_checkin import ClientCheckIn
+    from app.models.calendar_booking_sales import CalendarBookingSales
+
+    # Only mark by client_id (associated client card) - not by email
+    check_in = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.client_id == client.id,
+            ClientCheckIn.is_sales_call == True,
+            (ClientCheckIn.sale_closed == False) | (ClientCheckIn.sale_closed.is_(None)),
+        )
+        .order_by(ClientCheckIn.start_time.desc())
+        .limit(1)
+        .first()
+    )
+    if not check_in:
+        return
+
+    check_in.sale_closed = True
+    check_in.updated_at = datetime.utcnow()
+    meta = (
+        db.query(CalendarBookingSales)
+        .filter(
+            CalendarBookingSales.org_id == org_id,
+            CalendarBookingSales.provider == check_in.provider,
+            CalendarBookingSales.event_id == check_in.event_id,
+        )
+        .first()
+    )
+    if meta:
+        meta.sale_closed = True
+        meta.updated_at = datetime.utcnow()
+    else:
+        db.add(
+            CalendarBookingSales(
+                org_id=org_id,
+                provider=check_in.provider,
+                event_id=check_in.event_id,
+                event_uri=check_in.event_uri,
+                is_sales_call=True,
+                sale_closed=True,
+            )
+        )
+    db.commit()
+    print(f"[SALES_CLOSE] Marked sales call {check_in.event_id} as closed for client {client.id} after payment")
+
+
+def _unclose_sales_call_for_client(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> None:
+    """Un-close the most recent closed sales call for this client (e.g. after refund)."""
+    from app.models.client_checkin import ClientCheckIn
+    from app.models.calendar_booking_sales import CalendarBookingSales
+
+    check_in = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.client_id == client_id,
+            ClientCheckIn.is_sales_call == True,
+            ClientCheckIn.sale_closed == True,
+        )
+        .order_by(ClientCheckIn.start_time.desc())
+        .limit(1)
+        .first()
+    )
+    if not check_in:
+        return
+    check_in.sale_closed = False
+    check_in.updated_at = datetime.utcnow()
+    meta = (
+        db.query(CalendarBookingSales)
+        .filter(
+            CalendarBookingSales.org_id == org_id,
+            CalendarBookingSales.provider == check_in.provider,
+            CalendarBookingSales.event_id == check_in.event_id,
+        )
+        .first()
+    )
+    if meta:
+        meta.sale_closed = False
+        meta.updated_at = datetime.utcnow()
+    db.commit()
+    print(f"[SALES_CLOSE] Un-closed sales call {check_in.event_id} for client {client_id} after refund")
 
 
 def _process_failed_payment(db: Session, data: Dict[str, Any], event: Dict[str, Any], event_type: str, org_id: uuid.UUID):
@@ -640,18 +737,16 @@ def _process_customer_updated(db: Session, data: Dict[str, Any], org_id: uuid.UU
 
 
 def _process_refund(db: Session, data: Dict[str, Any], org_id: uuid.UUID):
-    """Process refund - mark payment as refunded"""
-    
+    """Process refund - mark payment as refunded and un-close sales call for that client."""
     charge_id = data.get("charge") or data.get("id")
     if not charge_id:
         return
-    
-    # Find payment by charge ID and org_id
+
     payment = db.query(StripePayment).filter(
         StripePayment.stripe_id == charge_id,
         StripePayment.org_id == org_id
     ).first()
-    
+
     if payment:
         payment.status = "refunded"
         payment.updated_at = datetime.utcnow()
@@ -662,4 +757,10 @@ def _process_refund(db: Session, data: Dict[str, Any], org_id: uuid.UUID):
             print(f"❌ ERROR committing refund for payment {charge_id}: {str(commit_error)}")
             db.rollback()
             raise
+        # If this payment was linked to a client, un-close their most recent closed sales call (close rate accuracy)
+        if payment.client_id:
+            try:
+                _unclose_sales_call_for_client(db, org_id, payment.client_id)
+            except Exception as unclose_err:
+                print(f"[SALES_CLOSE] ⚠️  Error un-closing sales call after refund: {str(unclose_err)}")
 

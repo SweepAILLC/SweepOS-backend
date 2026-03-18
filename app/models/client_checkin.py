@@ -35,6 +35,9 @@ class ClientCheckIn(Base):
     completed = Column(Boolean, default=False, nullable=False)  # True if meeting has passed
     cancelled = Column(Boolean, default=False, nullable=False)  # True if event was cancelled
     no_show = Column(Boolean, default=False, nullable=False)  # True if attendee/host was marked no-show
+    # Sales call tracking (for close rate)
+    is_sales_call = Column(Boolean, default=False, nullable=False)
+    sale_closed = Column(Boolean, nullable=True)  # True=closed, False=open, None=not set
     
     # Metadata
     raw_event_data = Column(Text, nullable=True)  # JSON string of full event data for reference

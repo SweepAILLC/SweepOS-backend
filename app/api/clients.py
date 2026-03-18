@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 import re
 from sqlalchemy import desc, func, or_, and_
 from typing import List, Optional, Tuple
@@ -34,50 +34,82 @@ from app.services.client_health_score import get_health_score
 router = APIRouter()
 
 
-def _fetch_brevo_transactional_stats_for_email(
-    headers: dict, email: str, days: int = 90
-) -> Tuple[Optional[float], Optional[float]]:
+def _parse_campaign_stats_response(data: dict) -> Tuple[int, int, int, int, int, int, Optional[float], Optional[float]]:
     """
-    Fetch per-contact transactional email open/click rates from Brevo using the events API.
-    GET /v3/smtp/statistics/events with email filter; date range cannot exceed 90 days.
-    Returns (open_rate, click_rate) or (None, None).
+    Parse Brevo GET /v3/contacts/{identifier}/campaignStats response.
+    Returns (messages_sent, opened_count, clicked_count, trans_sent, trans_opened, trans_clicked,
+             trans_open_rate, trans_click_rate).
+    Transactional stats are derived from items with campaignId == 0 (Brevo convention for transactional).
     """
-    import httpx
-    try:
-        params = {"email": email, "days": min(days, 90), "limit": 2500}
-        with httpx.Client(timeout=15.0) as client:
-            r = client.get(
-                "https://api.brevo.com/v3/smtp/statistics/events",
-                headers=headers,
-                params=params,
-            )
-        if r.status_code != 200:
-            return (None, None)
-        data = r.json()
-        if not isinstance(data, dict):
-            return (None, None)
-        events = data.get("events") or []
-        if not events:
-            return (None, None)
-        requests_count = sum(1 for e in events if isinstance(e, dict) and e.get("event") == "requests")
-        opened_count = sum(1 for e in events if isinstance(e, dict) and e.get("event") == "opened")
-        clicks_count = sum(1 for e in events if isinstance(e, dict) and e.get("event") == "clicks")
-        if requests_count <= 0:
-            return (None, None)
-        open_rate = (opened_count / requests_count) * 100.0
-        click_rate = (clicks_count / requests_count) * 100.0
-        return (open_rate, click_rate)
-    except Exception:
-        return (None, None)
+    messages_sent_list = data.get("messagesSent") or []
+    opened_list = data.get("opened") or []
+    clicked_list = data.get("clicked") or []
+
+    def _campaign_id(item: dict):
+        return item.get("campaignId") if isinstance(item, dict) else None
+
+    # Total campaign (all) stats
+    messages_sent = len(messages_sent_list)
+    messages_opened = sum(int(i.get("count", 0) or 0) for i in opened_list if isinstance(i, dict))
+    # clicked: each item has campaignId and "links" array; each link has "count"
+    messages_clicked = 0
+    for i in clicked_list:
+        if not isinstance(i, dict):
+            continue
+        for link in i.get("links") or []:
+            messages_clicked += int(link.get("count", 0) or 0)
+
+    # Transactional: same endpoint, filter by campaignId == 0 (transactional in Brevo)
+    trans_sent = sum(1 for i in messages_sent_list if _campaign_id(i) == 0)
+    trans_opened = sum(int(i.get("count", 0) or 0) for i in opened_list if isinstance(i, dict) and _campaign_id(i) == 0)
+    trans_clicked = 0
+    for i in clicked_list:
+        if not isinstance(i, dict) or _campaign_id(i) != 0:
+            continue
+        for link in i.get("links") or []:
+            trans_clicked += int(link.get("count", 0) or 0)
+
+    trans_open_rate = (trans_opened / trans_sent * 100.0) if trans_sent > 0 else None
+    trans_click_rate = (trans_clicked / trans_sent * 100.0) if trans_sent > 0 else None
+
+    return messages_sent, messages_opened, messages_clicked, trans_sent, trans_opened, trans_clicked, trans_open_rate, trans_click_rate
+
+
+def _merge_brevo_stats(stats_list: List[dict]) -> Optional[dict]:
+    """
+    Merge Brevo stats from multiple emails into one dict for health score.
+    Sums raw counts (messages_sent, messages_opened, etc.) and recomputes rates.
+    Returns None if no stats had any data.
+    """
+    if not stats_list:
+        return None
+    total_sent = sum(s.get("messages_sent") or 0 for s in stats_list)
+    total_opened = sum(s.get("messages_opened") or 0 for s in stats_list)
+    total_clicked = sum(s.get("messages_clicked") or 0 for s in stats_list)
+    total_trans_sent = sum(s.get("trans_sent") or 0 for s in stats_list)
+    total_trans_opened = sum(s.get("trans_opened") or 0 for s in stats_list)
+    total_trans_clicked = sum(s.get("trans_clicked") or 0 for s in stats_list)
+    if total_sent == 0 and total_trans_sent == 0:
+        return None
+    out = {
+        "campaign_open_rate": (total_opened / total_sent * 100.0) if total_sent > 0 else None,
+        "campaign_click_rate": (total_clicked / total_sent * 100.0) if total_sent > 0 else None,
+        "messages_sent": total_sent,
+        "trans_open_rate": (total_trans_opened / total_trans_sent * 100.0) if total_trans_sent > 0 else None,
+        "trans_click_rate": (total_trans_clicked / total_trans_sent * 100.0) if total_trans_sent > 0 else None,
+    }
+    return out
 
 
 def _fetch_brevo_email_stats(
     db: Session, org_id: uuid.UUID, user_id: uuid.UUID, email: str
 ) -> dict:
     """
-    Fetch Brevo campaign stats for a contact and account-level transactional stats.
+    Fetch Brevo email stats for a contact using GET /v3/contacts/{identifier}/campaignStats.
+    Campaign and transactional open/click rates are derived from the same endpoint (last 90 days).
+    Transactional = events with campaignId == 0 per Brevo; campaign = all other campaignIds.
     Returns dict: campaign_open_rate, campaign_click_rate, messages_sent,
-                  trans_open_rate, trans_click_rate (optional, account-level).
+                  trans_open_rate, trans_click_rate.
     """
     import httpx
     from urllib.parse import quote
@@ -88,6 +120,11 @@ def _fetch_brevo_email_stats(
         "campaign_open_rate": None,
         "campaign_click_rate": None,
         "messages_sent": 0,
+        "messages_opened": 0,
+        "messages_clicked": 0,
+        "trans_sent": 0,
+        "trans_opened": 0,
+        "trans_clicked": 0,
         "trans_open_rate": None,
         "trans_click_rate": None,
     }
@@ -119,33 +156,33 @@ def _fetch_brevo_email_stats(
         with httpx.Client(timeout=10.0) as client:
             r = client.get(url, headers=headers, params=params)
         if r.status_code != 200:
-            trans_open, trans_click = _fetch_brevo_transactional_stats_for_email(headers, email, days=90)
-            out["trans_open_rate"] = trans_open
-            out["trans_click_rate"] = trans_click
             return out
         data = r.json()
         if not isinstance(data, dict):
-            trans_open, trans_click = _fetch_brevo_transactional_stats_for_email(headers, email, days=90)
-            out["trans_open_rate"] = trans_open
-            out["trans_click_rate"] = trans_click
             return out
-        messages_sent = len(data.get("messagesSent") or [])
+        (
+            messages_sent,
+            messages_opened,
+            messages_clicked,
+            trans_sent,
+            trans_opened,
+            trans_clicked,
+            trans_open_rate,
+            trans_click_rate,
+        ) = _parse_campaign_stats_response(data)
         out["messages_sent"] = messages_sent
-
-        opened_list = data.get("opened") or []
-        messages_opened = sum(int(item.get("count", 0) or 0) for item in opened_list if isinstance(item, dict))
-        clicked_list = data.get("clicked") or []
-        messages_clicked = sum(int(item.get("count", 0) or 0) for item in clicked_list if isinstance(item, dict))
-
+        out["messages_opened"] = messages_opened
+        out["messages_clicked"] = messages_clicked
+        out["trans_sent"] = trans_sent
+        out["trans_opened"] = trans_opened
+        out["trans_clicked"] = trans_clicked
         if messages_sent > 0:
             out["campaign_open_rate"] = (messages_opened / messages_sent) * 100.0
             out["campaign_click_rate"] = (messages_clicked / messages_sent) * 100.0
+        out["trans_open_rate"] = trans_open_rate
+        out["trans_click_rate"] = trans_click_rate
     except Exception:
         pass
-
-    trans_open, trans_click = _fetch_brevo_transactional_stats_for_email(headers, email, days=90)
-    out["trans_open_rate"] = trans_open
-    out["trans_click_rate"] = trans_click
     return out
 
 
@@ -354,16 +391,22 @@ def get_client_health_score(
     if not client:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 
-    brevo_stats = None
     emails_to_try = [client.email] if getattr(client, "email", None) else []
     if getattr(client, "emails", None) and isinstance(client.emails, list):
         emails_to_try = list(emails_to_try) + [e for e in client.emails if e and str(e).strip()]
-    for email in emails_to_try:
-        email = str(email).strip().lower()
-        if not email:
-            continue
-        brevo_stats = _fetch_brevo_email_stats(db, org_id, current_user.id, email)
-        break
+    # Normalize and dedupe so we don't hit Brevo twice for the same address
+    seen = set()
+    emails_unique = []
+    for e in emails_to_try:
+        e = str(e).strip().lower()
+        if e and e not in seen:
+            seen.add(e)
+            emails_unique.append(e)
+    all_stats = []
+    for email in emails_unique:
+        s = _fetch_brevo_email_stats(db, org_id, current_user.id, email)
+        all_stats.append(s)
+    brevo_stats = _merge_brevo_stats(all_stats)
 
     result = get_health_score(
         db, client_uuid, org_id,
@@ -1572,12 +1615,21 @@ def get_client_check_ins(
             detail="Client not found"
         )
     
-    # Get check-ins for this client
-    check_ins = db.query(ClientCheckIn).filter(
+    # Get check-ins for this client (defer optional columns so this works when migration 029 not applied)
+    check_ins = db.query(ClientCheckIn).options(
+        defer(ClientCheckIn.is_sales_call),
+        defer(ClientCheckIn.sale_closed),
+    ).filter(
         ClientCheckIn.client_id == client_uuid,
         ClientCheckIn.org_id == current_user.org_id
     ).order_by(desc(ClientCheckIn.start_time)).limit(limit).all()
-    
+
+    def _get_sales_flags(c):
+        try:
+            return getattr(c, "is_sales_call", False), getattr(c, "sale_closed", None)
+        except Exception:
+            return False, None
+
     return [
         {
             "id": str(checkin.id),
@@ -1594,9 +1646,12 @@ def get_client_check_ins(
             "completed": checkin.completed,
             "cancelled": checkin.cancelled,
             "no_show": getattr(checkin, "no_show", False),
+            "is_sales_call": is_sc,
+            "sale_closed": sale_cl,
             "created_at": checkin.created_at.isoformat() if checkin.created_at else None,
         }
         for checkin in check_ins
+        for is_sc, sale_cl in [_get_sales_flags(checkin)]
     ]
 
 
@@ -1606,12 +1661,16 @@ def update_check_in(
     completed: Optional[bool] = Body(None),
     cancelled: Optional[bool] = Body(None),
     no_show: Optional[bool] = Body(None),
+    is_sales_call: Optional[bool] = Body(None),
+    sale_closed: Optional[bool] = Body(None),
+    start_time: Optional[str] = Body(None),
+    end_time: Optional[str] = Body(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Update a check-in (mark as completed/cancelled/no-show or update other fields).
-    Accepts JSON body with optional 'completed', 'cancelled', and 'no_show' boolean fields.
+    Update a check-in (mark as completed/cancelled/no-show/sales call/sale closed).
+    Accepts JSON body with optional 'completed', 'cancelled', 'no_show', 'is_sales_call', 'sale_closed', 'start_time', 'end_time'.
     """
     try:
         check_in_uuid = UUID(check_in_id)
@@ -1621,20 +1680,23 @@ def update_check_in(
             detail="Invalid check-in ID format"
         )
     
-    # Get check-in and verify it belongs to user's org
-    check_in = db.query(ClientCheckIn).filter(
+    # Get check-in and verify it belongs to user's org (defer optional columns for pre-029 DBs)
+    check_in = db.query(ClientCheckIn).options(
+        defer(ClientCheckIn.is_sales_call),
+        defer(ClientCheckIn.sale_closed),
+    ).filter(
         and_(
             ClientCheckIn.id == check_in_uuid,
             ClientCheckIn.org_id == current_user.org_id
         )
     ).first()
-    
+
     if not check_in:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Check-in not found"
         )
-    
+
     # Update fields
     if completed is not None:
         check_in.completed = completed
@@ -1642,6 +1704,24 @@ def update_check_in(
         check_in.cancelled = cancelled
     if no_show is not None:
         check_in.no_show = no_show
+    if is_sales_call is not None:
+        check_in.is_sales_call = is_sales_call
+    if sale_closed is not None:
+        check_in.sale_closed = sale_closed
+
+    # Allow rescheduling only for manually created check-ins.
+    if start_time is not None or end_time is not None:
+        if getattr(check_in, "provider", None) != "manual":
+            raise HTTPException(status_code=400, detail="Only manual check-ins can be rescheduled")
+
+        def _parse_iso_dt(s: str) -> datetime:
+            # Handle Cal.com / client inputs with trailing 'Z'
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+        if start_time is not None:
+            check_in.start_time = _parse_iso_dt(start_time)
+        if end_time is not None:
+            check_in.end_time = _parse_iso_dt(end_time)
     
     check_in.updated_at = datetime.now(timezone.utc)
     
@@ -1664,6 +1744,8 @@ def update_check_in(
             "completed": check_in.completed,
             "cancelled": check_in.cancelled,
             "no_show": getattr(check_in, "no_show", False),
+            "is_sales_call": getattr(check_in, "is_sales_call", False),
+            "sale_closed": getattr(check_in, "sale_closed", None),
             "created_at": check_in.created_at.isoformat() if check_in.created_at else None,
         }
     except Exception as e:
@@ -1691,14 +1773,17 @@ def delete_check_in(
             detail="Invalid check-in ID format"
         )
     
-    # Get check-in and verify it belongs to user's org
-    check_in = db.query(ClientCheckIn).filter(
+    # Get check-in and verify it belongs to user's org (defer optional columns for pre-029 DBs)
+    check_in = db.query(ClientCheckIn).options(
+        defer(ClientCheckIn.is_sales_call),
+        defer(ClientCheckIn.sale_closed),
+    ).filter(
         and_(
             ClientCheckIn.id == check_in_uuid,
             ClientCheckIn.org_id == current_user.org_id
         )
     ).first()
-    
+
     if not check_in:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1726,12 +1811,14 @@ def create_manual_check_in(
     completed: Optional[bool] = Body(False),
     cancelled: Optional[bool] = Body(False),
     no_show: Optional[bool] = Body(False),
+    is_sales_call: Optional[bool] = Body(False),
+    sale_closed: Optional[bool] = Body(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
     Create a manual check-in for a client (for days without calendar bookings).
-    Optional status: completed, cancelled, no_show (all default False).
+    Optional status: completed, cancelled, no_show, is_sales_call (default False); sale_closed (default None).
     """
     try:
         client_uuid = UUID(client_id)
@@ -1777,6 +1864,8 @@ def create_manual_check_in(
         completed=completed or False,
         cancelled=cancelled or False,
         no_show=no_show or False,
+        is_sales_call=is_sales_call or False,
+        sale_closed=sale_closed,
     )
     
     try:
@@ -1799,6 +1888,8 @@ def create_manual_check_in(
             "completed": manual_check_in.completed,
             "cancelled": manual_check_in.cancelled,
             "no_show": getattr(manual_check_in, "no_show", False),
+            "is_sales_call": getattr(manual_check_in, "is_sales_call", False),
+            "sale_closed": getattr(manual_check_in, "sale_closed", None),
             "created_at": manual_check_in.created_at.isoformat() if manual_check_in.created_at else None,
         }
     except Exception as e:
@@ -1839,9 +1930,12 @@ def get_next_check_in(
             detail="Client not found"
         )
     
-    # Get next upcoming check-in (not completed, not cancelled, not no-show, in the future)
+    # Get next upcoming check-in (defer optional columns for pre-029 DBs)
     now = datetime.now(timezone.utc)
-    next_checkin = db.query(ClientCheckIn).filter(
+    next_checkin = db.query(ClientCheckIn).options(
+        defer(ClientCheckIn.is_sales_call),
+        defer(ClientCheckIn.sale_closed),
+    ).filter(
         ClientCheckIn.client_id == client_uuid,
         ClientCheckIn.org_id == current_user.org_id,
         ClientCheckIn.completed == False,

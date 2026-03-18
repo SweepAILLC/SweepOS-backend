@@ -74,10 +74,11 @@ class CalComBooking(BaseModel):
     updatedAt: Optional[str] = None
     rating: Optional[int] = None
     guests: Optional[List[str]] = None
-    responses: Optional[dict] = None  # Form responses from booking questions
+    responses: Optional[dict] = None  # Form responses (mapped from bookingFieldsResponses)
+    bookingFieldsResponses: Optional[dict] = None  # Cal.com JSON: booking field slug -> value
     bookingFields: Optional[List[dict]] = None  # Custom booking fields and their responses
     routingFormResponses: Optional[List[dict]] = None  # Routing form responses matched by booking UID
-    
+
     class Config:
         extra = "allow"  # Allow extra fields from Cal.com API
 

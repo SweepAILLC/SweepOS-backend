@@ -19,6 +19,8 @@ def get_current_user(
     """
     Get current authenticated user and verify org_id matches token.
     This enforces org isolation: users can only access data from their org.
+    Session is not bound to IP so users are not forced to re-login on IP change
+    (e.g. switching networks or VPN); IP may still be logged for audit elsewhere.
     """
     token = credentials.credentials
     payload = decode_access_token(token)

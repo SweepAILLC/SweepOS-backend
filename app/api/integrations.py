@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request, Body
 from sqlalchemy.orm import Session
+from sqlalchemy import func, case, and_, exists
 from app.db.session import get_db
 from app.schemas.integration import (
     BrevoStatus, CalComStatus, CalComBooking, CalComEventType,
@@ -16,16 +17,66 @@ from app.schemas.brevo import (
     BrevoAnalyticsResponse, BrevoAccountStatistics, BrevoTransactionalStatistics, BrevoCampaignStatistics
 )
 from app.models.client import Client, LifecycleState
+from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
+from app.models.client_checkin import ClientCheckIn
+from app.models.stripe_payment import StripePayment
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.core.encryption import decrypt_token
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 import uuid
 import httpx
 
 router = APIRouter()
+
+
+def get_calendar_booking_sales_metadata(
+    db: Session,
+    org_id: uuid.UUID,
+    provider: str,
+    booking_keys: List[Tuple[str, str]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    For each (event_id, event_type_id), return is_sales_call and sale_closed.
+    booking_keys: list of (event_id, event_type_identifier).
+    Returns empty dict if tables don't exist (migration 029 not applied).
+    """
+    if not booking_keys:
+        return {}
+    try:
+        event_ids = [k[0] for k in booking_keys]
+        # Per-booking metadata
+        rows = db.query(CalendarBookingSales).filter(
+            CalendarBookingSales.org_id == org_id,
+            CalendarBookingSales.provider == provider,
+            CalendarBookingSales.event_id.in_(event_ids),
+        ).all()
+        by_event = {r.event_id: {"is_sales_call": r.is_sales_call, "sale_closed": r.sale_closed} for r in rows}
+        # Event types marked as sales call
+        type_ids = list({k[1] for k in booking_keys if k[1]})
+        sales_event_types = set()
+        if type_ids:
+            type_rows = db.query(EventTypeSalesCall.event_type_id).filter(
+                EventTypeSalesCall.org_id == org_id,
+                EventTypeSalesCall.provider == provider,
+                EventTypeSalesCall.event_type_id.in_(type_ids),
+            ).all()
+            sales_event_types = {r[0] for r in type_rows}
+        result = {}
+        for event_id, event_type_id in booking_keys:
+            if event_id in by_event:
+                result[event_id] = by_event[event_id]
+            elif event_type_id and event_type_id in sales_event_types:
+                result[event_id] = {"is_sales_call": True, "sale_closed": None}
+            else:
+                result[event_id] = {"is_sales_call": False, "sale_closed": None}
+        return result
+    except Exception as e:
+        # Tables calendar_booking_sales / event_type_sales_calls may not exist yet (migration 029)
+        print(f"[CALENDAR SALES] Could not load sales metadata: {e}")
+        return {}
 
 
 def get_brevo_auth_headers(
@@ -411,40 +462,30 @@ def get_calcom_auth_headers(
 
 
 # IMPORTANT: Using singular "booking" to avoid route conflicts with plural "bookings"
-# FastAPI matches routes in order, but using a different base path is more reliable
 # This route MUST be defined before /calcom/bookings to ensure proper matching
-# Route path: /integrations/calcom/booking/{booking_id}
-@router.get("/calcom/booking/{booking_id}")
+# Cal.com API v2: GET /v2/bookings/{bookingUid} (bookingUid is string UUID, not numeric id)
+# Docs: cal-api-version header 2026-02-25 for Get a booking
+@router.get("/calcom/booking/{booking_uid:path}")
 def get_calcom_booking_details(
-    booking_id: int,
+    booking_uid: str,
     request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Get detailed information for a specific Cal.com booking, including form responses.
-    This endpoint fetches:
-    - Full booking details from Cal.com API
-    - Routing form responses matched by booking UID (or email as fallback)
-    - All pre-call client information
-    
-    Route: GET /integrations/calcom/booking/{booking_id}
+    Get detailed information for a specific Cal.com booking by UID, including form responses.
+    Uses Cal.com API GET /v2/bookings/{bookingUid} with cal-api-version: 2026-02-25.
+    Fetches full booking (including bookingFieldsResponses) and routing form responses.
     """
     print(f"[CALCOM BOOKING DETAILS] ===== ENDPOINT CALLED =====")
-    print(f"[CALCOM BOOKING DETAILS] Route: /integrations/calcom/booking/{booking_id}")
-    print(f"[CALCOM BOOKING DETAILS] Request URL: {request.url}")
-    print(f"[CALCOM BOOKING DETAILS] Request path: {request.url.path}")
-    print(f"[CALCOM BOOKING DETAILS] booking_id: {booking_id}, type: {type(booking_id)}")
-    # Get selected org_id from user object (set by get_current_user)
+    print(f"[CALCOM BOOKING DETAILS] booking_uid: {booking_uid}")
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
-    print(f"[CALCOM BOOKING DETAILS] user: {current_user.id}, org: {org_id}")
-    headers = get_calcom_auth_headers(db, org_id, current_user.id)
-    
+    # API version required by Cal.com for Get a booking (2026-02-25)
+    headers = get_calcom_auth_headers(db, org_id, current_user.id, api_version="2026-02-25")
+
     try:
-        # Fetch the specific booking
         response = httpx.get(
-            f"https://api.cal.com/v2/bookings/{booking_id}",
+            f"https://api.cal.com/v2/bookings/{booking_uid}",
             headers=headers,
             timeout=30.0
         )
@@ -463,14 +504,20 @@ def get_calcom_booking_details(
                     detail=f"Cal.com API error: {error_msg}"
                 )
             
-            booking_data = api_response.get("data", {})
+            raw_data = api_response.get("data")
+            # API can return a single booking object or an array (recurring)
+            if isinstance(raw_data, list):
+                booking_data = raw_data[0] if raw_data else {}
+            elif isinstance(raw_data, dict):
+                booking_data = raw_data
+            else:
+                booking_data = {}
             if not booking_data:
                 print(f"[CALCOM BOOKING DETAILS] WARNING: No booking data in response")
                 raise HTTPException(
                     status_code=404,
                     detail="Booking not found or no data returned"
                 )
-            
             print(f"[CALCOM BOOKING DETAILS] Booking data keys: {list(booking_data.keys())}")
             booking_uid = booking_data.get("uid")
             booking_email = None
@@ -578,6 +625,27 @@ def get_calcom_booking_details(
                     import traceback
                     traceback.print_exc()
             
+            # Sales call metadata
+            event_id = booking_data.get("uid") or str(booking_data.get("id", ""))
+            et = booking_data.get("eventType") or {}
+            event_type_id = str(et.get("id") or booking_data.get("eventTypeId") or "")
+            sales_meta = get_calendar_booking_sales_metadata(db, org_id, "calcom", [(event_id, event_type_id)])
+            meta = sales_meta.get(event_id, {"is_sales_call": False, "sale_closed": None})
+
+            # Form response data: prefer "bookingFieldsResponses" from Cal.com JSON (slug -> value).
+            # API may return camelCase or snake_case; fallback to "responses" if present.
+            booking_fields_responses = (
+                booking_data.get("bookingFieldsResponses")
+                or booking_data.get("booking_fields_responses")
+            )
+            if not isinstance(booking_fields_responses, dict):
+                booking_fields_responses = {}
+            api_responses = booking_data.get("responses")
+            if isinstance(api_responses, dict) and not booking_fields_responses:
+                booking_fields_responses = api_responses
+            form_responses = dict(booking_fields_responses)
+            print(f"[CALCOM BOOKING DETAILS] Form responses keys: {list(form_responses.keys())}")
+
             # Transform to our schema format
             transformed_booking = {
                 **booking_data,
@@ -585,26 +653,34 @@ def get_calcom_booking_details(
                 "endTime": booking_data.get("end"),
                 "user": booking_data.get("hosts", [{}])[0] if booking_data.get("hosts") else None,
                 "eventType": booking_data.get("eventType", {}),
-                "routingFormResponses": routing_form_responses  # Add routing form responses
+                "responses": form_responses,
+                "bookingFieldsResponses": booking_fields_responses,
+                "routingFormResponses": routing_form_responses,
+                "is_sales_call": meta["is_sales_call"],
+                "sale_closed": meta["sale_closed"],
             }
             
             try:
                 result = CalComBooking(**transformed_booking)
-                print(f"[CALCOM BOOKING DETAILS] Successfully fetched booking: {result.id} with {len(routing_form_responses)} routing form responses")
-                # Return as dict to avoid Pydantic validation issues
-                return result.model_dump() if hasattr(result, 'model_dump') else result.dict()
+                print(f"[CALCOM BOOKING DETAILS] Successfully fetched booking: {result.id} with {len(routing_form_responses)} routing form responses, {len(form_responses)} form field(s)")
+                out = result.model_dump() if hasattr(result, 'model_dump') else result.dict()
+                # Ensure form data is always present (Pydantic may omit None or extra)
+                if "responses" not in out or out.get("responses") is None:
+                    out["responses"] = form_responses
+                if "bookingFieldsResponses" not in out or out.get("bookingFieldsResponses") is None:
+                    out["bookingFieldsResponses"] = booking_fields_responses
+                return out
             except Exception as e:
                 print(f"[CALCOM BOOKING DETAILS] Error creating CalComBooking object: {e}")
                 print(f"[CALCOM BOOKING DETAILS] Transformed booking keys: {list(transformed_booking.keys())}")
                 import traceback
                 traceback.print_exc()
-                # Return raw data if Pydantic validation fails
                 return transformed_booking
         elif response.status_code == 404:
-            print(f"[CALCOM BOOKING DETAILS] Booking {booking_id} not found in Cal.com API")
+            print(f"[CALCOM BOOKING DETAILS] Booking {booking_uid} not found in Cal.com API")
             raise HTTPException(
                 status_code=404,
-                detail=f"Booking {booking_id} not found"
+                detail=f"Booking not found"
             )
         else:
             error_text = response.text[:500] if hasattr(response, 'text') else "Unknown error"
@@ -697,18 +773,30 @@ def get_calcom_bookings(
             total_items = pagination.get("totalItems", len(bookings_data))
             print(f"[CALCOM BOOKINGS] Pagination info: {pagination}")
             
+            # Build booking keys for sales metadata (event_id, event_type_id)
+            booking_keys = []
+            for booking in bookings_data:
+                event_id = booking.get("uid") or str(booking.get("id", ""))
+                et = booking.get("eventType") or {}
+                event_type_id = str(et.get("id") or booking.get("eventTypeId") or "")
+                booking_keys.append((event_id, event_type_id))
+            sales_meta = get_calendar_booking_sales_metadata(db, org_id, "calcom", booking_keys)
+            
             # Parse bookings, handling any validation errors gracefully
             bookings = []
             for idx, booking in enumerate(bookings_data):
                 try:
+                    event_id = booking.get("uid") or str(booking.get("id", ""))
+                    meta = sales_meta.get(event_id, {"is_sales_call": False, "sale_closed": None})
                     # Transform Cal.com API fields to our schema format
-                    # Cal.com uses 'start'/'end', we use 'startTime'/'endTime'
                     transformed_booking = {
                         **booking,
-                        "startTime": booking.get("start"),  # Map 'start' to 'startTime'
-                        "endTime": booking.get("end"),  # Map 'end' to 'endTime'
-                        "user": booking.get("hosts", [{}])[0] if booking.get("hosts") else None,  # Map 'hosts' to 'user'
-                        "eventType": booking.get("eventType", {})  # Keep as is
+                        "startTime": booking.get("start"),
+                        "endTime": booking.get("end"),
+                        "user": booking.get("hosts", [{}])[0] if booking.get("hosts") else None,
+                        "eventType": booking.get("eventType", {}),
+                        "is_sales_call": meta["is_sales_call"],
+                        "sale_closed": meta["sale_closed"],
                     }
                     print(f"[CALCOM BOOKINGS] Parsing booking {idx}: {booking.get('id', 'unknown')}")
                     bookings.append(CalComBooking(**transformed_booking))
@@ -1204,15 +1292,30 @@ def get_calendly_scheduled_events(
             
             print(f"[CALENDLY EVENTS] Found {len(collection_data)} scheduled events")
             
+            # Build keys for sales metadata (event_id, event_type_uri)
+            booking_keys = []
+            for event in collection_data:
+                uri = event.get("uri") or ""
+                event_id = uri.split("/")[-1] if uri else str(event.get("event_type", ""))
+                event_type_uri = event.get("event_type") or ""
+                if isinstance(event_type_uri, dict):
+                    event_type_uri = event_type_uri.get("uri") or ""
+                booking_keys.append((event_id, event_type_uri))
+            sales_meta = get_calendar_booking_sales_metadata(db, org_id, "calendly", booking_keys)
+            
             # Parse scheduled events
             scheduled_events = []
             for idx, event in enumerate(collection_data):
                 try:
-                    # Transform Calendly API fields to our schema format
+                    uri = event.get("uri") or ""
+                    event_id = uri.split("/")[-1] if uri else ""
+                    meta = sales_meta.get(event_id, {"is_sales_call": False, "sale_closed": None})
                     transformed_event = {
                         **event,
-                        "start_time": event.get("start_time"),  # ISO 8601
-                        "end_time": event.get("end_time"),  # ISO 8601
+                        "start_time": event.get("start_time"),
+                        "end_time": event.get("end_time"),
+                        "is_sales_call": meta["is_sales_call"],
+                        "sale_closed": meta["sale_closed"],
                     }
                     print(f"[CALENDLY EVENTS] Parsing event {idx}: {event.get('uri', 'unknown')}")
                     scheduled_events.append(CalendlyScheduledEvent(**transformed_event))
@@ -3042,9 +3145,12 @@ def get_calendar_upcoming_summary(
         # Fetch only manual check-ins from database (exclude calcom/calendly - those are already
         # in all_bookings from the API; including them would show duplicates)
         from app.models.client_checkin import ClientCheckIn
-        from sqlalchemy.orm import joinedload
+        from sqlalchemy.orm import joinedload, defer
+        # Defer optional columns so this works when migration 029 (is_sales_call/sale_closed) is not yet applied
         manual_check_ins = db.query(ClientCheckIn).options(
-            joinedload(ClientCheckIn.client)
+            joinedload(ClientCheckIn.client),
+            defer(ClientCheckIn.is_sales_call),
+            defer(ClientCheckIn.sale_closed),
         ).filter(
             ClientCheckIn.org_id == org_id,
             ClientCheckIn.provider == "manual",
@@ -3122,7 +3228,20 @@ def get_calendar_upcoming_summary(
                 
                 # Upcoming (from now onwards)
                 if start_time >= now:
-                    upcoming_bookings.append(booking)
+                    # Terminal notifications should not include cancelled appointments.
+                    # Manual check-ins are already filtered to exclude cancelled/no-show above.
+                    booking_provider = booking.get("provider")
+                    booking_status = booking.get("status")
+                    is_cancelled = False
+
+                    if booking_provider != "manual":
+                        if provider == "calcom":
+                            is_cancelled = booking_status in {"cancelled", "rejected"}
+                        elif provider == "calendly":
+                            is_cancelled = booking_status in {"canceled", "cancelled"}
+
+                    if not is_cancelled:
+                        upcoming_bookings.append(booking)
                 
                 # Last week (7 days ago to now)
                 if one_week_ago <= start_time < now:
@@ -3251,6 +3370,396 @@ def get_calendar_upcoming_summary(
         )
 
 
+@router.get("/calendar/manual-events")
+def get_calendar_manual_events(
+    start: str,
+    end: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Return manual check-ins for the org within the given date range (start/end as YYYY-MM-DD).
+    Used by the calendar grid to show manual bookings alongside Cal.com/Calendly events.
+    """
+    from sqlalchemy.orm import joinedload
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    try:
+        start_dt = datetime.fromisoformat(start + "T00:00:00").replace(tzinfo=None)
+        end_dt = datetime.fromisoformat(end + "T23:59:59").replace(tzinfo=None)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="start and end must be YYYY-MM-DD")
+    from datetime import timezone
+    start_dt = start_dt.replace(tzinfo=timezone.utc)
+    end_dt = end_dt.replace(tzinfo=timezone.utc)
+    manual_check_ins = db.query(ClientCheckIn).options(
+        joinedload(ClientCheckIn.client),
+    ).filter(
+        ClientCheckIn.org_id == org_id,
+        ClientCheckIn.provider == "manual",
+        ClientCheckIn.start_time >= start_dt,
+        ClientCheckIn.start_time <= end_dt,
+    ).order_by(ClientCheckIn.start_time).all()
+    out = []
+    for check_in in manual_check_ins:
+        client_name = None
+        if check_in.client:
+            client_name = f"{check_in.client.first_name or ''} {check_in.client.last_name or ''}".strip() or check_in.client.email
+        elif check_in.attendee_name:
+            client_name = check_in.attendee_name
+        out.append({
+            "id": f"manual_{check_in.id}",
+            "title": check_in.title or "Manual Check-In",
+            "start_time": check_in.start_time.isoformat() if check_in.start_time else None,
+            "end_time": check_in.end_time.isoformat() if check_in.end_time else None,
+            "provider": "manual",
+            "is_sales_call": getattr(check_in, "is_sales_call", False),
+            "sale_closed": getattr(check_in, "sale_closed", None),
+            "completed": check_in.completed,
+            "cancelled": check_in.cancelled,
+            "no_show": getattr(check_in, "no_show", False),
+            "client_name": client_name,
+        })
+    return out
+
+
+# ---------- Calendar sales call tracking (sales vs check-in, close rate) ----------
+
+
+def _ensure_calendar_sales_tables(db: Session) -> None:
+    """Create calendar_booking_sales and event_type_sales_calls if they don't exist (fallback when migrations didn't run or DB mismatch)."""
+    from sqlalchemy import text
+    try:
+        # event_type_sales_calls
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS event_type_sales_calls (
+                id UUID PRIMARY KEY,
+                org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                provider VARCHAR(20) NOT NULL,
+                event_type_id VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+            )
+        """))
+        db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_event_type_sales_calls_org_provider ON event_type_sales_calls (org_id, provider, event_type_id)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_event_type_sales_calls_org_id ON event_type_sales_calls (org_id)"))
+        # calendar_booking_sales
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS calendar_booking_sales (
+                id UUID PRIMARY KEY,
+                org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                provider VARCHAR(20) NOT NULL,
+                event_id VARCHAR(255) NOT NULL,
+                event_uri VARCHAR(512),
+                is_sales_call BOOLEAN NOT NULL DEFAULT false,
+                sale_closed BOOLEAN,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+                updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+            )
+        """))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_calendar_booking_sales_org_id ON calendar_booking_sales (org_id)"))
+        db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_calendar_booking_sales_provider_event_id ON calendar_booking_sales (org_id, provider, event_id)"))
+        # Add is_sales_call / sale_closed to client_check_ins if missing (migration 029)
+        try:
+            db.execute(text("""
+                ALTER TABLE client_check_ins
+                ADD COLUMN IF NOT EXISTS is_sales_call BOOLEAN NOT NULL DEFAULT false
+            """))
+            db.execute(text("""
+                ALTER TABLE client_check_ins
+                ADD COLUMN IF NOT EXISTS sale_closed BOOLEAN
+            """))
+        except Exception as alt_e:
+            print(f"[CALENDAR SALES] ensure client_check_ins columns: {alt_e}")
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[CALENDAR SALES] ensure tables failed: {e}")
+        raise
+
+
+@router.get("/calendar/sales-close-rate")
+def get_calendar_sales_close_rate(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Return sales close rates from client check-ins (sales calls taken).
+
+    Closed is derived from client_id + whether the client has at least one succeeded Stripe payment.
+    So 'closed' is derived from payment status, not a stored flag.
+
+    Cancelled check-ins are excluded from both totals and closed counts.
+    """
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    try:
+        from datetime import timezone
+        now = datetime.now(timezone.utc)
+        start_30d = now - timedelta(days=30)
+
+        # Sales close rate should align with the Past table (Cal.com/Calendly events),
+        # so exclude "manual" check-ins from the computation.
+        base_filter = (
+            (ClientCheckIn.org_id == org_id) &
+            (ClientCheckIn.is_sales_call == True) &
+            (ClientCheckIn.cancelled == False) &
+            (ClientCheckIn.provider.in_(["calcom", "calendly"]))
+        )
+        # Close-rate should be based on past sales calls (matches the "Past" table).
+        past_filter = base_filter & (ClientCheckIn.start_time < now)
+
+        total_all_time = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(past_filter)
+            .scalar()
+        ) or 0
+        total_last_30d = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(
+                past_filter,
+                ClientCheckIn.start_time >= start_30d
+            )
+            .scalar()
+        ) or 0
+
+        # Closed = sales calls whose client (client_id) has at least one succeeded payment
+        has_succeeded_payment = exists().where(
+            and_(
+                StripePayment.client_id == ClientCheckIn.client_id,
+                StripePayment.org_id == org_id,
+                StripePayment.status == "succeeded",
+            )
+        )
+
+        closed_all_time = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(
+                past_filter,
+                has_succeeded_payment,
+            )
+            .scalar()
+        ) or 0
+        closed_last_30d = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(
+                past_filter,
+                ClientCheckIn.start_time >= start_30d,
+                has_succeeded_payment,
+            )
+            .scalar()
+        ) or 0
+
+        close_rate_pct_all_time = round((closed_all_time / total_all_time) * 100) if total_all_time else 0
+        close_rate_pct_last_30d = round((closed_last_30d / total_last_30d) * 100) if total_last_30d else 0
+        return {
+            "all_time": {
+                "total_sales_calls": total_all_time,
+                "closed_count": closed_all_time,
+                "close_rate_pct": close_rate_pct_all_time,
+            },
+            "last_30d": {
+                "total_sales_calls": total_last_30d,
+                "closed_count": closed_last_30d,
+                "close_rate_pct": close_rate_pct_last_30d,
+            },
+        }
+    except Exception as e:
+        print(f"[CALENDAR SALES] Could not compute close rate: {e}")
+        return {
+            "all_time": {"total_sales_calls": 0, "closed_count": 0, "close_rate_pct": 0},
+            "last_30d": {"total_sales_calls": 0, "closed_count": 0, "close_rate_pct": 0},
+        }
+
+
+@router.patch("/calendar/bookings/sales")
+def update_calendar_booking_sales(
+    provider: str = Body(..., embed=True),
+    event_id: str = Body(..., embed=True),
+    event_uri: Optional[str] = Body(None, embed=True),
+    is_sales_call: Optional[bool] = Body(None, embed=True),
+    sale_closed: Optional[bool] = Body(None, embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Mark a calendar booking as sales call and/or set sale closed.
+    Updates calendar_booking_sales and any matching client_check_in.
+    """
+    if provider not in ("calcom", "calendly"):
+        raise HTTPException(status_code=400, detail="provider must be 'calcom' or 'calendly'")
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    
+    row = db.query(CalendarBookingSales).filter(
+        CalendarBookingSales.org_id == org_id,
+        CalendarBookingSales.provider == provider,
+        CalendarBookingSales.event_id == event_id,
+    ).first()
+    
+    if row:
+        if is_sales_call is not None:
+            row.is_sales_call = is_sales_call
+        if sale_closed is not None:
+            row.sale_closed = sale_closed
+        if event_uri is not None:
+            row.event_uri = event_uri
+        row.updated_at = datetime.utcnow()
+    else:
+        row = CalendarBookingSales(
+            org_id=org_id,
+            provider=provider,
+            event_id=event_id,
+            event_uri=event_uri,
+            is_sales_call=is_sales_call if is_sales_call is not None else False,
+            sale_closed=sale_closed,
+        )
+        db.add(row)
+    
+    # Update any synced client_check_in for this event (match by event_id; Calendly uses uuid)
+    check_in = db.query(ClientCheckIn).filter(
+        ClientCheckIn.org_id == org_id,
+        ClientCheckIn.provider == provider,
+        ClientCheckIn.event_id == event_id,
+    ).first()
+    if check_in:
+        if is_sales_call is not None:
+            check_in.is_sales_call = is_sales_call
+        if sale_closed is not None:
+            check_in.sale_closed = sale_closed
+        check_in.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(row)
+    return {
+        "event_id": event_id,
+        "provider": provider,
+        "is_sales_call": row.is_sales_call,
+        "sale_closed": row.sale_closed,
+    }
+
+
+@router.get("/calendar/event-types/sales-call")
+def list_sales_call_event_types(
+    provider: str = Query(..., description="calcom or calendly"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """List event type IDs/URIs marked as sales calls."""
+    if provider not in ("calcom", "calendly"):
+        raise HTTPException(status_code=400, detail="provider must be 'calcom' or 'calendly'")
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    try:
+        rows = db.query(EventTypeSalesCall).filter(
+            EventTypeSalesCall.org_id == org_id,
+            EventTypeSalesCall.provider == provider,
+        ).all()
+        return {"event_type_ids": [r.event_type_id for r in rows]}
+    except Exception as e:
+        err_msg = str(e)
+        if "does not exist" in err_msg or "relation" in err_msg.lower():
+            try:
+                _ensure_calendar_sales_tables(db)
+                rows = db.query(EventTypeSalesCall).filter(
+                    EventTypeSalesCall.org_id == org_id,
+                    EventTypeSalesCall.provider == provider,
+                ).all()
+                return {"event_type_ids": [r.event_type_id for r in rows]}
+            except Exception:
+                return {"event_type_ids": []}
+        raise
+
+
+@router.post("/calendar/event-types/sales-call")
+def add_sales_call_event_type(
+    provider: str = Body(..., embed=True),
+    event_type_id: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Mark an event type as sales call (all new bookings of this type = sales call)."""
+    if provider not in ("calcom", "calendly"):
+        raise HTTPException(status_code=400, detail="provider must be 'calcom' or 'calendly'")
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    if org_id is None:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    if not event_type_id or not str(event_type_id).strip():
+        raise HTTPException(status_code=400, detail="event_type_id is required")
+    event_type_id = str(event_type_id).strip()
+    try:
+        existing = db.query(EventTypeSalesCall).filter(
+            EventTypeSalesCall.org_id == org_id,
+            EventTypeSalesCall.provider == provider,
+            EventTypeSalesCall.event_type_id == event_type_id,
+        ).first()
+        if existing:
+            return {"event_type_id": event_type_id, "provider": provider, "already_added": True}
+        row = EventTypeSalesCall(
+            id=uuid.uuid4(),
+            org_id=org_id,
+            provider=provider,
+            event_type_id=event_type_id,
+        )
+        db.add(row)
+        db.commit()
+        return {"event_type_id": event_type_id, "provider": provider}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        err_msg = str(e)
+        if "does not exist" in err_msg or "relation" in err_msg.lower():
+            try:
+                _ensure_calendar_sales_tables(db)
+                # Retry insert
+                existing = db.query(EventTypeSalesCall).filter(
+                    EventTypeSalesCall.org_id == org_id,
+                    EventTypeSalesCall.provider == provider,
+                    EventTypeSalesCall.event_type_id == event_type_id,
+                ).first()
+                if existing:
+                    return {"event_type_id": event_type_id, "provider": provider, "already_added": True}
+                row = EventTypeSalesCall(
+                    id=uuid.uuid4(),
+                    org_id=org_id,
+                    provider=provider,
+                    event_type_id=event_type_id,
+                )
+                db.add(row)
+                db.commit()
+                return {"event_type_id": event_type_id, "provider": provider}
+            except Exception as e2:
+                db.rollback()
+                print(f"[CALENDAR SALES] add_sales_call_event_type retry/ensure error: {e2}")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Calendar sales tables could not be created. Run database migrations: alembic upgrade head"
+                )
+        print(f"[CALENDAR SALES] add_sales_call_event_type error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to mark event type as sales call: {err_msg}"
+        )
+
+
+@router.delete("/calendar/event-types/sales-call")
+def remove_sales_call_event_type(
+    provider: str = Query(...),
+    event_type_id: str = Query(..., alias="event_type_id"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Unmark an event type as sales call."""
+    if provider not in ("calcom", "calendly"):
+        raise HTTPException(status_code=400, detail="provider must be 'calcom' or 'calendly'")
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    deleted = db.query(EventTypeSalesCall).filter(
+        EventTypeSalesCall.org_id == org_id,
+        EventTypeSalesCall.provider == provider,
+        EventTypeSalesCall.event_type_id == event_type_id,
+    ).delete()
+    db.commit()
+    return {"deleted": deleted > 0, "event_type_id": event_type_id}
+
+
 @router.get("/calendly/event/{event_uri:path}")
 def get_calendly_event_details(
     event_uri: str,
@@ -3364,14 +3873,31 @@ def get_calendly_event_details(
                         submissions_data = submissions_response.json()
                         submissions_collection = submissions_data.get("collection", [])
                         
-                        # Filter submissions by event URI or invitee email
+                        # Filter submissions by event URI or invitee email, then fetch each by UUID for questions_and_answers
                         for submission in submissions_collection:
                             submission_event_uri = submission.get("event")
                             submission_email = submission.get("submitter_email") or submission.get("email")
-                            
-                            # Match by event URI or email
-                            if (submission_event_uri and submission_event_uri == event_uri_path) or \
-                               (submission_email and submission_email in invitee_emails):
+                            if (submission_event_uri and submission_event_uri == event_uri_path) or (
+                                submission_email and submission_email in invitee_emails
+                            ):
+                                # GET /routing_form_submissions/{uuid} to get full submission with questions_and_answers
+                                sub_uri = submission.get("uri") or ""
+                                sub_uuid = sub_uri.split("/")[-1] if sub_uri and "/" in sub_uri else None
+                                if sub_uuid:
+                                    try:
+                                        sub_response = httpx.get(
+                                            f"https://api.calendly.com/routing_form_submissions/{sub_uuid}",
+                                            headers=headers,
+                                            timeout=15.0,
+                                        )
+                                        if sub_response.status_code == 200:
+                                            sub_data = sub_response.json()
+                                            resource = sub_data.get("resource", {})
+                                            # Form data from Calendly JSON: questions_and_answers only
+                                            qa = resource.get("questions_and_answers") if isinstance(resource.get("questions_and_answers"), list) else []
+                                            submission = {**submission, **resource, "questions_and_answers": qa, "answers": qa}
+                                    except Exception as sub_e:
+                                        print(f"[CALENDLY EVENT DETAILS] Failed to fetch submission {sub_uuid}: {sub_e}")
                                 routing_form_submissions.append(submission)
                                 print(f"[CALENDLY EVENT DETAILS] Matched routing form submission for {submission_email or 'event'}")
                     else:
@@ -3387,11 +3913,20 @@ def get_calendly_event_details(
         event_resource["invitees"] = invitees
         event_resource["routingFormSubmissions"] = routing_form_submissions
         
+        # Sales call metadata
+        event_type_uri = event_resource.get("event_type") or ""
+        if isinstance(event_type_uri, dict):
+            event_type_uri = event_type_uri.get("uri") or ""
+        sales_meta = get_calendar_booking_sales_metadata(db, org_id, "calendly", [(event_uuid, event_type_uri)])
+        meta = sales_meta.get(event_uuid, {"is_sales_call": False, "sale_closed": None})
+        
         # Transform to our schema format
         transformed_event = {
             **event_resource,
             "start_time": event_resource.get("start_time"),
             "end_time": event_resource.get("end_time"),
+            "is_sales_call": meta["is_sales_call"],
+            "sale_closed": meta["sale_closed"],
         }
         
         return CalendlyScheduledEvent(**transformed_event)
