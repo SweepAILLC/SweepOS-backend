@@ -701,6 +701,36 @@ def get_calcom_booking_details(
         )
 
 
+@router.post("/calcom/booking/{booking_uid:path}/cancel")
+def cancel_calcom_booking(
+    booking_uid: str,
+    reason: Optional[str] = Body(None, embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cancel a Cal.com booking by UID."""
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    headers = get_calcom_auth_headers(db, org_id, current_user.id, api_version="2026-02-25")
+    payload = {}
+    if reason and str(reason).strip():
+        payload = {"reason": str(reason).strip(), "cancellationReason": str(reason).strip()}
+    try:
+        resp = httpx.post(
+            f"https://api.cal.com/v2/bookings/{booking_uid}/cancel",
+            headers=headers,
+            json=payload,
+            timeout=30.0,
+        )
+        if resp.status_code not in (200, 201):
+            detail = resp.text[:500] if hasattr(resp, "text") else "Unknown error"
+            raise HTTPException(status_code=resp.status_code, detail=f"Failed to cancel booking: {detail}")
+        return {"success": True, "provider": "calcom", "booking_uid": booking_uid}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error cancelling Cal.com booking: {str(e)}")
+
+
 @router.get("/calcom/bookings", response_model=CalComBookingsResponse)
 def get_calcom_bookings(
     take: int = Query(50, ge=1, le=100, alias="limit"),  # Support both 'limit' and 'take' for backward compatibility
@@ -3941,4 +3971,33 @@ def get_calendly_event_details(
             status_code=500,
             detail=f"Error fetching Calendly event details: {str(e)}"
         )
+
+
+@router.post("/calendly/event/{event_uri:path}/cancel")
+def cancel_calendly_event(
+    event_uri: str,
+    reason: Optional[str] = Body(None, embed=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cancel a Calendly scheduled event (UUID or full URI)."""
+    from urllib.parse import unquote
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    headers, _ = get_calendly_auth_headers(db, org_id, current_user.id)
+    try:
+        event_uri = unquote(event_uri)
+        if not event_uri.startswith("http"):
+            event_uri = f"https://api.calendly.com/scheduled_events/{event_uri}"
+        event_uuid = event_uri.split("/")[-1]
+        cancel_url = f"https://api.calendly.com/scheduled_events/{event_uuid}/cancellation"
+        payload = {"reason": str(reason).strip()} if reason and str(reason).strip() else {}
+        resp = httpx.post(cancel_url, headers=headers, json=payload, timeout=30.0)
+        if resp.status_code not in (200, 201):
+            detail = resp.text[:500] if hasattr(resp, "text") else "Unknown error"
+            raise HTTPException(status_code=resp.status_code, detail=f"Failed to cancel Calendly event: {detail}")
+        return {"success": True, "provider": "calendly", "event_uri": event_uri}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error cancelling Calendly event: {str(e)}")
 

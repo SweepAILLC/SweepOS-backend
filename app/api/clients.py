@@ -1756,6 +1756,51 @@ def update_check_in(
         )
 
 
+@router.get("/check-ins/{check_in_id}")
+def get_check_in(
+    check_in_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fetch a single check-in (used by calendar modal for manual events)."""
+    try:
+        check_in_uuid = UUID(check_in_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid check-in ID format")
+
+    check_in = db.query(ClientCheckIn).options(
+        defer(ClientCheckIn.is_sales_call),
+        defer(ClientCheckIn.sale_closed),
+    ).filter(
+        and_(
+            ClientCheckIn.id == check_in_uuid,
+            ClientCheckIn.org_id == current_user.org_id,
+        )
+    ).first()
+    if not check_in:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Check-in not found")
+
+    return {
+        "id": str(check_in.id),
+        "event_id": check_in.event_id,
+        "event_uri": check_in.event_uri,
+        "provider": check_in.provider,
+        "title": check_in.title,
+        "start_time": check_in.start_time.isoformat() if check_in.start_time else None,
+        "end_time": check_in.end_time.isoformat() if check_in.end_time else None,
+        "location": check_in.location,
+        "meeting_url": check_in.meeting_url,
+        "attendee_email": check_in.attendee_email,
+        "attendee_name": check_in.attendee_name,
+        "completed": check_in.completed,
+        "cancelled": check_in.cancelled,
+        "no_show": getattr(check_in, "no_show", False),
+        "is_sales_call": getattr(check_in, "is_sales_call", False),
+        "sale_closed": getattr(check_in, "sale_closed", None),
+        "created_at": check_in.created_at.isoformat() if check_in.created_at else None,
+    }
+
+
 @router.delete("/check-ins/{check_in_id}")
 def delete_check_in(
     check_in_id: str,
