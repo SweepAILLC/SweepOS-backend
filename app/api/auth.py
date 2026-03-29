@@ -16,6 +16,7 @@ from app.core.security import verify_password, create_access_token, get_password
 from app.core.config import settings
 from app.core.rate_limit import rate_limit
 from app.api.deps import get_current_user
+from app.services.fathom_client import normalize_fathom_api_key
 
 router = APIRouter()
 
@@ -240,17 +241,24 @@ def refresh_session(current_user: User = Depends(get_current_user)):
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+def _organization_name(db: Session, org_id: UUID) -> Optional[str]:
+    row = db.query(Organization).filter(Organization.id == org_id).first()
+    return row.name if row else None
+
+
 @router.get("/me", response_model=UserSchema)
-def get_current_user_info(current_user: User = Depends(get_current_user)):
+def get_current_user_info(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get current user info with proper enum serialization"""
     try:
         # Convert role enum to string for Pydantic serialization
         role_value = current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role)
         # Return the currently selected org (from token), not the user row's primary org_id
         org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+        org_name = _organization_name(db, org_id)
         return UserSchema(
             id=current_user.id,
             org_id=org_id,
+            org_name=org_name,
             email=current_user.email,
             role=role_value,
             is_admin=current_user.is_admin,
@@ -317,15 +325,23 @@ def update_user_settings(
         user_row.hashed_password = get_password_hash(settings_data.new_password)
     
     if settings_data.fathom_api_key is not None:
-        user_row.fathom_api_key = settings_data.fathom_api_key if settings_data.fathom_api_key else None
-    
+        user_row.fathom_api_key = normalize_fathom_api_key(settings_data.fathom_api_key)
+
+    if settings_data.ai_profile is not None:
+        user_row.ai_profile = settings_data.ai_profile
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(user_row, "ai_profile")
+
     db.commit()
     db.refresh(user_row)
     
     role_value = user_row.role.value if hasattr(user_row.role, "value") else str(user_row.role)
+    org_id = getattr(current_user, "selected_org_id", user_row.org_id)
+    org_name = _organization_name(db, org_id)
     return UserSchema(
         id=user_row.id,
-        org_id=user_row.org_id,
+        org_id=org_id,
+        org_name=org_name,
         email=user_row.email,
         role=role_value,
         is_admin=user_row.is_admin,
@@ -334,21 +350,44 @@ def update_user_settings(
 
 
 @router.get("/me/settings")
-def get_user_settings(current_user: User = Depends(get_current_user)):
+def get_user_settings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
     Get current user settings.
     Returns user info and default privacy settings.
+    ai_profile is read from the database row — UserProxy from JWT auth does not include JSON columns.
     """
+    user_row = db.query(User).filter(User.id == current_user.id).first()
+    ai_profile = getattr(user_row, "ai_profile", None) if user_row else None
+    fathom_key = getattr(user_row, "fathom_api_key", None) if user_row else getattr(current_user, "fathom_api_key", None)
     return {
         "email": current_user.email,
         "role": current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
         "org_id": str(current_user.org_id),
         "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
-        # Default privacy settings (can be stored in DB later)
         "data_sharing_enabled": True,
         "analytics_enabled": True,
-        "fathom_api_key": getattr(current_user, "fathom_api_key", None) or None,
+        "fathom_api_key": fathom_key or None,
+        "ai_profile": ai_profile,
     }
+
+
+@router.get("/me/sales-content-themes")
+def get_my_org_sales_content_themes(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Recurring objection/circumstance themes validated across multiple clients in the current org.
+    Used for transparency (Intelligence) and for email-draft LLM context.
+    """
+    from app.services.org_sales_theme_service import list_validated_themes_payload
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    themes = list_validated_themes_payload(db, org_id)
+    return {"themes": themes}
 
 
 @router.get("/organizations", response_model=List[UserOrganizationResponse])

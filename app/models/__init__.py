@@ -20,6 +20,15 @@ from app.models.user_tab_permission import UserTabPermission
 from app.models.user_organization import UserOrganization
 from app.models.audit_log import AuditLog, AuditEventType
 from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
+from app.models.fathom_call_record import FathomCallRecord
+from app.models.client_health_score_cache import ClientHealthScoreCache
+from app.models.health_outcome_snapshot import HealthOutcomeSnapshot
+from app.models.client_ai_recommendation_state import ClientAIRecommendationState
+from app.models.client_call_insight import ClientCallInsight, ClientInsightSummary
+from app.models.org_sales_content_theme import OrgSalesContentTheme
+from app.models.content_studio_knowledge_item import ContentStudioKnowledgeItem
+from app.models.content_studio_generation import ContentStudioGeneration
+from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -28,6 +37,13 @@ __all__ = [
     "Funnel", "FunnelStep", "Session", "EventError",
     "OrganizationTabPermission", "UserTabPermission", "UserOrganization",
     "AuditLog", "AuditEventType",
-    "CalendarBookingSales", "EventTypeSalesCall"
+    "CalendarBookingSales", "EventTypeSalesCall",
+    "FathomCallRecord", "ClientHealthScoreCache", "HealthOutcomeSnapshot",
+    "ClientAIRecommendationState",
+    "ClientCallInsight", "ClientInsightSummary",
+    "OrgSalesContentTheme",
+    "ContentStudioKnowledgeItem",
+    "ContentStudioGeneration",
+    "ContentStudioTranscriptAnalysis",
 ]
 

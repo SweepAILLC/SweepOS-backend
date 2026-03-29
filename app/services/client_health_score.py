@@ -4,16 +4,20 @@ for referral/testimonial/retention/upsell recommendations.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session, defer
 
 from app.models.client import Client
 from app.models.client_checkin import ClientCheckIn
 from app.models.stripe_payment import StripePayment
+from app.models.stripe_treasury_transaction import StripeTreasuryTransaction
 from app.models.event import Event
+from app.utils.stripe_helpers import extract_email_from_payment_raw
 
 
 def _factor_show_rate(db: Session, client_id: uuid.UUID, org_id: uuid.UUID) -> Dict[str, Any]:
@@ -46,12 +50,42 @@ def _factor_show_rate(db: Session, client_id: uuid.UUID, org_id: uuid.UUID) -> D
 
 
 def _factor_failed_payments(db: Session, client_id: uuid.UUID, org_id: uuid.UUID) -> Dict[str, Any]:
-    """Count of failed Stripe payments for this client."""
+    """Count of failed Stripe payments for this client (by client_id or by email match)."""
+    # Directly linked
     count = db.query(StripePayment).filter(
         StripePayment.client_id == client_id,
         StripePayment.org_id == org_id,
         StripePayment.status == "failed",
     ).count()
+
+    # Include unlinked payments that match client email (primary or additional)
+    client = db.query(Client).filter(Client.id == client_id, Client.org_id == org_id).first()
+    if client:
+        all_emails = client.get_all_emails_normalized()
+        if all_emails:
+            unlinked = db.query(StripePayment).filter(
+                StripePayment.client_id.is_(None),
+                StripePayment.org_id == org_id,
+                StripePayment.status == "failed",
+            ).all()
+            for p in unlinked:
+                if p.raw_event:
+                    email = extract_email_from_payment_raw(p.raw_event)
+                    if email and re.sub(r'\s+', '', email.lower().strip()) in all_emails:
+                        count += 1
+
+            # Include Treasury void transactions (failed payments) by customer_email
+            try:
+                treasury_voids = db.query(StripeTreasuryTransaction).filter(
+                    StripeTreasuryTransaction.org_id == org_id,
+                    text("stripe_treasury_transactions.status = 'void'::treasurytransactionstatus"),
+                    StripeTreasuryTransaction.customer_email.isnot(None),
+                ).all()
+                for t in treasury_voids:
+                    if t.customer_email and re.sub(r'\s+', '', t.customer_email.lower().strip()) in all_emails:
+                        count += 1
+            except Exception:
+                pass
 
     return {
         "key": "failed_payments",
@@ -221,43 +255,34 @@ def compute_health_factors(
     return factors
 
 
-def get_health_score(
+def _grade_from_score(score: float) -> str:
+    if score >= 80:
+        return "A"
+    if score >= 65:
+        return "B"
+    if score >= 50:
+        return "C"
+    if score >= 35:
+        return "D"
+    return "F"
+
+
+def assemble_factors_and_logic_score(
     db: Session,
-    client_id: uuid.UUID,
+    client: Client,
     org_id: uuid.UUID,
     brevo_email_stats: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+) -> Tuple[List[Dict[str, Any]], float, str]:
     """
-    Full health score for a client. Returns score (0–100), grade, and factors list.
-    brevo_email_stats: optional dict with campaign_open_rate, campaign_click_rate, messages_sent,
-                       trans_open_rate, trans_click_rate (from Brevo).
+    Build the same factors list as get_health_score (including optional Brevo block) and logic score/grade.
     """
-    client = db.query(Client).filter(
-        Client.id == client_id,
-        Client.org_id == org_id,
-    ).first()
-    if not client:
-        return {}
-
     campaign_open = brevo_email_stats.get("campaign_open_rate") if brevo_email_stats else None
     emails_sent = brevo_email_stats.get("messages_sent") if brevo_email_stats else None
 
     factors = compute_health_factors(db, client, org_id)
     score = _score_from_factors(factors, campaign_open, emails_sent)
+    grade = _grade_from_score(score)
 
-    # Letter grade for quick scan
-    if score >= 80:
-        grade = "A"
-    elif score >= 65:
-        grade = "B"
-    elif score >= 50:
-        grade = "C"
-    elif score >= 35:
-        grade = "D"
-    else:
-        grade = "F"
-
-    # Add email engagement factor (campaign + transactional) whenever we have Brevo data
     if brevo_email_stats is not None:
         messages_sent = brevo_email_stats.get("messages_sent", 0)
         campaign_open = brevo_email_stats.get("campaign_open_rate")
@@ -293,6 +318,29 @@ def get_health_score(
             "unit": "percent",
             "description": description,
         })
+
+    return factors, score, grade
+
+
+def get_health_score(
+    db: Session,
+    client_id: uuid.UUID,
+    org_id: uuid.UUID,
+    brevo_email_stats: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Full health score for a client. Returns score (0–100), grade, and factors list.
+    brevo_email_stats: optional dict with campaign_open_rate, campaign_click_rate, messages_sent,
+                       trans_open_rate, trans_click_rate (from Brevo).
+    """
+    client = db.query(Client).filter(
+        Client.id == client_id,
+        Client.org_id == org_id,
+    ).first()
+    if not client:
+        return {}
+
+    factors, score, grade = assemble_factors_and_logic_score(db, client, org_id, brevo_email_stats)
 
     return {
         "client_id": str(client_id),

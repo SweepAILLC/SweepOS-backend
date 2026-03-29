@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field
+import json
+
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from uuid import UUID
@@ -84,6 +86,9 @@ class EventResponse(BaseModel):
 
 
 # Lead capture: create/update client from funnel (lead forms, quiz funnels)
+MAX_PROSPECT_BYTES = 50000
+
+
 class FunnelLeadIn(BaseModel):
     """Payload for creating or updating a client from a funnel lead capture form or quiz."""
     funnel_id: UUID
@@ -94,6 +99,24 @@ class FunnelLeadIn(BaseModel):
     phone: Optional[str] = None
     instagram: Optional[str] = Field(None, description="Instagram handle (e.g. @username)")
     notes: Optional[str] = None
+    source: Optional[str] = Field(None, description='e.g. "quiz", "opt_in", "form"')
+    quiz_answers: Optional[Dict[str, Any]] = None
+    opt_in_data: Optional[Dict[str, Any]] = None
+    funnel_step_reached: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_prospect_payload_size(self):
+        """Limit arbitrary JSON size for quiz/opt-in (DoS / prompt injection mitigation)."""
+        try:
+            blob = json.dumps(
+                {"quiz_answers": self.quiz_answers, "opt_in_data": self.opt_in_data},
+                default=str,
+            )
+        except Exception:
+            raise ValueError("Invalid prospect data")
+        if len(blob.encode("utf-8")) > MAX_PROSPECT_BYTES:
+            raise ValueError(f"Prospect payload exceeds {MAX_PROSPECT_BYTES} bytes")
+        return self
 
 
 class FunnelLeadResponse(BaseModel):

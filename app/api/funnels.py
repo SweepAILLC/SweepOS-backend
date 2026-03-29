@@ -40,6 +40,7 @@ from app.schemas.funnel import (
 )
 from app.models.client import find_client_by_email
 from app.models.client import LifecycleState
+from app.services.health_score_cache_service import invalidate_health_score_cache
 
 router = APIRouter()
 
@@ -485,6 +486,29 @@ def create_lead_from_funnel(
     if email:
         client = find_client_by_email(db, org_id, email)
 
+    def _apply_prospect_meta(c: Client) -> None:
+        has_prospect = any(
+            [
+                lead_data.source,
+                lead_data.quiz_answers,
+                lead_data.opt_in_data,
+                lead_data.funnel_step_reached,
+            ]
+        )
+        if not has_prospect:
+            return
+        meta = c.meta if isinstance(c.meta, dict) else {}
+        prospect = {
+            "source": lead_data.source,
+            "quiz_answers": lead_data.quiz_answers or {},
+            "opt_in_data": lead_data.opt_in_data or {},
+            "funnel_step_reached": lead_data.funnel_step_reached,
+            "funnel_id": str(lead_data.funnel_id),
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+        }
+        meta = {**meta, "prospect": prospect}
+        c.meta = meta
+
     if client:
         # Update existing client with provided fields
         if first_name is not None and first_name:
@@ -497,9 +521,11 @@ def create_lead_from_funnel(
             client.instagram = instagram
         if notes is not None and notes:
             client.notes = (client.notes or "").strip() + ("\n\n" + notes if (client.notes or "").strip() else notes)
+        _apply_prospect_meta(client)
         client.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(client)
+        invalidate_health_score_cache(db, client.id, org_id)
         return FunnelLeadResponse(client_id=client.id, created=False, message="Client updated")
     else:
         # Create new client (require at least email or name for a useful record)
@@ -518,9 +544,11 @@ def create_lead_from_funnel(
             notes=notes or None,
             lifecycle_state=LifecycleState.COLD_LEAD,
         )
+        _apply_prospect_meta(client)
         db.add(client)
         db.commit()
         db.refresh(client)
+        invalidate_health_score_cache(db, client.id, org_id)
         return FunnelLeadResponse(client_id=client.id, created=True, message="Client created")
 
 

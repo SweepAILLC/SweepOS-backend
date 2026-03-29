@@ -10,7 +10,7 @@ from app.models.client import Client
 from app.models.recommendation import Recommendation
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Dict, Any
+from typing import Any, Dict
 import re
 import uuid
 
@@ -154,29 +154,19 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
                 decrypted_token = decrypt_token(oauth_token.access_token)
                 stripe.api_key = decrypted_token
                 
-                # Try to retrieve customer from Stripe to get email
                 try:
                     customer_data = stripe.Customer.retrieve(customer_id)
-                    customer_email = getattr(customer_data, 'email', None)
-                    
-                    # Try to find existing client by email (primary or emails list) to avoid duplicates
-                    if customer_email:
-                        from app.models.client import find_client_by_email
-                        client = find_client_by_email(db, org_id, customer_email)
-                        
-                        if client:
-                            # Link the stripe_customer_id to the existing client
-                            if not client.stripe_customer_id:
-                                client.stripe_customer_id = customer_id
-                                print(f"[WEBHOOK] Linked existing client {client.id} to Stripe customer {customer_id} by email {customer_email}")
+                    from app.services.stripe_sync_v2 import upsert_client_with_retry
+                    client = upsert_client_with_retry(db, customer_data, org_id)
+                    if client:
+                        print(f"[WEBHOOK] Upserted client {client.id} for Stripe customer {customer_id}")
                 except Exception as e:
-                    print(f"[WEBHOOK] Could not retrieve customer {customer_id} from Stripe: {e}")
+                    print(f"[WEBHOOK] Could not retrieve/upsert customer {customer_id} from Stripe: {e}")
         except Exception as e:
             print(f"[WEBHOOK] Error matching customer by email: {e}")
     
     if not client:
-        # Do not auto-create unnamed placeholder clients; payment will have client_id=None
-        print(f"[WEBHOOK] No client found for Stripe customer {customer_id}; skipping unnamed client creation")
+        print(f"[WEBHOOK] No client linked for Stripe customer {customer_id} (missing OAuth, Stripe customer, or identifiable email)")
     
     # If subscription_id is still None, try to find active subscription for this client
     if not subscription_id and client:
@@ -391,10 +381,32 @@ def _process_failed_payment(db: Session, data: Dict[str, Any], event: Dict[str, 
     # For invoice events, get charge from invoice
     # For charge/payment_intent events, use the ID directly
     if event_type.startswith("invoice."):
-        payment_id = data.get("charge")  # Charge ID from invoice
-        amount_cents = data.get("amount_due", 0)
+        # invoice.payment_failed often has no charge yet (first failure) — use PI or invoice id
+        payment_id = data.get("charge")
+        if isinstance(payment_id, dict):
+            payment_id = payment_id.get("id")
+        if not payment_id:
+            pi = data.get("payment_intent")
+            if isinstance(pi, str):
+                payment_id = pi
+            elif isinstance(pi, dict):
+                payment_id = pi.get("id")
+        if not payment_id:
+            inv = data.get("id")
+            if inv:
+                payment_id = str(inv)
+        amount_cents = (
+            data.get("amount_due")
+            or data.get("amount_remaining")
+            or data.get("total")
+            or 0
+        )
         subscription_id = data.get("subscription")
+        if isinstance(subscription_id, dict):
+            subscription_id = subscription_id.get("id")
         customer_id = data.get("customer")
+        if isinstance(customer_id, dict):
+            customer_id = customer_id.get("id")
         currency = data.get("currency", "usd")
         receipt_url = data.get("hosted_invoice_url")
     else:
@@ -402,6 +414,8 @@ def _process_failed_payment(db: Session, data: Dict[str, Any], event: Dict[str, 
         amount_cents = data.get("amount", 0)
         subscription_id = None
         customer_id = data.get("customer")
+        if isinstance(customer_id, dict):
+            customer_id = customer_id.get("id")
         currency = data.get("currency", "usd")
         receipt_url = None
     

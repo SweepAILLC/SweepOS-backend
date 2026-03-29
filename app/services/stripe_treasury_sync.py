@@ -81,14 +81,24 @@ def extract_customer_info_from_flow(flow_data: Optional[Dict[str, Any]], api_key
     # Try to get customer info from flow
     if isinstance(flow_data, dict):
         customer_id = flow_data.get("customer") or flow_data.get("customer_id")
-        
-        # Some flows have customer details
+        if isinstance(customer_id, dict):
+            customer_id = customer_id.get("id")
+
+        # Some flows have customer details (customer may be expanded object)
         customer_details = flow_data.get("customer_details") or flow_data.get("customer")
         if isinstance(customer_details, dict):
             customer_email = customer_details.get("email")
-            if not customer_id:
+            if not customer_id and customer_details.get("id"):
                 customer_id = customer_details.get("id")
-    
+
+        # ReceivedDebit and similar may have billing_details
+        if not customer_email:
+            billing = flow_data.get("billing_details")
+            if isinstance(billing, dict):
+                customer_email = billing.get("email")
+            elif billing and hasattr(billing, "email"):
+                customer_email = getattr(billing, "email", None)
+
     return customer_email, customer_id
 
 

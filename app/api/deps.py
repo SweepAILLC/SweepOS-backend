@@ -1,13 +1,18 @@
+import logging
+import uuid
+from typing import Optional
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-from typing import Optional
+
 from app.db.session import get_db
 from app.models.user import User, UserRole
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.user_tab_permission import UserTabPermission
 from app.core.security import decode_access_token
-import uuid
+
+_logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
 
@@ -48,7 +53,7 @@ def get_current_user(
             user_id_uuid = uuid.UUID(user_id_from_token)
             user_row = db.execute(
                 text("""
-                    SELECT id, org_id, email, hashed_password, role, is_admin, created_at
+                    SELECT id, org_id, email, hashed_password, role, is_admin, created_at, fathom_api_key
                     FROM users
                     WHERE id = :user_id
                 """),
@@ -61,7 +66,7 @@ def get_current_user(
     if user_row is None:
         user_row = db.execute(
             text("""
-                SELECT id, org_id, email, hashed_password, role, is_admin, created_at
+                SELECT id, org_id, email, hashed_password, role, is_admin, created_at, fathom_api_key
                 FROM users
                 WHERE email = :email
             """),
@@ -77,7 +82,7 @@ def get_current_user(
     # Create a User-like object from the raw SQL result
     # We need to avoid SQLAlchemy enum conversion, so we'll create a proxy object
     class UserProxy:
-        def __init__(self, user_id, org_id, email, hashed_password, role, is_admin, created_at):
+        def __init__(self, user_id, org_id, email, hashed_password, role, is_admin, created_at, fathom_api_key=None):
             self.id = user_id
             self.org_id = org_id
             self.email = email
@@ -85,6 +90,7 @@ def get_current_user(
             self.role_str = role  # Store raw role string to avoid enum conversion
             self.is_admin = is_admin
             self.created_at = created_at
+            self.fathom_api_key = fathom_api_key
             # Create a role property that returns a UserRole enum when accessed
             # Map database enum value to Python enum
             role_lower = role.lower() if role else "admin"
@@ -108,7 +114,8 @@ def get_current_user(
         user_row[3],  # hashed_password
         user_row[4],  # role
         user_row[5],  # is_admin
-        user_row[6]   # created_at
+        user_row[6],  # created_at
+        user_row[7] if len(user_row) > 7 else None,  # fathom_api_key
     )
     
     # Verify org_id matches (if present in token) and set selected_org_id attribute
@@ -119,7 +126,7 @@ def get_current_user(
             org_id_uuid = uuid.UUID(org_id_from_token)
         except (ValueError, TypeError) as e:
             # Invalid UUID format in token - log and use primary org
-            print(f"[AUTH] Invalid org_id format in token: {org_id_from_token}, error: {e}")
+            _logger.warning("Invalid org_id format in token: %s", org_id_from_token)
             org_id_uuid = None
         
         if org_id_uuid:
@@ -132,7 +139,7 @@ def get_current_user(
             
             # Also check if user.org_id matches (backward compatibility)
             if not user_org and user.org_id != org_id_uuid:
-                print(f"[AUTH] User {user.id} does not have access to org {org_id_uuid}. User's primary org: {user.org_id}")
+                _logger.warning("User %s denied access to org %s", user.id, org_id_uuid)
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="User does not have access to this organization",
@@ -140,7 +147,7 @@ def get_current_user(
             
             # User has access - use the selected org from token
             selected_org_id = org_id_uuid
-            print(f"[AUTH] User {user.id} accessing org {selected_org_id} (primary org: {user.org_id})")
+            _logger.debug("User %s accessing org %s", user.id, selected_org_id)
     
     # Set selected_org_id as an attribute on the user object
     # This allows endpoints to access the selected org without needing a separate dependency

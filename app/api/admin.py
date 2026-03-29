@@ -4,7 +4,7 @@ Only accessible to admin/owner users.
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc, asc, and_
+from sqlalchemy import func, desc, asc, and_, text
 from typing import List, Optional
 from uuid import UUID
 
@@ -33,6 +33,7 @@ from app.schemas.admin import (
     OrganizationFunnelUpdate,
     FunnelConversionMetric,
     FunnelStepConversion,
+    GlobalHealthResponse,
 )
 from app.schemas.funnel import Funnel as FunnelSchema
 from app.schemas.permission import (
@@ -332,29 +333,155 @@ def delete_organization(
 
 
 # Global Health Stats
-@router.get("/health")
+@router.get("/health", response_model=GlobalHealthResponse)
 def get_global_health(
     db: Session = Depends(get_db),
     admin_user: User = Depends(require_admin)
 ):
-    """Get global system health stats"""
+    """Platform-wide metrics: revenue, scale, funnel engagement, growth (30d), integrations."""
+    now = datetime.utcnow()
+    thirty_days_ago = now - timedelta(days=30)
+
     total_orgs = db.query(func.count(Organization.id)).scalar() or 0
+    orgs_created_30d = db.query(func.count(Organization.id)).filter(
+        Organization.created_at >= thirty_days_ago
+    ).scalar() or 0
+
     total_users = db.query(func.count(User.id)).scalar() or 0
+    users_created_30d = db.query(func.count(User.id)).filter(
+        User.created_at >= thirty_days_ago
+    ).scalar() or 0
+
     total_clients = db.query(func.count(Client.id)).scalar() or 0
+    clients_created_30d = db.query(func.count(Client.id)).filter(
+        Client.created_at >= thirty_days_ago
+    ).scalar() or 0
+
     total_funnels = db.query(func.count(Funnel.id)).scalar() or 0
     total_events = db.query(func.count(Event.id)).scalar() or 0
+    total_events_30d = db.query(func.count(Event.id)).filter(
+        Event.occurred_at >= thirty_days_ago
+    ).scalar() or 0
+
     total_payments = db.query(func.count(StripePayment.id)).scalar() or 0
     total_subscriptions = db.query(func.count(StripeSubscription.id)).scalar() or 0
-    
-    return {
-        "total_organizations": total_orgs,
-        "total_users": total_users,
-        "total_clients": total_clients,
-        "total_funnels": total_funnels,
-        "total_events": total_events,
-        "total_payments": total_payments,
-        "total_subscriptions": total_subscriptions
-    }
+    active_subscriptions = db.query(func.count(StripeSubscription.id)).filter(
+        StripeSubscription.status.in_(["active", "trialing"])
+    ).scalar() or 0
+
+    mrr_sum = db.query(func.sum(StripeSubscription.mrr)).filter(
+        StripeSubscription.status.in_(["active", "trialing"])
+    ).scalar()
+    total_mrr_usd = float(mrr_sum) if mrr_sum is not None else 0.0
+
+    rev_all = db.query(func.sum(StripePayment.amount_cents)).filter(
+        StripePayment.status == "succeeded"
+    ).scalar() or 0
+    total_revenue_stripe = float(rev_all) / 100.0
+
+    rev_30 = db.query(func.sum(StripePayment.amount_cents)).filter(
+        StripePayment.status == "succeeded",
+        StripePayment.created_at >= thirty_days_ago,
+    ).scalar() or 0
+    last_30_stripe = float(rev_30) / 100.0
+
+    treasury_30 = 0.0
+    try:
+        tsum = db.query(func.sum(StripeTreasuryTransaction.amount)).filter(
+            StripeTreasuryTransaction.status == TreasuryTransactionStatus.POSTED,
+            StripeTreasuryTransaction.amount > 0,
+            StripeTreasuryTransaction.posted_at >= thirty_days_ago,
+            StripeTreasuryTransaction.posted_at <= now,
+        ).scalar()
+        treasury_30 = float(tsum) / 100.0 if tsum else 0.0
+    except Exception:
+        # Failed SQL poisons the transaction; must rollback before further queries
+        db.rollback()
+        treasury_30 = 0.0
+
+    # First funnel step = event rows matching each funnel's lowest step_order (PostgreSQL DISTINCT ON)
+    funnel_first_all = 0
+    funnel_first_30d = 0
+    try:
+        row_all = db.execute(
+            text("""
+                WITH first_steps AS (
+                    SELECT DISTINCT ON (funnel_id) funnel_id, event_name
+                    FROM funnel_steps
+                    ORDER BY funnel_id, step_order ASC
+                )
+                SELECT COUNT(e.id)::bigint AS cnt
+                FROM events e
+                INNER JOIN first_steps fs ON e.funnel_id = fs.funnel_id AND e.event_name = fs.event_name
+            """)
+        ).fetchone()
+        funnel_first_all = int(row_all[0] or 0) if row_all else 0
+
+        row_30 = db.execute(
+            text("""
+                WITH first_steps AS (
+                    SELECT DISTINCT ON (funnel_id) funnel_id, event_name
+                    FROM funnel_steps
+                    ORDER BY funnel_id, step_order ASC
+                )
+                SELECT COUNT(e.id)::bigint AS cnt
+                FROM events e
+                INNER JOIN first_steps fs ON e.funnel_id = fs.funnel_id AND e.event_name = fs.event_name
+                WHERE e.occurred_at >= :thirty
+            """),
+            {"thirty": thirty_days_ago},
+        ).fetchone()
+        funnel_first_30d = int(row_30[0] or 0) if row_30 else 0
+    except Exception:
+        db.rollback()
+        funnel_first_all = 0
+        funnel_first_30d = 0
+
+    unique_visitors_all = db.query(func.count(func.distinct(Event.visitor_id))).filter(
+        Event.visitor_id.isnot(None)
+    ).scalar() or 0
+    unique_visitors_30d = db.query(func.count(func.distinct(Event.visitor_id))).filter(
+        Event.visitor_id.isnot(None),
+        Event.occurred_at >= thirty_days_ago,
+    ).scalar() or 0
+
+    orgs_stripe = db.query(func.count(func.distinct(OAuthToken.org_id))).filter(
+        OAuthToken.provider == OAuthProvider.STRIPE
+    ).scalar() or 0
+    orgs_brevo = db.query(func.count(func.distinct(OAuthToken.org_id))).filter(
+        OAuthToken.provider == OAuthProvider.BREVO
+    ).scalar() or 0
+
+    pending_inv = db.query(func.count(OrganizationInvitation.id)).filter(
+        OrganizationInvitation.used_at.is_(None),
+        OrganizationInvitation.expires_at > now,
+    ).scalar() or 0
+
+    return GlobalHealthResponse(
+        total_organizations=total_orgs,
+        organizations_created_last_30_days=orgs_created_30d,
+        total_users=total_users,
+        users_created_last_30_days=users_created_30d,
+        total_clients=total_clients,
+        clients_created_last_30_days=clients_created_30d,
+        total_funnels=total_funnels,
+        total_events=total_events,
+        total_events_last_30_days=total_events_30d,
+        total_payments=total_payments,
+        total_subscriptions=total_subscriptions,
+        active_subscriptions=active_subscriptions,
+        total_mrr_usd=total_mrr_usd,
+        total_revenue_stripe_succeeded_usd=total_revenue_stripe,
+        last_30_days_revenue_stripe_usd=last_30_stripe,
+        treasury_posted_last_30_days_usd=treasury_30,
+        funnel_first_step_views_all_time=funnel_first_all,
+        funnel_first_step_views_last_30_days=funnel_first_30d,
+        unique_visitors_all_time=unique_visitors_all,
+        unique_visitors_last_30_days=unique_visitors_30d,
+        orgs_with_stripe_connected=orgs_stripe,
+        orgs_with_brevo_connected=orgs_brevo,
+        pending_invitations=pending_inv,
+    )
 
 
 # Global Settings (read-only for now, can be extended)

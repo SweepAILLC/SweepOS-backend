@@ -21,6 +21,41 @@ class FunnelConversionMetric(BaseModel):
     step_counts: List[FunnelStepConversion] = []
 
 
+class GlobalHealthResponse(BaseModel):
+    """Platform-wide metrics for owner/admin Health tab (impact & growth)."""
+
+    total_organizations: int = 0
+    organizations_created_last_30_days: int = 0
+
+    total_users: int = 0
+    users_created_last_30_days: int = 0
+
+    total_clients: int = 0
+    clients_created_last_30_days: int = 0
+
+    total_funnels: int = 0
+    total_events: int = 0
+    total_events_last_30_days: int = 0
+
+    total_payments: int = 0
+    total_subscriptions: int = 0
+    active_subscriptions: int = 0
+
+    total_mrr_usd: float = 0.0
+    total_revenue_stripe_succeeded_usd: float = 0.0
+    last_30_days_revenue_stripe_usd: float = 0.0
+    treasury_posted_last_30_days_usd: float = 0.0
+
+    funnel_first_step_views_all_time: int = 0
+    funnel_first_step_views_last_30_days: int = 0
+    unique_visitors_all_time: int = 0
+    unique_visitors_last_30_days: int = 0
+
+    orgs_with_stripe_connected: int = 0
+    orgs_with_brevo_connected: int = 0
+    pending_invitations: int = 0
+
+
 class OrganizationFunnelCreate(BaseModel):
     """Schema for creating a funnel in an organization (admin only)"""
     name: str

@@ -58,6 +58,55 @@ class Settings(BaseSettings):
     # Backend public URL for webhook endpoints (required for per-org Stripe webhooks)
     # e.g. https://api.sweepai.site or http://localhost:8000 for local dev
     BACKEND_PUBLIC_URL: Optional[str] = None
+
+    # Fathom (optional — omit for logic-only health score; sync/webhook no-op).
+    # AI health score overlay is skipped until FATHOM_API_KEY is set; scoring stays logic-based.
+    FATHOM_API_KEY: Optional[str] = None
+    # Secret from Fathom webhook create response; if unset, signature verification is skipped
+    FATHOM_WEBHOOK_SECRET: Optional[str] = None
+
+    # LLM for Fathom sentiment + AI health score (optional — falls back to logic score)
+    # Use Gemini: set GOOGLE_API_KEY (or LLM_API_KEY) and HEALTH_SCORE_LLM_MODEL e.g. gemini-2.0-flash
+    # Or OpenAI: set OPENAI_API_KEY and model e.g. gpt-4o-mini
+    LLM_API_KEY: Optional[str] = None
+    GOOGLE_API_KEY: Optional[str] = None
+    OPENAI_API_KEY: Optional[str] = None
+    HEALTH_SCORE_LLM_MODEL: str = "gemini-2.0-flash"
+    LLM_PROVIDER: str = "auto"  # auto | gemini | openai
+    AI_HEALTH_SCORE_ENABLED: bool = True  # If False, never call LLM for health score (sentiment still uses LLM when Fathom ingests)
+
+    # LLM cost & safety (per-org in-memory budget; tune for your traffic)
+    LLM_BUDGET_ENABLED: bool = True
+    LLM_MAX_CALLS_PER_MINUTE_PER_ORG: int = 45
+    LLM_MAX_INPUT_CHARS_TOTAL: int = 48000  # Hard cap on system+user prompt size sent to providers
+
+    # Fathom sentiment: skip LLM when combined input is too small (saves calls; default neutral locally)
+    FATHOM_SENTIMENT_MIN_INPUT_CHARS: int = 80
+
+    # GET /clients/{id}/health-score rate limits (sliding window, per user+org)
+    HEALTH_SCORE_RATE_LIMIT_WINDOW_SEC: int = 300
+    HEALTH_SCORE_RATE_LIMIT_MAX: int = 120  # logic-only path
+    HEALTH_SCORE_AI_RATE_LIMIT_MAX: int = 25  # use_ai=true (more expensive)
+
+    # Fathom sync: optional pause between meetings to respect provider rate limits (ms)
+    FATHOM_SYNC_DELAY_MS: int = 0
+    # Max pages per sync request (cost / time bound)
+    FATHOM_SYNC_MAX_PAGES: int = 5
+
+    # Call insights (LLM per matched Fathom recording; safeguards for cost)
+    CALL_INSIGHT_MIN_INPUT_CHARS: int = 400
+    CALL_INSIGHT_MIN_TRANSCRIPT_LINES: int = 3
+    CALL_INSIGHT_CHECKIN_WINDOW_MINUTES: int = 105
+    CALL_INSIGHT_COOLDOWN_HOURS: int = 24
+    CALL_INSIGHT_ORG_MAX_PER_HOUR: int = 40
+    CALL_INSIGHT_HEALTH_SCORE_DELTA_OVERRIDE: float = 15.0
+
+    # Org sales content themes (objections / patterns must recur across clients before content use)
+    ORG_SALES_THEME_MIN_DISTINCT_CLIENTS: int = 3
+    ORG_SALES_THEME_MIN_OCCURRENCES: int = 3
+    ORG_SALES_THEME_LOOKBACK_DAYS: int = 120
+    ORG_SALES_THEME_MAX_CONTRIBUTING_CLIENTS: int = 500
+    ORG_SALES_THEME_MAX_SAMPLE_QUOTES: int = 8
     
     # Admin
     SUDO_ADMIN_EMAIL: str = "admin@sweepos.local"

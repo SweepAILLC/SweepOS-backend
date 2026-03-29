@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_, desc, select
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import time
 from decimal import Decimal
@@ -44,6 +44,66 @@ from app.schemas.stripe import (
 )
 
 router = APIRouter()
+
+
+def _stripe_date_range(scope: Optional[str], range_days: int):
+    """Return (start_date, end_date) for Stripe queries. scope='mtd' = month to date; else use range_days."""
+    end_date = datetime.utcnow()
+    if scope == "mtd":
+        start_date = end_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start_date = end_date - timedelta(days=range_days)
+    return start_date, end_date
+
+
+def _extract_invoice_id_from_treasury_raw(raw_data) -> Optional[str]:
+    """Extract invoice_id from Treasury transaction raw_data for dedup."""
+    if not raw_data or not isinstance(raw_data, dict):
+        return None
+    flow = raw_data.get("flow")
+    if isinstance(flow, dict):
+        inv = flow.get("invoice")
+        if isinstance(inv, str) and inv.startswith("in_"):
+            return inv
+        if isinstance(inv, dict):
+            return inv.get("id")
+    return None
+
+
+def _extract_email_from_payment_raw(raw_event) -> Optional[str]:
+    """Extract customer/receipt email from StripePayment.raw_event or Treasury transaction."""
+    if not raw_event:
+        return None
+    d = raw_event if isinstance(raw_event, dict) else {}
+    email = d.get("customer_email") or d.get("receipt_email")
+    if email:
+        return email
+    billing = d.get("billing_details") or {}
+    if isinstance(billing, dict):
+        email = billing.get("email")
+        if email:
+            return email
+    obj = d.get("data")
+    if isinstance(obj, dict):
+        obj = obj.get("object", {})
+    if isinstance(obj, dict):
+        email = obj.get("customer_email") or obj.get("receipt_email")
+        if email:
+            return email
+        billing = obj.get("billing_details") or {}
+        if isinstance(billing, dict):
+            return billing.get("email")
+    return None
+
+
+def _payment_display_client_info(client, transaction_email=None, payment_raw_event=None):
+    """Get (client_name, client_email) for payment. When no client name, use email instead of Unknown."""
+    name = (f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None) or ""
+    email = (client.email if client else None) or transaction_email
+    if not email and payment_raw_event:
+        email = _extract_email_from_payment_raw(payment_raw_event)
+    display_name = name or email or "Unknown"
+    return display_name, email
 
 
 def check_stripe_connected(db: Session, org_id: uuid.UUID) -> bool:
@@ -237,9 +297,17 @@ def get_stripe_last_updated(
         OAuthToken.provider == OAuthProvider.STRIPE,
         OAuthToken.org_id == org_id,
     ).first()
-    if not token or not token.last_webhook_processed_at:
-        return {"last_updated": None}
-    return {"last_updated": token.last_webhook_processed_at.isoformat() + "Z"}
+    if not token:
+        return {"last_updated": None, "last_updated_ms": None}
+
+    # Webhooks are ideal, but manual sync should also advance this marker so Terminal refreshes.
+    candidates = [dt for dt in [token.last_webhook_processed_at, token.last_sync_at] if dt is not None]
+    if not candidates:
+        return {"last_updated": None, "last_updated_ms": None}
+
+    latest = max(candidates)
+    ms = int(latest.replace(tzinfo=timezone.utc).timestamp() * 1000) if latest.tzinfo is None else int(latest.timestamp() * 1000)
+    return {"last_updated": latest.isoformat() + "Z", "last_updated_ms": ms}
 
 
 @router.post("/sync", status_code=status.HTTP_200_OK)
@@ -326,6 +394,18 @@ def sync_stripe_data(
                 "payments_updated": sync_result.get("payments_updated", 0),
             }
         }
+
+        # Mark "data updated" so Terminal refetch works even without webhooks.
+        try:
+            oauth_token = db.query(OAuthToken).filter(
+                OAuthToken.provider == OAuthProvider.STRIPE,
+                OAuthToken.org_id == org_id,
+            ).first()
+            if oauth_token:
+                oauth_token.last_webhook_processed_at = datetime.utcnow()
+                db.commit()
+        except Exception:
+            db.rollback()
         
         return response_data
     except HTTPException:
@@ -579,28 +659,26 @@ def delete_payment(
 @router.get("/summary", response_model=StripeSummaryResponse)
 def get_stripe_summary(
     range_days: int = Query(30, alias="range", ge=1, le=365),
+    scope: Optional[str] = Query(None, description="Use 'mtd' for month-to-date"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Get comprehensive Stripe financial summary with KPIs.
     Uses database data from webhook-processed events.
+    scope=mtd: month to date (1st of current month to now).
     """
-    # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
     if not check_stripe_connected(db, org_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Stripe not connected. Please connect Stripe via OAuth first."
         )
-    
-    # CRITICAL: All queries must filter by org_id for multi-tenant isolation (use selected org from token)
-    
-    # Calculate date range
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=range_days)
-    prev_start_date = start_date - timedelta(days=range_days)
+    start_date, end_date = _stripe_date_range(scope, range_days)
+    if scope == "mtd":
+        prev_start_date = (start_date - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        prev_start_date = start_date - timedelta(days=range_days)
     
     # Get current MRR (from active and trialing subscriptions)
     # Include both "active" and "trialing" status subscriptions
@@ -876,7 +954,13 @@ def get_stripe_summary(
             ).all()
             unique_failures = set()
             for payment in failed_payment_records:
-                group_key = (normalize_stripe_id_for_dedup(payment.subscription_id) if payment.subscription_id else None, payment.client_id)
+                # Match failed-payments queue dedup: invoice_id first, then subscription_id, then client_id
+                if payment.invoice_id:
+                    group_key = ('inv', normalize_stripe_id_for_dedup(payment.invoice_id))
+                elif payment.subscription_id:
+                    group_key = ('sub', normalize_stripe_id_for_dedup(payment.subscription_id))
+                else:
+                    group_key = (None, payment.client_id)
                 unique_failures.add(group_key)
             failed_payments = len(unique_failures)
     except Exception as e:
@@ -893,7 +977,12 @@ def get_stripe_summary(
             ).all()
             unique_failures = set()
             for payment in failed_payment_records:
-                group_key = (normalize_stripe_id_for_dedup(payment.subscription_id) if payment.subscription_id else None, payment.client_id)
+                if payment.invoice_id:
+                    group_key = ('inv', normalize_stripe_id_for_dedup(payment.invoice_id))
+                elif payment.subscription_id:
+                    group_key = ('sub', normalize_stripe_id_for_dedup(payment.subscription_id))
+                else:
+                    group_key = (None, payment.client_id)
                 unique_failures.add(group_key)
             
             failed_payments = len(unique_failures)
@@ -1303,21 +1392,15 @@ def get_stripe_summary(
 @router.get("/kpis", response_model=StripeKPIsResponse)
 def get_stripe_kpis(
     range_days: int = Query(30, alias="range", ge=1, le=365),
+    scope: Optional[str] = Query(None, description="Use 'mtd' for month-to-date"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Get top-line KPI cards with time-range selection"""
-    # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
     if not check_stripe_connected(db, org_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
-        )
-    
-    # Use summary endpoint logic
-    summary = get_stripe_summary(range_days=range_days, current_user=current_user, db=db)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stripe not connected.")
+    summary = get_stripe_summary(range_days=range_days, scope=scope, current_user=current_user, db=db)
     
     return StripeKPIsResponse(
         mrr=summary.total_mrr,
@@ -1333,24 +1416,16 @@ def get_stripe_kpis(
 @router.get("/revenue-timeline", response_model=StripeRevenueTimelineResponse)
 def get_revenue_timeline(
     range_days: int = Query(30, alias="range", ge=1, le=365),
+    scope: Optional[str] = Query(None, description="Use 'mtd' for month-to-date"),
     group_by: str = Query("day", regex="^(day|week)$"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Get daily/weekly revenue timeline chart data using same deduplication logic as total revenue"""
-    # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
     if not check_stripe_connected(db, org_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
-        )
-    
-    # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
-    
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=range_days)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stripe not connected.")
+    start_date, end_date = _stripe_date_range(scope, range_days)
     
     # Use the SAME deduplication function as the summary endpoint
     # This ensures revenue timeline matches total revenue calculation exactly
@@ -1487,12 +1562,13 @@ def get_subscriptions(
     result = []
     for sub in subscriptions:
         client = db.query(Client).filter(Client.id == sub.client_id).first() if sub.client_id else None
+        disp_name, disp_email = _payment_display_client_info(client)
         result.append(StripeSubscriptionResponse(
             id=str(sub.id),
             stripe_subscription_id=sub.stripe_subscription_id,
             client_id=str(sub.client_id) if sub.client_id else None,
-            client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-            client_email=client.email if client else None,
+            client_name=disp_name,
+            client_email=disp_email,
             status=sub.status,
             plan_id=sub.plan_id,
             mrr=float(sub.mrr),
@@ -1508,6 +1584,7 @@ def get_subscriptions(
 def get_payments(
     status_filter: Optional[str] = Query(None, alias="status"),
     range_days: Optional[int] = Query(None, alias="range", ge=1),
+    scope: Optional[str] = Query(None, description="Use 'mtd' for month-to-date"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     use_treasury: bool = Query(True, description="Use Treasury Transactions API as source of truth"),
@@ -1564,13 +1641,12 @@ def get_payments(
                 query = query.filter(text("stripe_treasury_transactions.status = 'open'::treasurytransactionstatus"))
         
         # Filter by date range if provided
-        if range_days is not None:
-            end_date = datetime.utcnow()
-            start_date = end_date - timedelta(days=range_days)
+        if scope == "mtd" or range_days is not None:
+            start_date, end_date = _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
             query = query.filter(
                 and_(
-                    StripeTreasuryTransaction.posted_at >= start_date,
-                    StripeTreasuryTransaction.posted_at <= end_date
+                    (StripeTreasuryTransaction.posted_at or StripeTreasuryTransaction.created) >= start_date,
+                    (StripeTreasuryTransaction.posted_at or StripeTreasuryTransaction.created) <= end_date
                 )
             )
         
@@ -1619,12 +1695,13 @@ def get_payments(
             else:
                 display_id = f"Transaction: {display_id}"
             
+            disp_name, disp_email = _payment_display_client_info(client, transaction_email=transaction.customer_email)
             result.append(StripePaymentResponse(
                 id=str(transaction.id),
                 stripe_id=transaction.stripe_transaction_id,
                 client_id=str(transaction.client_id) if transaction.client_id else None,
-                client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-                client_email=(client.email if client else None) or transaction.customer_email,
+                client_name=disp_name,
+                client_email=disp_email,
                 amount_cents=abs(transaction.amount),  # Use absolute value for display
                 currency=transaction.currency or "usd",
                 status="succeeded" if str(transaction.status) == "posted" else str(transaction.status),
@@ -1644,10 +1721,9 @@ def get_payments(
     if status_filter:
         query = query.filter(StripePayment.status == status_filter)
     
-    # Filter by date range if provided (None means all time)
-    if range_days is not None:
-        end_date = datetime.utcnow()
-        start_date = end_date - timedelta(days=range_days)
+    # Filter by date range if provided
+    if scope == "mtd" or range_days is not None:
+        start_date, end_date = _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
         query = query.filter(
             and_(
                 StripePayment.created_at >= start_date,
@@ -1737,12 +1813,13 @@ def get_payments(
                 # If no invoice_id either, show the payment ID
                 display_subscription_id = f"Payment: {payment.stripe_id}"
         
+        disp_name, disp_email = _payment_display_client_info(client, payment_raw_event=payment.raw_event)
         result.append(StripePaymentResponse(
             id=str(payment.id),
             stripe_id=payment.stripe_id,
             client_id=str(payment.client_id) if payment.client_id else None,
-            client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-            client_email=client.email if client else None,
+            client_name=disp_name,
+            client_email=disp_email,
             amount_cents=payment.amount_cents or 0,
             currency=payment.currency or "usd",
             status=payment.status,
@@ -1751,6 +1828,220 @@ def get_payments(
             created_at=int(payment.created_at.timestamp()) if payment.created_at else 0
         ))
     
+    return result
+
+
+def _merge_treasury_and_stripe_failed_queues(
+    treasury_rows: List[StripeFailedPaymentResponse],
+    stripe_rows: List[StripeFailedPaymentResponse],
+) -> List[StripeFailedPaymentResponse]:
+    """
+    Treasury voids may not cover every failure (e.g. invoice.payment_failed before Treasury sync).
+    Merge StripePayment-based rows without duplicating the same logical failure.
+    Dedup by: normalized transaction_id (stripe_id), (client_id, subscription_id), (client_id, invoice_id).
+    """
+    treasury_stripe_ids = set()
+    client_sub_pairs = set()
+    client_invoice_pairs = set()
+    for r in treasury_rows:
+        if r.stripe_id:
+            norm = normalize_stripe_id_for_dedup(r.stripe_id)
+            if norm:
+                treasury_stripe_ids.add(norm)
+        cid = str(r.client_id or "")
+        sid = normalize_stripe_id_for_dedup(r.subscription_id) if r.subscription_id else ""
+        if cid and sid:
+            client_sub_pairs.add((cid, sid))
+        inv = getattr(r, 'invoice_id', None)
+        if cid and inv:
+            norm_inv = normalize_stripe_id_for_dedup(inv)
+            if norm_inv:
+                client_invoice_pairs.add((cid, norm_inv))
+    out = list(treasury_rows)
+    seen_stripe_ids = {normalize_stripe_id_for_dedup(r.stripe_id) for r in out if r.stripe_id}
+    for r in stripe_rows:
+        if r.stripe_id:
+            tid = normalize_stripe_id_for_dedup(r.stripe_id)
+            if tid and (tid in treasury_stripe_ids or tid in seen_stripe_ids):
+                continue
+        cid = str(r.client_id or "")
+        sid = normalize_stripe_id_for_dedup(r.subscription_id) if r.subscription_id else ""
+        if cid and sid and (cid, sid) in client_sub_pairs:
+            continue
+        inv = getattr(r, 'invoice_id', None)
+        if cid and inv:
+            norm_inv = normalize_stripe_id_for_dedup(inv)
+            if norm_inv and (cid, norm_inv) in client_invoice_pairs:
+                continue
+        out.append(r)
+        if r.stripe_id:
+            tid = normalize_stripe_id_for_dedup(r.stripe_id)
+            if tid:
+                seen_stripe_ids.add(tid)
+    return out
+
+
+def _build_failed_payments_from_stripe_payment_table(
+    db: Session,
+    org_id: uuid.UUID,
+    exclude_resolved: bool,
+) -> List[StripeFailedPaymentResponse]:
+    """Group failed/past_due StripePayment rows into failed queue response items (no pagination)."""
+    all_failed_payments = db.query(StripePayment).filter(
+        and_(
+            StripePayment.org_id == org_id,
+            or_(
+                StripePayment.status == "failed",
+                StripePayment.status == "past_due"
+            )
+        )
+    ).order_by(desc(StripePayment.created_at)).all()
+
+    print(f"[DEBUG] Total failed payments found: {len(all_failed_payments)}")
+    for p in all_failed_payments[:20]:
+        print(f"  - ID: {p.stripe_id}, Sub: {p.subscription_id}, Client: {p.client_id}, Invoice: {p.invoice_id}, Created: {p.created_at}, Status: {p.status}")
+
+    sub_counts = {}
+    for p in all_failed_payments:
+        if p.subscription_id:
+            sub_counts[p.subscription_id] = sub_counts.get(p.subscription_id, 0) + 1
+    print(f"[DEBUG] Subscription IDs with multiple failed payments: {[(sub, count) for sub, count in sub_counts.items() if count > 1]}")
+
+    grouped_payments = {}
+
+    for payment in all_failed_payments:
+        # Dedup by canonical identifiers. Invoice is the canonical payment-attempt id in Stripe;
+        # use it first so pi_xxx, ch_xxx, in_xxx for the same invoice are grouped together.
+        if payment.invoice_id:
+            group_key = ('inv', normalize_stripe_id_for_dedup(payment.invoice_id))
+        elif payment.subscription_id:
+            group_key = ('sub', normalize_stripe_id_for_dedup(payment.subscription_id))
+        elif payment.client_id:
+            group_key = (None, payment.client_id)
+        else:
+            group_key = ('stripe', normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id)
+
+        if group_key not in grouped_payments:
+            grouped_payments[group_key] = {
+                'payments': [],
+                'first_attempt': payment.created_at,
+                'latest_attempt': payment.created_at
+            }
+            print(f"[DEBUG] New group created: key={group_key}, payment_id={payment.stripe_id}, sub={payment.subscription_id}, client={payment.client_id}, invoice={payment.invoice_id}")
+        else:
+            existing_count = len(grouped_payments[group_key]['payments'])
+            print(f"[DEBUG] Adding to existing group: key={group_key}, payment_id={payment.stripe_id}, existing_count={existing_count}, sub={payment.subscription_id}, client={payment.client_id}, invoice={payment.invoice_id}")
+
+        grouped_payments[group_key]['payments'].append(payment)
+
+        if payment.created_at < grouped_payments[group_key]['first_attempt']:
+            grouped_payments[group_key]['first_attempt'] = payment.created_at
+        if payment.created_at > grouped_payments[group_key]['latest_attempt']:
+            grouped_payments[group_key]['latest_attempt'] = payment.created_at
+
+    result = []
+    type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}
+    for group_key, group_data in grouped_payments.items():
+        # Prefer charge > payment_intent > invoice, then earliest by created_at
+        representative_payment = min(
+            group_data['payments'],
+            key=lambda p: (type_priority.get(p.type, 3), p.created_at or datetime.max)
+        )
+        attempt_count = len(group_data['payments'])
+
+        subscription_id = None
+        client_id = None
+        invoice_id = None
+
+        if len(group_key) == 2 and group_key[0] == 'sub':
+            subscription_id = representative_payment.subscription_id
+        elif len(group_key) == 2 and group_key[0] == 'inv':
+            invoice_id = representative_payment.invoice_id
+            subscription_id = representative_payment.subscription_id
+        elif len(group_key) == 2 and group_key[0] == 'stripe':
+            # Standalone failed payments (pi_xxx, ch_xxx) with no sub/invoice/client - include them
+            subscription_id = representative_payment.subscription_id
+        elif len(group_key) == 2:
+            first, second = group_key
+            if first is None:
+                if isinstance(second, uuid.UUID):
+                    client_id = second
+                else:
+                    invoice_id = representative_payment.invoice_id
+
+        if not client_id:
+            client_id = representative_payment.client_id
+        if not subscription_id:
+            subscription_id = representative_payment.subscription_id
+
+        print(f"[DEBUG] Failed payment group: key={group_key}, attempt_count={attempt_count}, subscription_id={subscription_id}, client_id={client_id}")
+
+        client = db.query(Client).filter(Client.id == representative_payment.client_id).first() if representative_payment.client_id else None
+
+        recovery = None
+        rejected_recovery = None
+        if representative_payment.client_id:
+            recovery = db.query(Recommendation).filter(
+                and_(
+                    Recommendation.org_id == org_id,
+                    Recommendation.client_id == representative_payment.client_id,
+                    Recommendation.type == "payment_recovery",
+                    Recommendation.status == "PENDING"
+                )
+            ).first()
+
+        if exclude_resolved:
+            from sqlalchemy import text
+            payment_id_str = str(representative_payment.id)
+
+            if representative_payment.client_id:
+                rejected_recovery = db.query(Recommendation).filter(
+                    and_(
+                        Recommendation.org_id == org_id,
+                        Recommendation.client_id == representative_payment.client_id,
+                        Recommendation.type == "payment_recovery",
+                        Recommendation.status == "REJECTED"
+                    )
+                ).first()
+
+            if not rejected_recovery:
+                rejected_by_payment_id = db.query(Recommendation).filter(
+                    and_(
+                        Recommendation.org_id == org_id,
+                        Recommendation.type == "payment_recovery",
+                        Recommendation.status == "REJECTED",
+                        text("recommendations.payload->>'payment_id' = :payment_id")
+                    )
+                ).params(payment_id=payment_id_str).first()
+
+                if rejected_by_payment_id:
+                    rejected_recovery = rejected_by_payment_id
+
+        if exclude_resolved and rejected_recovery:
+            continue
+
+        disp_name, disp_email = _payment_display_client_info(client, payment_raw_event=representative_payment.raw_event)
+        result.append(StripeFailedPaymentResponse(
+            id=str(representative_payment.id),
+            stripe_id=representative_payment.stripe_id,
+            client_id=str(representative_payment.client_id) if representative_payment.client_id else None,
+            client_name=disp_name,
+            client_email=disp_email,
+            amount_cents=representative_payment.amount_cents or 0,
+            currency=representative_payment.currency or "usd",
+            status=representative_payment.status,
+            subscription_id=representative_payment.subscription_id,
+            receipt_url=representative_payment.receipt_url,
+            created_at=int(group_data['first_attempt'].timestamp()) if group_data['first_attempt'] else 0,
+            has_recovery_recommendation=recovery is not None,
+            recovery_recommendation_id=str(recovery.id) if recovery else None,
+            attempt_count=attempt_count,
+            first_attempt_at=int(group_data['first_attempt'].timestamp()) if group_data['first_attempt'] else 0,
+            latest_attempt_at=int(group_data['latest_attempt'].timestamp()) if group_data['latest_attempt'] else 0,
+            invoice_id=representative_payment.invoice_id
+        ))
+
+    result.sort(key=lambda x: x.latest_attempt_at, reverse=True)
     return result
 
 
@@ -1765,9 +2056,10 @@ def get_failed_payments(
 ):
     """
     Get failed payments queue.
-    Uses Treasury Transactions API as source of truth when use_treasury=True.
-    Failed payments are transactions with status='void' or negative amounts that failed.
-    
+    When use_treasury=True and Treasury rows exist, void Treasury transactions are the primary source,
+    but StripePayment rows (failed/past_due from webhooks/sync) are merged in so failures that never
+    appear as Treasury voids still show up.
+
     If exclude_resolved=True, only returns payments that haven't been resolved (no REJECTED recommendations).
     This is used for the terminal queue, while the Stripe dashboard shows all failed payments.
     """
@@ -1889,12 +2181,14 @@ def get_failed_payments(
             if exclude_resolved and rejected_recovery:
                 continue
             
+            disp_name, disp_email = _payment_display_client_info(client, transaction_email=representative.customer_email)
+            treasury_invoice_id = _extract_invoice_id_from_treasury_raw(representative.raw_data) if representative.raw_data else None
             result.append(StripeFailedPaymentResponse(
                 id=str(representative.id),
                 stripe_id=representative.stripe_transaction_id,
                 client_id=str(representative.client_id) if representative.client_id else None,
-                client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-                client_email=client.email if client else representative.customer_email,
+                client_name=disp_name,
+                client_email=disp_email,
                 amount_cents=abs(representative.amount),
                 currency=representative.currency or "usd",
                 status="failed",
@@ -1905,187 +2199,21 @@ def get_failed_payments(
                 recovery_recommendation_id=str(recovery.id) if recovery else None,
                 attempt_count=attempt_count,
                 first_attempt_at=int(group_data['first_attempt'].timestamp()) if group_data['first_attempt'] else 0,
-                latest_attempt_at=int(group_data['latest_attempt'].timestamp()) if group_data['latest_attempt'] else 0
+                latest_attempt_at=int(group_data['latest_attempt'].timestamp()) if group_data['latest_attempt'] else 0,
+                invoice_id=treasury_invoice_id
             ))
         
-        # Sort by latest attempt (most recent first) before pagination
+        # Sort by latest attempt (most recent first)
         result.sort(key=lambda r: r.latest_attempt_at, reverse=True)
-        
-        # Apply pagination
-        total = len(result)
-        failed_payments = result[(page - 1) * page_size:page * page_size]
-        
-        return failed_payments
+        # Merge StripePayment failures not represented in Treasury (webhooks/sync)
+        stripe_only = _build_failed_payments_from_stripe_payment_table(db, org_id, exclude_resolved)
+        merged = _merge_treasury_and_stripe_failed_queues(result, stripe_only)
+        merged.sort(key=lambda r: r.latest_attempt_at, reverse=True)
+        return merged[(page - 1) * page_size:page * page_size]
     
-    # Fallback to old payment system
-    # Get all failed payments
-    all_failed_payments = db.query(StripePayment).filter(
-        and_(
-            StripePayment.org_id == org_id,
-            or_(
-                StripePayment.status == "failed",
-                StripePayment.status == "past_due"
-            )
-        )
-    ).order_by(desc(StripePayment.created_at)).all()
-    
-    print(f"[DEBUG] Total failed payments found: {len(all_failed_payments)}")
-    for p in all_failed_payments[:20]:  # Print first 20
-        print(f"  - ID: {p.stripe_id}, Sub: {p.subscription_id}, Client: {p.client_id}, Invoice: {p.invoice_id}, Created: {p.created_at}, Status: {p.status}")
-    
-    # Debug: Check for duplicate subscription_ids
-    sub_counts = {}
-    for p in all_failed_payments:
-        if p.subscription_id:
-            sub_counts[p.subscription_id] = sub_counts.get(p.subscription_id, 0) + 1
-    print(f"[DEBUG] Subscription IDs with multiple failed payments: {[(sub, count) for sub, count in sub_counts.items() if count > 1]}")
-    
-    # Group failed payments by subscription_id + client_id to condense retry attempts
-    # For subscription payments: group by (subscription_id, client_id) - all retries for same subscription
-    # For non-subscription payments: group by (None, client_id, invoice_id) if invoice_id exists,
-    #   otherwise group by (None, client_id) - this ensures retries for same invoice are grouped
-    grouped_payments = {}
-    
-    for payment in all_failed_payments:
-        # Group using normalized IDs (first 17 chars of suffix for dedup)
-        if payment.subscription_id:
-            group_key = ('sub', normalize_stripe_id_for_dedup(payment.subscription_id))
-        elif payment.invoice_id:
-            group_key = (None, normalize_stripe_id_for_dedup(payment.invoice_id))
-        elif payment.client_id:
-            group_key = (None, payment.client_id)
-        else:
-            group_key = ('stripe', normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id)
-        
-        if group_key not in grouped_payments:
-            grouped_payments[group_key] = {
-                'payments': [],
-                'first_attempt': payment.created_at,
-                'latest_attempt': payment.created_at
-            }
-            print(f"[DEBUG] New group created: key={group_key}, payment_id={payment.stripe_id}, sub={payment.subscription_id}, client={payment.client_id}, invoice={payment.invoice_id}")
-        else:
-            existing_count = len(grouped_payments[group_key]['payments'])
-            print(f"[DEBUG] Adding to existing group: key={group_key}, payment_id={payment.stripe_id}, existing_count={existing_count}, sub={payment.subscription_id}, client={payment.client_id}, invoice={payment.invoice_id}")
-        
-        grouped_payments[group_key]['payments'].append(payment)
-        
-        # Track first and latest attempt dates
-        if payment.created_at < grouped_payments[group_key]['first_attempt']:
-            grouped_payments[group_key]['first_attempt'] = payment.created_at
-        if payment.created_at > grouped_payments[group_key]['latest_attempt']:
-            grouped_payments[group_key]['latest_attempt'] = payment.created_at
-    
-    # Convert grouped payments to result list
-    result = []
-    for group_key, group_data in grouped_payments.items():
-        # Handle different group_key formats
-        # group_key can be:
-        #   - (subscription_id,) - 1-tuple for subscription payments
-        #   - (None, invoice_id) - 2-tuple for invoice payments
-        #   - (None, client_id) - 2-tuple for client payments
-        #   - (stripe_id,) - 1-tuple for unique payments
-        
-        representative_payment = min(group_data['payments'], key=lambda p: p.created_at)
-        attempt_count = len(group_data['payments'])
-        
-        subscription_id = None
-        client_id = None
-        invoice_id = None
-        
-        if len(group_key) == 2 and group_key[0] == 'sub':
-            subscription_id = representative_payment.subscription_id
-        elif len(group_key) == 2 and group_key[0] == 'stripe':
-            continue
-        elif len(group_key) == 2:
-            first, second = group_key
-            if first is None:
-                if isinstance(second, uuid.UUID):
-                    client_id = second
-                else:
-                    invoice_id = representative_payment.invoice_id
-        
-        if not client_id:
-            client_id = representative_payment.client_id
-        if not subscription_id:
-            subscription_id = representative_payment.subscription_id
-        
-        print(f"[DEBUG] Failed payment group: key={group_key}, attempt_count={attempt_count}, subscription_id={subscription_id}, client_id={client_id}")
-        
-        client = db.query(Client).filter(Client.id == representative_payment.client_id).first() if representative_payment.client_id else None
-        
-        # Check if recovery recommendation exists (filter by org_id)
-        recovery = None
-        rejected_recovery = None
-        if representative_payment.client_id:
-            recovery = db.query(Recommendation).filter(
-                and_(
-                    Recommendation.org_id == org_id,
-                    Recommendation.client_id == representative_payment.client_id,
-                    Recommendation.type == "payment_recovery",
-                    Recommendation.status == "PENDING"
-                )
-            ).first()
-            
-        # Check if payment is resolved (by payment_id in payload - works for all cases)
-        if exclude_resolved:
-            from sqlalchemy import text
-            payment_id_str = str(representative_payment.id)
-            
-            # First check by client_id if available
-            if representative_payment.client_id:
-                rejected_recovery = db.query(Recommendation).filter(
-                    and_(
-                        Recommendation.org_id == org_id,
-                        Recommendation.client_id == representative_payment.client_id,
-                        Recommendation.type == "payment_recovery",
-                        Recommendation.status == "REJECTED"
-                    )
-                ).first()
-            
-            # Also check by payment_id in payload (works for all cases, including no client_id)
-            if not rejected_recovery:
-                rejected_by_payment_id = db.query(Recommendation).filter(
-                    and_(
-                        Recommendation.org_id == org_id,
-                        Recommendation.type == "payment_recovery",
-                        Recommendation.status == "REJECTED",
-                        text("recommendations.payload->>'payment_id' = :payment_id")
-                    )
-                ).params(payment_id=payment_id_str).first()
-                
-                if rejected_by_payment_id:
-                    rejected_recovery = rejected_by_payment_id
-        
-        # Skip resolved payments if exclude_resolved is True
-        if exclude_resolved and rejected_recovery:
-            continue
-        
-        result.append(StripeFailedPaymentResponse(
-            id=str(representative_payment.id),
-            stripe_id=representative_payment.stripe_id,
-            client_id=str(representative_payment.client_id) if representative_payment.client_id else None,
-            client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-            client_email=client.email if client else None,
-            amount_cents=representative_payment.amount_cents or 0,
-            currency=representative_payment.currency or "usd",
-            status=representative_payment.status,
-            subscription_id=representative_payment.subscription_id,
-            receipt_url=representative_payment.receipt_url,
-            created_at=int(group_data['first_attempt'].timestamp()) if group_data['first_attempt'] else 0,  # Use first attempt date
-            has_recovery_recommendation=recovery is not None,
-            recovery_recommendation_id=str(recovery.id) if recovery else None,
-            attempt_count=attempt_count,
-            first_attempt_at=int(group_data['first_attempt'].timestamp()) if group_data['first_attempt'] else 0,
-            latest_attempt_at=int(group_data['latest_attempt'].timestamp()) if group_data['latest_attempt'] else 0
-        ))
-    
-    # Sort by latest attempt date (most recent first) and apply pagination
-    result.sort(key=lambda x: x.latest_attempt_at, reverse=True)
-    total = len(result)
-    paginated_result = result[(page - 1) * page_size:page * page_size]
-    
-    return paginated_result
+    # Fallback: StripePayment table only (no Treasury rows or use_treasury=False)
+    result = _build_failed_payments_from_stripe_payment_table(db, org_id, exclude_resolved)
+    return result[(page - 1) * page_size:page * page_size]
 
 
 @router.get("/client/{client_id}/revenue", response_model=StripeClientRevenueResponse)
@@ -2151,10 +2279,11 @@ def get_client_revenue(
         for p in payments
     ]
     
+    disp_name, disp_email = _payment_display_client_info(client)
     return StripeClientRevenueResponse(
         client_id=client_id,
-        client_name=f"{client.first_name or ''} {client.last_name or ''}".strip(),
-        client_email=client.email,
+        client_name=disp_name,
+        client_email=disp_email,
         lifetime_revenue_cents=lifetime_revenue_cents,
         current_subscription_id=current_subscription.stripe_subscription_id if current_subscription else None,
         current_mrr=float(current_subscription.mrr) if current_subscription else 0.0,
@@ -2508,22 +2637,16 @@ def get_top_customers(
 @router.get("/mrr-trend", response_model=MRRTrendResponse)
 def get_mrr_trend(
     range_days: int = Query(90, alias="range", ge=7, le=365),
+    scope: Optional[str] = Query(None, description="Use 'mtd' for month-to-date"),
     group_by: str = Query("day", regex="^(day|week|month)$"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Get MRR trend over time for charting"""
-    # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
     if not check_stripe_connected(db, org_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
-        )
-    
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=range_days)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stripe not connected.")
+    start_date, end_date = _stripe_date_range(scope, range_days)
     
     # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
     
@@ -2970,12 +3093,13 @@ def assign_payment_to_client(
                 import traceback
                 traceback.print_exc()
         
+        disp_name, _ = _payment_display_client_info(client)
         return {
             "success": True,
-            "message": f"Payment assigned to {client.first_name or ''} {client.last_name or ''}".strip() or client.email or "client",
+            "message": f"Payment assigned to {disp_name}",
             "payment_id": payment_id,
             "client_id": client_id,
-            "client_name": f"{client.first_name or ''} {client.last_name or ''}".strip() or client.email or "Unknown",
+            "client_name": disp_name,
             "reconciliation": reconciliation_result
         }
         

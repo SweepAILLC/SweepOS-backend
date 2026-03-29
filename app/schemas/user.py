@@ -33,19 +33,19 @@ class UserPasswordChange(BaseModel):
 
 class UserSettingsUpdate(BaseModel):
     """User settings including privacy and data preferences"""
-    email: Optional[str] = None  # Changed from EmailStr to str to allow .local domains
-    current_password: Optional[str] = None  # Required if changing password
+    email: Optional[str] = None
+    current_password: Optional[str] = None
     new_password: Optional[str] = None
-    # Privacy settings
     data_sharing_enabled: Optional[bool] = None
     analytics_enabled: Optional[bool] = None
-    # Intelligence: Fathom API key for call summaries/transcripts
     fathom_api_key: Optional[str] = None
+    ai_profile: Optional[Dict[str, Any]] = None
 
 
 class User(UserBase):
     id: UUID
     org_id: UUID
+    org_name: Optional[str] = None
     role: str
     is_admin: bool
     created_at: datetime

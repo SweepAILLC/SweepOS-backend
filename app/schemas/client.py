@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from datetime import datetime
 from typing import List, Optional, Union
 from decimal import Decimal
@@ -38,6 +38,23 @@ class ClientBase(BaseModel):
         # This allows test emails that EmailStr would reject
         return str(v) if v is not None else None
     
+    @field_validator('emails', mode='before')
+    @classmethod
+    def normalize_emails_list(cls, v):
+        """Coerce DB JSON to a clean list of strings so email-only clients serialize reliably."""
+        if v is None:
+            return None
+        if isinstance(v, list):
+            out: List[str] = []
+            for e in v:
+                if e is None:
+                    continue
+                s = str(e).strip()
+                if s:
+                    out.append(s)
+            return out if out else None
+        return None
+
     @field_validator('program_start_date', 'program_end_date', mode='before')
     @classmethod
     def parse_program_date(cls, v):
@@ -119,6 +136,28 @@ class Client(ClientBase):
     created_at: datetime
     updated_at: datetime
 
+    @field_validator('program_progress_percent', mode='before')
+    @classmethod
+    def coerce_program_progress_percent(cls, v):
+        """SQLAlchemy may return Decimal; coerce so unnamed/email-only clients never fail validation."""
+        if v is None:
+            return None
+        if isinstance(v, Decimal):
+            return float(v)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator('meta', mode='before')
+    @classmethod
+    def coerce_meta_dict(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            return v
+        return None
+
     class Config:
         from_attributes = True
         json_encoders = {
@@ -131,6 +170,7 @@ class TerminalCashCollected(BaseModel):
     today: float = 0.0
     last_7_days: float = 0.0
     last_30_days: float = 0.0
+    last_mtd: float = 0.0  # Month to date (1st of current month to now)
 
 
 class TerminalMRR(BaseModel):
@@ -169,4 +209,39 @@ class ClientHealthScoreResponse(BaseModel):
     grade: str
     factors: List[ClientHealthFactor]
     computed_at: Optional[str] = None
+    source: Optional[str] = None  # "logic" | "ai"
+    explanation: Optional[str] = None
+    source_reason: Optional[str] = None  # e.g. ai_unavailable when AI requested but skipped
+
+
+# AI recommendation checklist (modular actions; manual completion until call-insights pipeline)
+class AIRecommendationActionOut(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    title: str
+    detail: Optional[str] = None
+    category: Optional[str] = None
+    priority: int = 0
+    completed: bool = False
+    completed_at: Optional[str] = None
+    supports_email_draft: bool = False
+
+
+class ClientAIRecommendationsResponse(BaseModel):
+    client_id: str
+    headline: Optional[str] = None
+    actions: List[AIRecommendationActionOut]
+    updated_at: Optional[str] = None
+
+
+class AIRecommendationActionPatch(BaseModel):
+    completed: bool
+
+
+class AIRecommendationEmailDraftResponse(BaseModel):
+    subject: str
+    body_plain: str
+    body_html: str
+    source: str = "template"  # "llm" | "template"
 

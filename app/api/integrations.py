@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status, Request, Body
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, Request, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import func, case, and_, exists
 from app.db.session import get_db
@@ -2606,10 +2606,11 @@ def send_brevo_transactional_email(
             if request.params:
                 email_payload["params"] = request.params
         else:
-            if request.htmlContent:
-                email_payload["htmlContent"] = request.htmlContent
+            # Plain text is primary; HTML is optional rich fallback (matches product UI)
             if request.textContent:
                 email_payload["textContent"] = request.textContent
+            if request.htmlContent:
+                email_payload["htmlContent"] = request.htmlContent
         
         # Optional fields
         if request.tags:
@@ -4000,4 +4001,41 @@ def cancel_calendly_event(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error cancelling Calendly event: {str(e)}")
+
+
+@router.post("/fathom/sync")
+def sync_fathom_meetings(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Poll Fathom for recent meetings (requires FATHOM_API_KEY in env). Use from cron or manually.
+    Only meetings whose invitee/transcript emails match a client in this org are ingested and analyzed.
+    Response includes ingested, skipped_no_client_match, meetings_seen.
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    from app.services.fathom_ingest import sync_recent_meetings_for_org
+    from app.services.call_insight_service import run_call_insight_background
+
+    try:
+        result = sync_recent_meetings_for_org(db, org_id, user=current_user)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 401:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Fathom rejected the API key (401). Regenerate it at Fathom → Settings → API Access, "
+                    "paste it under Intelligence, save, then sync again. If you use .env, set FATHOM_API_KEY there."
+                ),
+            ) from e
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Fathom API error ({e.response.status_code if e.response else 'unknown'}). Try again later.",
+        ) from e
+
+    oid_str = str(org_id)
+    for rid in result.get("pending_insight_record_ids") or []:
+        background_tasks.add_task(run_call_insight_background, oid_str, rid)
+    return result
 

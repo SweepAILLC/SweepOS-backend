@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, webhooks, funnels, admin, users, organizations, encryption, email_ingestion
+from app.api import auth, clients, events, oauth, integrations, stripe, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio
 from app.core.config import settings as app_settings
 
 app = FastAPI(title="Sweep Coach OS API", version="1.0.0")
@@ -23,14 +23,12 @@ from fastapi import Request
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Ensure CORS headers are included even on unhandled exceptions"""
-    import traceback
-    print(f"Unhandled exception: {str(exc)}")
-    print(traceback.format_exc())
-    
-    # Create response with CORS headers
+    import logging
+    logging.getLogger("app").exception("Unhandled exception on %s %s", request.method, request.url.path)
+
     response = JSONResponse(
         status_code=500,
-        content={"detail": f"Internal server error: {str(exc)}"}
+        content={"detail": "Internal server error"}
     )
     
     # Add CORS headers manually (same allowed origins as middleware)
@@ -50,6 +48,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 # See backend/app/api/ROUTING_GUIDELINES.md for details.
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(clients.router, prefix="/clients", tags=["clients"])
+app.include_router(performance.router, prefix="/performance", tags=["performance"])
+app.include_router(content_studio.router, prefix="/content-studio", tags=["content-studio"])
 app.include_router(events.router, prefix="/events", tags=["events"])
 app.include_router(funnels.router, prefix="/funnels", tags=["funnels"])
 app.include_router(users.router, prefix="/users", tags=["users"])
@@ -58,6 +58,7 @@ app.include_router(oauth.router, prefix="/oauth", tags=["oauth"])
 app.include_router(integrations.router, prefix="/integrations", tags=["integrations"])
 app.include_router(stripe.router, prefix="/integrations/stripe", tags=["stripe"])
 app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
+app.include_router(fathom_webhooks.router, prefix="/webhooks", tags=["fathom"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])

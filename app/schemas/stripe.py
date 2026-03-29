@@ -142,6 +142,7 @@ class StripeFailedPaymentResponse(StripePaymentResponse):
     attempt_count: int = 1  # Number of failed attempts for this subscription/client
     first_attempt_at: int  # Unix timestamp of first failed attempt
     latest_attempt_at: int  # Unix timestamp of most recent failed attempt
+    invoice_id: Optional[str] = None  # For dedup: canonical invoice when present
 
     class Config:
         from_attributes = True

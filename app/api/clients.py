@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, Request
 from sqlalchemy.orm import Session, defer
 import re
 from sqlalchemy import desc, func, or_, and_
@@ -24,12 +24,47 @@ from app.schemas.client import (
     TerminalTopContributor,
     ClientHealthScoreResponse,
     ClientHealthFactor,
+    ClientAIRecommendationsResponse,
+    AIRecommendationActionOut,
+    AIRecommendationActionPatch,
+    AIRecommendationEmailDraftResponse,
+)
+from app.schemas.call_insights import (
+    ClientCallInsightsResponse,
+    ClientInsightSummaryOut,
+    CallInsightPerCallOut,
+    CallInsightsRollupOut,
+    RefreshCallInsightsResponse,
 )
 from app.api.deps import get_current_user, get_selected_org_id
 from app.models.user import User
 from app.utils.stripe_ids import normalize_stripe_id_for_dedup
+from app.utils.stripe_helpers import extract_email_from_payment_raw
 from app.services.client_automation import update_client_progress, update_client_lifecycle_state, process_client_automation
-from app.services.client_health_score import get_health_score
+from app.services.health_score_cache_service import resolve_health_score, invalidate_health_score_cache, batch_read_cached_health_scores
+from app.services.client_ai_recommendations_service import (
+    get_recommendation_state_dict,
+    set_action_completed,
+)
+
+
+def _user_pipeline_priorities(user: User):
+    """Extract pipeline_priorities list from user.ai_profile, or None."""
+    raw = getattr(user, "ai_profile", None)
+    if not raw or not isinstance(raw, dict):
+        return None
+    pp = raw.get("pipeline_priorities")
+    if isinstance(pp, list) and all(isinstance(x, str) for x in pp):
+        return pp
+    return None
+from app.services.ai_recommendation_email_draft import build_recommendation_email_draft
+from app.services.call_insight_service import (
+    get_client_insights_response,
+    get_call_insight_tags_batch,
+    refresh_latest_call_insight,
+)
+from app.core.config import settings
+from app.core.rate_limit import check_sliding_window
 
 router = APIRouter()
 
@@ -99,6 +134,27 @@ def _merge_brevo_stats(stats_list: List[dict]) -> Optional[dict]:
         "trans_click_rate": (total_trans_clicked / total_trans_sent * 100.0) if total_trans_sent > 0 else None,
     }
     return out
+
+
+def _brevo_merged_stats_for_client(
+    db: Session, org_id: uuid.UUID, user_id: uuid.UUID, client: Client
+) -> Optional[dict]:
+    """Same Brevo aggregation as GET /clients/{id}/health-score (multi-email clients)."""
+    emails_to_try = [client.email] if getattr(client, "email", None) else []
+    if getattr(client, "emails", None) and isinstance(client.emails, list):
+        emails_to_try = list(emails_to_try) + [e for e in client.emails if e and str(e).strip()]
+    seen = set()
+    emails_unique = []
+    for e in emails_to_try:
+        e = str(e).strip().lower()
+        if e and e not in seen:
+            seen.add(e)
+            emails_unique.append(e)
+    all_stats = []
+    for email in emails_unique:
+        s = _fetch_brevo_email_stats(db, org_id, user_id, email)
+        all_stats.append(s)
+    return _merge_brevo_stats(all_stats)
 
 
 def _fetch_brevo_email_stats(
@@ -305,15 +361,27 @@ def create_client(
 
 @router.get("/health-scores")
 def get_clients_health_scores(
+    request: Request,
     client_ids: str = Query(..., description="Comma-separated client IDs"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Batch health scores for board tags. Returns { client_id: { score, grade } }.
-    Does not fetch Brevo (no per-email API calls) for performance.
+    Batch health scores for board tags. Returns { client_id: { score, grade, source } }.
+    Reads persisted cache first (fast). For org clients with no row yet, computes and persists a
+    logic-only score (no Brevo fetch, no LLM) so leads without Fathom/AI still show a tag.
+    Drawer GET /health-score?use_ai=true may later upgrade cache to AI when configured.
     """
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    check_sliding_window(
+        f"health_scores_batch:{current_user.id}:{org_id}",
+        max_requests=200,
+        window_seconds=getattr(settings, "HEALTH_SCORE_RATE_LIMIT_WINDOW_SEC", 300),
+        db=db,
+        audit_user=current_user,
+        audit_request=request,
+        endpoint_name="get_clients_health_scores",
+    )
     ids_str = [x.strip() for x in client_ids.split(",") if x.strip()]
     if not ids_str:
         return {}
@@ -325,13 +393,241 @@ def get_clients_health_scores(
             continue
     if not uuids:
         return {}
-    clients = db.query(Client).filter(Client.id.in_(uuids), Client.org_id == org_id).all()
-    out = {}
-    for c in clients:
-        result = get_health_score(db, c.id, org_id, brevo_email_stats=None)
-        if result:
-            out[str(c.id)] = {"score": result["score"], "grade": result["grade"]}
+    cached = batch_read_cached_health_scores(db, uuids, org_id)
+    out: dict = {}
+    for cid, data in cached.items():
+        out[str(cid)] = {
+            "score": data["score"],
+            "grade": data["grade"],
+            "source": data.get("source"),
+        }
+
+    allowed_ids = {
+        row[0]
+        for row in db.query(Client.id).filter(Client.id.in_(uuids), Client.org_id == org_id).all()
+    }
+    missing = [cid for cid in uuids if cid in allowed_ids and cid not in cached]
+    # Cap backfill so very large boards stay bounded (subsequent polls fill more if needed)
+    _MAX_LOGIC_BACKFILL = 100
+    for cid in missing[:_MAX_LOGIC_BACKFILL]:
+        try:
+            filled = resolve_health_score(
+                db,
+                cid,
+                org_id,
+                brevo_email_stats=None,
+                use_ai=False,
+                persist_cache=True,
+                record_outcome_snapshot=False,
+            )
+            if filled and filled.get("score") is not None:
+                out[str(cid)] = {
+                    "score": filled["score"],
+                    "grade": filled["grade"],
+                    "source": filled.get("source"),
+                }
+        except Exception:
+            continue
+
     return out
+
+
+@router.get("/call-insight-tags")
+def get_call_insight_tags(
+    request: Request,
+    client_ids: str = Query(..., description="Comma-separated client IDs"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Batch opportunity tags + short headline for board chips (same pattern as health-scores)."""
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    check_sliding_window(
+        f"call_insight_tags_batch:{current_user.id}:{org_id}",
+        max_requests=200,
+        window_seconds=getattr(settings, "HEALTH_SCORE_RATE_LIMIT_WINDOW_SEC", 300),
+        db=db,
+        audit_user=current_user,
+        audit_request=request,
+        endpoint_name="get_call_insight_tags",
+    )
+    ids_str = [x.strip() for x in client_ids.split(",") if x.strip()]
+    if not ids_str:
+        return {}
+    uuids = []
+    for i in ids_str:
+        try:
+            uuids.append(UUID(i))
+        except ValueError:
+            continue
+    if not uuids:
+        return {}
+    clients_ok = db.query(Client.id).filter(Client.id.in_(uuids), Client.org_id == org_id).all()
+    allowed = {row[0] for row in clients_ok}
+    filtered = [i for i in uuids if i in allowed]
+    return get_call_insight_tags_batch(db, org_id, filtered)
+
+
+@router.get("/{client_id}/call-insights", response_model=ClientCallInsightsResponse)
+def get_client_call_insights(
+    client_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        client_uuid = UUID(client_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid client ID format")
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    client = db.query(Client).filter(Client.id == client_uuid, Client.org_id == org_id).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+    data = get_client_insights_response(db, org_id, client_uuid)
+    summary = data.get("summary")
+    summary_out = None
+    if summary:
+        summary_out = ClientInsightSummaryOut(
+            headline=summary.get("headline"),
+            tags=summary.get("tags") or [],
+            last_call_at=summary.get("last_call_at"),
+            last_insight_at=summary.get("last_insight_at"),
+        )
+    insights_out = [CallInsightPerCallOut(**x) for x in data.get("insights") or []]
+    rollup_raw = data.get("rollup")
+    rollup_out = CallInsightsRollupOut(**rollup_raw) if isinstance(rollup_raw, dict) else None
+    return ClientCallInsightsResponse(
+        client_id=data.get("client_id", str(client_uuid)),
+        summary=summary_out,
+        insights=insights_out,
+        rollup=rollup_out,
+    )
+
+
+@router.post("/{client_id}/call-insights/refresh", response_model=RefreshCallInsightsResponse)
+def post_client_call_insights_refresh(
+    client_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        client_uuid = UUID(client_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid client ID format")
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    client = db.query(Client).filter(Client.id == client_uuid, Client.org_id == org_id).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+    status, detail = refresh_latest_call_insight(db, org_id, client_uuid)
+    return RefreshCallInsightsResponse(status=status, detail=detail)
+
+
+@router.get("/{client_id}/ai-recommendations", response_model=ClientAIRecommendationsResponse)
+def get_client_ai_recommendations(
+    client_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Lifecycle-based recommended actions (modular checklist). User can mark items complete via PATCH.
+    Populated from defaults until call-insights AI is wired; completions persist per client.
+    """
+    try:
+        client_uuid = UUID(client_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid client ID format")
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    client = db.query(Client).filter(Client.id == client_uuid, Client.org_id == org_id).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+    pp = _user_pipeline_priorities(current_user)
+    data = get_recommendation_state_dict(db, client, pipeline_priorities=pp)
+    actions = [AIRecommendationActionOut.model_validate(a) for a in data.get("actions", []) if isinstance(a, dict)]
+    return ClientAIRecommendationsResponse(
+        client_id=data["client_id"],
+        headline=data.get("headline"),
+        actions=actions,
+        updated_at=data.get("updated_at"),
+    )
+
+
+@router.patch(
+    "/{client_id}/ai-recommendations/actions/{action_id}",
+    response_model=ClientAIRecommendationsResponse,
+)
+def patch_client_ai_recommendation_action(
+    client_id: str,
+    action_id: str,
+    body: AIRecommendationActionPatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        client_uuid = UUID(client_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid client ID format")
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    client = db.query(Client).filter(Client.id == client_uuid, Client.org_id == org_id).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+    updated = set_action_completed(
+        db, client, action_id, body.completed, user_id=current_user.id
+    )
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action not found")
+    pp = _user_pipeline_priorities(current_user)
+    data = get_recommendation_state_dict(db, client, pipeline_priorities=pp)
+    actions = [AIRecommendationActionOut.model_validate(a) for a in data.get("actions", []) if isinstance(a, dict)]
+    return ClientAIRecommendationsResponse(
+        client_id=data["client_id"],
+        headline=data.get("headline"),
+        actions=actions,
+        updated_at=data.get("updated_at"),
+    )
+
+
+@router.post(
+    "/{client_id}/ai-recommendations/actions/{action_id}/email-draft",
+    response_model=AIRecommendationEmailDraftResponse,
+)
+def post_ai_recommendation_email_draft(
+    client_id: str,
+    action_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Generate a conversion-focused email draft using rich client context (health, Fathom sentiment/transcript,
+    call-insight wins, notes) and expert copywriting when LLM is configured; else a short template fallback.
+    """
+    try:
+        client_uuid = UUID(client_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid client ID format")
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    check_sliding_window(
+        f"ai_rec_email_draft:{current_user.id}:{org_id}",
+        max_requests=40,
+        window_seconds=300,
+        db=db,
+        audit_user=current_user,
+        audit_request=request,
+        endpoint_name="post_ai_recommendation_email_draft",
+    )
+    client = db.query(Client).filter(Client.id == client_uuid, Client.org_id == org_id).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+    draft = build_recommendation_email_draft(db, client, action_id, org_id, sender_user=current_user)
+    if draft is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Action not found or email draft not available for this recommendation",
+        )
+    return AIRecommendationEmailDraftResponse(
+        subject=draft["subject"],
+        body_plain=draft["body_plain"],
+        body_html=draft["body_html"],
+        source=draft.get("source", "template"),
+    )
 
 
 @router.get("/{client_id}", response_model=ClientSchema)
@@ -371,14 +667,19 @@ def get_client(
 
 @router.get("/{client_id}/health-score", response_model=ClientHealthScoreResponse)
 def get_client_health_score(
+    request: Request,
     client_id: str,
+    use_ai: bool = Query(
+        False,
+        description="Request AI overlay when LLM + FATHOM_API_KEY are configured; otherwise logic score with source_reason",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Get logic-based client/lead health score (0–100) and factors.
-    Architecture is AI-ready: factors include key, label, value, raw, unit, description
-    for future referral/testimonial/retention/upsell recommendations.
+    Get client/lead health score (0–100) and factors. Defaults to logic-based scoring.
+    When use_ai=true and FATHOM_API_KEY + LLM are configured, may return source=\"ai\" with explanation;
+    if Fathom is not configured, returns logic score and source_reason=fathom_not_configured (no error).
     Factors: show rate, email open rate (Brevo), failed payments, program timeline/tenure, days since last contact.
     """
     try:
@@ -387,30 +688,34 @@ def get_client_health_score(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid client ID format")
 
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    win = getattr(settings, "HEALTH_SCORE_RATE_LIMIT_WINDOW_SEC", 300)
+    max_req = (
+        getattr(settings, "HEALTH_SCORE_AI_RATE_LIMIT_MAX", 25)
+        if use_ai
+        else getattr(settings, "HEALTH_SCORE_RATE_LIMIT_MAX", 120)
+    )
+    check_sliding_window(
+        f"health_score:{current_user.id}:{org_id}:{'ai' if use_ai else 'base'}",
+        max_requests=max_req,
+        window_seconds=win,
+        db=db,
+        audit_user=current_user,
+        audit_request=request,
+        endpoint_name="get_client_health_score",
+    )
+
     client = db.query(Client).filter(Client.id == client_uuid, Client.org_id == org_id).first()
     if not client:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
 
-    emails_to_try = [client.email] if getattr(client, "email", None) else []
-    if getattr(client, "emails", None) and isinstance(client.emails, list):
-        emails_to_try = list(emails_to_try) + [e for e in client.emails if e and str(e).strip()]
-    # Normalize and dedupe so we don't hit Brevo twice for the same address
-    seen = set()
-    emails_unique = []
-    for e in emails_to_try:
-        e = str(e).strip().lower()
-        if e and e not in seen:
-            seen.add(e)
-            emails_unique.append(e)
-    all_stats = []
-    for email in emails_unique:
-        s = _fetch_brevo_email_stats(db, org_id, current_user.id, email)
-        all_stats.append(s)
-    brevo_stats = _merge_brevo_stats(all_stats)
+    brevo_stats = _brevo_merged_stats_for_client(db, org_id, current_user.id, client)
 
-    result = get_health_score(
-        db, client_uuid, org_id,
+    result = resolve_health_score(
+        db,
+        client_uuid,
+        org_id,
         brevo_email_stats=brevo_stats,
+        use_ai=use_ai,
     )
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
@@ -432,6 +737,9 @@ def get_client_health_score(
         grade=result["grade"],
         factors=factors_out,
         computed_at=result.get("computed_at"),
+        source=result.get("source"),
+        explanation=result.get("explanation"),
+        source_reason=result.get("source_reason"),
     )
 
 
@@ -456,6 +764,7 @@ def get_terminal_summary(
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     seven_days_ago = today_start - timedelta(days=7)
     thirty_days_ago = today_start - timedelta(days=30)
+    mtd_start = today_start.replace(day=1)  # First of current month
 
     # --- Cash collected: Stripe (succeeded, dedupe by stripe_id) + Manual ---
     stripe_payments = (
@@ -470,6 +779,7 @@ def get_terminal_summary(
     today_cash = 0.0
     last_7_cash = 0.0
     last_30_cash = 0.0
+    mtd_cash = 0.0
     for p in stripe_payments:
         if p.stripe_id and p.stripe_id in seen_stripe_ids:
             continue
@@ -485,6 +795,8 @@ def get_terminal_summary(
             last_7_cash += amount
         if ts >= thirty_days_ago:
             last_30_cash += amount
+        if ts >= mtd_start:
+            mtd_cash += amount
 
     manual_payments = (
         db.query(ManualPayment)
@@ -504,11 +816,14 @@ def get_terminal_summary(
             last_7_cash += amount
         if ts >= thirty_days_ago:
             last_30_cash += amount
+        if ts >= mtd_start:
+            mtd_cash += amount
 
     cash_collected = TerminalCashCollected(
         today=today_cash,
         last_7_days=last_7_cash,
         last_30_days=last_30_cash,
+        last_mtd=mtd_cash,
     )
 
     # --- MRR/ARR: from Stripe subscriptions (active/trialing) or fallback to client estimated_mrr ---
@@ -791,20 +1106,9 @@ def get_client_payments(
             if payment.id in added_payment_ids:
                 continue
             
-            # Check if customer email matches in raw_event
-            customer_email = None
-            if payment.raw_event:
-                if isinstance(payment.raw_event, dict):
-                    # Check various paths where email might be (including receipt_email for invoices)
-                    customer_email = (
-                        payment.raw_event.get('customer_email') or
-                        payment.raw_event.get('receipt_email') or  # Common for invoices
-                        (payment.raw_event.get('customer', {}).get('email') if isinstance(payment.raw_event.get('customer'), dict) else None) or
-                        (payment.raw_event.get('data', {}).get('object', {}).get('customer_email') if isinstance(payment.raw_event.get('data'), dict) else None) or
-                        (payment.raw_event.get('data', {}).get('object', {}).get('receipt_email') if isinstance(payment.raw_event.get('data'), dict) else None) or  # For invoice events
-                        (payment.raw_event.get('data', {}).get('object', {}).get('customer', {}).get('email') if isinstance(payment.raw_event.get('data', {}).get('object', {}).get('customer'), dict) else None)
-                    )
-            
+            # Check if customer email matches in raw_event (Charge, PaymentIntent, Invoice, or webhook format)
+            customer_email = extract_email_from_payment_raw(payment.raw_event) if payment.raw_event else None
+
             # Also check if payment is linked to a client with matching email
             if not customer_email and payment.client_id:
                 linked_client = db.query(Client).filter(Client.id == payment.client_id).first()
@@ -1170,10 +1474,11 @@ def update_client(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # CRITICAL: Filter by org_id for multi-tenant isolation
+    # CRITICAL: Filter by org_id for multi-tenant isolation (selected org from token)
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
     client = db.query(Client).filter(
         Client.id == client_id,
-        Client.org_id == current_user.org_id
+        Client.org_id == org_id
     ).first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
@@ -1247,6 +1552,7 @@ def update_client(
         
         db.commit()
         db.refresh(client)
+        invalidate_health_score_cache(db, client.id, org_id)
         return client
     except HTTPException:
         raise
@@ -1377,12 +1683,22 @@ def merge_clients(
             StripeTreasuryTransaction.client_id == rid,
             StripeTreasuryTransaction.org_id == org_id,
         ).update({StripeTreasuryTransaction.client_id: keep_id}, synchronize_session=False)
+        try:
+            from app.models.fathom_call_record import FathomCallRecord
+
+            db.query(FathomCallRecord).filter(
+                FathomCallRecord.client_id == rid,
+                FathomCallRecord.org_id == org_id,
+            ).update({FathomCallRecord.client_id: keep_id}, synchronize_session=False)
+        except Exception:
+            pass
 
     for c in to_remove:
         db.delete(c)
 
     db.commit()
     db.refresh(keep)
+    invalidate_health_score_cache(db, keep_id, org_id)
     return ClientSchema.model_validate(keep, from_attributes=True)
 
 

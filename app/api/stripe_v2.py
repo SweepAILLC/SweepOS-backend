@@ -34,6 +34,40 @@ from app.schemas.stripe import (
 router = APIRouter()
 
 
+def _extract_email_from_payment_raw(raw_event) -> Optional[str]:
+    """Extract customer/receipt email from StripePayment.raw_event."""
+    if not raw_event:
+        return None
+    d = raw_event if isinstance(raw_event, dict) else {}
+    email = d.get("customer_email") or d.get("receipt_email")
+    if email:
+        return email
+    billing = d.get("billing_details") or {}
+    if isinstance(billing, dict) and billing.get("email"):
+        return billing.get("email")
+    obj = d.get("data")
+    if isinstance(obj, dict):
+        obj = obj.get("object", {})
+    if isinstance(obj, dict):
+        email = obj.get("customer_email") or obj.get("receipt_email")
+        if email:
+            return email
+        billing = obj.get("billing_details") or {}
+        if isinstance(billing, dict):
+            return billing.get("email")
+    return None
+
+
+def _payment_display_client_info(client, transaction_email=None, payment_raw_event=None):
+    """Get (client_name, client_email) for payment. When no client name, use email instead of Unknown."""
+    name = (f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None) or ""
+    email = (client.email if client else None) or transaction_email
+    if not email and payment_raw_event:
+        email = _extract_email_from_payment_raw(payment_raw_event)
+    display_name = name or email or "Unknown"
+    return display_name, email
+
+
 def check_stripe_connected(db: Session) -> bool:
     """Check if Stripe is connected via OAuth"""
     oauth_token = db.query(OAuthToken).filter(
@@ -328,12 +362,13 @@ def get_subscriptions(
     result = []
     for sub in subscriptions:
         client = db.query(Client).filter(Client.id == sub.client_id).first() if sub.client_id else None
+        disp_name, disp_email = _payment_display_client_info(client)
         result.append(StripeSubscriptionResponse(
             id=sub.id,
             stripe_subscription_id=sub.stripe_subscription_id,
             client_id=sub.client_id,
-            client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-            client_email=client.email if client else None,
+            client_name=disp_name,
+            client_email=disp_email,
             status=sub.status,
             plan_id=sub.plan_id,
             mrr=float(sub.mrr),
@@ -373,12 +408,13 @@ def get_payments(
     result = []
     for payment in payments:
         client = db.query(Client).filter(Client.id == payment.client_id).first() if payment.client_id else None
+        disp_name, disp_email = _payment_display_client_info(client, payment_raw_event=payment.raw_event)
         result.append(StripePaymentResponse(
             id=payment.id,
             stripe_id=payment.stripe_id,
             client_id=payment.client_id,
-            client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-            client_email=client.email if client else None,
+            client_name=disp_name,
+            client_email=disp_email,
             amount_cents=payment.amount_cents,
             currency=payment.currency,
             status=payment.status,
@@ -428,12 +464,13 @@ def get_failed_payments(
             )
         ).first()
         
+        disp_name, disp_email = _payment_display_client_info(client, payment_raw_event=payment.raw_event)
         result.append(StripeFailedPaymentResponse(
             id=payment.id,
             stripe_id=payment.stripe_id,
             client_id=payment.client_id,
-            client_name=f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None,
-            client_email=client.email if client else None,
+            client_name=disp_name,
+            client_email=disp_email,
             amount_cents=payment.amount_cents,
             currency=payment.currency,
             status=payment.status,
@@ -503,10 +540,11 @@ def get_client_revenue(
         for p in payments
     ]
     
+    disp_name, disp_email = _payment_display_client_info(client)
     return StripeClientRevenueResponse(
         client_id=client_id,
-        client_name=f"{client.first_name or ''} {client.last_name or ''}".strip(),
-        client_email=client.email,
+        client_name=disp_name,
+        client_email=disp_email,
         lifetime_revenue_cents=lifetime_revenue_cents,
         current_subscription_id=current_subscription.stripe_subscription_id if current_subscription else None,
         current_mrr=float(current_subscription.mrr) if current_subscription else 0.0,

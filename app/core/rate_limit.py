@@ -3,7 +3,7 @@ Simple in-memory rate limiting for API endpoints
 """
 from functools import wraps
 from fastapi import HTTPException, status, Request
-from typing import Callable
+from typing import Callable, Optional
 from datetime import datetime, timedelta
 from collections import defaultdict
 import threading
@@ -141,4 +141,58 @@ def rate_limit(max_requests: int = 5, window_seconds: int = 300, identifier_func
         
         return wrapper
     return decorator
+
+
+def check_sliding_window(
+    identifier: str,
+    max_requests: int,
+    window_seconds: int,
+    *,
+    db: Optional[object] = None,
+    audit_user: Optional[object] = None,
+    audit_request: Optional[Request] = None,
+    endpoint_name: str = "check_sliding_window",
+) -> None:
+    """
+    Enforce the same sliding-window limit as @rate_limit for use inside route handlers.
+    Raises HTTPException 429 when exceeded. Records this request on success.
+    """
+    if max_requests <= 0:
+        return
+    _cleanup_old_entries()
+    now = datetime.utcnow()
+    window_start = now - timedelta(seconds=window_seconds)
+
+    with _rate_limit_lock:
+        recent_requests = [ts for ts, _ in _rate_limit_store[identifier] if ts > window_start]
+        if len(recent_requests) >= max_requests:
+            try:
+                if db is not None and audit_user is not None and audit_request is not None:
+                    from app.core.audit import log_security_event
+                    from app.models.audit_log import AuditEventType
+                    log_security_event(
+                        db=db,
+                        event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
+                        org_id=getattr(audit_user, "org_id", None),
+                        user_id=getattr(audit_user, "id", None),
+                        resource_type="api_endpoint",
+                        resource_id=endpoint_name,
+                        ip_address=audit_request.client.host if audit_request.client else None,
+                        user_agent=audit_request.headers.get("user-agent") if audit_request else None,
+                        details={
+                            "endpoint": endpoint_name,
+                            "max_requests": max_requests,
+                            "window_seconds": window_seconds,
+                        },
+                    )
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Rate limit exceeded: {max_requests} requests per {window_seconds} seconds. "
+                    "Please try again later."
+                ),
+            )
+        _rate_limit_store[identifier].append((now, 1))
 

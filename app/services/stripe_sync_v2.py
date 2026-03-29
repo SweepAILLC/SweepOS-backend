@@ -221,14 +221,17 @@ def upsert_client(db: Session, customer_data, org_id: uuid.UUID) -> Client:
             client.stripe_customer_id = customer_id
         client.updated_at = datetime.utcnow()
     else:
-        # Create new only when Stripe provided a real name (do not create unnamed clients)
-        customer_name = getattr(customer_data, 'name', None) or ''
-        customer_name = (customer_name or '').strip()
-        if not customer_name:
-            print(f"[SYNC] Skipping unnamed client for Stripe customer {customer_id}")
+        # Create new when Stripe provides a display name and/or email (email-only payers get a card)
+        customer_name = (getattr(customer_data, 'name', None) or '').strip()
+        if not customer_name and not customer_email:
+            print(f"[SYNC] Skipping client with no name and no email for Stripe customer {customer_id}")
             return None
-        first_name = customer_name.split()[0] if customer_name.split() else None
-        last_name = ' '.join(customer_name.split()[1:]) if len(customer_name.split()) > 1 else None
+        first_name = None
+        last_name = None
+        if customer_name:
+            parts = customer_name.split()
+            first_name = parts[0] if parts else None
+            last_name = ' '.join(parts[1:]) if len(parts) > 1 else None
         client = Client(
             org_id=org_id,
             stripe_customer_id=customer_id,
@@ -262,7 +265,8 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
             'requires_confirmation': 'pending',
             'requires_action': 'pending',
             'canceled': 'failed',
-            'requires_capture': 'pending'
+            'requires_capture': 'pending',
+            'failed': 'failed',  # some Stripe API versions / test modes
         }
         status = status_map.get(payment_data.status, 'pending')
     else:  # invoice
@@ -274,50 +278,56 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
             status = 'failed'
         elif invoice_status in ('open', 'void') and not paid:
             # Check if there are failed payment attempts
-            # If invoice has attempts and all failed, mark as failed
             if hasattr(payment_data, 'attempt_count') and payment_data.attempt_count > 0:
                 if hasattr(payment_data, 'last_payment_error') and payment_data.last_payment_error:
                     status = 'failed'
                 else:
                     status = 'pending'
             else:
-                status = 'failed'
+                # No attempts yet (e.g. scheduled) - pending, not failed
+                status = 'pending'
         else:
             status = 'pending'
     
     # Get client - try to find existing, or create if missing
+    from app.utils.stripe_helpers import extract_email_from_payment_data
+
     client = None
-    if hasattr(payment_data, 'customer') and payment_data.customer:
-        customer_id = payment_data.customer
-        # First try to find existing client
+    customer_id = getattr(payment_data, 'customer', None)
+    customer_email = extract_email_from_payment_data(payment_data)
+
+    if customer_id:
+        # First try to find existing client by stripe_customer_id
         client = db.query(Client).filter(
             Client.stripe_customer_id == customer_id,
             Client.org_id == org_id
         ).first()
-        
+
         # If client not found, try to fetch customer from Stripe and create client
         if not client:
             try:
                 print(f"[SYNC] Client not found for customer {customer_id}, fetching from Stripe...")
                 customer = stripe.Customer.retrieve(customer_id)
                 client = upsert_client_with_retry(db, customer, org_id)
-                print(f"[SYNC] Created/found client {client.id} for customer {customer_id}")
+                if client:
+                    print(f"[SYNC] Created/found client {client.id} for customer {customer_id}")
+                else:
+                    print(f"[SYNC] No client created for customer {customer_id} (Stripe customer has no name and no email)")
             except Exception as e:
                 print(f"[SYNC] ⚠️  Failed to fetch customer {customer_id} from Stripe: {str(e)}")
-                # Try to create a minimal client from payment data if available
-                customer_email = getattr(payment_data, 'customer_email', None) or getattr(payment_data, 'receipt_email', None)
+                # Try to find existing client by email (primary or additional emails)
                 if customer_email:
-                    # Try to find by email (primary or emails list)
                     client = find_client_by_email(db, org_id, customer_email)
                     if client:
-                        # Link stripe_customer_id to existing client
                         if not client.stripe_customer_id:
                             client.stripe_customer_id = customer_id
                             db.flush()
                         print(f"[SYNC] Linked existing client {client.id} to customer {customer_id} by email")
-                    else:
-                        # Do not create unnamed client (email-only); payment will have client_id=None
-                        print(f"[SYNC] Skipping unnamed client for customer {customer_id} (email-only)")
+    elif customer_email:
+        # No customer_id (e.g. Checkout one-off) - try to find client by email
+        client = find_client_by_email(db, org_id, customer_email)
+        if client:
+            print(f"[SYNC] Linked payment {payment_id} to existing client {client.id} by email (no customer_id)")
     
     # Get subscription_id and invoice_id
     subscription_id = None
@@ -821,6 +831,7 @@ def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str
     }
     
     print(f"[REPAIR] Starting repair of payments without clients for org {org_id}")
+    from app.utils.stripe_helpers import extract_email_from_payment_raw
     
     # Find all payments without client_id for this org
     payments_without_clients = db.query(StripePayment).filter(
@@ -844,13 +855,24 @@ def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str
                 customer_id = None
                 customer_email = None
                 
-                # Try to extract customer info from raw_event
+                # Try to extract customer info from raw_event (charge object or webhook envelope)
                 if payment.raw_event:
                     raw_data = payment.raw_event
-                    customer_id = raw_data.get('customer') if isinstance(raw_data, dict) else getattr(raw_data, 'customer', None)
-                    customer_email = raw_data.get('customer_email') if isinstance(raw_data, dict) else getattr(raw_data, 'customer_email', None)
+                    if isinstance(raw_data, dict):
+                        customer_id = raw_data.get('customer')
+                        customer_email = raw_data.get('customer_email') or raw_data.get('receipt_email')
+                        if not customer_id or not customer_email:
+                            obj = raw_data.get('data', {}).get('object', {})
+                            if isinstance(obj, dict):
+                                if not customer_id:
+                                    customer_id = obj.get('customer')
+                                if not customer_email:
+                                    customer_email = obj.get('customer_email') or obj.get('receipt_email')
+                    else:
+                        customer_id = getattr(raw_data, 'customer', None)
+                        customer_email = getattr(raw_data, 'customer_email', None) or getattr(raw_data, 'receipt_email', None)
                     if not customer_email:
-                        customer_email = raw_data.get('receipt_email') if isinstance(raw_data, dict) else getattr(raw_data, 'receipt_email', None)
+                        customer_email = extract_email_from_payment_raw(payment.raw_event)
                 
                 # If no customer_id in raw_event, try to fetch from Stripe based on payment type
                 if not customer_id:
@@ -892,11 +914,11 @@ def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str
                         try:
                             customer = stripe.Customer.retrieve(customer_id)
                             client = upsert_client_with_retry(db, customer, org_id)
-                            results["clients_created"] += 1
-                            print(f"[REPAIR] Created client {client.id} for customer {customer_id}")
+                            if client:
+                                results["clients_created"] += 1
+                                print(f"[REPAIR] Created/found client {client.id} for customer {customer_id}")
                         except Exception as e:
                             print(f"[REPAIR] ⚠️  Could not fetch customer {customer_id} from Stripe: {str(e)}")
-                            # Try to create from email if available
                             if customer_email:
                                 client = find_client_by_email(db, org_id, customer_email)
                                 if client:
@@ -905,9 +927,6 @@ def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str
                                         db.flush()
                                     results["clients_linked"] += 1
                                     print(f"[REPAIR] Linked existing client {client.id} to customer {customer_id} by email")
-                                else:
-                                    # Do not create unnamed client (email-only)
-                                    print(f"[REPAIR] Skipping unnamed client for customer {customer_id} (email-only)")
                     
                     # Link payment to client
                     if client:
@@ -1266,7 +1285,52 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             import traceback
             traceback.print_exc()
             # Continue - don't fail entire sync if invoices fail
-        
+
+        # Sync failed invoices (open with failed attempts, uncollectible)
+        # These show in Stripe Billing > Invoices but were never pulled by paid-only sync.
+        # Use 90-day window so we catch failures that predate last incremental sync.
+        print(f"[SYNC] Syncing failed invoices (open/uncollectible)...")
+        failed_invoice_since = (datetime.utcnow() - timedelta(days=90)).timestamp()
+        for failed_status in ("open", "uncollectible"):
+            try:
+                failed_invoice_params = {"limit": 100, "status": failed_status, "created": {"gte": int(failed_invoice_since)}}
+                failed_invoices = stripe.Invoice.list(**failed_invoice_params)
+                for invoice in failed_invoices.auto_paging_iter():
+                    try:
+                        if invoice.customer:
+                            try:
+                                customer = stripe.Customer.retrieve(invoice.customer)
+                                upsert_client_with_retry(db, customer, org_id)
+                            except Exception as e:
+                                print(f"[SYNC] ⚠️  Could not retrieve customer {invoice.customer} for failed invoice {invoice.id}: {str(e)}")
+                        payment = upsert_payment(db, invoice, org_id, 'invoice')
+                        if payment and payment.status == 'failed':
+                            if not sync_start or (payment.created_at and payment.created_at >= sync_start):
+                                results["payments_synced"] += 1
+                            else:
+                                results["payments_updated"] += 1
+                            print(f"[SYNC] Failed invoice synced: {invoice.id} status={invoice.status} amount_due={getattr(invoice, 'amount_due', 0)}")
+                        if (results["payments_synced"] + results["payments_updated"]) % 50 == 0:
+                            try:
+                                db.commit()
+                            except Exception as commit_err:
+                                print(f"[SYNC] Error committing during failed invoice sync: {str(commit_err)}")
+                                db.rollback()
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
+                            print(f"[SYNC] Deadlock upserting failed invoice {invoice.id}, rolling back: {str(e)}")
+                            db.rollback()
+                        else:
+                            print(f"[SYNC] Error upserting failed invoice {invoice.id}: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+            except Exception as e:
+                print(f"[SYNC] Error listing {failed_status} invoices: {str(e)}")
+                import traceback
+                traceback.print_exc()
+
         # Repair existing payments without clients (runs every sync to fix any missing links)
         print(f"[SYNC] Repairing payments without clients...")
         try:
