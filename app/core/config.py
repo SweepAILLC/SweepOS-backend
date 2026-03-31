@@ -92,6 +92,8 @@ class Settings(BaseSettings):
     FATHOM_SYNC_DELAY_MS: int = 0
     # Max pages per sync request (cost / time bound)
     FATHOM_SYNC_MAX_PAGES: int = 5
+    # Hard wall-clock cap per sync (seconds) to avoid very long requests on huge accounts
+    FATHOM_SYNC_MAX_SECONDS: int = 90
 
     # Call insights (LLM per matched Fathom recording; safeguards for cost)
     CALL_INSIGHT_MIN_INPUT_CHARS: int = 400

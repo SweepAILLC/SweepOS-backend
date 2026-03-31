@@ -498,6 +498,47 @@ def switch_organization(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+@router.delete("/organizations/{org_id}", status_code=status.HTTP_204_NO_CONTENT)
+def leave_organization(
+    org_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Leave a secondary organization.
+
+    - Users cannot leave their primary org (backward-compat `user.org_id` or UserOrganization.is_primary).
+    - Only affects the UserOrganization link; does not delete the org or user account.
+    """
+    # Prevent leaving primary org
+    if org_id == current_user.org_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot leave your primary organization.",
+        )
+
+    user_org = db.query(UserOrganization).filter(
+        UserOrganization.user_id == current_user.id,
+        UserOrganization.org_id == org_id,
+    ).first()
+
+    if not user_org:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="You are not a member of this organization.",
+        )
+
+    if user_org.is_primary:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot leave your primary organization.",
+        )
+
+    db.delete(user_org)
+    db.commit()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Invitation acceptance (public; no auth required for validate/accept)
 # ---------------------------------------------------------------------------

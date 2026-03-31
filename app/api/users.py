@@ -18,6 +18,7 @@ from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.user_tab_permission import UserTabPermission
 from app.core.security import get_password_hash
 from app.schemas.user import User as UserSchema, UserCreate, UserUpdate
+from app.schemas.organization import Organization as OrganizationSchema, OrganizationUpdate
 from app.schemas.permission import (
     OrganizationTabPermission as OrgTabPermissionSchema,
     OrganizationTabPermissionCreate,
@@ -562,6 +563,48 @@ def delete_user(
     
     db.commit()
     return None
+
+
+@router.patch("/me/organization", response_model=OrganizationSchema)
+def update_my_organization(
+    org_update: OrganizationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Update the current organization (currently supports renaming).
+
+    - Uses selected_org_id from token when present.
+    - Only OWNER or ADMIN in that org may change its name.
+    """
+    # Only admins/owners can rename org
+    if current_user.role not in [UserRole.ADMIN, UserRole.OWNER] and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can update organization settings",
+        )
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organization not found",
+        )
+
+    if org_update.name is not None:
+        new_name = org_update.name.strip()
+        if not new_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Organization name cannot be empty",
+            )
+        org.name = new_name
+
+    db.commit()
+    db.refresh(org)
+    # Return Pydantic schema to satisfy FastAPI response_model requirements
+    return OrganizationSchema.model_validate(org, from_attributes=True)
 
 
 # Tab Permissions Endpoints

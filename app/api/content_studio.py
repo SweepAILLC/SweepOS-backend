@@ -199,18 +199,25 @@ def get_bootstrap(
     gen_row = css.get_latest_generation_row(db, org_id)
     urow = _user_orm(db, current_user)
 
+    # If underlying signals changed, trigger bundle regeneration in the background.
+    # Do not block the request; return the last known bundle (if any) so the UI can
+    # keep rendering while a fresh draft is generated.
     if _needs_bundle_regeneration(gen_row, fingerprint):
         lock = _get_org_regen_lock(org_id)
-        acquired = lock.acquire(blocking=False)
-        if acquired:
+        if lock.acquire(blocking=False):
             try:
-                _regenerate_bundle_outside_session(org_id, urow.id, fingerprint)
+                import threading
+
+                t = threading.Thread(
+                    target=_regenerate_bundle_outside_session,
+                    args=(org_id, urow.id, fingerprint),
+                    daemon=True,
+                )
+                t.start()
             finally:
                 lock.release()
-        else:
-            lock.acquire(timeout=65)
-            lock.release()
-        gen_row = css.get_latest_generation_row(db, org_id)
+        # Do not wait on the lock here; another request already kicked off regen.
+        # We intentionally keep using gen_row from before so callers see the previous bundle.
 
     content_bundle: ContentStudioBundleOut | None = None
     if gen_row and isinstance(gen_row.ideas_json, dict) and int(gen_row.ideas_json.get("version") or 0) >= BUNDLE_VERSION:

@@ -75,6 +75,46 @@ def fathom_configured_for_org(db: Session, org_id: uuid.UUID) -> bool:
     return bool(resolve_fathom_api_key(db, org_id))
 
 
+_RETRYABLE_STATUS = frozenset({429, 502, 503})
+
+
+def _get_with_retries(
+    fn,
+    *,
+    timeout: float,
+    max_attempts: int = 3,
+) -> Any:
+    """
+    Small wrapper around httpx.Client.get with limited retries and backoff.
+
+    Fathom's API can sporadically time out or return transient 5xx/429s for large accounts.
+    Retrying a couple times on these cases dramatically reduces visible failures
+    without pushing undue load.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                r = fn(client)
+                if r.status_code in _RETRYABLE_STATUS and attempt < max_attempts - 1:
+                    # Simple exponential backoff with upper bound
+                    import time as _time
+
+                    _time.sleep(min(0.5 * (2**attempt), 4.0))
+                    continue
+                r.raise_for_status()
+                return r.json()
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
+            last_exc = e
+            if attempt < max_attempts - 1:
+                import time as _time
+
+                _time.sleep(min(0.5 * (2**attempt), 4.0))
+                continue
+            raise
+    raise last_exc or RuntimeError("Fathom request exhausted retries")
+
+
 def _headers(api_key: str) -> Dict[str, str]:
     if not api_key or not str(api_key).strip():
         raise RuntimeError("Fathom API key not set")
@@ -104,10 +144,10 @@ def list_meetings(
         params["cursor"] = cursor
     if created_after:
         params["created_after"] = created_after
-    with httpx.Client(timeout=timeout) as client:
-        r = client.get(f"{BASE}/meetings", headers=_headers(key), params=params)
-        r.raise_for_status()
-        return r.json()
+    return _get_with_retries(
+        lambda c: c.get(f"{BASE}/meetings", headers=_headers(key), params=params),
+        timeout=timeout,
+    )
 
 
 def get_recording_summary(
@@ -121,13 +161,13 @@ def get_recording_summary(
     key = api_key or resolve_fathom_api_key(db, org_id)
     if not key:
         raise RuntimeError("Fathom not configured")
-    with httpx.Client(timeout=timeout) as client:
-        r = client.get(
+    return _get_with_retries(
+        lambda c: c.get(
             f"{BASE}/recordings/{recording_id}/summary",
             headers=_headers(key),
-        )
-        r.raise_for_status()
-        return r.json()
+        ),
+        timeout=timeout,
+    )
 
 
 def get_recording_transcript(
@@ -141,13 +181,13 @@ def get_recording_transcript(
     key = api_key or resolve_fathom_api_key(db, org_id)
     if not key:
         raise RuntimeError("Fathom not configured")
-    with httpx.Client(timeout=timeout) as client:
-        r = client.get(
+    return _get_with_retries(
+        lambda c: c.get(
             f"{BASE}/recordings/{recording_id}/transcript",
             headers=_headers(key),
-        )
-        r.raise_for_status()
-        return r.json()
+        ),
+        timeout=timeout,
+    )
 
 
 def create_webhook(

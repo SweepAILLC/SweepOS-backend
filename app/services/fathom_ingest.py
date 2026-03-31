@@ -238,7 +238,13 @@ def sync_recent_meetings_for_org(
     skipped_no_client = 0
     total_seen = 0
     pending_insight_record_ids: List[uuid.UUID] = []
+    max_seconds = int(getattr(app_settings, "FATHOM_SYNC_MAX_SECONDS", 90) or 90)
+    started_at = time.time()
+
     for _ in range(max_pages):
+        # Hard wall-clock guard: stop the sync if we've been running too long
+        if max_seconds > 0 and time.time() - started_at > max_seconds:
+            break
         data = fathom_client.list_meetings(
             cursor=cursor,
             include_summary=True,

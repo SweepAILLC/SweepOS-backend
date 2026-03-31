@@ -245,6 +245,7 @@ def _fetch_brevo_email_stats(
 @router.get("", response_model=List[ClientSchema])
 def list_clients(
     lifecycle_state: Optional[LifecycleState] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -256,27 +257,13 @@ def list_clients(
         query = db.query(Client).filter(Client.org_id == org_id)
         if lifecycle_state:
             query = query.filter(Client.lifecycle_state == lifecycle_state)
-        clients = query.all()
+        # Order by most recently updated/created and cap result size to keep response fast
+        clients = (
+            query.order_by(Client.updated_at.desc(), Client.created_at.desc())
+            .limit(limit)
+            .all()
+        )
 
-        # Trigger client automation in a background thread to avoid blocking the API request
-        import threading
-        def run_client_automation_in_background():
-            from app.db.session import SessionLocal
-            bg_db = SessionLocal()
-            try:
-                print(f"[CLIENT_API] Starting background client automation for org {org_id}...")
-                result = process_client_automation(bg_db, org_id=org_id)
-                print(f"[CLIENT_API] Background client automation complete: {result.get('progress_updates', 0)} progress updates, {result.get('state_changes', 0)} state changes")
-            except Exception as e:
-                import traceback
-                print(f"[CLIENT_API] ❌ Background client automation failed: {str(e)}")
-                traceback.print_exc()
-            finally:
-                bg_db.close()
-
-        automation_thread = threading.Thread(target=run_client_automation_in_background, daemon=True)
-        automation_thread.start()
-        
         # Convert each client with proper error handling
         result = []
         for client in clients:
