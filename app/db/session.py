@@ -6,10 +6,10 @@ from app.core.config import settings
 engine = create_engine(
     settings.DATABASE_URL,
     echo=False,
-    pool_size=8,
-    max_overflow=12,
-    pool_timeout=30,
-    pool_recycle=1800,
+    pool_size=getattr(settings, "DATABASE_POOL_SIZE", 10),
+    max_overflow=getattr(settings, "DATABASE_MAX_OVERFLOW", 20),
+    pool_timeout=getattr(settings, "DATABASE_POOL_TIMEOUT", 30),
+    pool_recycle=getattr(settings, "DATABASE_POOL_RECYCLE", 1800),
     pool_pre_ping=True,
 )
 

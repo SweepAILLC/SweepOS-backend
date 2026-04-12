@@ -4,7 +4,7 @@ Only accessible to admin/owner users.
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc, asc, and_, text
+from sqlalchemy import func, desc, asc, and_, text, exists
 from typing import List, Optional
 from uuid import UUID
 
@@ -27,6 +27,7 @@ from app.schemas.organization import (
 )
 from app.schemas.invitation import InviteOrgAdminRequest, InvitationResponse
 from app.models.organization_invitation import OrganizationInvitation
+from app.models.client_checkin import ClientCheckIn
 from app.schemas.admin import (
     OrganizationDashboardSummary,
     OrganizationFunnelCreate,
@@ -34,6 +35,7 @@ from app.schemas.admin import (
     FunnelConversionMetric,
     FunnelStepConversion,
     GlobalHealthResponse,
+    HealthTrendPeriod,
 )
 from app.schemas.funnel import Funnel as FunnelSchema
 from app.schemas.permission import (
@@ -46,9 +48,80 @@ from app.core.config import settings
 from app.core.rate_limit import rate_limit
 from datetime import datetime
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 router = APIRouter()
+
+
+def _utc_naive(dt_aware: datetime) -> datetime:
+    return dt_aware.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _global_show_up_rate_pct(
+    db: Session,
+    period_start: datetime,
+    period_end: datetime,
+    now_utc: datetime,
+) -> Optional[float]:
+    """Past Cal.com/Calendly check-ins in window: attended / scheduled (non-cancelled)."""
+    q = db.query(ClientCheckIn).filter(
+        ClientCheckIn.cancelled == False,
+        ClientCheckIn.provider.in_(["calcom", "calendly"]),
+        ClientCheckIn.start_time >= period_start,
+        ClientCheckIn.start_time < period_end,
+        ClientCheckIn.start_time < now_utc,
+    )
+    rows = q.all()
+    if not rows:
+        return None
+    attended = sum(1 for c in rows if c.completed and not c.no_show)
+    total = len(rows)
+    return round((attended / total) * 100.0, 1) if total else None
+
+
+def _global_close_rate_pct(
+    db: Session,
+    period_start: datetime,
+    period_end: datetime,
+    now_utc: datetime,
+) -> Optional[float]:
+    """Sales calls: share with client having at least one succeeded Stripe payment (matches org calendar endpoint)."""
+    has_succeeded_payment = exists().where(
+        and_(
+            StripePayment.client_id == ClientCheckIn.client_id,
+            StripePayment.org_id == ClientCheckIn.org_id,
+            StripePayment.status == "succeeded",
+        )
+    )
+    base = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.is_sales_call == True,
+            ClientCheckIn.cancelled == False,
+            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+            ClientCheckIn.start_time >= period_start,
+            ClientCheckIn.start_time < period_end,
+            ClientCheckIn.start_time < now_utc,
+        )
+    )
+    total = base.scalar() or 0
+    if not total:
+        return None
+    closed = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.is_sales_call == True,
+            ClientCheckIn.cancelled == False,
+            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+            ClientCheckIn.start_time >= period_start,
+            ClientCheckIn.start_time < period_end,
+            ClientCheckIn.start_time < now_utc,
+        )
+        .filter(has_succeeded_payment)
+        .scalar()
+        or 0
+    )
+    return round((closed / total) * 100.0, 1)
 
 
 # Organizations Management
@@ -457,6 +530,149 @@ def get_global_health(
         OrganizationInvitation.expires_at > now,
     ).scalar() or 0
 
+    sixty_days_ago = now - timedelta(days=30) * 2
+
+    # Stripe revenue from tenured clients (client record created before the last 30d window)
+    existing_rev_cents = (
+        db.query(func.coalesce(func.sum(StripePayment.amount_cents), 0))
+        .join(Client, Client.id == StripePayment.client_id)
+        .filter(
+            StripePayment.status == "succeeded",
+            StripePayment.created_at >= thirty_days_ago,
+            StripePayment.created_at <= now,
+            Client.created_at < thirty_days_ago,
+        )
+        .scalar()
+        or 0
+    )
+    revenue_from_existing_clients_last_30d_usd = float(existing_rev_cents) / 100.0
+
+    invitation_emails_sent_last_30d = (
+        db.query(func.count(OrganizationInvitation.id))
+        .filter(OrganizationInvitation.created_at >= thirty_days_ago)
+        .scalar()
+        or 0
+    )
+    invitation_emails_sent_previous_30d = (
+        db.query(func.count(OrganizationInvitation.id))
+        .filter(
+            OrganizationInvitation.created_at >= sixty_days_ago,
+            OrganizationInvitation.created_at < thirty_days_ago,
+        )
+        .scalar()
+        or 0
+    )
+
+    now_utc = datetime.now(timezone.utc)
+    thirty_utc = now_utc - timedelta(days=30)
+    sixty_utc = now_utc - timedelta(days=60)
+
+    calls_booked_last_30d = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.start_time >= thirty_utc,
+            ClientCheckIn.start_time < now_utc,
+        )
+        .scalar()
+        or 0
+    )
+    calls_booked_previous_30d = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.start_time >= sixty_utc,
+            ClientCheckIn.start_time < thirty_utc,
+        )
+        .scalar()
+        or 0
+    )
+
+    lifecycle_active_clients_current = (
+        db.query(func.count(Client.id))
+        .filter(Client.lifecycle_state == LifecycleState.ACTIVE)
+        .scalar()
+        or 0
+    )
+    lifecycle_active_clients_previous_30d_cohort = (
+        db.query(func.count(Client.id))
+        .filter(
+            Client.lifecycle_state == LifecycleState.ACTIVE,
+            Client.created_at < thirty_days_ago,
+        )
+        .scalar()
+        or 0
+    )
+
+    # Six rolling 30-day buckets, oldest first (≈180d lookback)
+    health_trend_periods: List[HealthTrendPeriod] = []
+    show_up_rate_last_30d_pct: Optional[float] = None
+    close_rate_last_30d_pct: Optional[float] = None
+
+    for i in range(5, -1, -1):
+        period_end = now_utc - timedelta(days=30 * i)
+        period_start = period_end - timedelta(days=30)
+        ps_naive = _utc_naive(period_start)
+        pe_naive = _utc_naive(period_end)
+
+        period_label = (
+            f"{period_start.strftime('%b %d')} – {period_end.strftime('%b %d, %Y')}"
+        )
+
+        rev_bucket = (
+            db.query(func.coalesce(func.sum(StripePayment.amount_cents), 0))
+            .filter(
+                StripePayment.status == "succeeded",
+                StripePayment.created_at >= ps_naive,
+                StripePayment.created_at < pe_naive,
+            )
+            .scalar()
+            or 0
+        )
+        stripe_rev = float(rev_bucket) / 100.0
+
+        calls_ct = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(
+                ClientCheckIn.start_time >= period_start,
+                ClientCheckIn.start_time < period_end,
+            )
+            .scalar()
+            or 0
+        )
+
+        cum_clients = (
+            db.query(func.count(Client.id)).filter(Client.created_at < pe_naive).scalar() or 0
+        )
+        active_cohort = (
+            db.query(func.count(Client.id))
+            .filter(
+                Client.lifecycle_state == LifecycleState.ACTIVE,
+                Client.created_at < pe_naive,
+            )
+            .scalar()
+            or 0
+        )
+
+        sup = _global_show_up_rate_pct(db, period_start, period_end, now_utc)
+        cr = _global_close_rate_pct(db, period_start, period_end, now_utc)
+
+        if i == 0:
+            show_up_rate_last_30d_pct = sup
+            close_rate_last_30d_pct = cr
+
+        health_trend_periods.append(
+            HealthTrendPeriod(
+                period_label=period_label,
+                period_start=period_start.isoformat(),
+                period_end=period_end.isoformat(),
+                show_up_rate_pct=sup,
+                close_rate_pct=cr,
+                stripe_revenue_usd=stripe_rev,
+                calls_booked_count=calls_ct,
+                cumulative_total_clients=cum_clients,
+                active_clients_cohort=active_cohort,
+            )
+        )
+
     return GlobalHealthResponse(
         total_organizations=total_orgs,
         organizations_created_last_30_days=orgs_created_30d,
@@ -481,6 +697,16 @@ def get_global_health(
         orgs_with_stripe_connected=orgs_stripe,
         orgs_with_brevo_connected=orgs_brevo,
         pending_invitations=pending_inv,
+        revenue_from_existing_clients_last_30d_usd=revenue_from_existing_clients_last_30d_usd,
+        invitation_emails_sent_last_30d=invitation_emails_sent_last_30d,
+        invitation_emails_sent_previous_30d=invitation_emails_sent_previous_30d,
+        calls_booked_last_30d=calls_booked_last_30d,
+        calls_booked_previous_30d=calls_booked_previous_30d,
+        lifecycle_active_clients_current=lifecycle_active_clients_current,
+        lifecycle_active_clients_previous_30d_cohort=lifecycle_active_clients_previous_30d_cohort,
+        show_up_rate_last_30d_pct=show_up_rate_last_30d_pct,
+        close_rate_last_30d_pct=close_rate_last_30d_pct,
+        health_trend_periods=health_trend_periods,
     )
 
 

@@ -22,6 +22,7 @@ from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, Tr
 from app.models.client import Client
 from app.models.recommendation import Recommendation, RecommendationStatus
 from app.utils.stripe_ids import normalize_stripe_id, normalize_stripe_id_for_dedup
+from app.utils.stripe_helpers import collect_email_from_raw_events, extract_email_from_payment_raw
 from app.schemas.stripe import (
     StripeSummaryResponse,
     StripeConnectionStatus,
@@ -70,39 +71,19 @@ def _extract_invoice_id_from_treasury_raw(raw_data) -> Optional[str]:
     return None
 
 
-def _extract_email_from_payment_raw(raw_event) -> Optional[str]:
-    """Extract customer/receipt email from StripePayment.raw_event or Treasury transaction."""
-    if not raw_event:
-        return None
-    d = raw_event if isinstance(raw_event, dict) else {}
-    email = d.get("customer_email") or d.get("receipt_email")
-    if email:
-        return email
-    billing = d.get("billing_details") or {}
-    if isinstance(billing, dict):
-        email = billing.get("email")
-        if email:
-            return email
-    obj = d.get("data")
-    if isinstance(obj, dict):
-        obj = obj.get("object", {})
-    if isinstance(obj, dict):
-        email = obj.get("customer_email") or obj.get("receipt_email")
-        if email:
-            return email
-        billing = obj.get("billing_details") or {}
-        if isinstance(billing, dict):
-            return billing.get("email")
-    return None
-
-
 def _payment_display_client_info(client, transaction_email=None, payment_raw_event=None):
     """Get (client_name, client_email) for payment. When no client name, use email instead of Unknown."""
     name = (f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None) or ""
     email = (client.email if client else None) or transaction_email
+    if not email and client and getattr(client, "emails", None):
+        if isinstance(client.emails, list):
+            for e in client.emails:
+                if e and str(e).strip():
+                    email = str(e).strip()
+                    break
     if not email and payment_raw_event:
-        email = _extract_email_from_payment_raw(payment_raw_event)
-    display_name = name or email or "Unknown"
+        email = extract_email_from_payment_raw(payment_raw_event)
+    display_name = (name.strip() if name else "") or (email or "") or "Unknown"
     return display_name, email
 
 
@@ -1838,9 +1819,11 @@ def _merge_treasury_and_stripe_failed_queues(
     """
     Treasury voids may not cover every failure (e.g. invoice.payment_failed before Treasury sync).
     Merge StripePayment-based rows without duplicating the same logical failure.
-    Dedup by: normalized transaction_id (stripe_id), (client_id, subscription_id), (client_id, invoice_id).
+    Dedup by: normalized transaction_id (stripe_id), (client_id, subscription_id), (client_id, invoice_id),
+    and standalone invoice_id when Treasury already recorded that invoice failure.
     """
     treasury_stripe_ids = set()
+    treasury_invoice_ids = set()
     client_sub_pairs = set()
     client_invoice_pairs = set()
     for r in treasury_rows:
@@ -1848,6 +1831,11 @@ def _merge_treasury_and_stripe_failed_queues(
             norm = normalize_stripe_id_for_dedup(r.stripe_id)
             if norm:
                 treasury_stripe_ids.add(norm)
+        inv_only = getattr(r, "invoice_id", None)
+        if inv_only:
+            ni = normalize_stripe_id_for_dedup(inv_only)
+            if ni:
+                treasury_invoice_ids.add(ni)
         cid = str(r.client_id or "")
         sid = normalize_stripe_id_for_dedup(r.subscription_id) if r.subscription_id else ""
         if cid and sid:
@@ -1864,11 +1852,15 @@ def _merge_treasury_and_stripe_failed_queues(
             tid = normalize_stripe_id_for_dedup(r.stripe_id)
             if tid and (tid in treasury_stripe_ids or tid in seen_stripe_ids):
                 continue
+        inv = getattr(r, 'invoice_id', None)
+        if inv:
+            norm_inv = normalize_stripe_id_for_dedup(inv)
+            if norm_inv and norm_inv in treasury_invoice_ids:
+                continue
         cid = str(r.client_id or "")
         sid = normalize_stripe_id_for_dedup(r.subscription_id) if r.subscription_id else ""
         if cid and sid and (cid, sid) in client_sub_pairs:
             continue
-        inv = getattr(r, 'invoice_id', None)
         if cid and inv:
             norm_inv = normalize_stripe_id_for_dedup(inv)
             if norm_inv and (cid, norm_inv) in client_invoice_pairs:
@@ -2020,7 +2012,12 @@ def _build_failed_payments_from_stripe_payment_table(
         if exclude_resolved and rejected_recovery:
             continue
 
-        disp_name, disp_email = _payment_display_client_info(client, payment_raw_event=representative_payment.raw_event)
+        tx_email = collect_email_from_raw_events([p.raw_event for p in group_data["payments"]])
+        disp_name, disp_email = _payment_display_client_info(
+            client,
+            transaction_email=tx_email,
+            payment_raw_event=representative_payment.raw_event,
+        )
         result.append(StripeFailedPaymentResponse(
             id=str(representative_payment.id),
             stripe_id=representative_payment.stripe_id,
@@ -2181,7 +2178,11 @@ def get_failed_payments(
             if exclude_resolved and rejected_recovery:
                 continue
             
-            disp_name, disp_email = _payment_display_client_info(client, transaction_email=representative.customer_email)
+            disp_name, disp_email = _payment_display_client_info(
+                client,
+                transaction_email=representative.customer_email,
+                payment_raw_event=representative.raw_data,
+            )
             treasury_invoice_id = _extract_invoice_id_from_treasury_raw(representative.raw_data) if representative.raw_data else None
             result.append(StripeFailedPaymentResponse(
                 id=str(representative.id),

@@ -18,6 +18,8 @@ COPY . .
 # Expose port
 EXPOSE 8000
 
-# Run the application
+# Single worker: in-memory rate limits are process-local. For multiple workers or replicas,
+# set REDIS_URL and use e.g. gunicorn with uvicorn workers:
+#   gunicorn app.main:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --workers 4
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 

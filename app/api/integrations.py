@@ -26,8 +26,13 @@ from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.core.encryption import decrypt_token
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple, Dict, Any
+import json
+import logging
 import uuid
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -1351,6 +1356,7 @@ def get_calendly_scheduled_events(
                     scheduled_events.append(CalendlyScheduledEvent(**transformed_event))
                 except Exception as e:
                     print(f"[CALENDLY EVENTS] Warning: Failed to parse event {event.get('uri', 'unknown')}: {e}")
+
                     import traceback
                     traceback.print_exc()
                     continue
@@ -3453,6 +3459,107 @@ def get_calendar_manual_events(
     return out
 
 
+def _calcom_uid_from_raw(raw_event_data: Optional[str]) -> Optional[str]:
+    if not raw_event_data:
+        return None
+    try:
+        d = json.loads(raw_event_data)
+        if not isinstance(d, dict):
+            return None
+        u = d.get("uid")
+        return str(u) if u else None
+    except Exception:
+        return None
+
+
+def _calendar_row_display_status(ci: ClientCheckIn, now_utc: datetime) -> str:
+    """Human-readable status for calendar UI (aligned with synced check-in flags)."""
+    if ci.cancelled:
+        return "cancelled"
+    if getattr(ci, "no_show", False):
+        return "no_show"
+    if ci.start_time and ci.start_time >= now_utc:
+        return "confirmed"
+    return "completed"
+
+
+@router.get("/calendar/synced-bookings")
+def get_calendar_synced_bookings(
+    upcoming_limit: int = Query(100, ge=1, le=300),
+    past_limit: int = Query(100, ge=1, le=300),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Canonical calendar rows from `client_check_ins` (Cal.com / Calendly) after sync.
+    Use this for the Calendar tab instead of calling provider list APIs directly, so UI matches
+    sales flags, close-rate data, and manual edits. Run `POST /clients/check-ins/sync` to refresh.
+    """
+    from sqlalchemy.orm import joinedload
+    from datetime import timezone
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    now = datetime.now(timezone.utc)
+
+    base = (
+        db.query(ClientCheckIn)
+        .options(joinedload(ClientCheckIn.client))
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+        )
+    )
+
+    upcoming_rows = (
+        base.filter(ClientCheckIn.start_time >= now)
+        .order_by(ClientCheckIn.start_time.asc())
+        .limit(upcoming_limit)
+        .all()
+    )
+    past_rows = (
+        base.filter(ClientCheckIn.start_time < now)
+        .order_by(ClientCheckIn.start_time.desc())
+        .limit(past_limit)
+        .all()
+    )
+
+    def serialize(ci: ClientCheckIn) -> Dict[str, Any]:
+        client_name = None
+        if ci.client:
+            client_name = (
+                f"{ci.client.first_name or ''} {ci.client.last_name or ''}".strip() or ci.client.email
+            )
+        calcom_uid = _calcom_uid_from_raw(getattr(ci, "raw_event_data", None))
+        return {
+            "id": str(ci.id),
+            "provider": ci.provider,
+            "event_id": ci.event_id,
+            "event_uri": ci.event_uri,
+            "client_id": str(ci.client_id),
+            "client_name": client_name,
+            "title": ci.title,
+            "start_time": ci.start_time.isoformat() if ci.start_time else None,
+            "end_time": ci.end_time.isoformat() if ci.end_time else None,
+            "location": ci.location,
+            "meeting_url": ci.meeting_url,
+            "attendee_email": ci.attendee_email,
+            "attendee_name": ci.attendee_name,
+            "completed": ci.completed,
+            "cancelled": ci.cancelled,
+            "no_show": getattr(ci, "no_show", False),
+            "is_sales_call": getattr(ci, "is_sales_call", False),
+            "sale_closed": getattr(ci, "sale_closed", None),
+            "display_status": _calendar_row_display_status(ci, now),
+            "calcom_uid": calcom_uid,
+        }
+
+    return {
+        "server_time": now.isoformat(),
+        "upcoming": [serialize(ci) for ci in upcoming_rows],
+        "past": [serialize(ci) for ci in past_rows],
+    }
+
+
 # ---------- Calendar sales call tracking (sales vs check-in, close rate) ----------
 
 
@@ -4017,6 +4124,7 @@ def sync_fathom_meetings(
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
     from app.services.fathom_ingest import sync_recent_meetings_for_org
     from app.services.call_insight_service import run_call_insight_background
+    from app.services.call_library_service import run_call_library_report_background
 
     try:
         result = sync_recent_meetings_for_org(db, org_id, user=current_user)
@@ -4026,16 +4134,47 @@ def sync_fathom_meetings(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     "Fathom rejected the API key (401). Regenerate it at Fathom → Settings → API Access, "
-                    "paste it under Intelligence, save, then sync again. If you use .env, set FATHOM_API_KEY there."
+                    "then paste it under Integrations (organization key), save, and sync again. "
+                    "Alternatively set FATHOM_API_KEY in the server environment."
                 ),
             ) from e
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Fathom API error ({e.response.status_code if e.response else 'unknown'}). Try again later.",
         ) from e
+    except (RuntimeError, ValueError) as e:
+        msg = str(e)
+        logger.warning("fathom sync client/runtime error: %s", msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg if msg else "Fathom sync could not run (configuration or API response).",
+        ) from e
+    except json.JSONDecodeError as e:
+        logger.exception("fathom sync: unexpected JSON decode")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Fathom returned invalid JSON. Try again in a moment.",
+        ) from e
+    except SQLAlchemyError as e:
+        logger.exception("fathom sync database error")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Database error while syncing Fathom. Run database migrations "
+                "(`alembic upgrade head`) and ensure columns exist on `fathom_call_records`."
+            ),
+        ) from e
+    except Exception as e:
+        logger.exception("fathom sync failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Fathom sync failed: {e!s}",
+        ) from e
 
     oid_str = str(org_id)
     for rid in result.get("pending_insight_record_ids") or []:
         background_tasks.add_task(run_call_insight_background, oid_str, rid)
+    for rid in result.get("pending_library_record_ids") or []:
+        background_tasks.add_task(run_call_library_report_background, oid_str, rid)
     return result
 

@@ -28,6 +28,11 @@ class FathomCallRecord(Base):
     sentiment_snippet = Column(String(512), nullable=True)
 
     meeting_at = Column(DateTime(timezone=True), nullable=True)
+
+    recording_url = Column(Text, nullable=True)
+    attendees_json = Column(JSON, nullable=True)
+    related_client_ids = Column(JSON, nullable=True)
+
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

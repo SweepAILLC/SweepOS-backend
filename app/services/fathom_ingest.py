@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.models.client import find_client_by_email
 from app.models.fathom_call_record import FathomCallRecord
+from app.services.fathom_attendee_clients import resolve_clients_for_meeting
 from app.services.fathom_client import resolve_fathom_api_key, get_recording_summary, get_recording_transcript
 from app.services.fathom_sentiment import default_neutral, derive_sentiment
 from app.services.health_score_cache_service import invalidate_health_score_cache
@@ -89,6 +90,10 @@ def upsert_call_record(
     summary_md: str,
     transcript_text: str,
     meeting_at: Optional[datetime],
+    *,
+    recording_url: Optional[str] = None,
+    attendees_json: Optional[List[Dict[str, Any]]] = None,
+    related_client_ids: Optional[List[str]] = None,
 ) -> FathomCallRecord:
     row = (
         db.query(FathomCallRecord)
@@ -110,6 +115,12 @@ def upsert_call_record(
     row.summary_text = summary_md[:50000] if summary_md else None
     row.transcript_snippet = truncate_for_tokens(transcript_text, 24000) if transcript_text else None
     row.meeting_at = meeting_at
+    if recording_url:
+        row.recording_url = recording_url[:2000]
+    if attendees_json is not None:
+        row.attendees_json = attendees_json
+    if related_client_ids is not None:
+        row.related_client_ids = related_client_ids
     row.sentiment_status = "pending"
     row.updated_at = datetime.now(timezone.utc)
     if not row.created_at:
@@ -153,9 +164,9 @@ def ingest_meeting_payload(
     """
     Process a Fathom Meeting JSON object (webhook or list API).
 
-    **Order:** resolve org client by invitee / transcript emails first. Only if a client profile
-    matches do we pull recording details from Fathom (extra API calls) and run sentiment (LLM).
-    Unmatched meetings return early — no per-recording Fathom fetches and no analysis spend.
+    **Order:** resolve org client by invitee / transcript emails first.  Only matched
+    clients get sentiment analysis (LLM) and health-score invalidation.
+    Unmatched meetings are still persisted so they appear in the Call Library.
     """
     recording_id = meeting.get("recording_id")
     if recording_id is None:
@@ -165,11 +176,12 @@ def ingest_meeting_payload(
     except (TypeError, ValueError):
         return "bad_recording_id", None, None
 
-    client_id = find_client_for_invitees(db, org_id, meeting)
+    primary_cid, attendees_payload, related_strs, recording_url = resolve_clients_for_meeting(db, org_id, meeting)
+    client_id = primary_cid
     if client_id is None:
-        return "no_client_match", None, None
+        client_id = find_client_for_invitees(db, org_id, meeting)
 
-    # --- Matched client: safe to fetch recording content and analyze ---
+    # --- Parse common fields (needed for all calls, matched or not) ---
     summary_md = ""
     if meeting.get("default_summary"):
         summary_md = summary_to_markdown(meeting["default_summary"])
@@ -200,7 +212,20 @@ def ingest_meeting_payload(
         except Exception:
             pass
 
-    rec = upsert_call_record(db, org_id, client_id, rid, summary_md, transcript_text, meeting_at)
+    common_upsert_kwargs = dict(
+        recording_url=recording_url or None,
+        attendees_json=attendees_payload,
+        related_client_ids=related_strs,
+    )
+
+    if client_id is None:
+        # No org client matched any attendee emails: do not ingest into library.
+        return "no_client_match", None, None
+
+    # --- Matched client: run sentiment and health-score invalidation ---
+    rec = upsert_call_record(
+        db, org_id, client_id, rid, summary_md, transcript_text, meeting_at, **common_upsert_kwargs
+    )
     apply_sentiment_to_record(db, rec)
     invalidate_health_score_cache(db, client_id, org_id, do_commit=False)
     db.commit()
@@ -238,6 +263,7 @@ def sync_recent_meetings_for_org(
     skipped_no_client = 0
     total_seen = 0
     pending_insight_record_ids: List[uuid.UUID] = []
+    pending_library_record_ids: List[uuid.UUID] = []  # all calls for library reports
     max_seconds = int(getattr(app_settings, "FATHOM_SYNC_MAX_SECONDS", 90) or 90)
     started_at = time.time()
 
@@ -261,6 +287,9 @@ def sync_recent_meetings_for_org(
                 ingested += 1
             elif status == "no_client_match":
                 skipped_no_client += 1
+            # Queue call library report only for matched calls.
+            if fathom_row_id and status == "ok":
+                pending_library_record_ids.append(fathom_row_id)
             if delay_ms > 0:
                 time.sleep(delay_ms / 1000.0)
         cursor = data.get("next_cursor")
@@ -274,4 +303,6 @@ def sync_recent_meetings_for_org(
         "meetings_seen": total_seen,
         "pending_insight_record_ids": [str(x) for x in pending_insight_record_ids],
         "call_insights_queued": len(pending_insight_record_ids),
+        "pending_library_record_ids": [str(x) for x in pending_library_record_ids],
+        "library_reports_queued": len(pending_library_record_ids),
     }

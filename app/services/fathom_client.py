@@ -1,6 +1,7 @@
 """HTTP client for Fathom External API (https://api.fathom.ai/external/v1)."""
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +9,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models.organization import Organization
 from app.models.user import User
 
 BASE = "https://api.fathom.ai/external/v1"
@@ -44,13 +46,17 @@ def resolve_fathom_api_key(
     Resolve which Fathom API key to use.
 
     Order:
-    1. Explicit `user` (e.g. current user who saved key in Settings → /auth/me/settings).
-    2. Any user in the org with `fathom_api_key` set (webhooks / background jobs).
-    3. `FATHOM_API_KEY` in environment.
-
-    Settings UI stores the key on User; until now only .env was read — that broke local dev
-    when the key was only saved in the app.
+    1. Organization row for `org_id` (`organizations.fathom_api_key`) — primary, per-org.
+    2. Explicit `user` (legacy key on user row).
+    3. Any user in the org with `users.fathom_api_key` set (legacy / webhooks).
+    4. `FATHOM_API_KEY` in environment.
     """
+    if db is not None and org_id is not None:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if org and getattr(org, "fathom_api_key", None):
+            k = normalize_fathom_api_key(org.fathom_api_key)
+            if k:
+                return k
     if user is not None:
         k = normalize_fathom_api_key(getattr(user, "fathom_api_key", None))
         if k:
@@ -103,7 +109,13 @@ def _get_with_retries(
                     _time.sleep(min(0.5 * (2**attempt), 4.0))
                     continue
                 r.raise_for_status()
-                return r.json()
+                try:
+                    return r.json()
+                except json.JSONDecodeError as e:
+                    snippet = (r.text or "")[:300]
+                    raise RuntimeError(
+                        f"Fathom returned non-JSON response (HTTP {r.status_code}): {snippet!r}"
+                    ) from e
         except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
             last_exc = e
             if attempt < max_attempts - 1:

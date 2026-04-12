@@ -12,7 +12,7 @@ import string
 
 from app.db.session import get_db
 from app.api.deps import get_current_user, check_tab_access, get_user_tab_permissions
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, parse_user_role_from_api, role_to_api
 from app.models.organization import Organization
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.user_tab_permission import UserTabPermission
@@ -34,7 +34,7 @@ router = APIRouter()
 # Available tabs
 # Note: 'owner' tab is restricted to OWNER role only
 # 'users' tab is restricted from MEMBER role
-AVAILABLE_TABS = ['brevo', 'clients', 'stripe', 'funnels', 'performance', 'content_studio', 'users', 'owner']
+AVAILABLE_TABS = ['brevo', 'clients', 'stripe', 'funnels', 'performance', 'content_studio', 'call_library', 'integrations', 'users', 'owner']
 
 
 @router.get("", response_model=List[UserSchema])
@@ -143,13 +143,7 @@ def create_user(
     # Determine role for new user
     user_role = UserRole.MEMBER  # Default to member
     if hasattr(user_data, 'role') and user_data.role:
-        try:
-            user_role = UserRole(user_data.role.lower())
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid role: {user_data.role}. Must be one of: owner, admin, member"
-            )
+        user_role = parse_user_role_from_api(user_data.role)
     
     # Only OWNER can assign OWNER role
     if user_role == UserRole.OWNER and current_user.role != UserRole.OWNER:
@@ -165,32 +159,8 @@ def create_user(
     import uuid as uuid_lib
     user_id = uuid_lib.uuid4()
     
-    # Query database to get actual enum values
-    enum_values_result = db.execute(
-        text("SELECT unnest(enum_range(NULL::userrole))")
-    ).fetchall()
-    enum_values = [str(row[0]) for row in enum_values_result]
-    
-    # Map Python enum to actual database enum value
-    if user_role == UserRole.OWNER:
-        role_db_value = "OWNER"  # Always uppercase
-    elif user_role == UserRole.ADMIN:
-        role_db_value = "ADMIN"  # Always uppercase
-    elif user_role == UserRole.MEMBER:
-        # Check which case exists in database
-        if "member" in enum_values:
-            role_db_value = "member"  # Lowercase
-        elif "MEMBER" in enum_values:
-            role_db_value = "MEMBER"  # Uppercase
-        else:
-            # If neither exists, try to add it (migration may not have run)
-            # For now, default to ADMIN and log warning
-            print(f"[WARNING] MEMBER role not found in database enum. Available values: {enum_values}. Defaulting to ADMIN.")
-            role_db_value = "ADMIN"
-            user_role = UserRole.ADMIN  # Update to match
-    else:
-        role_db_value = "ADMIN"  # Default fallback
-    
+    role_db_value = user_role.value
+
     db.execute(
         text("""
             INSERT INTO users (id, org_id, email, hashed_password, role, is_admin, created_at)
@@ -370,14 +340,7 @@ def update_user(
     
     # Role change restrictions
     if user_update.role is not None:
-        new_role_str = user_update.role.lower()
-        try:
-            new_role = UserRole(new_role_str)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid role: {user_update.role}. Must be one of: owner, admin, member"
-            )
+        new_role = parse_user_role_from_api(user_update.role)
         
         # Only OWNER can assign OWNER role
         if new_role == UserRole.OWNER and current_user.role != UserRole.OWNER:
@@ -435,33 +398,9 @@ def update_user(
     
     # Update role if provided
     if user_update.role is not None:
-        new_role_str = user_update.role.lower()
-        new_role = UserRole(new_role_str)
-        # Query database to get actual enum values
-        enum_values_result = db.execute(
-            text("SELECT unnest(enum_range(NULL::userrole))")
-        ).fetchall()
-        enum_values = [str(row[0]) for row in enum_values_result]
-        
-        # Map Python enum to actual database enum value
-        if new_role == UserRole.OWNER:
-            role_db_value = "OWNER"  # Always uppercase
-        elif new_role == UserRole.ADMIN:
-            role_db_value = "ADMIN"  # Always uppercase
-        elif new_role == UserRole.MEMBER:
-            # Check which case exists in database
-            if "member" in enum_values:
-                role_db_value = "member"  # Lowercase
-            elif "MEMBER" in enum_values:
-                role_db_value = "MEMBER"  # Uppercase
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="MEMBER role not found in database. Please run migration 012."
-                )
-        else:
-            role_db_value = "ADMIN"  # Default fallback
-        
+        new_role = parse_user_role_from_api(user_update.role)
+        role_db_value = new_role.value
+
         update_fields.append("role = CAST(:role AS userrole)")
         update_params["role"] = role_db_value
         # Update is_admin flag for backward compatibility

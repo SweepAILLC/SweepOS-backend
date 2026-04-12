@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio
+from app.api import auth, clients, events, oauth, integrations, stripe, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio, call_library
 from app.core.config import settings as app_settings
+from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
 
 app = FastAPI(title="Sweep Coach OS API", version="1.0.0")
 
@@ -15,6 +16,8 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+# Global throttle (after CORS registration so this runs first on each request — see Starlette order)
+app.add_middleware(GlobalRateLimitMiddleware)
 
 # Add exception handler to ensure CORS headers are included even on errors
 from fastapi.responses import JSONResponse
@@ -50,6 +53,7 @@ app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(clients.router, prefix="/clients", tags=["clients"])
 app.include_router(performance.router, prefix="/performance", tags=["performance"])
 app.include_router(content_studio.router, prefix="/content-studio", tags=["content-studio"])
+app.include_router(call_library.router, prefix="/call-library", tags=["call-library"])
 app.include_router(events.router, prefix="/events", tags=["events"])
 app.include_router(funnels.router, prefix="/funnels", tags=["funnels"])
 app.include_router(users.router, prefix="/users", tags=["users"])

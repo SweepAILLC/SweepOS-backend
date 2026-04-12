@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, Request, BackgroundTasks
 from sqlalchemy.orm import Session, defer
 import re
 from sqlalchemy import desc, func, or_, and_
@@ -13,6 +13,7 @@ from app.models.stripe_subscription import StripeSubscription
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
 from app.models.manual_payment import ManualPayment
 from app.models.client_checkin import ClientCheckIn
+from app.models.calendar_booking_sales import CalendarBookingSales
 from app.schemas.client import (
     Client as ClientSchema,
     ClientCreate,
@@ -67,6 +68,19 @@ from app.core.config import settings
 from app.core.rate_limit import check_sliding_window
 
 router = APIRouter()
+
+
+def _effective_org_id(user: User):
+    """Org to scope queries (JWT selected org when present; else user's primary org)."""
+    return getattr(user, "selected_org_id", user.org_id)
+
+
+def _scope_org_id(user: User) -> UUID:
+    """Selected org from JWT as a UUID (matches create/delete/list filtering)."""
+    raw = getattr(user, "selected_org_id", None) or user.org_id
+    if isinstance(raw, UUID):
+        return raw
+    return UUID(str(raw))
 
 
 def _parse_campaign_stats_response(data: dict) -> Tuple[int, int, int, int, int, int, Optional[float], Optional[float]]:
@@ -250,9 +264,9 @@ def list_clients(
     current_user: User = Depends(get_current_user)
 ):
     try:
-        # Get selected org_id from user object (set by get_current_user)
-        org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-        
+        # Same org scope as create/delete (JWT selected org, UUID-normalized)
+        org_id = _scope_org_id(current_user)
+
         # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
         query = db.query(Client).filter(Client.org_id == org_id)
         if lifecycle_state:
@@ -301,8 +315,8 @@ def create_client(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Get selected org_id from user object (set by get_current_user)
-    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    # Selected org from JWT — same scope as list/delete (UUID-normalized)
+    org_id = _scope_org_id(current_user)
     
     # Check for duplicate client by email
     if client_data.email:
@@ -999,7 +1013,7 @@ def get_client_payments(
         # Fetch all merged clients to get their emails
         merged_clients_list = db.query(Client).filter(
             Client.id.in_([UUID(cid) for cid in client_ids_to_fetch if cid]),
-            Client.org_id == current_user.org_id
+            Client.org_id == org_id
         ).all()
         print(f"[CLIENT_PAYMENTS] Using provided merged_client_ids: {client_ids_to_fetch}")
     # Check if client has merged_client_ids in meta field (from frontend)
@@ -1011,7 +1025,7 @@ def get_client_payments(
                 merged_uuids = [UUID(cid) for cid in merged_ids_from_meta if cid]
                 merged_clients_list = db.query(Client).filter(
                     Client.id.in_(merged_uuids),
-                    Client.org_id == current_user.org_id
+                    Client.org_id == org_id
                 ).all()
                 client_ids_to_fetch = [str(c.id) for c in merged_clients_list]
                 print(f"[CLIENT_PAYMENTS] Found merged_client_ids in meta: {client_ids_to_fetch}")
@@ -1027,7 +1041,7 @@ def get_client_payments(
         # Find all clients with the same email (fetch all and filter in Python for better normalization)
         all_clients_with_email = db.query(Client).filter(
             and_(
-                Client.org_id == current_user.org_id,
+                Client.org_id == org_id,
                 Client.email.isnot(None)
             )
         ).all()
@@ -1082,7 +1096,7 @@ def get_client_payments(
         # Fetch ALL StripePayments (not just unlinked ones) to check for email matches
         # This handles cases where payment is linked to wrong client but email matches merged clients
         all_stripe_payments = db.query(StripePayment).filter(
-            StripePayment.org_id == current_user.org_id
+            StripePayment.org_id == org_id
         ).all()
         
         # Track which payments we've already added (by ID) to avoid duplicates
@@ -1701,15 +1715,31 @@ def delete_client(
     Before deleting, sets client_id to NULL in all related records (payments, subscriptions, events, etc.)
     to avoid foreign key constraint violations.
     """
-    # CRITICAL: Filter by org_id for multi-tenant isolation
+    try:
+        client_uuid = UUID(client_id.strip())
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid client ID")
+
+    org_id = _scope_org_id(current_user)
+    # CRITICAL: Filter by org_id for multi-tenant isolation (selected org from token)
     client = db.query(Client).filter(
-        Client.id == client_id,
-        Client.org_id == current_user.org_id
+        Client.id == client_uuid,
+        Client.org_id == org_id
     ).first()
     if not client:
+        # Exists in another org → help user fix org context; truly missing → 404
+        other = db.query(Client).filter(Client.id == client_uuid).first()
+        if other:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "This client belongs to another organization. "
+                    "Open Settings → Accounts and switch to the correct organization, then try again."
+                ),
+            )
         raise HTTPException(status_code=404, detail="Client not found")
-    
-    client_ids_to_delete = [client_id]
+
+    client_ids_to_delete = [str(client_uuid)]
     
     # If delete_merged is True and client has an email, find and delete all clients with same email
     if delete_merged and client.email:
@@ -1719,7 +1749,7 @@ def delete_client(
         # Find all clients with the same email
         all_clients_with_email = db.query(Client).filter(
             and_(
-                Client.org_id == current_user.org_id,
+                Client.org_id == org_id,
                 Client.email.isnot(None)
             )
         ).all()
@@ -1746,7 +1776,7 @@ def delete_client(
             client_uuid = UUID(cid)
             client_to_delete = db.query(Client).filter(
                 Client.id == client_uuid,
-                Client.org_id == current_user.org_id
+                Client.org_id == org_id
             ).first()
             
             if not client_to_delete:
@@ -1756,37 +1786,37 @@ def delete_client(
             # Stripe Payments
             db.query(StripePayment).filter(
                 StripePayment.client_id == client_uuid,
-                StripePayment.org_id == current_user.org_id
+                StripePayment.org_id == org_id
             ).update({StripePayment.client_id: None}, synchronize_session=False)
             
             # Stripe Subscriptions
             db.query(StripeSubscription).filter(
                 StripeSubscription.client_id == client_uuid,
-                StripeSubscription.org_id == current_user.org_id
+                StripeSubscription.org_id == org_id
             ).update({StripeSubscription.client_id: None}, synchronize_session=False)
             
             # Events
             db.query(Event).filter(
                 Event.client_id == client_uuid,
-                Event.org_id == current_user.org_id
+                Event.org_id == org_id
             ).update({Event.client_id: None}, synchronize_session=False)
             
             # Funnels
             db.query(Funnel).filter(
                 Funnel.client_id == client_uuid,
-                Funnel.org_id == current_user.org_id
+                Funnel.org_id == org_id
             ).update({Funnel.client_id: None}, synchronize_session=False)
             
             # Recommendations
             db.query(Recommendation).filter(
                 Recommendation.client_id == client_uuid,
-                Recommendation.org_id == current_user.org_id
+                Recommendation.org_id == org_id
             ).update({Recommendation.client_id: None}, synchronize_session=False)
             
             # Client check-ins (client_id is NOT NULL; delete rows instead of nullifying)
             db.query(ClientCheckIn).filter(
                 ClientCheckIn.client_id == client_uuid,
-                ClientCheckIn.org_id == current_user.org_id
+                ClientCheckIn.org_id == org_id
             ).delete(synchronize_session=False)
             
             # Now delete the client
@@ -1823,7 +1853,8 @@ def process_client_automation_endpoint(
     This can also be called via a scheduled task/cron job.
     """
     try:
-        result = process_client_automation(db, org_id=current_user.org_id)
+        org_id = _effective_org_id(current_user)
+        result = process_client_automation(db, org_id=org_id)
         return {
             "success": True,
             "message": "Client automation processed successfully",
@@ -1841,6 +1872,7 @@ def process_client_automation_endpoint(
 # Check-in endpoints - MUST be before /{client_id}/check-ins to avoid route conflicts
 @router.post("/check-ins/sync")
 def sync_check_ins(
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1848,8 +1880,10 @@ def sync_check_ins(
     Sync calendar events (Cal.com/Calendly) with clients by matching attendee emails.
     Creates or updates check-in records for matching clients.
     """
+    from fastapi import BackgroundTasks
+    org_id = _effective_org_id(current_user)
     print(f"[CHECKIN SYNC API] ===== ENDPOINT CALLED =====")
-    print(f"[CHECKIN SYNC API] User: {current_user.id}, Org: {current_user.org_id}")
+    print(f"[CHECKIN SYNC API] User: {current_user.id}, Org: {org_id}")
     
     try:
         from app.services.checkin_sync import sync_all_checkins
@@ -1867,7 +1901,18 @@ def sync_check_ins(
     
     try:
         print(f"[CHECKIN SYNC API] Calling sync_all_checkins...")
-        results = sync_all_checkins(db, current_user.org_id, current_user.id)
+        results = sync_all_checkins(db, org_id, current_user.id)
+        
+        # Trigger targeted Fathom sync for affected clients implicitly
+        from app.services.call_insight_service import refresh_latest_call_insight
+        affected_client_ids = results.get("affected_client_ids", [])
+        if affected_client_ids:
+            print(f"[CHECKIN SYNC API] Queuing {len(affected_client_ids)} targeted Fathom syncs...")
+            for client_id in affected_client_ids:
+                background_tasks.add_task(
+                    refresh_latest_call_insight, str(org_id), client_id
+                )
+        
         print(f"[CHECKIN SYNC API] ✅ Sync completed successfully")
         return {
             "success": True,
@@ -1906,10 +1951,11 @@ def get_client_check_ins(
             detail="Invalid client ID format"
         )
     
+    org_id = _effective_org_id(current_user)
     # Verify client exists and belongs to user's org
     client = db.query(Client).filter(
         Client.id == client_uuid,
-        Client.org_id == current_user.org_id
+        Client.org_id == org_id
     ).first()
     
     if not client:
@@ -1924,7 +1970,7 @@ def get_client_check_ins(
         defer(ClientCheckIn.sale_closed),
     ).filter(
         ClientCheckIn.client_id == client_uuid,
-        ClientCheckIn.org_id == current_user.org_id
+        ClientCheckIn.org_id == org_id
     ).order_by(desc(ClientCheckIn.start_time)).limit(limit).all()
 
     def _get_sales_flags(c):
@@ -1983,6 +2029,7 @@ def update_check_in(
             detail="Invalid check-in ID format"
         )
     
+    org_id = _effective_org_id(current_user)
     # Get check-in and verify it belongs to user's org (defer optional columns for pre-029 DBs)
     check_in = db.query(ClientCheckIn).options(
         defer(ClientCheckIn.is_sales_call),
@@ -1990,7 +2037,7 @@ def update_check_in(
     ).filter(
         and_(
             ClientCheckIn.id == check_in_uuid,
-            ClientCheckIn.org_id == current_user.org_id
+            ClientCheckIn.org_id == org_id
         )
     ).first()
 
@@ -2011,6 +2058,31 @@ def update_check_in(
         check_in.is_sales_call = is_sales_call
     if sale_closed is not None:
         check_in.sale_closed = sale_closed
+
+    # Mirror sales flags to CalendarBookingSales so they survive provider
+    # re-syncs (the sync reads from that table for new rows).
+    if (is_sales_call is not None or sale_closed is not None) and getattr(check_in, "provider", None) in ("calcom", "calendly"):
+        _event_id = check_in.event_id or ""
+        if _event_id:
+            sales_row = db.query(CalendarBookingSales).filter(
+                CalendarBookingSales.org_id == org_id,
+                CalendarBookingSales.provider == check_in.provider,
+                CalendarBookingSales.event_id == _event_id,
+            ).first()
+            if sales_row:
+                if is_sales_call is not None:
+                    sales_row.is_sales_call = is_sales_call
+                if sale_closed is not None:
+                    sales_row.sale_closed = sale_closed
+            else:
+                sales_row = CalendarBookingSales(
+                    org_id=org_id,
+                    provider=check_in.provider,
+                    event_id=_event_id,
+                    is_sales_call=is_sales_call if is_sales_call is not None else False,
+                    sale_closed=sale_closed,
+                )
+                db.add(sales_row)
 
     # Allow rescheduling only for manually created check-ins.
     if start_time is not None or end_time is not None:
@@ -2071,17 +2143,32 @@ def get_check_in(
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid check-in ID format")
 
+    org_id = _effective_org_id(current_user)
     check_in = db.query(ClientCheckIn).options(
         defer(ClientCheckIn.is_sales_call),
         defer(ClientCheckIn.sale_closed),
     ).filter(
         and_(
             ClientCheckIn.id == check_in_uuid,
-            ClientCheckIn.org_id == current_user.org_id,
+            ClientCheckIn.org_id == org_id,
         )
     ).first()
     if not check_in:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Check-in not found")
+
+    calcom_uid = None
+    if check_in.provider == "calcom" and getattr(check_in, "raw_event_data", None):
+        try:
+            import json as _json
+
+            raw = _json.loads(check_in.raw_event_data)
+            if isinstance(raw, dict):
+                u = raw.get("uid")
+                if not u and isinstance(raw.get("data"), dict):
+                    u = raw["data"].get("uid")
+                calcom_uid = str(u).strip() if u else None
+        except Exception:
+            calcom_uid = None
 
     return {
         "id": str(check_in.id),
@@ -2101,6 +2188,7 @@ def get_check_in(
         "is_sales_call": getattr(check_in, "is_sales_call", False),
         "sale_closed": getattr(check_in, "sale_closed", None),
         "created_at": check_in.created_at.isoformat() if check_in.created_at else None,
+        "calcom_uid": calcom_uid,
     }
 
 
@@ -2121,6 +2209,7 @@ def delete_check_in(
             detail="Invalid check-in ID format"
         )
     
+    org_id = _effective_org_id(current_user)
     # Get check-in and verify it belongs to user's org (defer optional columns for pre-029 DBs)
     check_in = db.query(ClientCheckIn).options(
         defer(ClientCheckIn.is_sales_call),
@@ -2128,7 +2217,7 @@ def delete_check_in(
     ).filter(
         and_(
             ClientCheckIn.id == check_in_uuid,
-            ClientCheckIn.org_id == current_user.org_id
+            ClientCheckIn.org_id == org_id
         )
     ).first()
 
@@ -2176,10 +2265,11 @@ def create_manual_check_in(
             detail="Invalid client ID format"
         )
     
+    org_id = _effective_org_id(current_user)
     # Verify client exists and belongs to user's org
     client = db.query(Client).filter(
         Client.id == client_uuid,
-        Client.org_id == current_user.org_id
+        Client.org_id == org_id
     ).first()
     
     if not client:
@@ -2200,7 +2290,7 @@ def create_manual_check_in(
     
     # Create manual check-in
     manual_check_in = ClientCheckIn(
-        org_id=current_user.org_id,
+        org_id=org_id,
         client_id=client_uuid,
         event_id=f"manual_{uuid.uuid4()}",  # Generate unique ID for manual check-ins
         provider="manual",
@@ -2266,10 +2356,11 @@ def get_next_check_in(
             detail="Invalid client ID format"
         )
     
+    org_id = _effective_org_id(current_user)
     # Verify client exists and belongs to user's org
     client = db.query(Client).filter(
         Client.id == client_uuid,
-        Client.org_id == current_user.org_id
+        Client.org_id == org_id
     ).first()
     
     if not client:
@@ -2285,7 +2376,7 @@ def get_next_check_in(
         defer(ClientCheckIn.sale_closed),
     ).filter(
         ClientCheckIn.client_id == client_uuid,
-        ClientCheckIn.org_id == current_user.org_id,
+        ClientCheckIn.org_id == org_id,
         ClientCheckIn.completed == False,
         ClientCheckIn.cancelled == False,
         ClientCheckIn.no_show == False,

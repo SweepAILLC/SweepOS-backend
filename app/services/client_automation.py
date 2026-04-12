@@ -154,11 +154,16 @@ def move_client_to_active_on_payment(db: Session, client: Client):
     This is called from the Stripe webhook processor.
     
     Rules:
-    - Only move if currently in 'offboarding' or 'dead'
+    - Only move if currently in 'cold_lead', 'warm_lead', 'offboarding' or 'dead'
     - Reset program if needed (optional - could extend program instead)
     """
-    if client.lifecycle_state in [LifecycleState.OFFBOARDING, LifecycleState.DEAD]:
-        print(f"[CLIENT_AUTOMATION] Moving client {client.id} back to ACTIVE due to new payment (was {client.lifecycle_state.value})")
+    if client.lifecycle_state in [
+        LifecycleState.COLD_LEAD, 
+        LifecycleState.WARM_LEAD, 
+        LifecycleState.OFFBOARDING, 
+        LifecycleState.DEAD
+    ]:
+        print(f"[CLIENT_AUTOMATION] Moving client {client.id} to ACTIVE due to new payment (was {client.lifecycle_state.value})")
         client.lifecycle_state = LifecycleState.ACTIVE
         # Optionally reset program or extend it - for now, just move to active
         # The program progress will continue from where it was

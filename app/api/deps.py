@@ -7,7 +7,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.user import User, UserRole
+from app.models.user import User, UserRole, parse_user_role_from_db
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.user_tab_permission import UserTabPermission
 from app.core.security import decode_access_token
@@ -91,21 +91,7 @@ def get_current_user(
             self.is_admin = is_admin
             self.created_at = created_at
             self.fathom_api_key = fathom_api_key
-            # Create a role property that returns a UserRole enum when accessed
-            # Map database enum value to Python enum
-            role_lower = role.lower() if role else "admin"
-            if role == "member" or role == "MEMBER":
-                role_lower = "member"
-            elif role == "OWNER":
-                role_lower = "owner"
-            elif role == "ADMIN":
-                role_lower = "admin"
-            try:
-                from app.models.user import UserRole
-                self.role = UserRole(role_lower)
-            except ValueError:
-                # Fallback to ADMIN if role doesn't match
-                self.role = UserRole.ADMIN
+            self.role = parse_user_role_from_db(role)
     
     user = UserProxy(
         user_row[0],  # id
@@ -227,7 +213,7 @@ def require_admin(
         )
     
     # Check if user has admin or owner role
-    if user.role.value in ['admin', 'owner'] or user.is_admin:
+    if user.role in (UserRole.ADMIN, UserRole.OWNER) or user.is_admin:
         return user
     
     raise HTTPException(
@@ -253,9 +239,7 @@ def require_admin_or_owner(
         return user
     
     # Check if user has admin or owner role (or is_admin flag)
-    # Handle both enum and string role values
-    role_value = user.role.value if hasattr(user.role, 'value') else str(user.role)
-    if role_value in ['admin', 'owner'] or user.is_admin or user.role == UserRole.ADMIN or user.role == UserRole.OWNER:
+    if user.role in (UserRole.ADMIN, UserRole.OWNER) or user.is_admin:
         return user
     
     raise HTTPException(

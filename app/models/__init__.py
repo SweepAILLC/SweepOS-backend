@@ -29,6 +29,7 @@ from app.models.org_sales_content_theme import OrgSalesContentTheme
 from app.models.content_studio_knowledge_item import ContentStudioKnowledgeItem
 from app.models.content_studio_generation import ContentStudioGeneration
 from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
+from app.models.call_library_report import CallLibraryReport
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -45,5 +46,6 @@ __all__ = [
     "ContentStudioKnowledgeItem",
     "ContentStudioGeneration",
     "ContentStudioTranscriptAnalysis",
+    "CallLibraryReport",
 ]
 

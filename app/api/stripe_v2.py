@@ -17,6 +17,7 @@ from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
 from app.models.client import Client
 from app.models.recommendation import Recommendation
+from app.utils.stripe_helpers import extract_email_from_payment_raw
 from app.schemas.stripe import (
     StripeSummaryResponse,
     StripeConnectionStatus,
@@ -34,37 +35,19 @@ from app.schemas.stripe import (
 router = APIRouter()
 
 
-def _extract_email_from_payment_raw(raw_event) -> Optional[str]:
-    """Extract customer/receipt email from StripePayment.raw_event."""
-    if not raw_event:
-        return None
-    d = raw_event if isinstance(raw_event, dict) else {}
-    email = d.get("customer_email") or d.get("receipt_email")
-    if email:
-        return email
-    billing = d.get("billing_details") or {}
-    if isinstance(billing, dict) and billing.get("email"):
-        return billing.get("email")
-    obj = d.get("data")
-    if isinstance(obj, dict):
-        obj = obj.get("object", {})
-    if isinstance(obj, dict):
-        email = obj.get("customer_email") or obj.get("receipt_email")
-        if email:
-            return email
-        billing = obj.get("billing_details") or {}
-        if isinstance(billing, dict):
-            return billing.get("email")
-    return None
-
-
 def _payment_display_client_info(client, transaction_email=None, payment_raw_event=None):
     """Get (client_name, client_email) for payment. When no client name, use email instead of Unknown."""
     name = (f"{client.first_name or ''} {client.last_name or ''}".strip() if client else None) or ""
     email = (client.email if client else None) or transaction_email
+    if not email and client and getattr(client, "emails", None):
+        if isinstance(client.emails, list):
+            for e in client.emails:
+                if e and str(e).strip():
+                    email = str(e).strip()
+                    break
     if not email and payment_raw_event:
-        email = _extract_email_from_payment_raw(payment_raw_event)
-    display_name = name or email or "Unknown"
+        email = extract_email_from_payment_raw(payment_raw_event)
+    display_name = (name.strip() if name else "") or (email or "") or "Unknown"
     return display_name, email
 
 

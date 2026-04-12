@@ -6,7 +6,7 @@ from typing import List, Optional
 from uuid import UUID
 import uuid
 from app.db.session import get_db
-from app.models.user import User
+from app.models.user import User, parse_user_role_from_db, role_to_api, parse_user_role_from_api
 from app.models.user_organization import UserOrganization
 from app.models.organization import Organization
 from app.schemas.user import UserLogin, Token, User as UserSchema, UserSettingsUpdate, LoginResponse
@@ -14,7 +14,8 @@ from app.schemas.organization import UserOrganizationResponse, OrganizationSwitc
 from app.schemas.invitation import InviteValidateResponse, InviteAcceptRequest, InviteAcceptResponse
 from app.core.security import verify_password, create_access_token, get_password_hash
 from app.core.config import settings
-from app.core.rate_limit import rate_limit
+from app.core.rate_limit import rate_limit, check_sliding_window
+from app.core.request_ip import get_client_ip
 from app.api.deps import get_current_user
 from app.services.fathom_client import normalize_fathom_api_key
 
@@ -23,13 +24,20 @@ router = APIRouter()
 
 @router.post("/login", response_model=LoginResponse)
 def login(
+    request: Request,
     user_credentials: UserLogin,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Login endpoint. If user belongs to multiple organizations and org_id is not provided,
     returns a response indicating organization selection is needed.
     """
+    check_sliding_window(
+        f"auth_login:{get_client_ip(request)}",
+        settings.LOGIN_RATE_LIMIT_MAX,
+        settings.LOGIN_RATE_LIMIT_WINDOW_SEC,
+        endpoint_name="login",
+    )
     # Normalize email: lowercase and strip whitespace
     # This prevents login issues from case sensitivity or accidental spaces
     normalized_email = user_credentials.email.lower().strip()
@@ -64,21 +72,8 @@ def login(
         user_id, org_id, email, hashed_password, role_db_value, is_admin, created_at = row
         if verify_password(normalized_password, hashed_password):
             # Create a minimal user-like object for matching
-            # Map database enum value to Python enum
-            role_lower = role_db_value.lower() if role_db_value else "admin"
-            if role_db_value == "member" or role_db_value == "MEMBER":
-                role_lower = "member"
-            elif role_db_value == "OWNER":
-                role_lower = "owner"
-            elif role_db_value == "ADMIN":
-                role_lower = "admin"
-            
-            from app.models.user import UserRole
-            try:
-                user_role_enum = UserRole(role_lower)
-            except ValueError:
-                user_role_enum = UserRole.ADMIN  # Fallback
-            
+            user_role_enum = parse_user_role_from_db(role_db_value)
+
             class UserProxy:
                 def __init__(self, user_id, org_id, email, hashed_password, role_enum, is_admin, created_at):
                     self.id = user_id
@@ -209,7 +204,7 @@ def login(
             "sub": user.email,
             "org_id": str(target_org_id),  # Include org_id in token for multi-tenant isolation
             "user_id": str(user.id),
-            "role": user.role.value if hasattr(user.role, 'value') else str(user.role)
+            "role": role_to_api(user.role),
         },
         expires_delta=access_token_expires
     )
@@ -234,7 +229,7 @@ def refresh_session(current_user: User = Depends(get_current_user)):
             "sub": current_user.email,
             "org_id": str(org_id),
             "user_id": str(current_user.id),
-            "role": current_user.role.value if hasattr(current_user.role, "value") else str(current_user.role),
+            "role": role_to_api(current_user.role),
         },
         expires_delta=access_token_expires,
     )
@@ -250,8 +245,7 @@ def _organization_name(db: Session, org_id: UUID) -> Optional[str]:
 def get_current_user_info(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get current user info with proper enum serialization"""
     try:
-        # Convert role enum to string for Pydantic serialization
-        role_value = current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role)
+        role_value = role_to_api(current_user.role)
         # Return the currently selected org (from token), not the user row's primary org_id
         org_id = getattr(current_user, "selected_org_id", current_user.org_id)
         org_name = _organization_name(db, org_id)
@@ -325,7 +319,18 @@ def update_user_settings(
         user_row.hashed_password = get_password_hash(settings_data.new_password)
     
     if settings_data.fathom_api_key is not None:
-        user_row.fathom_api_key = normalize_fathom_api_key(settings_data.fathom_api_key)
+        from app.models.user import UserRole
+
+        org_id = getattr(current_user, "selected_org_id", user_row.org_id)
+        if current_user.role not in (UserRole.ADMIN, UserRole.OWNER) and not current_user.is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization admins and owners can set the Fathom API key.",
+            )
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if not org:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+        org.fathom_api_key = normalize_fathom_api_key(settings_data.fathom_api_key)
 
     if settings_data.ai_profile is not None:
         user_row.ai_profile = settings_data.ai_profile
@@ -335,7 +340,7 @@ def update_user_settings(
     db.commit()
     db.refresh(user_row)
     
-    role_value = user_row.role.value if hasattr(user_row.role, "value") else str(user_row.role)
+    role_value = role_to_api(user_row.role)
     org_id = getattr(current_user, "selected_org_id", user_row.org_id)
     org_name = _organization_name(db, org_id)
     return UserSchema(
@@ -361,11 +366,17 @@ def get_user_settings(
     """
     user_row = db.query(User).filter(User.id == current_user.id).first()
     ai_profile = getattr(user_row, "ai_profile", None) if user_row else None
-    fathom_key = getattr(user_row, "fathom_api_key", None) if user_row else getattr(current_user, "fathom_api_key", None)
+    org_id_settings = getattr(current_user, "selected_org_id", current_user.org_id)
+    org_row = db.query(Organization).filter(Organization.id == org_id_settings).first()
+    fathom_key = None
+    if org_row is not None:
+        fathom_key = getattr(org_row, "fathom_api_key", None)
+    if not fathom_key and user_row:
+        fathom_key = getattr(user_row, "fathom_api_key", None)
     return {
         "email": current_user.email,
-        "role": current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role),
-        "org_id": str(current_user.org_id),
+        "role": role_to_api(current_user.role),
+        "org_id": str(org_id_settings),
         "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
         "data_sharing_enabled": True,
         "analytics_enabled": True,
@@ -491,7 +502,7 @@ def switch_organization(
             "sub": current_user.email,
             "org_id": str(switch_request.org_id),
             "user_id": str(current_user.id),
-            "role": current_user.role.value if hasattr(current_user.role, 'value') else str(current_user.role)
+            "role": role_to_api(current_user.role),
         },
         expires_delta=access_token_expires
     )
@@ -631,7 +642,7 @@ def accept_invitation(
                 "sub": existing_user.email,
                 "org_id": str(inv.org_id),
                 "user_id": str(existing_user.id),
-                "role": existing_user.role.value if hasattr(existing_user.role, "value") else str(existing_user.role),
+                "role": role_to_api(existing_user.role),
             },
             expires_delta=access_token_expires,
         )
@@ -670,22 +681,7 @@ def accept_invitation(
                 detail="Organization user limit has been reached. The invitation can no longer be accepted.",
             )
 
-    try:
-        user_role = UserRole(role_normalized)
-    except ValueError:
-        user_role = UserRole.MEMBER
-
-    # Map Python enum to DB enum value (userrole has 'OWNER', 'ADMIN', 'member' - lowercase)
-    enum_values_result = db.execute(text("SELECT unnest(enum_range(NULL::userrole))")).fetchall()
-    enum_values = [str(row[0]) for row in enum_values_result]
-    if user_role == UserRole.OWNER:
-        role_db_value = "OWNER"
-    elif user_role == UserRole.ADMIN:
-        role_db_value = "ADMIN"
-    elif user_role == UserRole.MEMBER:
-        role_db_value = "member" if "member" in enum_values else ("MEMBER" if "MEMBER" in enum_values else "ADMIN")
-    else:
-        role_db_value = "ADMIN"
+    user_role = parse_user_role_from_api(role_normalized)
 
     new_user_id = uuid.uuid4()
     db.execute(
@@ -698,7 +694,7 @@ def accept_invitation(
             "org_id": inv.org_id,
             "email": email_normalized,
             "hashed_password": get_password_hash(password),
-            "role": role_db_value,
+            "role": user_role.value,
             "is_admin": (user_role in (UserRole.ADMIN, UserRole.OWNER)),
         },
     )
@@ -717,7 +713,7 @@ def accept_invitation(
             "sub": email_normalized,
             "org_id": str(inv.org_id),
             "user_id": str(new_user_id),
-            "role": user_role.value if hasattr(user_role, "value") else role_normalized,
+            "role": role_to_api(user_role),
         },
         expires_delta=access_token_expires,
     )

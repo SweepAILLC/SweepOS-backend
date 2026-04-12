@@ -1,7 +1,21 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from uuid import UUID
+
+
+class HealthTrendPeriod(BaseModel):
+    """One 30-day bucket for owner health trends (oldest-first in the list)."""
+
+    period_label: str
+    period_start: str  # ISO 8601
+    period_end: str
+    show_up_rate_pct: Optional[float] = None
+    close_rate_pct: Optional[float] = None
+    stripe_revenue_usd: float = 0.0
+    calls_booked_count: int = 0
+    cumulative_total_clients: int = 0
+    active_clients_cohort: int = 0
 
 
 class FunnelStepConversion(BaseModel):
@@ -54,6 +68,27 @@ class GlobalHealthResponse(BaseModel):
     orgs_with_stripe_connected: int = 0
     orgs_with_brevo_connected: int = 0
     pending_invitations: int = 0
+
+    # Owner health — product & coaching signals
+    revenue_from_existing_clients_last_30d_usd: float = 0.0
+    """Stripe revenue in the last 30d from clients whose client record was created before that window (tenured clients)."""
+
+    invitation_emails_sent_last_30d: int = 0
+    invitation_emails_sent_previous_30d: int = 0
+    """Org/user invitation emails initiated (invitation rows created); proxy for app-sent email volume."""
+
+    calls_booked_last_30d: int = 0
+    calls_booked_previous_30d: int = 0
+    """Calendar check-ins (booked meetings) with start time in each window."""
+
+    lifecycle_active_clients_current: int = 0
+    lifecycle_active_clients_previous_30d_cohort: int = 0
+    """Clients currently in lifecycle `active` whose record was created before the prior 30d window start (rough prior-period cohort)."""
+
+    show_up_rate_last_30d_pct: Optional[float] = None
+    close_rate_last_30d_pct: Optional[float] = None
+
+    health_trend_periods: List[HealthTrendPeriod] = Field(default_factory=list)
 
 
 class OrganizationFunnelCreate(BaseModel):

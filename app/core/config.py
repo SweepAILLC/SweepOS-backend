@@ -24,6 +24,24 @@ _DEFAULT_CORS_ORIGINS = [
 class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql://postgres:postgres@db:5432/sweep"
+    # SQLAlchemy pool (tune for concurrent users; defaults suit small/medium traffic)
+    DATABASE_POOL_SIZE: int = 10
+    DATABASE_MAX_OVERFLOW: int = 20
+    DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_POOL_RECYCLE: int = 1800
+
+    # Reverse proxy: set True when the API sits behind a load balancer that sets X-Forwarded-For
+    TRUST_PROXY_HEADERS: bool = False
+
+    # Optional Redis for shared rate limits across multiple workers / instances
+    REDIS_URL: Optional[str] = None
+
+    # Global API throttle (per client IP, sliding 60s window). 0 = disabled.
+    GLOBAL_API_RATE_LIMIT_PER_MINUTE: int = 120
+
+    # Brute-force protection on POST /auth/login (per IP)
+    LOGIN_RATE_LIMIT_MAX: int = 30
+    LOGIN_RATE_LIMIT_WINDOW_SEC: int = 300
     
     # CORS: comma-separated extra origins for production (e.g. https://app.sweepai.site)
     # Default localhost origins are always included. Set this for Render/Vercel beta.

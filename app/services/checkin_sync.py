@@ -450,17 +450,27 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                     is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calcom", event_id, event_type_id or None)
                     
                     if existing_checkin:
-                        # Update existing check-in
+                        # Update existing check-in — preserve manually-edited
+                        # flags that the provider cannot know about.
                         existing_checkin.title = title
                         existing_checkin.start_time = start_time
                         existing_checkin.end_time = end_time
                         existing_checkin.location = location
                         existing_checkin.meeting_url = meeting_url
-                        existing_checkin.completed = completed
+                        # Provider-authoritative status flags
                         existing_checkin.cancelled = cancelled
                         existing_checkin.no_show = no_show
-                        existing_checkin.is_sales_call = is_sales_call
-                        existing_checkin.sale_closed = sale_closed
+                        # Only flip completed to True (past); never reset a
+                        # manually-completed event back to False.
+                        if completed and not existing_checkin.completed:
+                            existing_checkin.completed = True
+                        # Sales flags: keep the row's own values when they were
+                        # set directly (via the modal); fall back to the sales-
+                        # table / event-type lookup for new rows only.
+                        if not getattr(existing_checkin, "is_sales_call", False) and is_sales_call:
+                            existing_checkin.is_sales_call = True
+                        if getattr(existing_checkin, "sale_closed", None) is None and sale_closed is not None:
+                            existing_checkin.sale_closed = sale_closed
                         existing_checkin.updated_at = datetime.now(timezone.utc)
                         synced_count += 1
                     else:
@@ -674,6 +684,8 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         continue
                     
                     invitee_name = invitee.get("name")
+                    invitee_status = str(invitee.get("status") or "").lower()
+                    invitee_no_show = invitee_status == "no_show"
                     normalized_email = normalize_email(invitee_email)
                     print(f"[CHECKIN SYNC] Looking for client with email: {invitee_email} (normalized: {normalized_email})")
                     
@@ -716,24 +728,30 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                     now = datetime.now(timezone.utc)
                     completed = start_time < now
                     cancelled = status == "canceled"
-                    no_show = False  # Calendly event-level API does not expose invitee no-show here
+                    no_show = invitee_no_show
                     event_type_uri = event.get("event_type") or ""
                     if isinstance(event_type_uri, dict):
                         event_type_uri = event_type_uri.get("uri") or ""
                     is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calendly", event_uuid, event_type_uri or None)
                     
                     if existing_checkin:
-                        # Update existing check-in
+                        # Update existing check-in — preserve manually-edited
+                        # flags (same logic as Cal.com branch above).
                         existing_checkin.title = name
                         existing_checkin.start_time = start_time
                         existing_checkin.end_time = end_time
                         existing_checkin.location = meeting_url
                         existing_checkin.meeting_url = meeting_url
-                        existing_checkin.completed = completed
+                        # Provider-authoritative status flags
                         existing_checkin.cancelled = cancelled
                         existing_checkin.no_show = no_show
-                        existing_checkin.is_sales_call = is_sales_call
-                        existing_checkin.sale_closed = sale_closed
+                        if completed and not existing_checkin.completed:
+                            existing_checkin.completed = True
+                        # Sales flags: keep row values when already set.
+                        if not getattr(existing_checkin, "is_sales_call", False) and is_sales_call:
+                            existing_checkin.is_sales_call = True
+                        if getattr(existing_checkin, "sale_closed", None) is None and sale_closed is not None:
+                            existing_checkin.sale_closed = sale_closed
                         existing_checkin.updated_at = datetime.now(timezone.utc)
                         synced_count += 1
                     else:
@@ -852,15 +870,19 @@ def _ensure_client_check_ins_table(db: Session) -> None:
         print(f"[CHECKIN SYNC] ensure client_check_ins unique: {uq_e}")
 
 
-def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dict[str, int]:
+def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dict[str, Any]:
     """Sync check-ins from all connected calendar providers"""
+    from datetime import datetime, timezone
+    sync_start_time = datetime.now(timezone.utc)
+    
     print(f"[CHECKIN SYNC] ===== STARTING SYNC ======")
     print(f"[CHECKIN SYNC] Org ID: {org_id}, User ID: {user_id}")
     
     results = {
         "calcom": 0,
         "calendly": 0,
-        "total": 0
+        "total": 0,
+        "affected_client_ids": []
     }
     
     try:
@@ -878,8 +900,19 @@ def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dic
         print(f"[CHECKIN SYNC] Calendly sync complete: {results['calendly']} check-ins")
         
         results["total"] = results["calcom"] + results["calendly"]
+        
+        from app.models.client_checkin import ClientCheckIn
+        affected = db.query(ClientCheckIn.client_id).filter(
+            and_(
+                ClientCheckIn.org_id == org_id,
+                ClientCheckIn.updated_at >= sync_start_time
+            )
+        ).all()
+        results["affected_client_ids"] = list({str(r[0]) for r in affected if r[0]})
+        
         print(f"[CHECKIN SYNC] ===== SYNC COMPLETE ======")
         print(f"[CHECKIN SYNC] Total: {results['total']} check-ins (Cal.com: {results['calcom']}, Calendly: {results['calendly']})")
+        print(f"[CHECKIN SYNC] Affected clients for Fathom: {len(results['affected_client_ids'])}")
     except Exception as e:
         print(f"[CHECKIN SYNC] ❌ Error in sync_all_checkins: {e}")
         import traceback

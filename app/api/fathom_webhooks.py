@@ -16,6 +16,7 @@ from app.db.session import get_db
 from app.services.fathom_client import resolve_fathom_api_key
 from app.services.fathom_ingest import ingest_meeting_payload
 from app.services.call_insight_service import run_call_insight_background
+from app.services.call_library_service import run_call_library_report_background
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -66,6 +67,10 @@ async def fathom_new_meeting_webhook(
         logger.exception("Fathom ingest failed for org %s", org_id)
         return {"ok": False, "status": "ingest_error"}
 
+    if fathom_row_id:
+        background_tasks.add_task(
+            run_call_library_report_background, str(org_uuid), str(fathom_row_id)
+        )
     if status_str == "ok" and fathom_row_id:
         background_tasks.add_task(
             run_call_insight_background, str(org_uuid), str(fathom_row_id)
