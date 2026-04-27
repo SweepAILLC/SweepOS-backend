@@ -59,6 +59,14 @@ class GlobalHealthResponse(BaseModel):
     total_revenue_stripe_succeeded_usd: float = 0.0
     last_30_days_revenue_stripe_usd: float = 0.0
     treasury_posted_last_30_days_usd: float = 0.0
+    treasury_posted_all_time_usd: float = 0.0
+    """Posted positive Treasury amounts (platform-wide, all time)."""
+    cash_collected_all_time_combined_usd: float = 0.0
+    """Stripe succeeded (all time) + Treasury posted (all time); rails are usually distinct per org."""
+    manual_cash_all_time_usd: float = 0.0
+    """User-entered manual payments (all time), not from Stripe."""
+    total_processor_revenue_all_time_usd: float = 0.0
+    """Stripe + Treasury combined all-time cash plus manual cash entered in-app."""
 
     funnel_first_step_views_all_time: int = 0
     funnel_first_step_views_last_30_days: int = 0
@@ -70,8 +78,8 @@ class GlobalHealthResponse(BaseModel):
     pending_invitations: int = 0
 
     # Owner health — product & coaching signals
-    revenue_from_existing_clients_last_30d_usd: float = 0.0
-    """Stripe revenue in the last 30d from clients whose client record was created before that window (tenured clients)."""
+    stripe_revenue_post_onboarding_usd: float = 0.0
+    """Succeeded Stripe revenue (all time) only for charges on or after each org's onboarding (org created_at)."""
 
     invitation_emails_sent_last_30d: int = 0
     invitation_emails_sent_previous_30d: int = 0
@@ -143,4 +151,17 @@ class OrganizationDashboardSummary(BaseModel):
 
     # All funnels for the org (for management UI)
     recent_funnels: List[Dict[str, Any]]
+
+    # Platform onboarding & coaching trends (owner org modal)
+    organization_onboarded_at: Optional[str] = None  # ISO 8601 — org.created_at
+    cash_collected_since_onboarding_usd: float = 0.0
+    """Stripe payments (or Treasury posted cash if org uses Treasury), only after onboarding."""
+    cash_collected_all_time_usd: float = 0.0
+    """Canonical all-time cash for this org (Treasury if used, else succeeded Stripe)."""
+    manual_cash_all_time_usd: float = 0.0
+    """Manual payments entered in-app for this org (not Stripe)."""
+    total_processor_revenue_all_time_usd: float = 0.0
+    """Treasury-or-Stripe all-time plus manual payments for this org."""
+    monthly_health_since_onboarding: List[HealthTrendPeriod] = Field(default_factory=list)
+    """Calendar months from onboarding through now: show-up %, close %, cash collected."""
 

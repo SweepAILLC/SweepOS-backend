@@ -29,7 +29,7 @@ Schema:
   },
   "strengths": [
     {
-      "title": "Short label for the strength (e.g. 'Building trust through shared frustration')",
+      "title": "Short label for the strength teh salesperson demonstrated on the call in moving the deal forward toward closing (e.g. 'Building trust through shared frustration')",
       "detail": "2-3 sentences explaining exactly how and why this was effective",
       "timestamp": "Timestamp if visible in transcript (e.g. '09:12'), else null",
       "quote": "Verbatim short quote from the transcript that best illustrates this, or null"
@@ -37,23 +37,23 @@ Schema:
   ],
   "weaknesses": [
     {
-      "title": "Short label for the weakness",
-      "detail": "2-3 sentences explaining what went wrong and what the impact was",
+      "title": "Short label for the weakness the salesperson demonstrated on the call in failing to move the deal forward toward closing (e.g. 'Not asking for the sale')",
+      "detail": "2-3 sentences explaining what went wrong and what the impact was in terms of affecting the salesperson's ability to clsoe the sale",
       "timestamp": "Timestamp if visible, else null",
       "quote": "Verbatim short quote if relevant, or null"
     }
   ],
   "customer_response": {
-    "emotional_tone": "One sentence describing how the customer/prospect behaved emotionally",
+    "emotional_tone": "One sentence describing how the customer/prospect behaved emotionally to the salesperson's efforts",
     "questions_asked": ["List of key questions the customer asked, verbatim or close paraphrase"],
     "buying_signals": ["Any positive signals that suggest intent to purchase or deepen relationship"],
-    "objections_or_barriers": ["Objections, hesitations, or blockers the customer raised"]
+    "objections_or_barriers": ["Objections, hesitations, or blockers the customer raised that blocked or stalled the follow through or closing of the sale"]
   },
   "overall_impression": "One paragraph (4-6 sentences) summarizing whether the call succeeded at \
-relationship-building and/or sales process. Be direct and honest.",
-  "call_score": 72,
-  "low_signal": false,
-  "low_signal_reason": ""
+moving the deal forward toward closing or completing the sale or failed. Be direct, analytical, and honest.",
+  "call_score": integer 0-100 estimating sales call quality (discovery, next steps, objection handling, clarity). Not a lead score.,
+  "low_signal": boolean indicating if the call was so thin or lacked enough substance that it was not possible to generate a meaningful analysis,
+  "low_signal_reason": string explaining why the call was so thin or lacked enough substance that it was not possible to generate a meaningful analysis"
 }
 
 RULES:

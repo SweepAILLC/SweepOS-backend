@@ -6,11 +6,13 @@ import enum
 from app.db.session import Base
 
 
+# Values must match PostgreSQL enum `oauthprovider` labels exactly (mixed-case in this schema).
 class OAuthProvider(str, enum.Enum):
-    STRIPE = "stripe"
-    BREVO = "brevo"
+    STRIPE = "STRIPE"
+    BREVO = "BREVO"
     CALCOM = "calcom"
     CALENDLY = "calendly"
+    WHOP = "whop"
 
 
 class OAuthToken(Base):
@@ -18,7 +20,11 @@ class OAuthToken(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
-    provider = Column(SQLEnum(OAuthProvider), nullable=False)
+    # SQLAlchemy otherwise binds member *names* (e.g. WHOP); values must match pg enum labels.
+    provider = Column(
+        SQLEnum(OAuthProvider, values_callable=lambda obj: [m.value for m in obj]),
+        nullable=False,
+    )
     account_id = Column(String, nullable=True)  # e.g., stripe_user_id
     access_token = Column(String, nullable=False)  # encrypted
     refresh_token = Column(String, nullable=True)  # encrypted

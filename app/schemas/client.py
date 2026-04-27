@@ -1,9 +1,35 @@
-from pydantic import BaseModel, ConfigDict, field_validator
-from datetime import datetime
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from datetime import datetime, timezone
 from typing import List, Optional, Union
 from decimal import Decimal
 import uuid
 from app.models.client import LifecycleState
+
+
+def _naive_utc_program(dt: datetime) -> datetime:
+    """Program dates are stored/compared as naive UTC (matches utcnow in model helpers)."""
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def parse_optional_program_datetime(v):
+    """Parse program date fields from API (ISO-Z) or datetime; always naive UTC."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return _naive_utc_program(v)
+    if isinstance(v, str):
+        try:
+            s = v
+            if s.endswith("Z"):
+                s = s.replace("Z", "+00:00")
+            if "T" not in s and len(s) == 10:
+                s = s + "T00:00:00"
+            return _naive_utc_program(datetime.fromisoformat(s))
+        except Exception:
+            raise ValueError(f"Invalid datetime format: {v}")
+    return v
 
 
 class ClientBase(BaseModel):
@@ -55,26 +81,10 @@ class ClientBase(BaseModel):
             return out if out else None
         return None
 
-    @field_validator('program_start_date', 'program_end_date', mode='before')
+    @field_validator("program_start_date", "program_end_date", mode="before")
     @classmethod
     def parse_program_date(cls, v):
-        """Parse program dates from string or datetime"""
-        if v is None or v == '':
-            return None
-        if isinstance(v, datetime):
-            return v
-        if isinstance(v, str):
-            try:
-                # Handle ISO format strings
-                if v.endswith('Z'):
-                    v = v.replace('Z', '+00:00')
-                # Handle date-only strings (YYYY-MM-DD)
-                if 'T' not in v and len(v) == 10:
-                    v = v + 'T00:00:00'
-                return datetime.fromisoformat(v)
-            except Exception as e:
-                raise ValueError(f"Invalid datetime format: {v}")
-        return v
+        return parse_optional_program_datetime(v)
 
 
 class ClientCreate(ClientBase):
@@ -104,23 +114,10 @@ class ClientUpdate(BaseModel):
     program_end_date: Optional[datetime] = None
     program_progress_percent: Optional[float] = None
     
-    @field_validator('program_start_date', mode='before')
+    @field_validator("program_start_date", "program_end_date", mode="before")
     @classmethod
-    def parse_program_start_date(cls, v):
-        """Parse program_start_date from string or datetime"""
-        if v is None or v == '':
-            return None
-        if isinstance(v, datetime):
-            return v
-        if isinstance(v, str):
-            try:
-                # Handle ISO format strings
-                if v.endswith('Z'):
-                    v = v.replace('Z', '+00:00')
-                return datetime.fromisoformat(v)
-            except Exception as e:
-                raise ValueError(f"Invalid datetime format: {v}")
-        return v
+    def parse_program_dates_update(cls, v):
+        return parse_optional_program_datetime(v)
 
 
 class Client(ClientBase):
@@ -173,6 +170,21 @@ class TerminalCashCollected(BaseModel):
     last_mtd: float = 0.0  # Month to date (1st of current month to now)
 
 
+class TerminalCashSourceTotals(BaseModel):
+    """Cash collected from one source (same window definitions as TerminalCashCollected)."""
+
+    today: float = 0.0
+    last_7_days: float = 0.0
+    last_30_days: float = 0.0
+    last_mtd: float = 0.0
+
+
+class TerminalCashBySourceBreakdown(BaseModel):
+    stripe: TerminalCashSourceTotals = Field(default_factory=TerminalCashSourceTotals)
+    whop: TerminalCashSourceTotals = Field(default_factory=TerminalCashSourceTotals)
+    manual: TerminalCashSourceTotals = Field(default_factory=TerminalCashSourceTotals)
+
+
 class TerminalMRR(BaseModel):
     current_mrr: float = 0.0
     arr: float = 0.0
@@ -191,6 +203,7 @@ class TerminalSummaryResponse(BaseModel):
     mrr: TerminalMRR
     top_contributors_30d: List[TerminalTopContributor]
     top_contributors_90d: List[TerminalTopContributor]
+    cash_by_source: Optional[TerminalCashBySourceBreakdown] = None
 
 
 # Client health score (logic-based; AI-ready factors for future referral/testimonial/retention/upsell)

@@ -17,17 +17,11 @@ _logger = logging.getLogger(__name__)
 security = HTTPBearer()
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-) -> User:
+def _user_from_token(db: Session, token: str) -> User:
     """
-    Get current authenticated user and verify org_id matches token.
-    This enforces org isolation: users can only access data from their org.
-    Session is not bound to IP so users are not forced to re-login on IP change
-    (e.g. switching networks or VPN); IP may still be logged for audit elsewhere.
+    Resolve JWT + DB to a User-like proxy with selected_org_id set.
+    Shared by get_current_user and long-running jobs that must not double-book get_db sessions.
     """
-    token = credentials.credentials
     payload = decode_access_token(token)
     if payload is None:
         raise HTTPException(
@@ -38,16 +32,17 @@ def get_current_user(
     email: str = payload.get("sub")
     org_id_from_token: Optional[str] = payload.get("org_id")
     user_id_from_token: Optional[str] = payload.get("user_id")
-    
+
     if email is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
         )
-    
+
     # Use raw SQL to read user to avoid enum conversion issues.
     # Prefer user_id from token so we get the correct user row when same email has multiple rows (e.g. admin in one org, member in another).
     from sqlalchemy import text
+
     if user_id_from_token:
         try:
             user_id_uuid = uuid.UUID(user_id_from_token)
@@ -57,7 +52,7 @@ def get_current_user(
                     FROM users
                     WHERE id = :user_id
                 """),
-                {"user_id": str(user_id_uuid)}
+                {"user_id": str(user_id_uuid)},
             ).fetchone()
         except (ValueError, TypeError):
             user_row = None
@@ -70,17 +65,15 @@ def get_current_user(
                 FROM users
                 WHERE email = :email
             """),
-            {"email": email}
+            {"email": email},
         ).fetchone()
-    
+
     if user_row is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
         )
-    
-    # Create a User-like object from the raw SQL result
-    # We need to avoid SQLAlchemy enum conversion, so we'll create a proxy object
+
     class UserProxy:
         def __init__(self, user_id, org_id, email, hashed_password, role, is_admin, created_at, fathom_api_key=None):
             self.id = user_id
@@ -92,7 +85,7 @@ def get_current_user(
             self.created_at = created_at
             self.fathom_api_key = fathom_api_key
             self.role = parse_user_role_from_db(role)
-    
+
     user = UserProxy(
         user_row[0],  # id
         user_row[1],  # org_id
@@ -103,43 +96,60 @@ def get_current_user(
         user_row[6],  # created_at
         user_row[7] if len(user_row) > 7 else None,  # fathom_api_key
     )
-    
-    # Verify org_id matches (if present in token) and set selected_org_id attribute
+
     selected_org_id = user.org_id  # Default to user's primary org
     if org_id_from_token:
-        # Convert org_id_from_token to UUID for proper comparison
         try:
             org_id_uuid = uuid.UUID(org_id_from_token)
-        except (ValueError, TypeError) as e:
-            # Invalid UUID format in token - log and use primary org
+        except (ValueError, TypeError):
             _logger.warning("Invalid org_id format in token: %s", org_id_from_token)
             org_id_uuid = None
-        
+
         if org_id_uuid:
-            # Check if user has access to this org via UserOrganization table
             from app.models.user_organization import UserOrganization
+
             user_org = db.query(UserOrganization).filter(
                 UserOrganization.user_id == user.id,
-                UserOrganization.org_id == org_id_uuid
+                UserOrganization.org_id == org_id_uuid,
             ).first()
-            
-            # Also check if user.org_id matches (backward compatibility)
+
             if not user_org and user.org_id != org_id_uuid:
                 _logger.warning("User %s denied access to org %s", user.id, org_id_uuid)
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="User does not have access to this organization",
                 )
-            
-            # User has access - use the selected org from token
+
             selected_org_id = org_id_uuid
             _logger.debug("User %s accessing org %s", user.id, selected_org_id)
-    
-    # Set selected_org_id as an attribute on the user object
-    # This allows endpoints to access the selected org without needing a separate dependency
+
     user.selected_org_id = selected_org_id
-    
     return user
+
+
+def resolve_org_and_user_ids_for_checkin_sync(db: Session, token: str) -> tuple[uuid.UUID, uuid.UUID]:
+    """(selected_org_id, user_id) with same access rules as get_current_user — for use inside a short-lived session."""
+    user = _user_from_token(db, token)
+    sid = user.selected_org_id
+    uid = user.id
+    if not isinstance(sid, uuid.UUID):
+        sid = uuid.UUID(str(sid))
+    if not isinstance(uid, uuid.UUID):
+        uid = uuid.UUID(str(uid))
+    return sid, uid
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    """
+    Get current authenticated user and verify org_id matches token.
+    This enforces org isolation: users can only access data from their org.
+    Session is not bound to IP so users are not forced to re-login on IP change
+    (e.g. switching networks or VPN); IP may still be logged for audit elsewhere.
+    """
+    return _user_from_token(db, credentials.credentials)
 
 
 def get_selected_org_id(
@@ -281,12 +291,15 @@ def check_tab_access(
     # Main org users always have access to all other tabs
     if str(user.org_id) == str(MAIN_ORG_ID):
         return True
+
+    # Finances UI uses the same permission rows as the legacy "stripe" tab name in DB
+    lookup_tab = "stripe" if tab_name == "finances" else tab_name
     
     try:
         # Check user-specific permissions first
         user_permission = db.query(UserTabPermission).filter(
             UserTabPermission.user_id == user.id,
-            UserTabPermission.tab_name == tab_name
+            UserTabPermission.tab_name == lookup_tab
         ).first()
         
         if user_permission is not None:
@@ -295,7 +308,7 @@ def check_tab_access(
         # Check organization-level permissions
         org_permission = db.query(OrganizationTabPermission).filter(
             OrganizationTabPermission.org_id == user.org_id,
-            OrganizationTabPermission.tab_name == tab_name
+            OrganizationTabPermission.tab_name == lookup_tab
         ).first()
         
         if org_permission is not None:
@@ -324,5 +337,6 @@ def get_user_tab_permissions(
     permissions = {}
     for tab in AVAILABLE_TABS:
         permissions[tab] = check_tab_access(tab, user, db)
+    permissions["finances"] = check_tab_access("finances", user, db)
     
     return permissions

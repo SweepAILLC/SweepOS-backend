@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import uuid
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import httpx
+from sqlalchemy.exc import SQLAlchemyError
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, check_tab_access, get_db
+from app.long_jobs import schedule_background_work
 from app.core.rate_limit import check_sliding_window
 from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
 from app.models.user import User
@@ -22,6 +27,7 @@ from app.schemas.content_studio import (
     ContentStudioBundleOut,
     KnowledgeOut,
     KnowledgePutBody,
+    ReanalyzeResponse,
     SalesPlaybookOut,
     SectionIdeaOut,
     TranscriptAnalyzeBody,
@@ -42,6 +48,8 @@ from app.services.content_studio_fathom_context import (
     collect_fathom_sales_signals,
 )
 from app.services.llm_client import llm_available
+from app.models.client import Client
+from app.services.health_score_cache_service import invalidate_health_score_cache
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -57,7 +65,7 @@ def _require_content_studio_tab(
     if not check_tab_access("content_studio", current_user, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Content Studio is not enabled for your organization.",
+            detail="Marketing Intel is not enabled for your organization.",
         )
 
 
@@ -206,14 +214,13 @@ def get_bootstrap(
         lock = _get_org_regen_lock(org_id)
         if lock.acquire(blocking=False):
             try:
-                import threading
-
-                t = threading.Thread(
-                    target=_regenerate_bundle_outside_session,
-                    args=(org_id, urow.id, fingerprint),
-                    daemon=True,
+                schedule_background_work(
+                    _regenerate_bundle_outside_session,
+                    None,
+                    org_id,
+                    urow.id,
+                    fingerprint,
                 )
-                t.start()
             finally:
                 lock.release()
         # Do not wait on the lock here; another request already kicked off regen.
@@ -233,6 +240,111 @@ def get_bootstrap(
         content_bundle=content_bundle,
         completed_idea_ids=completed,
         batch_id=bid_prof or row_batch,
+    )
+
+
+@router.post("/reanalyze", response_model=ReanalyzeResponse)
+def post_content_studio_reanalyze(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Rate-limited: pull Fathom meetings, queue call-insight + call-library follow-ups,
+    invalidate client health caches (Intelligence / board), and regenerate the Content Studio
+    bundle (all sections + voice/marketing) from fresh signals.
+    """
+    _require_content_studio_tab(db, current_user)
+    org_id = _org_id(current_user)
+    check_sliding_window(
+        f"cs_reanalyze_{org_id}_{current_user.id}",
+        max_requests=3,
+        window_seconds=3600,
+        endpoint_name="content_studio_reanalyze",
+    )
+    urow = _user_orm(db, current_user)
+
+    from app.services.fathom_ingest import queue_fathom_sync_followups, sync_recent_meetings_for_org
+
+    try:
+        result = sync_recent_meetings_for_org(db, org_id, user=current_user)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 401:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Fathom rejected the API key (401). Regenerate it at Fathom → Settings → API Access, "
+                    "then paste it under Integrations (organization key), save, and sync again. "
+                    "Alternatively set FATHOM_API_KEY in the server environment."
+                ),
+            ) from e
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Fathom API error ({e.response.status_code if e.response else 'unknown'}). Try again later.",
+        ) from e
+    except (RuntimeError, ValueError) as e:
+        msg = str(e)
+        logger.warning("content_studio reanalyze fathom sync: %s", msg)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=msg if msg else "Fathom sync could not run (configuration or API response).",
+        ) from e
+    except json.JSONDecodeError as e:
+        logger.exception("content_studio reanalyze: JSON decode")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Fathom returned invalid JSON. Try again in a moment.",
+        ) from e
+    except SQLAlchemyError as e:
+        logger.exception("content_studio reanalyze: database error during Fathom sync")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Database error while syncing Fathom. Run database migrations "
+                "(`alembic upgrade head`) and ensure columns exist on `fathom_call_records`."
+            ),
+        ) from e
+    except Exception as e:
+        logger.exception("content_studio reanalyze: Fathom sync failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Fathom sync failed: {e!s}",
+        ) from e
+
+    if not isinstance(result, dict):
+        result = {}
+
+    queue_fathom_sync_followups(background_tasks, org_id, result)
+
+    cids = [row[0] for row in db.query(Client.id).filter(Client.org_id == org_id).all()]
+    for cid in cids:
+        try:
+            invalidate_health_score_cache(db, cid, org_id, do_commit=False)
+        except Exception:
+            logger.exception("content_studio reanalyze: invalidate health cache for client %s", cid)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("content_studio reanalyze: commit after health invalidation")
+
+    fingerprint = compute_signals_fingerprint(db, org_id)
+    lock = _get_org_regen_lock(org_id)
+    if lock.acquire(blocking=False):
+        try:
+            t = threading.Thread(
+                target=_regenerate_bundle_outside_session,
+                args=(org_id, urow.id, fingerprint),
+                daemon=True,
+            )
+            t.start()
+        finally:
+            lock.release()
+
+    return ReanalyzeResponse(
+        fathom_sync=result,
+        bundle_regenerating=True,
+        health_clients_invalidated=len(cids),
     )
 
 

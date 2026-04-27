@@ -25,6 +25,19 @@ DEFAULT_ORG_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 router = APIRouter()
 
 
+def _calendar_integration_org_id(current_user: User) -> uuid.UUID:
+    """
+    Org for storing and disconnecting Cal.com / Calendly tokens.
+    Must match /integrations/calcom/status and /integrations/calendly/status, which use
+    the JWT selected org (selected_org_id). Using primary user.org_id alone breaks
+    multi-org users: tokens were saved to one org while status was read from another.
+    """
+    sid = getattr(current_user, "selected_org_id", None)
+    if sid is not None:
+        return sid
+    return current_user.org_id
+
+
 @router.post("/stripe/start", response_model=OAuthStartResponse)
 def start_stripe_oauth(
     current_user: User = Depends(get_current_user)
@@ -1615,7 +1628,8 @@ def connect_calcom_direct(
     
     # Rate limiting: 3 attempts per 15 minutes per user
     _cleanup_old_entries()
-    identifier = f"calcom_direct_api_key_{current_user.id}_{current_user.org_id}"
+    org_id_for_limit = _calendar_integration_org_id(current_user)
+    identifier = f"calcom_direct_api_key_{current_user.id}_{org_id_for_limit}"
     now = datetime.utcnow()
     window_start = now - timedelta(seconds=900)  # 15 minutes
     
@@ -1632,7 +1646,7 @@ def connect_calcom_direct(
             log_security_event(
                 db=db,
                 event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
-                org_id=current_user.org_id,
+                org_id=org_id_for_limit,
                 user_id=current_user.id,
                 resource_type="api_endpoint",
                 resource_id="connect_calcom_direct",
@@ -1661,7 +1675,7 @@ def connect_calcom_direct(
         )
     
     api_key = api_key.strip()
-    org_id = current_user.org_id
+    org_id = _calendar_integration_org_id(current_user)
     
     # VALIDATION: Check if Calendly is already connected
     # Users should connect ONE calendar provider, not both
@@ -1734,7 +1748,6 @@ def connect_calcom_direct(
         print(f"[CALCOM DIRECT] Validated API key for account: {account_email}")
         
         # Log security event BEFORE storing (for audit trail)
-        org_id = current_user.org_id
         log_security_event(
             db=db,
             event_type=AuditEventType.API_KEY_CONNECTED,
@@ -1891,7 +1904,8 @@ def connect_calendly_direct(
     
     # Rate limiting: 3 attempts per 15 minutes per user
     _cleanup_old_entries()
-    identifier = f"calendly_direct_api_key_{current_user.id}_{current_user.org_id}"
+    org_id_for_limit = _calendar_integration_org_id(current_user)
+    identifier = f"calendly_direct_api_key_{current_user.id}_{org_id_for_limit}"
     now = datetime.utcnow()
     window_start = now - timedelta(seconds=900)  # 15 minutes
     
@@ -1907,7 +1921,7 @@ def connect_calendly_direct(
             log_security_event(
                 db=db,
                 event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
-                org_id=current_user.org_id,
+                org_id=org_id_for_limit,
                 user_id=current_user.id,
                 resource_type="api_endpoint",
                 resource_id="connect_calendly_direct",
@@ -1935,7 +1949,7 @@ def connect_calendly_direct(
         )
     
     api_key = api_key.strip()
-    org_id = current_user.org_id
+    org_id = _calendar_integration_org_id(current_user)
     
     # VALIDATION: Check if Cal.com is already connected
     # Users should connect ONE calendar provider, not both
@@ -2133,7 +2147,7 @@ def disconnect_calendly(
                 AND org_id = :org_id 
                 LIMIT 1
             """),
-            {"org_id": current_user.org_id}
+            {"org_id": _calendar_integration_org_id(current_user)}
         ).first()
         
         if result:
@@ -2156,7 +2170,7 @@ def disconnect_calendly(
             log_security_event(
                 db=db,
                 event_type=AuditEventType.API_KEY_DISCONNECTED,
-                org_id=current_user.org_id,
+                org_id=_calendar_integration_org_id(current_user),
                 user_id=current_user.id,
                 resource_type="calendly_token",
                 resource_id=str(token_id),
@@ -2193,7 +2207,7 @@ def disconnect_calcom(
                 AND org_id = :org_id 
                 LIMIT 1
             """),
-            {"org_id": current_user.org_id}
+            {"org_id": _calendar_integration_org_id(current_user)}
         ).first()
         
         if result:
@@ -2218,14 +2232,14 @@ def disconnect_calcom(
             log_security_event(
                 db=db,
                 event_type=AuditEventType.API_KEY_DISCONNECTED,
-                org_id=current_user.org_id,
+                org_id=_calendar_integration_org_id(current_user),
                 user_id=current_user.id,
                 resource_type="calcom_token",
                 resource_id=str(token_id),
                 details={"provider": "calcom"}
             )
         else:
-            print(f"[CALCOM DISCONNECT] No Cal.com token found for org {current_user.org_id}")
+            print(f"[CALCOM DISCONNECT] No Cal.com token found for org {_calendar_integration_org_id(current_user)}")
         
         return None
         

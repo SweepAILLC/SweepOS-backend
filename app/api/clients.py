@@ -1,18 +1,27 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body, Request, BackgroundTasks
 from sqlalchemy.orm import Session, defer
+from sqlalchemy.orm.attributes import flag_modified
 import re
 from sqlalchemy import desc, func, or_, and_
+from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Tuple
 from uuid import UUID
 import uuid
 from datetime import datetime, timezone, timedelta
-from app.db.session import get_db
+from threading import Lock as ThreadingLock
+
+from starlette.concurrency import run_in_threadpool
+from fastapi.security import HTTPAuthorizationCredentials
+
+from app.db.session import get_db, SessionLocal
 from app.models.client import Client, LifecycleState
 from app.models.stripe_payment import StripePayment
+from app.models.whop_payment import WhopPayment
 from app.models.stripe_subscription import StripeSubscription
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
 from app.models.manual_payment import ManualPayment
 from app.models.client_checkin import ClientCheckIn
+from app.models.organization import Organization
 from app.models.calendar_booking_sales import CalendarBookingSales
 from app.schemas.client import (
     Client as ClientSchema,
@@ -21,6 +30,8 @@ from app.schemas.client import (
     MergeClientsRequest,
     TerminalSummaryResponse,
     TerminalCashCollected,
+    TerminalCashBySourceBreakdown,
+    TerminalCashSourceTotals,
     TerminalMRR,
     TerminalTopContributor,
     ClientHealthScoreResponse,
@@ -35,9 +46,11 @@ from app.schemas.call_insights import (
     ClientInsightSummaryOut,
     CallInsightPerCallOut,
     CallInsightsRollupOut,
+    OfferSuggestionOut,
     RefreshCallInsightsResponse,
 )
-from app.api.deps import get_current_user, get_selected_org_id
+from app.api.deps import get_current_user, get_selected_org_id, security
+from app.schemas.calendar_metrics import CalendarMonthlyRateRow, CalendarMonthlyCoachingResponse
 from app.models.user import User
 from app.utils.stripe_ids import normalize_stripe_id_for_dedup
 from app.utils.stripe_helpers import extract_email_from_payment_raw
@@ -62,8 +75,12 @@ from app.services.ai_recommendation_email_draft import build_recommendation_emai
 from app.services.call_insight_service import (
     get_client_insights_response,
     get_call_insight_tags_batch,
+    reconcile_call_insights_for_client_merge,
+    refresh_insight_summary_from_latest_stored_insight,
     refresh_latest_call_insight,
+    refresh_latest_call_insight_background,
 )
+from app.long_jobs import schedule_background_work
 from app.core.config import settings
 from app.core.rate_limit import check_sliding_window
 
@@ -73,6 +90,60 @@ router = APIRouter()
 def _effective_org_id(user: User):
     """Org to scope queries (JWT selected org when present; else user's primary org)."""
     return getattr(user, "selected_org_id", user.org_id)
+
+
+# POST /check-ins/sync can run for minutes; without this, two get_db scopes + concurrent syncs exhaust QueuePool.
+_checkin_sync_locks_guard = ThreadingLock()
+_checkin_sync_org_locks: dict[str, ThreadingLock] = {}
+
+
+def _org_checkin_sync_lock(org_key: str) -> ThreadingLock:
+    with _checkin_sync_locks_guard:
+        if org_key not in _checkin_sync_org_locks:
+            _checkin_sync_org_locks[org_key] = ThreadingLock()
+        return _checkin_sync_org_locks[org_key]
+
+
+def _sync_check_ins_in_worker(token: str) -> dict:
+    """Short auth session, then one org-serialized sync with its own session (no route-level get_db)."""
+    from app.api.deps import resolve_org_and_user_ids_for_checkin_sync
+    from app.services.checkin_sync import sync_all_checkins
+
+    db_auth = SessionLocal()
+    try:
+        org_id, user_id = resolve_org_and_user_ids_for_checkin_sync(db_auth, token)
+    finally:
+        db_auth.close()
+
+    org_key = str(org_id)
+    lk = _org_checkin_sync_lock(org_key)
+    lk.acquire()
+    try:
+        db_sync = SessionLocal()
+        try:
+            return sync_all_checkins(db_sync, org_id, user_id)
+        finally:
+            db_sync.close()
+    finally:
+        lk.release()
+
+
+def _refresh_call_insights_after_checkin_sync(org_id_str: str, client_ids: list[str]) -> None:
+    """
+    Run Fathom call-insight refreshes for clients touched by calendar sync.
+
+    Previously we scheduled one BackgroundTasks/RQ job per client, which could start
+    immediately after the sync response and contend with the browser's follow-up
+    GET /integrations/calendar/synced-bookings for DB pool slots on the API process.
+
+    A short deferral + single task keeps behavior the same (every client still refreshes)
+    while letting the lightweight bookings read complete first.
+    """
+    import time
+
+    time.sleep(2)
+    for cid in client_ids:
+        refresh_latest_call_insight_background(org_id_str, str(cid))
 
 
 def _scope_org_id(user: User) -> UUID:
@@ -318,17 +389,17 @@ def create_client(
     # Selected org from JWT — same scope as list/delete (UUID-normalized)
     org_id = _scope_org_id(current_user)
     
-    # Check for duplicate client by email
+    # Indexed-friendly duplicate check (case-insensitive); JSON `emails` overlap is rare on manual create
     if client_data.email:
+        trimmed = client_data.email.strip()
         existing_client = db.query(Client).filter(
-            Client.email == client_data.email,
-            Client.org_id == org_id
+            Client.org_id == org_id,
+            func.lower(Client.email) == trimmed.lower(),
         ).first()
-        
         if existing_client:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Client with email {client_data.email} already exists (ID: {existing_client.id})"
+                detail=f"Client with email {trimmed} already exists (ID: {existing_client.id})",
             )
     
     # CRITICAL: Set org_id from selected org (token)
@@ -355,7 +426,14 @@ def create_client(
         client.program_progress_percent = client.calculate_progress()
     
     db.add(client)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Could not create client due to a conflict with existing data (e.g. duplicate email).",
+        )
     db.refresh(client)
     return client
 
@@ -468,6 +546,67 @@ def get_call_insight_tags(
     return get_call_insight_tags_batch(db, org_id, filtered)
 
 
+@router.get(
+    "/calendar/monthly-coaching-metrics",
+    response_model=CalendarMonthlyCoachingResponse,
+)
+def get_calendar_monthly_coaching_metrics(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Monthly show-up % vs sales close % for the current org (same logic as owner org dashboard graphs).
+    For the Calendar tab so members can review trends without admin access.
+    """
+    org_id = _scope_org_id(current_user)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    # Lazy import to avoid pulling admin helpers at router load time
+    from app.api import admin as admin_api
+
+    now_utc_dash = datetime.now(timezone.utc)
+
+    if org.created_at:
+        oc_anchor = (
+            org.created_at.replace(tzinfo=timezone.utc)
+            if org.created_at.tzinfo is None
+            else org.created_at.astimezone(timezone.utc)
+        )
+    else:
+        oc_anchor = now_utc_dash
+
+    month_cursor = admin_api._utc_month_start(oc_anchor)
+    cap_month = admin_api._first_of_month_n_months_ago(now_utc_dash, 35)
+    if month_cursor < cap_month:
+        month_cursor = cap_month
+
+    periods_out: List[CalendarMonthlyRateRow] = []
+
+    while month_cursor <= now_utc_dash:
+        month_end_exclusive = min(admin_api._add_one_calendar_month_first(month_cursor), now_utc_dash)
+
+        sup = admin_api._org_show_up_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+        cr = admin_api._org_close_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+
+        periods_out.append(
+            CalendarMonthlyRateRow(
+                period_label=month_cursor.strftime("%b %Y"),
+                period_start=month_cursor.isoformat(),
+                period_end=month_end_exclusive.isoformat(),
+                show_up_rate_pct=sup,
+                close_rate_pct=cr,
+            )
+        )
+
+        if month_end_exclusive >= now_utc_dash:
+            break
+        month_cursor = admin_api._add_one_calendar_month_first(month_cursor)
+
+    return CalendarMonthlyCoachingResponse(periods=periods_out)
+
+
 @router.get("/{client_id}/call-insights", response_model=ClientCallInsightsResponse)
 def get_client_call_insights(
     client_id: str,
@@ -495,17 +634,21 @@ def get_client_call_insights(
     insights_out = [CallInsightPerCallOut(**x) for x in data.get("insights") or []]
     rollup_raw = data.get("rollup")
     rollup_out = CallInsightsRollupOut(**rollup_raw) if isinstance(rollup_raw, dict) else None
+    offer_raw = data.get("offer_suggestion")
+    offer_out = OfferSuggestionOut(**offer_raw) if isinstance(offer_raw, dict) else None
     return ClientCallInsightsResponse(
         client_id=data.get("client_id", str(client_uuid)),
         summary=summary_out,
         insights=insights_out,
         rollup=rollup_out,
+        offer_suggestion=offer_out,
     )
 
 
 @router.post("/{client_id}/call-insights/refresh", response_model=RefreshCallInsightsResponse)
 def post_client_call_insights_refresh(
     client_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -517,8 +660,17 @@ def post_client_call_insights_refresh(
     client = db.query(Client).filter(Client.id == client_uuid, Client.org_id == org_id).first()
     if not client:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
-    status, detail = refresh_latest_call_insight(db, org_id, client_uuid)
-    return RefreshCallInsightsResponse(status=status, detail=detail)
+    check_sliding_window(
+        f"call_insights_refresh_{org_id}_{current_user.id}_{client_uuid}",
+        max_requests=8,
+        window_seconds=3600,
+        endpoint_name="post_client_call_insights_refresh",
+        db=db,
+        audit_user=current_user,
+        audit_request=request,
+    )
+    refresh_status, detail = refresh_latest_call_insight(db, org_id, client_uuid)
+    return RefreshCallInsightsResponse(status=refresh_status, detail=detail)
 
 
 @router.get("/{client_id}/ai-recommendations", response_model=ClientAIRecommendationsResponse)
@@ -767,7 +919,18 @@ def get_terminal_summary(
     thirty_days_ago = today_start - timedelta(days=30)
     mtd_start = today_start.replace(day=1)  # First of current month
 
-    # --- Cash collected: Stripe (succeeded, dedupe by stripe_id) + Manual ---
+    # --- Cash collected: Stripe (dedupe by stripe_id) + Whop (paid) + Manual ---
+    def _add_amount(tot: dict, ts: datetime, amount: float) -> None:
+        if ts >= today_start:
+            tot["today"] += amount
+        if ts >= seven_days_ago:
+            tot["last_7"] += amount
+        if ts >= thirty_days_ago:
+            tot["last_30"] += amount
+        if ts >= mtd_start:
+            tot["mtd"] += amount
+
+    stripe_tot = {"today": 0.0, "last_7": 0.0, "last_30": 0.0, "mtd": 0.0}
     stripe_payments = (
         db.query(StripePayment)
         .filter(
@@ -777,10 +940,6 @@ def get_terminal_summary(
         .all()
     )
     seen_stripe_ids = set()
-    today_cash = 0.0
-    last_7_cash = 0.0
-    last_30_cash = 0.0
-    mtd_cash = 0.0
     for p in stripe_payments:
         if p.stripe_id and p.stripe_id in seen_stripe_ids:
             continue
@@ -790,15 +949,9 @@ def get_terminal_summary(
         if not ts:
             continue
         amount = (p.amount_cents or 0) / 100.0
-        if ts >= today_start:
-            today_cash += amount
-        if ts >= seven_days_ago:
-            last_7_cash += amount
-        if ts >= thirty_days_ago:
-            last_30_cash += amount
-        if ts >= mtd_start:
-            mtd_cash += amount
+        _add_amount(stripe_tot, ts, amount)
 
+    manual_tot = {"today": 0.0, "last_7": 0.0, "last_30": 0.0, "mtd": 0.0}
     manual_payments = (
         db.query(ManualPayment)
         .filter(ManualPayment.org_id == org_id)
@@ -811,20 +964,48 @@ def get_terminal_summary(
         if getattr(ts, "tzinfo", None):
             ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
         amount = (p.amount_cents or 0) / 100.0
-        if ts >= today_start:
-            today_cash += amount
-        if ts >= seven_days_ago:
-            last_7_cash += amount
-        if ts >= thirty_days_ago:
-            last_30_cash += amount
-        if ts >= mtd_start:
-            mtd_cash += amount
+        _add_amount(manual_tot, ts, amount)
+
+    whop_tot = {"today": 0.0, "last_7": 0.0, "last_30": 0.0, "mtd": 0.0}
+    for p in db.query(WhopPayment).filter(WhopPayment.org_id == org_id).all():
+        if (p.status or "").lower() != "paid":
+            continue
+        ts = p.created_at
+        if not ts:
+            continue
+        amount = (p.amount_cents or 0) / 100.0
+        _add_amount(whop_tot, ts, amount)
+
+    today_cash = stripe_tot["today"] + manual_tot["today"] + whop_tot["today"]
+    last_7_cash = stripe_tot["last_7"] + manual_tot["last_7"] + whop_tot["last_7"]
+    last_30_cash = stripe_tot["last_30"] + manual_tot["last_30"] + whop_tot["last_30"]
+    mtd_cash = stripe_tot["mtd"] + manual_tot["mtd"] + whop_tot["mtd"]
 
     cash_collected = TerminalCashCollected(
         today=today_cash,
         last_7_days=last_7_cash,
         last_30_days=last_30_cash,
         last_mtd=mtd_cash,
+    )
+    cash_by_source = TerminalCashBySourceBreakdown(
+        stripe=TerminalCashSourceTotals(
+            today=stripe_tot["today"],
+            last_7_days=stripe_tot["last_7"],
+            last_30_days=stripe_tot["last_30"],
+            last_mtd=stripe_tot["mtd"],
+        ),
+        whop=TerminalCashSourceTotals(
+            today=whop_tot["today"],
+            last_7_days=whop_tot["last_7"],
+            last_30_days=whop_tot["last_30"],
+            last_mtd=whop_tot["mtd"],
+        ),
+        manual=TerminalCashSourceTotals(
+            today=manual_tot["today"],
+            last_7_days=manual_tot["last_7"],
+            last_30_days=manual_tot["last_30"],
+            last_mtd=manual_tot["mtd"],
+        ),
     )
 
     # --- MRR/ARR: from Stripe subscriptions (active/trialing) or fallback to client estimated_mrr ---
@@ -980,6 +1161,7 @@ def get_terminal_summary(
         mrr=mrr,
         top_contributors_30d=top_30,
         top_contributors_90d=top_90,
+        cash_by_source=cash_by_source,
     )
 
 
@@ -1567,6 +1749,31 @@ def update_client(
         )
 
 
+def _merge_client_meta_from_duplicates(keep: Client, to_remove: List[Client]) -> None:
+    """Carry prospect/ROI opportunity blobs from merged profiles onto the kept client."""
+    base: dict = {}
+    if isinstance(keep.meta, dict):
+        base = dict(keep.meta)
+    for c in to_remove:
+        if not isinstance(c.meta, dict):
+            continue
+        m = c.meta
+        for key in ("prospect_voice_profile", "roi_state"):
+            v = m.get(key)
+            bv = base.get(key)
+            if isinstance(v, dict) and v:
+                if not isinstance(bv, dict) or not bv:
+                    base[key] = dict(v)
+                elif key == "prospect_voice_profile":
+                    base[key] = {**dict(v), **dict(bv)}
+        lf = m.get("lead_follow_up")
+        if lf and not base.get("lead_follow_up"):
+            base["lead_follow_up"] = lf
+    if base:
+        keep.meta = base
+        flag_modified(keep, "meta")
+
+
 @router.post("/merge", response_model=ClientSchema)
 def merge_clients(
     body: MergeClientsRequest,
@@ -1645,6 +1852,9 @@ def merge_clients(
         keep.program_end_date = best_program.program_end_date
         keep.program_progress_percent = best_program.program_progress_percent
 
+    _merge_client_meta_from_duplicates(keep, to_remove)
+    reconcile_call_insights_for_client_merge(db, org_id, keep_id, remove_ids)
+
     # Reassign related records from to_remove to keep
     from app.models.stripe_subscription import StripeSubscription
     from app.models.event import Event
@@ -1676,6 +1886,10 @@ def merge_clients(
             ManualPayment.client_id == rid,
             ManualPayment.org_id == org_id,
         ).update({ManualPayment.client_id: keep_id}, synchronize_session=False)
+        db.query(WhopPayment).filter(
+            WhopPayment.client_id == rid,
+            WhopPayment.org_id == org_id,
+        ).update({WhopPayment.client_id: keep_id}, synchronize_session=False)
         db.query(ClientCheckIn).filter(
             ClientCheckIn.client_id == rid,
             ClientCheckIn.org_id == org_id,
@@ -1697,9 +1911,10 @@ def merge_clients(
     for c in to_remove:
         db.delete(c)
 
+    refresh_insight_summary_from_latest_stored_insight(db, org_id, keep_id)
     db.commit()
     db.refresh(keep)
-    invalidate_health_score_cache(db, keep_id, org_id)
+    invalidate_health_score_cache(db, keep_id, org_id, do_commit=True)
     return ClientSchema.model_validate(keep, from_attributes=True)
 
 
@@ -1871,66 +2086,67 @@ def process_client_automation_endpoint(
 
 # Check-in endpoints - MUST be before /{client_id}/check-ins to avoid route conflicts
 @router.post("/check-ins/sync")
-def sync_check_ins(
+async def sync_check_ins(
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """
     Sync calendar events (Cal.com/Calendly) with clients by matching attendee emails.
     Creates or updates check-in records for matching clients.
+
+    Runs the heavy sync in a worker thread with dedicated DB session(s) so we do not hold two
+    pool connections (get_current_user + route get_db) for the entire Cal.com/Calendly pull.
     """
-    from fastapi import BackgroundTasks
-    org_id = _effective_org_id(current_user)
-    print(f"[CHECKIN SYNC API] ===== ENDPOINT CALLED =====")
-    print(f"[CHECKIN SYNC API] User: {current_user.id}, Org: {org_id}")
-    
+    token = credentials.credentials
+    print("[CHECKIN SYNC API] ===== ENDPOINT CALLED ===== (async + worker pool)")
+
     try:
-        from app.services.checkin_sync import sync_all_checkins
-        print(f"[CHECKIN SYNC API] ✅ Successfully imported sync_all_checkins")
+        results = await run_in_threadpool(_sync_check_ins_in_worker, token)
     except ImportError as e:
         import traceback
+
         error_trace = traceback.format_exc()
         print(f"[CHECKIN SYNC API] ❌ Import error: {str(e)}")
         print(f"[CHECKIN SYNC API] Traceback:\n{error_trace}")
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to import checkin_sync service: {str(e)}"
+            detail=f"Failed to import checkin_sync service: {str(e)}",
         )
-    
-    try:
-        print(f"[CHECKIN SYNC API] Calling sync_all_checkins...")
-        results = sync_all_checkins(db, org_id, current_user.id)
-        
-        # Trigger targeted Fathom sync for affected clients implicitly
-        from app.services.call_insight_service import refresh_latest_call_insight
-        affected_client_ids = results.get("affected_client_ids", [])
-        if affected_client_ids:
-            print(f"[CHECKIN SYNC API] Queuing {len(affected_client_ids)} targeted Fathom syncs...")
-            for client_id in affected_client_ids:
-                background_tasks.add_task(
-                    refresh_latest_call_insight, str(org_id), client_id
-                )
-        
-        print(f"[CHECKIN SYNC API] ✅ Sync completed successfully")
-        return {
-            "success": True,
-            "message": f"Synced {results['total']} check-ins",
-            "calcom": results["calcom"],
-            "calendly": results["calendly"],
-            "total": results["total"]
-        }
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
+
         error_trace = traceback.format_exc()
         print(f"[CHECKIN SYNC API] ❌ Error: {str(e)}")
         print(f"[CHECKIN SYNC API] Traceback:\n{error_trace}")
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error syncing check-ins: {str(e)}"
+            detail=f"Error syncing check-ins: {str(e)}",
         )
+
+    affected_client_ids = results.get("affected_client_ids", [])
+    org_id_str = results.get("sync_org_id")
+    if affected_client_ids and org_id_str:
+        cids = [str(x) for x in affected_client_ids]
+        print(f"[CHECKIN SYNC API] Queuing {len(cids)} call-insight refreshes (batched, deferred)...")
+        schedule_background_work(
+            _refresh_call_insights_after_checkin_sync,
+            background_tasks,
+            org_id_str,
+            cids,
+        )
+
+    print("[CHECKIN SYNC API] ✅ Sync completed successfully")
+    return {
+        "success": True,
+        "message": f"Synced {results['total']} check-ins",
+        "calcom": results["calcom"],
+        "calendly": results["calendly"],
+        "total": results["total"],
+    }
 
 
 @router.get("/{client_id}/check-ins")

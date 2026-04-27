@@ -25,8 +25,9 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "postgresql://postgres:postgres@db:5432/sweep"
     # SQLAlchemy pool (tune for concurrent users; defaults suit small/medium traffic)
-    DATABASE_POOL_SIZE: int = 10
-    DATABASE_MAX_OVERFLOW: int = 20
+    # Defaults sized so bursts (terminal + calendar + webhooks) are less likely to hit QueuePool timeout.
+    DATABASE_POOL_SIZE: int = 15
+    DATABASE_MAX_OVERFLOW: int = 30
     DATABASE_POOL_TIMEOUT: int = 30
     DATABASE_POOL_RECYCLE: int = 1800
 
@@ -35,9 +36,14 @@ class Settings(BaseSettings):
 
     # Optional Redis for shared rate limits across multiple workers / instances
     REDIS_URL: Optional[str] = None
+    # When True with REDIS_URL, heavy jobs (Fathom follow-ups, bundle regen, etc.) use RQ
+    # instead of FastAPI BackgroundTasks / in-process threads. Run `python -m app.worker`.
+    USE_RQ_LONG_JOBS: bool = False
 
     # Global API throttle (per client IP, sliding 60s window). 0 = disabled.
-    GLOBAL_API_RATE_LIMIT_PER_MINUTE: int = 120
+    # SPAs (funnel analytics polling + terminal widgets) can burst >120/min from one user; too low causes
+    # 429 + Retry-After: 60 and looks like "network errors" for ~1 minute. Override on Render via env if needed.
+    GLOBAL_API_RATE_LIMIT_PER_MINUTE: int = 480
 
     # Brute-force protection on POST /auth/login (per IP)
     LOGIN_RATE_LIMIT_MAX: int = 30

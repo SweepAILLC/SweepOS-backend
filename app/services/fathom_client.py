@@ -207,6 +207,7 @@ def create_webhook(
     *,
     include_transcript: bool = True,
     include_summary: bool = True,
+    include_action_items: bool = True,
     triggered_for: Optional[List[str]] = None,
     timeout: float = 30.0,
     db: Optional[Session] = None,
@@ -221,8 +222,13 @@ def create_webhook(
         "include_transcript": include_transcript,
         "include_summary": include_summary,
         "include_crm_matches": False,
-        "include_action_items": False,
-        "triggered_for": triggered_for or ["my_recordings", "my_shared_with_team_recordings"],
+        "include_action_items": include_action_items,
+        "triggered_for": triggered_for
+        or [
+            "my_recordings",
+            "my_shared_with_team_recordings",
+            "shared_external_recordings",
+        ],
     }
     with httpx.Client(timeout=timeout) as client:
         r = client.post(f"{BASE}/webhooks", headers=_headers(key), json=body)

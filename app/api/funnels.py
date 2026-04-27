@@ -5,7 +5,7 @@ Provides CRUD for funnels, steps, event ingestion, analytics, and health monitor
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi import Request
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_, or_, desc, asc
+from sqlalchemy import func, and_, or_, desc, asc, text
 from typing import List, Optional, Union
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -862,35 +862,50 @@ def get_funnel_analytics(
         Event.occurred_at <= end_date
     ).scalar() or 0
     
-    # Revenue from metadata (if stored)
-    revenue_events = db.query(Event).filter(
-        Event.funnel_id == funnel_id,
-        Event.org_id == org_id,
-        Event.event_name == "payment_succeeded",
-        Event.occurred_at >= start_date,
-        Event.occurred_at <= end_date
-    ).all()
-    
-    revenue_cents = 0
-    for evt in revenue_events:
-        if evt.event_metadata and 'amount_cents' in evt.event_metadata:
-            revenue_cents += int(evt.event_metadata['amount_cents'])
+    # Revenue from metadata — aggregate in SQL (avoid loading every payment row into Python).
+    revenue_row = db.execute(
+        text(
+            """
+            SELECT COALESCE(SUM((event_metadata::jsonb->>'amount_cents')::bigint), 0)
+            FROM events
+            WHERE funnel_id = CAST(:fid AS uuid)
+              AND org_id = CAST(:oid AS uuid)
+              AND event_name = 'payment_succeeded'
+              AND occurred_at >= :start
+              AND occurred_at <= :end
+              AND event_metadata IS NOT NULL
+              AND (event_metadata::jsonb ? 'amount_cents')
+            """
+        ),
+        {
+            "fid": str(funnel_id),
+            "oid": str(org_id),
+            "start": start_date,
+            "end": end_date,
+        },
+    ).scalar()
+    revenue_cents = int(revenue_row or 0)
     
     # Aggregate UTM sources
     # Get all events in range with sessions
-    events_with_sessions = db.query(Event, Session).join(
-        Session,
-        and_(
-            Event.session_id == Session.session_id,
-            Event.org_id == Session.org_id
+    events_with_sessions = (
+        db.query(Event, Session)
+        .join(
+            Session,
+            and_(
+                Event.session_id == Session.session_id,
+                Event.org_id == Session.org_id,
+            ),
         )
-    ).filter(
-        Event.funnel_id == funnel_id,
-        Event.org_id == org_id,
-        Event.occurred_at >= start_date,
-        Event.occurred_at <= end_date,
-        Session.utm.isnot(None)
-    ).all()
+        .filter(
+            Event.funnel_id == funnel_id,
+            Event.org_id == org_id,
+            Event.occurred_at >= start_date,
+            Event.occurred_at <= end_date,
+            Session.utm.isnot(None),
+        )
+        .yield_per(2000)
+    )
     
     # Aggregate UTM sources
     # Track unique visitors per source for conversion calculation
@@ -935,19 +950,24 @@ def get_funnel_analytics(
     ]
     
     # Aggregate referrers
-    events_with_referrers = db.query(Event, Session).join(
-        Session,
-        and_(
-            Event.session_id == Session.session_id,
-            Event.org_id == Session.org_id
+    events_with_referrers = (
+        db.query(Event, Session)
+        .join(
+            Session,
+            and_(
+                Event.session_id == Session.session_id,
+                Event.org_id == Session.org_id,
+            ),
         )
-    ).filter(
-        Event.funnel_id == funnel_id,
-        Event.org_id == org_id,
-        Event.occurred_at >= start_date,
-        Event.occurred_at <= end_date,
-        Session.referrer.isnot(None)
-    ).all()
+        .filter(
+            Event.funnel_id == funnel_id,
+            Event.org_id == org_id,
+            Event.occurred_at >= start_date,
+            Event.occurred_at <= end_date,
+            Session.referrer.isnot(None),
+        )
+        .yield_per(2000)
+    )
     
     # Track unique visitors per referrer for conversion calculation
     referrer_visitors = {}  # {referrer: set(visitor_ids)}

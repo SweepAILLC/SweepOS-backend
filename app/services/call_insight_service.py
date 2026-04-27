@@ -4,10 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import defaultdict
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import desc, nullslast
@@ -16,8 +17,20 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.client import Client
 from app.models.client_call_insight import ClientCallInsight, ClientInsightSummary
+from app.models.client_checkin import ClientCheckIn
 from app.models.fathom_call_record import FathomCallRecord
+from sqlalchemy.orm.attributes import flag_modified
+
 from app.services.call_insight_ai import compute_call_insight_json, headline_from_insight, validate_and_normalize_insight_json
+from app.services.offer_ladder import resolve_org_offer_ladder
+from app.services.roi_signal_validation import (
+    apply_roi_validation,
+    client_has_expansion_win_basis,
+    merge_client_roi_meta,
+    normalize_display_tags_for_client,
+    upsell_referral_testimonial_gate_bypass,
+)
+from app.services.user_ai_profile_context import resolve_org_sales_lens
 from app.services.call_insight_context import assemble_context_pack, is_thin_transcript
 from app.services.call_insight_correlation import link_fathom_to_checkin
 from app.services.health_score_cache_service import resolve_health_score
@@ -61,6 +74,169 @@ def _lifecycle_str(client: Client) -> str:
     if hasattr(ls, "value"):
         return str(ls.value)
     return str(ls)
+
+
+def parse_lead_follow_up_due_iso(s: str) -> Optional[datetime]:
+    """Parse LLM due_date_iso to UTC datetime for client.meta.follow_up_due_at."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        if "T" not in s and len(s) >= 10:
+            d = date.fromisoformat(s[:10])
+            return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def apply_lead_follow_up_from_insight(client: Client, insight_json: Dict[str, Any]) -> None:
+    """
+    Persist follow-up due date from call-insight lead_follow_up (LLM structured field).
+
+    Only cold_lead / warm_lead: when confirmed_on_call and due_date_iso parse, set meta.follow_up_due_at;
+    otherwise clear so the UI falls back to a 14-day window from last activity.
+    """
+    if _lifecycle_str(client) not in ("cold_lead", "warm_lead"):
+        return
+    lf = insight_json.get("lead_follow_up")
+    if not isinstance(lf, dict):
+        return
+    meta: Dict[str, Any] = dict(client.meta) if isinstance(client.meta, dict) else {}
+    if bool(lf.get("confirmed_on_call")) and lf.get("due_date_iso"):
+        parsed = parse_lead_follow_up_due_iso(str(lf.get("due_date_iso")))
+        if parsed:
+            meta["follow_up_due_at"] = parsed.isoformat().replace("+00:00", "Z")
+        else:
+            meta.pop("follow_up_due_at", None)
+    else:
+        meta.pop("follow_up_due_at", None)
+    client.meta = meta
+    flag_modified(client, "meta")
+
+
+def _lead_pipeline_snapshot(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> Dict[str, Any]:
+    """
+    Calendar + sales pipeline facts for call-insight LLM and ROI gating (cold/warm leads).
+    """
+    now = datetime.now(timezone.utc)
+    last_sales = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.client_id == client_id,
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.is_sales_call.is_(True),
+            ClientCheckIn.start_time < now,
+            ClientCheckIn.cancelled.is_(False),
+        )
+        .order_by(desc(ClientCheckIn.start_time))
+        .first()
+    )
+    has_past_sales_call = last_sales is not None
+    last_sales_dict: Optional[Dict[str, Any]] = None
+    open_sales_deal = False
+    if last_sales:
+        sc = getattr(last_sales, "sale_closed", None)
+        open_sales_deal = sc is not True
+        last_sales_dict = {
+            "start_time": last_sales.start_time.isoformat() if last_sales.start_time else None,
+            "sale_closed": sc,
+            "event_id": str(last_sales.event_id) if last_sales.event_id else None,
+        }
+
+    next_ci = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.client_id == client_id,
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.cancelled.is_(False),
+            ClientCheckIn.start_time > now,
+        )
+        .order_by(ClientCheckIn.start_time.asc())
+        .first()
+    )
+    has_upcoming = next_ci is not None
+    next_iso = next_ci.start_time.isoformat() if next_ci and next_ci.start_time else None
+    next_is_sales = bool(getattr(next_ci, "is_sales_call", False)) if next_ci else False
+
+    return {
+        "has_past_sales_call": has_past_sales_call,
+        "last_sales_call": last_sales_dict,
+        "open_sales_deal": bool(open_sales_deal),
+        "has_upcoming_check_in": has_upcoming,
+        "next_start_time_iso": next_iso,
+        "next_is_sales_call": next_is_sales,
+    }
+
+
+def _opportunity_tags_from_insight_row(row: ClientCallInsight) -> List[str]:
+    ij = row.insight_json
+    if not isinstance(ij, dict):
+        return []
+    raw = ij.get("opportunity_tags") or []
+    return [str(t).lower().strip() for t in raw if str(t).strip()]
+
+
+def _fallback_opportunity_tags_from_insights(
+    db: Session, org_id: uuid.UUID, client_id: uuid.UUID, *, lookback: int = 16
+) -> List[str]:
+    """Most recent complete insight rows with non-empty server-validated opportunity_tags."""
+    rows = (
+        db.query(ClientCallInsight)
+        .filter(
+            ClientCallInsight.org_id == org_id,
+            ClientCallInsight.client_id == client_id,
+            ClientCallInsight.status == "complete",
+        )
+        .order_by(desc(ClientCallInsight.computed_at))
+        .limit(lookback)
+        .all()
+    )
+    for r in rows:
+        tags = _opportunity_tags_from_insight_row(r)
+        if tags:
+            return tags
+    return []
+
+
+def _batch_fallback_opportunity_tags(
+    db: Session, org_id: uuid.UUID, client_ids: List[uuid.UUID]
+) -> Dict[uuid.UUID, List[str]]:
+    """First non-empty opportunity_tags per client from recent complete insights (global time order)."""
+    if not client_ids:
+        return {}
+    cap = min(4000, max(400, len(client_ids) * 48))
+    rows = (
+        db.query(ClientCallInsight)
+        .filter(
+            ClientCallInsight.org_id == org_id,
+            ClientCallInsight.client_id.in_(client_ids),
+            ClientCallInsight.status == "complete",
+        )
+        .order_by(desc(ClientCallInsight.computed_at))
+        .limit(cap)
+        .all()
+    )
+    by_cid: Dict[uuid.UUID, List[ClientCallInsight]] = defaultdict(list)
+    for r in rows:
+        lst = by_cid[r.client_id]
+        if len(lst) < 20:
+            lst.append(r)
+    out: Dict[uuid.UUID, List[str]] = {}
+    for cid in client_ids:
+        for r in by_cid.get(cid, []):
+            tags = _opportunity_tags_from_insight_row(r)
+            if tags:
+                out[cid] = tags
+                break
+    return out
 
 
 def run_call_insight_for_fathom_record(
@@ -123,6 +299,7 @@ def run_call_insight_for_fathom_record(
         return "skipped", {"reason": "no_health"}
 
     pack = assemble_context_pack(db, client, rec, check_in_id, health)
+    pack["pipeline"] = _lead_pipeline_snapshot(db, org_id, rec.client_id)
     input_hash = hash_context_pack(pack)
 
     if existing and existing.input_hash == input_hash and existing.status == "complete":
@@ -179,10 +356,14 @@ def run_call_insight_for_fathom_record(
         db.commit()
         return "skipped", {"reason": "org_throttle"}
 
+    org_offer_ladder = resolve_org_offer_ladder(db, org_id)
+    org_sales_lens = resolve_org_sales_lens(db, org_id)
     insight_json = compute_call_insight_json(
         context_pack=pack,
         lifecycle=_lifecycle_str(client),
         org_id=org_id,
+        offer_ladder=org_offer_ladder,
+        sales_lens=org_sales_lens,
     )
     if not insight_json:
         row = existing or ClientCallInsight(
@@ -209,6 +390,30 @@ def run_call_insight_for_fathom_record(
         return "failed", {"reason": "llm"}
 
     insight_json = validate_and_normalize_insight_json(insight_json)
+
+    trans_text = str((pack.get("call_text") or {}).get("transcript") or "")
+    prior_roi: Dict[str, Any] = {}
+    if isinstance(client.meta, dict):
+        pr = client.meta.get("roi_state")
+        if isinstance(pr, dict):
+            prior_roi = pr
+    meeting_iso = rec.meeting_at.isoformat() if rec.meeting_at else None
+    pipeline = pack.get("pipeline") if isinstance(pack.get("pipeline"), dict) else {}
+    gate_bypass = upsell_referral_testimonial_gate_bypass(client)
+    insight_json, roi_delta = apply_roi_validation(
+        insight_json,
+        trans_text,
+        _lifecycle_str(client),
+        prior_roi,
+        meeting_iso,
+        pipeline,
+        testimonial_gate_bypass=gate_bypass,
+    )
+    merge_client_roi_meta(client, roi_delta)
+    try:
+        flag_modified(client, "meta")
+    except Exception:
+        pass
 
     row = existing or ClientCallInsight(
         id=uuid.uuid4(),
@@ -257,6 +462,7 @@ def run_call_insight_for_fathom_record(
                 insight_json.get("next_steps") or [],
             )
             merge_prospect_voice_from_insight_into_client(c2, insight_json.get("prospect_voice"))
+            apply_lead_follow_up_from_insight(c2, insight_json)
             db.commit()
     except Exception as e:
         logger.exception("post_call_insight_merge failed client=%s: %s", client.id, e)
@@ -313,6 +519,27 @@ def run_call_insight_background(org_id_str: str, fathom_record_id_str: str) -> N
         db.close()
 
 
+def refresh_latest_call_insight_background(org_id_str: str, client_id_str: str) -> None:
+    """New DB session for thread/RQ after check-in sync."""
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        oid = uuid.UUID(org_id_str)
+        cid = uuid.UUID(str(client_id_str))
+        status, detail = refresh_latest_call_insight(db, oid, cid)
+        logger.info(
+            "refresh_latest_call_insight background done client=%s status=%s detail=%s",
+            client_id_str,
+            status,
+            detail,
+        )
+    except Exception as e:
+        logger.exception("refresh_latest_call_insight background failed: %s", e)
+    finally:
+        db.close()
+
+
 def refresh_latest_call_insight(
     db: Session, org_id: uuid.UUID, client_id: uuid.UUID
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -341,10 +568,18 @@ def _build_call_insights_rollup(db: Session, client: Client, rows: List[ClientCa
     clips: List[Dict[str, Any]] = []
     wins: List[str] = []
     stories: List[str] = []
+    roi_testimonials: List[Dict[str, Any]] = []
+    seen_roi_q: set = set()
+    latest_upsell: Optional[Dict[str, Any]] = None
+    latest_referral: Optional[Dict[str, Any]] = None
+    latest_revive_playbook: Optional[Dict[str, Any]] = None
     seen_p: set = set()
     seen_s: set = set()
     # Single narrative paragraph: always from the most recent complete insight (rows are newest-first).
     latest_synthesis = ""
+    # Latest sales-framework critique (only set when the operator has a sales lens
+    # configured AND the most recent call had sales-relevant content).
+    latest_framework_review: Dict[str, Any] = {}
 
     for r in rows:
         if r.status != "complete" or not r.insight_json or not isinstance(r.insight_json, dict):
@@ -354,6 +589,14 @@ def _build_call_insights_rollup(db: Session, client: Client, rows: List[ClientCa
             s = str(ij.get("client_state_synthesis") or "").strip()
             if s:
                 latest_synthesis = s[:2500]
+        if not latest_framework_review:
+            fr = str(ij.get("framework_review") or "").strip()
+            if fr:
+                fj_for_fr = r.fathom_call_record
+                latest_framework_review = {
+                    "summary": fr[:1200],
+                    "meeting_at": fj_for_fr.meeting_at.isoformat() if fj_for_fr and fj_for_fr.meeting_at else "",
+                }
         fj = r.fathom_call_record
         mat = fj.meeting_at.isoformat() if fj and fj.meeting_at else None
         for p in ij.get("priorities") or []:
@@ -391,6 +634,40 @@ def _build_call_insights_rollup(db: Session, client: Client, rows: List[ClientCa
             if ss and ss not in stories:
                 stories.append(ss[:600])
 
+        rs = ij.get("roi_signals")
+        if isinstance(rs, dict):
+            for m in (rs.get("testimonial_moments") or [])[:5]:
+                if not isinstance(m, dict):
+                    continue
+                qk = str(m.get("quote") or "").strip()[:200]
+                if qk and qk not in seen_roi_q:
+                    seen_roi_q.add(qk)
+                    mm = dict(m)
+                    mm["meeting_at"] = mat
+                    mm["fathom_call_record_id"] = str(r.fathom_call_record_id) if r.fathom_call_record_id else None
+                    roi_testimonials.append(mm)
+            up = rs.get("upsell")
+            if isinstance(up, dict) and up.get("active") and not latest_upsell:
+                latest_upsell = {
+                    "rationale": str(up.get("rationale") or "")[:800],
+                    "meeting_at": mat or "",
+                }
+            ref = rs.get("referral")
+            if isinstance(ref, dict) and ref.get("active") and not latest_referral:
+                latest_referral = {
+                    "variant": ref.get("variant"),
+                    "rationale": str(ref.get("rationale") or "")[:800],
+                    "meeting_at": mat or "",
+                }
+            rp = rs.get("revive_playbook")
+            if isinstance(rp, dict) and str(rp.get("rationale") or "").strip() and not latest_revive_playbook:
+                latest_revive_playbook = {
+                    "rationale": str(rp.get("rationale") or "")[:1200],
+                    "offer_angles": [str(x)[:300] for x in (rp.get("offer_angles") or [])[:8] if str(x).strip()],
+                    "outreach_hooks": [str(x)[:300] for x in (rp.get("outreach_hooks") or [])[:8] if str(x).strip()],
+                    "meeting_at": mat or "",
+                }
+
     prof: Dict[str, Any] = {}
     if isinstance(client.meta, dict):
         raw = client.meta.get("prospect_voice_profile")
@@ -404,6 +681,11 @@ def _build_call_insights_rollup(db: Session, client: Client, rows: List[ClientCa
         "accumulated_clips": clips[:35],
         "accumulated_wins": wins[:20],
         "accumulated_testimonial_stories": stories[:15],
+        "accumulated_roi_testimonials": roi_testimonials[:12],
+        "latest_upsell_signal": latest_upsell,
+        "latest_referral_signal": latest_referral,
+        "latest_revive_playbook": latest_revive_playbook,
+        "latest_framework_review": latest_framework_review or None,
         "prospect_voice_profile": prof,
         "org_validated_theme_keys": [],
     }
@@ -424,12 +706,36 @@ def get_client_insights_response(db: Session, org_id: uuid.UUID, client_id: uuid
     if not client:
         return {}
 
+    pipeline = _lead_pipeline_snapshot(db, org_id, client_id)
+
     summ = db.query(ClientInsightSummary).filter(ClientInsightSummary.client_id == client_id).first()
     summary_out = None
     if summ:
+        raw_tags: List[str] = []
+        if summ.tags:
+            raw_tags = [str(t).lower().strip() for t in summ.tags if str(t).strip()]
+        fb_tags = _fallback_opportunity_tags_from_insights(db, org_id, client_id)
+        ls_lc = _lifecycle_str(client).lower().strip()
+        if ls_lc in ("active", "offboarding") and not raw_tags and fb_tags:
+            raw_tags = list(fb_tags)
+        tags = normalize_display_tags_for_client(
+            _lifecycle_str(client),
+            pipeline,
+            raw_tags,
+            testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(client),
+            has_expansion_win_basis=client_has_expansion_win_basis(client),
+        )
+        if ls_lc in ("active", "offboarding") and not tags and fb_tags:
+            tags = normalize_display_tags_for_client(
+                _lifecycle_str(client),
+                pipeline,
+                list(fb_tags),
+                testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(client),
+                has_expansion_win_basis=client_has_expansion_win_basis(client),
+            )
         summary_out = {
             "headline": summ.headline,
-            "tags": summ.tags or [],
+            "tags": tags,
             "last_call_at": summ.last_call_at.isoformat() if summ.last_call_at else None,
             "last_insight_at": summ.last_insight_at.isoformat() if summ.last_insight_at else None,
         }
@@ -460,11 +766,45 @@ def get_client_insights_response(db: Session, org_id: uuid.UUID, client_id: uuid
 
     rollup = _build_call_insights_rollup(db, client, rows)
 
+    roi_state_out: Optional[Dict[str, Any]] = None
+    if isinstance(client.meta, dict):
+        rs = client.meta.get("roi_state")
+        if isinstance(rs, dict):
+            roi_state_out = dict(rs)
+
+    offer_suggestion: Optional[Dict[str, Any]] = None
+    try:
+        from app.services.offer_ladder import match_offer_for_client, resolve_org_offer_ladder
+
+        ladder = resolve_org_offer_ladder(db, org_id)
+        if ladder:
+            tags_for_match: List[str] = []
+            if summary_out and isinstance(summary_out.get("tags"), list):
+                tags_for_match = [str(t) for t in summary_out["tags"]]
+            prospect_voice = None
+            if isinstance(client.meta, dict):
+                pv = client.meta.get("prospect_voice_profile")
+                if isinstance(pv, dict):
+                    prospect_voice = pv
+            offer_suggestion = match_offer_for_client(
+                ladder,
+                lifecycle=_lifecycle_str(client),
+                roi_tags=tags_for_match,
+                headline=str((summary_out or {}).get("headline") or ""),
+                prospect_voice=prospect_voice,
+                has_testimonial_trigger=client_has_expansion_win_basis(client),
+            )
+    except Exception:
+        offer_suggestion = None
+
     return {
         "client_id": str(client_id),
         "summary": summary_out,
         "insights": insights,
         "rollup": rollup,
+        "roi_state": roi_state_out,
+        "pipeline": pipeline,
+        "offer_suggestion": offer_suggestion,
     }
 
 
@@ -480,9 +820,188 @@ def get_call_insight_tags_batch(db: Session, org_id: uuid.UUID, client_ids: List
         )
         .all()
     )
-    for r in rows:
-        out[str(r.client_id)] = {
-            "tags": r.tags or [],
-            "headline": (r.headline or "")[:120],
-        }
+    summ_by_cid = {r.client_id: r for r in rows}
+    clients = (
+        db.query(Client)
+        .filter(Client.org_id == org_id, Client.id.in_(client_ids))
+        .all()
+    )
+    client_by_id = {c.id: c for c in clients}
+    fallback_map = _batch_fallback_opportunity_tags(db, org_id, client_ids)
+    for cid in client_ids:
+        c = client_by_id.get(cid)
+        if not c:
+            continue
+        summ = summ_by_cid.get(cid)
+        stored_tags: List[str] = []
+        if summ and summ.tags:
+            stored_tags = [str(t).lower().strip() for t in summ.tags if str(t).strip()]
+        ls_lc = _lifecycle_str(c).lower().strip()
+        fb_tags = fallback_map.get(cid) or []
+        if ls_lc in ("active", "offboarding") and not stored_tags and fb_tags:
+            stored_tags = list(fb_tags)
+        pipe = _lead_pipeline_snapshot(db, org_id, cid)
+        tags = normalize_display_tags_for_client(
+            _lifecycle_str(c),
+            pipe,
+            stored_tags,
+            testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(c),
+            has_expansion_win_basis=client_has_expansion_win_basis(c),
+        )
+        if ls_lc in ("active", "offboarding") and not tags and fb_tags:
+            tags = normalize_display_tags_for_client(
+                _lifecycle_str(c),
+                pipe,
+                list(fb_tags),
+                testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(c),
+                has_expansion_win_basis=client_has_expansion_win_basis(c),
+            )
+        headline = (summ.headline or "")[:120] if summ else ""
+        out[str(cid)] = {"tags": tags, "headline": headline}
     return out
+
+
+def _merge_recommendation_actions(keep_actions: Any, remove_actions: Any) -> List[Dict[str, Any]]:
+    """Union AI checklist actions by id; if either row marked completed, keep completed."""
+    ka = keep_actions if isinstance(keep_actions, list) else []
+    ra = remove_actions if isinstance(remove_actions, list) else []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for a in ka:
+        if isinstance(a, dict) and a.get("id") is not None:
+            by_id[str(a["id"])] = dict(a)
+    for a in ra:
+        if not isinstance(a, dict) or a.get("id") is None:
+            continue
+        k = str(a["id"])
+        if k not in by_id:
+            by_id[k] = dict(a)
+        else:
+            ex = by_id[k]
+            if a.get("completed") and not ex.get("completed"):
+                ex["completed"] = True
+                ex["completed_at"] = a.get("completed_at") or ex.get("completed_at")
+    return list(by_id.values())
+
+
+def reconcile_call_insights_for_client_merge(
+    db: Session,
+    org_id: uuid.UUID,
+    keep_id: uuid.UUID,
+    remove_ids: List[uuid.UUID],
+) -> None:
+    """
+    Move per-call insights and merge 1:1 tables before merged client rows are deleted.
+    Avoids PK collisions on client_ai_recommendation_states / client_insight_summaries / health cache
+    and prevents CASCADE from dropping ClientCallInsight rows for the merged-away profile.
+    """
+    if not remove_ids:
+        return
+    from app.models.client_ai_recommendation_state import ClientAIRecommendationState
+    from app.models.client_health_score_cache import ClientHealthScoreCache
+
+    db.query(ClientCallInsight).filter(
+        ClientCallInsight.org_id == org_id,
+        ClientCallInsight.client_id.in_(remove_ids),
+    ).update({ClientCallInsight.client_id: keep_id}, synchronize_session=False)
+
+    keep_summ = db.query(ClientInsightSummary).filter(ClientInsightSummary.client_id == keep_id).first()
+    for rid in remove_ids:
+        r_summ = db.query(ClientInsightSummary).filter(ClientInsightSummary.client_id == rid).first()
+        if not r_summ:
+            continue
+        if keep_summ is None:
+            r_summ.client_id = keep_id
+            keep_summ = r_summ
+        else:
+            kt = list(keep_summ.tags) if isinstance(keep_summ.tags, list) else []
+            rt = list(r_summ.tags) if isinstance(r_summ.tags, list) else []
+            tag_union: List[str] = []
+            seen_l = set()
+            for t in kt + rt:
+                s = str(t).strip()
+                if not s:
+                    continue
+                sl = s.lower()
+                if sl in seen_l:
+                    continue
+                seen_l.add(sl)
+                tag_union.append(s)
+            keep_summ.tags = tag_union[:12]
+            kh, rh = (keep_summ.headline or "").strip(), (r_summ.headline or "").strip()
+            if not kh and rh:
+                keep_summ.headline = r_summ.headline
+            elif rh and len(rh) > len(kh):
+                keep_summ.headline = r_summ.headline
+            for attr in ("last_call_at", "last_insight_at"):
+                a, b = getattr(keep_summ, attr), getattr(r_summ, attr)
+                if b is not None and (a is None or b > a):
+                    setattr(keep_summ, attr, b)
+            if not (keep_summ.last_lifecycle_state or "").strip() and (r_summ.last_lifecycle_state or "").strip():
+                keep_summ.last_lifecycle_state = r_summ.last_lifecycle_state
+            if not (keep_summ.last_health_grade or "").strip() and (r_summ.last_health_grade or "").strip():
+                keep_summ.last_health_grade = r_summ.last_health_grade
+            if keep_summ.last_health_score is None and r_summ.last_health_score is not None:
+                keep_summ.last_health_score = r_summ.last_health_score
+            db.delete(r_summ)
+    db.flush()
+
+    keep_rec = db.query(ClientAIRecommendationState).filter(
+        ClientAIRecommendationState.org_id == org_id,
+        ClientAIRecommendationState.client_id == keep_id,
+    ).first()
+    for rid in remove_ids:
+        r_rec = db.query(ClientAIRecommendationState).filter(
+            ClientAIRecommendationState.org_id == org_id,
+            ClientAIRecommendationState.client_id == rid,
+        ).first()
+        if not r_rec:
+            continue
+        if keep_rec is None:
+            r_rec.client_id = keep_id
+            keep_rec = r_rec
+        else:
+            merged = _merge_recommendation_actions(keep_rec.actions, r_rec.actions)
+            keep_rec.actions = merged
+            if not (keep_rec.headline or "").strip() and (r_rec.headline or "").strip():
+                keep_rec.headline = r_rec.headline
+            db.delete(r_rec)
+        flag_modified(keep_rec, "actions")
+    db.flush()
+
+    db.query(ClientHealthScoreCache).filter(ClientHealthScoreCache.client_id.in_(remove_ids)).delete(
+        synchronize_session=False
+    )
+
+
+def refresh_insight_summary_from_latest_stored_insight(
+    db: Session,
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+) -> None:
+    """Rebuild board headline/tags from the newest stored complete insight (no LLM, no Fathom re-ingest)."""
+    client = db.query(Client).filter(Client.id == client_id, Client.org_id == org_id).first()
+    if not client:
+        return
+    row = (
+        db.query(ClientCallInsight)
+        .filter(
+            ClientCallInsight.org_id == org_id,
+            ClientCallInsight.client_id == client_id,
+            ClientCallInsight.status == "complete",
+        )
+        .order_by(desc(ClientCallInsight.computed_at))
+        .first()
+    )
+    if not row or not row.insight_json or not isinstance(row.insight_json, dict):
+        return
+    fj = db.query(FathomCallRecord).filter(FathomCallRecord.id == row.fathom_call_record_id).first()
+    if not fj:
+        return
+    from app.models.client_health_score_cache import ClientHealthScoreCache
+
+    cache_row = db.query(ClientHealthScoreCache).filter(ClientHealthScoreCache.client_id == client_id).first()
+    health: Dict[str, Any] = {
+        "grade": (cache_row.grade if cache_row else "") or "",
+        "score": float(cache_row.score) if cache_row and cache_row.score is not None else None,
+    }
+    _upsert_summary(db, org_id, client, fj, row.insight_json, health)

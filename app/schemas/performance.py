@@ -70,6 +70,24 @@ class PerformanceTaskOut(BaseModel):
     completed: bool = False
 
 
+class PerformanceTaskEmailDraftOut(BaseModel):
+    """Saved email draft for a Performance task (one per task id)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    task_id: str
+    subject: str = ""
+    body_plain: str = ""
+    body_html: str = ""
+    source: str = "llm"  # llm | template | placeholder
+    generated_at: str = ""
+    client_id: Optional[str] = None
+    # Lets the UI link straight to Brevo for that contact when present.
+    client_email: Optional[str] = None
+    # Truthy when the draft is missing because the task isn't tied to a client.
+    skipped_reason: Optional[str] = None
+
+
 class PerformanceSnapshotResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -80,6 +98,10 @@ class PerformanceSnapshotResponse(BaseModel):
     funnels: List[FunnelPerformanceSummary]
     diagnosis: PerformanceDiagnosisOut
     tasks: List[PerformanceTaskOut]
+    # Mirrors Intelligence tab pipeline_priorities (used to rank ROI + org tasks).
+    pipeline_priorities: List[str] = Field(default_factory=list)
+    # Persisted Performance email drafts (auto-generated + on-demand). Keyed by task_id on the client.
+    drafts: List[PerformanceTaskEmailDraftOut] = Field(default_factory=list)
 
 
 class PerformanceTasksPatchBody(BaseModel):
@@ -113,6 +135,22 @@ class PerformancePrescriptionResponse(BaseModel):
 
     tasks: List[PerformancePrescriptionTaskOut]
     source: str = "deterministic"  # llm | deterministic
+
+
+class PerformanceEmailDraftsBody(BaseModel):
+    """Request body for POST /performance/email-drafts: which tasks to draft for."""
+
+    task_ids: List[str] = Field(default_factory=list, max_length=20)
+    # If true, regenerate even when a saved draft already exists.
+    force: bool = False
+
+
+class PerformanceEmailDraftsResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    drafts: List[PerformanceTaskEmailDraftOut] = Field(default_factory=list)
+    skipped: List[str] = Field(default_factory=list)
+    source: str = "llm"
 
 
 def performance_state_from_ai_profile(ai_profile: Any) -> Dict[str, Any]:

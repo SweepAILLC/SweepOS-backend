@@ -13,6 +13,10 @@ class Organization(Base):
     max_user_seats = Column(Integer, nullable=True)  # null = unlimited; positive = cap
     # Per-organization Fathom API key (Call Library / Intelligence). Admins/owners only.
     fathom_api_key = Column(Text, nullable=True)
+    # Per-org Fathom webhook config (created via API using fathom_api_key).
+    fathom_webhook_id = Column(Text, nullable=True)
+    fathom_webhook_secret = Column(Text, nullable=True)
+    fathom_webhook_url = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

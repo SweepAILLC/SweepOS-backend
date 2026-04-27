@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import func, asc, desc
 from sqlalchemy.orm import Session
@@ -21,11 +21,17 @@ from app.models.manual_payment import ManualPayment
 from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
 from app.api.stripe import check_stripe_connected
+from app.services.call_insight_service import get_call_insight_tags_batch
 from app.services.client_ai_recommendations_service import (
     _CATEGORY_TO_PRIORITY_ID,
     get_recommendation_state_dict,
 )
 from app.services.health_score_cache_service import batch_read_cached_health_scores, resolve_health_score
+from app.services.offer_ladder import (
+    extract_offer_ladder,
+    match_offer_for_client,
+)
+from app.services.roi_signal_validation import client_has_expansion_win_basis
 
 
 def _normalize_email(email: str | None) -> str | None:
@@ -305,19 +311,221 @@ def _pipeline_priorities_from_user(ai_profile: Any) -> Optional[List[str]]:
 
 
 def _priority_boost(category: str, priorities: Optional[List[str]]) -> float:
+    """
+    Boost org-level tasks when their theme matches Intelligence `pipeline_priorities`
+    (testimonials, revenue, retention, conversion, referrals, win_back, onboarding, content).
+    """
     if not priorities:
         return 0.0
-    cat_map = {
-        "pipeline": ["conversion", "revenue", "retention", "win_back", "onboarding"],
-        "funnel": ["conversion", "content"],
-        "payments": ["revenue", "retention"],
-        "revenue": ["revenue"],
+    keys_by_cat: Dict[str, Set[str]] = {
+        "pipeline": {"conversion", "retention", "onboarding", "win_back"},
+        "funnel": {"conversion", "content"},
+        "payments": {"revenue", "retention"},
+        "revenue": {"revenue"},
     }
-    keys = cat_map.get(category, [])
+    keys = keys_by_cat.get(category, set())
+    bonus = 0.0
     for i, p in enumerate(priorities):
         if p in keys:
-            return max(0.0, 8.0 - i)
-    return 0.0
+            bonus = max(bonus, 12.0 - float(i) * 1.5)
+    return bonus
+
+
+ROI_BOARD_TAGS = frozenset({"testimonial", "upsell", "referral", "conversion", "deal_follow_up"})
+_ROI_TAG_TO_PRIORITY: Dict[str, str] = {
+    "testimonial": "testimonials",
+    "upsell": "revenue",
+    "referral": "referrals",
+    "conversion": "conversion",
+    "deal_follow_up": "conversion",
+}
+_ROI_TAG_WEIGHT = {"testimonial": 5.0, "upsell": 6.5, "referral": 6.5, "conversion": 4.0, "deal_follow_up": 4.0}
+
+
+def _roi_tags_priority_boost(tags: List[str], priorities: Optional[List[str]]) -> float:
+    """Extra impact when surfaced ROI chips align with the coach's ordered Intelligence priorities."""
+    if not priorities or not tags:
+        return 0.0
+    bonus = 0.0
+    seen_pid: Set[str] = set()
+    for t in tags:
+        pid = _ROI_TAG_TO_PRIORITY.get(str(t).lower().strip())
+        if not pid or pid not in priorities or pid in seen_pid:
+            continue
+        seen_pid.add(pid)
+        rank = priorities.index(pid)
+        bonus += max(0.0, 16.0 - float(rank) * 1.75)
+    return bonus
+
+
+MAX_ROI_SIGNAL_TASKS = 32
+
+
+def build_roi_signal_tasks(
+    db: Session,
+    org_id: uuid.UUID,
+    pipeline_priorities: Optional[List[str]],
+    completed_ids: set[str],
+    offer_ladder: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    One task per client with non-empty ROI-style call-insight tags (same chips as Kanban / drawer).
+    Ranked by MRR, tag strength, health, and alignment with Intelligence pipeline_priorities.
+    When `offer_ladder` is provided, each task also gets a deterministic offer suggestion
+    drawn from the ladder, tailored to that client's prospect voice profile.
+    """
+    candidates = (
+        db.query(Client)
+        .filter(
+            Client.org_id == org_id,
+            Client.lifecycle_state.in_(
+                (
+                    LifecycleState.ACTIVE,
+                    LifecycleState.OFFBOARDING,
+                    LifecycleState.WARM_LEAD,
+                    LifecycleState.COLD_LEAD,
+                )
+            ),
+        )
+        .order_by(desc(Client.estimated_mrr), desc(Client.updated_at))
+        .limit(320)
+        .all()
+    )
+    if not candidates:
+        return []
+    cids = [c.id for c in candidates]
+    tag_map = get_call_insight_tags_batch(db, org_id, cids)
+    health = batch_read_cached_health_scores(db, cids, org_id)
+    missing_h = [cid for cid in cids if cid not in health][:100]
+    for cid in missing_h:
+        try:
+            filled = resolve_health_score(
+                db,
+                cid,
+                org_id,
+                brevo_email_stats=None,
+                use_ai=False,
+                persist_cache=True,
+                record_outcome_snapshot=False,
+            )
+            if filled and filled.get("score") is not None:
+                health[cid] = {"score": float(filled["score"]), "grade": filled.get("grade")}
+        except Exception:
+            health[cid] = {"score": 50.0, "grade": "?"}
+
+    scored: List[Tuple[Client, List[str], float, str, str, str]] = []
+    for c in candidates:
+        entry = tag_map.get(str(c.id)) or {}
+        raw_tags = [str(x).lower().strip() for x in (entry.get("tags") or []) if str(x).strip()]
+        sig = [t for t in raw_tags if t in ROI_BOARD_TAGS]
+        if not sig:
+            continue
+        fn = (c.first_name or "").strip()
+        display_name = fn or ((c.email or "").split("@")[0] if c.email else "Client")
+        headline = str(entry.get("headline") or "").strip()
+        try:
+            est_mrr = float(c.estimated_mrr or 0)
+        except (TypeError, ValueError):
+            est_mrr = 0.0
+        hs = float((health.get(c.id) or {}).get("score", 50) or 50)
+        mrr_boost = min(18.0, (max(0.0, est_mrr) ** 0.5) * 2.2)
+        tw = sum(_ROI_TAG_WEIGHT.get(t, 2.0) for t in sig)
+        tag_boost = _roi_tags_priority_boost(sig, pipeline_priorities)
+        impact = 54.0 + tw + mrr_boost + hs * 0.2 + tag_boost
+        label = ", ".join(s.replace("_", " ") for s in sig[:5])
+        scored.append((c, sig, impact, display_name, label, headline))
+
+    scored.sort(key=lambda x: -x[2])
+    out: List[Dict[str, Any]] = []
+    for c, sig, impact, display_name, label, headline in scored[:MAX_ROI_SIGNAL_TASKS]:
+        tid = f"roi_signal.{c.id}"
+        try:
+            est_mrr = float(c.estimated_mrr or 0)
+        except (TypeError, ValueError):
+            est_mrr = 0.0
+        hs = float((health.get(c.id) or {}).get("score", 50) or 50)
+        hgrade = (health.get(c.id) or {}).get("grade")
+        hl = (headline[:200] + "…") if len(headline) > 200 else headline
+        hl_part = f" Drawer headline: {hl}" if hl else ""
+
+        prospect_voice: Optional[Dict[str, Any]] = None
+        if isinstance(c.meta, dict):
+            pv = c.meta.get("prospect_voice_profile")
+            if isinstance(pv, dict):
+                prospect_voice = pv
+        lifecycle_str = (
+            c.lifecycle_state.value if hasattr(c.lifecycle_state, "value") else str(c.lifecycle_state or "")
+        ).lower()
+        offer_suggestion = match_offer_for_client(
+            offer_ladder,
+            lifecycle=lifecycle_str,
+            roi_tags=sig,
+            headline=headline,
+            health_score=hs,
+            prospect_voice=prospect_voice,
+            has_testimonial_trigger=client_has_expansion_win_basis(c),
+        )
+
+        why_parts = [
+            f"Call-insight tags: {label}.{hl_part} "
+            f"Health {hs:.0f}/100 ({hgrade or '—'}) · est. MRR ${est_mrr:,.0f}. "
+            "Buying-signal / ROI triggers from transcripts (same chips as Kanban + client drawer)."
+        ]
+        if offer_suggestion:
+            why_parts.append(
+                f"Suggested offer: {offer_suggestion['kind_label']} — {offer_suggestion['name']}. "
+                f"{offer_suggestion['rationale']}"
+            )
+        why = " ".join(why_parts)
+
+        if offer_suggestion:
+            prescription = (
+                f"Prescribe the {offer_suggestion['kind_label']} (\"{offer_suggestion['name']}\") on the next touch. "
+                f"{offer_suggestion['script_hint']}".strip()
+            )
+        else:
+            prescription = (
+                "Open the client in Terminal, review Client profile & opportunity in the drawer, "
+                "and act on the strongest tag first (testimonial capture, upsell fit, referral ask, or lead follow-up)."
+            )
+
+        evidence: Dict[str, Any] = {
+            "client_id": str(c.id),
+            "client_name": display_name,
+            "roi_tags": sig,
+            "health_score": round(hs, 1),
+            "health_grade": hgrade,
+            "estimated_mrr": round(est_mrr, 2),
+            "source": "call_insight_roi",
+        }
+        if offer_suggestion:
+            evidence["offer_suggestion"] = offer_suggestion
+
+        out.append(
+            {
+                "id": tid,
+                "title": f"{display_name}: {label}",
+                "category": "roi_signal",
+                "impact_score": float(impact),
+                "confidence": 1.0,
+                "evidence": evidence,
+                "recommended_actions": [
+                    "Review call context + ROI tags in the client drawer",
+                    "Re-analyze the latest call if tags look stale",
+                    "Complete checklist items tied to this client when done",
+                ],
+                "why": why[:1200],
+                "prescription": prescription[:1200],
+                "next_step": f"Terminal → open {display_name}'s card → Client profile & opportunity.",
+            }
+        )
+
+    for t in out:
+        tid = str(t["id"])
+        t["completed"] = tid in completed_ids
+        if not t.get("why"):
+            t["why"] = t["title"]
+    return out
 
 
 def _client_action_pipeline_boost(action_category: Optional[str], priorities: Optional[List[str]]) -> float:
@@ -666,6 +874,7 @@ def build_tasks(
     completed_ids: set[str],
     pipeline_priorities: Optional[List[str]],
     client_recommendation_tasks: Optional[List[Dict[str, Any]]] = None,
+    roi_signal_tasks: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     tasks: List[Dict[str, Any]] = []
     lifecycle = snapshot.get("pipeline") or {}
@@ -823,16 +1032,23 @@ def build_tasks(
                     }
                 )
 
+    if roi_signal_tasks:
+        tasks.extend(roi_signal_tasks)
+
     if client_recommendation_tasks:
         tasks.extend(client_recommendation_tasks)
 
     for t in tasks:
         cat = str(t.get("category") or "")
-        extra = (
-            0.0
-            if cat == "client"
-            else _priority_boost(cat, pipeline_priorities)
-        )
+        if cat == "client":
+            extra = 0.0
+        elif cat == "roi_signal":
+            extra = _roi_tags_priority_boost(
+                list((t.get("evidence") or {}).get("roi_tags") or []),
+                pipeline_priorities,
+            )
+        else:
+            extra = _priority_boost(cat, pipeline_priorities)
         t["impact_score"] = float(t["impact_score"]) + extra
         tid = str(t["id"])
         t["completed"] = tid in completed_ids
@@ -979,6 +1195,7 @@ def build_performance_snapshot(
         }
     )
     priorities = _pipeline_priorities_from_user(user_ai_profile)
+    ladder = extract_offer_ladder(user_ai_profile)
     snap_for_tasks = {
         "pipeline": pipeline_block,
         "revenue": revenue_block,
@@ -988,7 +1205,14 @@ def build_performance_snapshot(
     client_tasks = build_client_recommendation_tasks(
         db, org_id, priorities, completed_set
     )
-    tasks = build_tasks(snap_for_tasks, completed_set, priorities, client_tasks)
+    roi_tasks = build_roi_signal_tasks(db, org_id, priorities, completed_set, offer_ladder=ladder)
+    tasks = build_tasks(
+        snap_for_tasks,
+        completed_set,
+        priorities,
+        client_tasks,
+        roi_signal_tasks=roi_tasks,
+    )
 
     return {
         "generated_at": datetime.utcnow().replace(tzinfo=None).isoformat() + "Z",
@@ -998,4 +1222,5 @@ def build_performance_snapshot(
         "funnels": funnel_summaries,
         "diagnosis": diagnosis,
         "tasks": tasks,
+        "pipeline_priorities": list(priorities or []),
     }

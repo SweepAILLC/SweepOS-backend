@@ -31,6 +31,8 @@ class CallLibraryReport(Base):
 
     call_score = Column(Float, nullable=True)  # 0-100 sales effectiveness (LLM)
     recording_url = Column(Text, nullable=True)  # snapshot; no video bytes stored
+    share_url = Column(Text, nullable=True)  # share link URL (when present)
+    video_url = Column(Text, nullable=True)  # direct/streaming video URL (when present)
     attendees_json = Column(JSON, nullable=True)  # [{email, name, ...}]
 
     computed_at = Column(DateTime(timezone=True), nullable=True)

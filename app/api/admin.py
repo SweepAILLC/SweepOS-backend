@@ -28,6 +28,7 @@ from app.schemas.organization import (
 from app.schemas.invitation import InviteOrgAdminRequest, InvitationResponse
 from app.models.organization_invitation import OrganizationInvitation
 from app.models.client_checkin import ClientCheckIn
+from app.models.manual_payment import ManualPayment
 from app.schemas.admin import (
     OrganizationDashboardSummary,
     OrganizationFunnelCreate,
@@ -122,6 +123,226 @@ def _global_close_rate_pct(
         or 0
     )
     return round((closed / total) * 100.0, 1)
+
+
+def _utc_month_start(dt: datetime) -> datetime:
+    """UTC-aware instant at start of calendar month for dt (naive assumed UTC)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _add_one_calendar_month_first(dt_start: datetime) -> datetime:
+    """dt_start must be UTC-aware first-of-month."""
+    y, m = dt_start.year, dt_start.month
+    if m == 12:
+        return dt_start.replace(year=y + 1, month=1)
+    return dt_start.replace(month=m + 1)
+
+
+def _org_show_up_rate_pct(
+    db: Session,
+    org_id: UUID,
+    period_start: datetime,
+    period_end: datetime,
+    now_utc: datetime,
+) -> Optional[float]:
+    q = db.query(ClientCheckIn).filter(
+        ClientCheckIn.org_id == org_id,
+        ClientCheckIn.cancelled == False,
+        ClientCheckIn.provider.in_(["calcom", "calendly"]),
+        ClientCheckIn.start_time >= period_start,
+        ClientCheckIn.start_time < period_end,
+        ClientCheckIn.start_time < now_utc,
+    )
+    rows = q.all()
+    if not rows:
+        return None
+    attended = sum(1 for c in rows if c.completed and not c.no_show)
+    total = len(rows)
+    return round((attended / total) * 100.0, 1) if total else None
+
+
+def _org_close_rate_pct(
+    db: Session,
+    org_id: UUID,
+    period_start: datetime,
+    period_end: datetime,
+    now_utc: datetime,
+) -> Optional[float]:
+    has_succeeded_payment = exists().where(
+        and_(
+            StripePayment.client_id == ClientCheckIn.client_id,
+            StripePayment.org_id == org_id,
+            StripePayment.status == "succeeded",
+        )
+    )
+    base = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.is_sales_call == True,
+            ClientCheckIn.cancelled == False,
+            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+            ClientCheckIn.start_time >= period_start,
+            ClientCheckIn.start_time < period_end,
+            ClientCheckIn.start_time < now_utc,
+        )
+    )
+    total = base.scalar() or 0
+    if not total:
+        return None
+    closed = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.is_sales_call == True,
+            ClientCheckIn.cancelled == False,
+            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+            ClientCheckIn.start_time >= period_start,
+            ClientCheckIn.start_time < period_end,
+            ClientCheckIn.start_time < now_utc,
+        )
+        .filter(has_succeeded_payment)
+        .scalar()
+        or 0
+    )
+    return round((closed / total) * 100.0, 1)
+
+
+def _org_cash_usd_window(
+    db: Session,
+    org_id: UUID,
+    org_created_naive: datetime,
+    ps_naive: datetime,
+    pe_exclusive_naive: datetime,
+    uses_treasury: bool,
+    now_naive: datetime,
+) -> float:
+    """Cash in [ps, pe); clips start to onboarding. Treasury or Stripe-only (matches single-org 30d logic)."""
+    effective_start = max(ps_naive.replace(tzinfo=None) if ps_naive.tzinfo else ps_naive, org_created_naive)
+    if effective_start >= pe_exclusive_naive:
+        return 0.0
+    ce = min(pe_exclusive_naive.replace(tzinfo=None) if pe_exclusive_naive.tzinfo else pe_exclusive_naive, now_naive)
+    if effective_start >= ce:
+        return 0.0
+    if uses_treasury:
+        tsum = db.query(func.coalesce(func.sum(StripeTreasuryTransaction.amount), 0)).filter(
+            StripeTreasuryTransaction.org_id == org_id,
+            StripeTreasuryTransaction.status == TreasuryTransactionStatus.POSTED,
+            StripeTreasuryTransaction.amount > 0,
+            StripeTreasuryTransaction.posted_at >= effective_start,
+            StripeTreasuryTransaction.posted_at < ce,
+            StripeTreasuryTransaction.posted_at >= org_created_naive,
+        ).scalar()
+        return float(tsum or 0) / 100.0
+    cents = db.query(func.coalesce(func.sum(StripePayment.amount_cents), 0)).filter(
+        StripePayment.org_id == org_id,
+        StripePayment.status == "succeeded",
+        StripePayment.created_at >= effective_start,
+        StripePayment.created_at < ce,
+        StripePayment.created_at >= org_created_naive,
+    ).scalar()
+    return float(cents or 0) / 100.0
+
+
+def _org_cash_total_since_onboarding(
+    db: Session,
+    org_id: UUID,
+    org_created_naive: datetime,
+    uses_treasury: bool,
+    now_naive: datetime,
+) -> float:
+    if uses_treasury:
+        tsum = db.query(func.coalesce(func.sum(StripeTreasuryTransaction.amount), 0)).filter(
+            StripeTreasuryTransaction.org_id == org_id,
+            StripeTreasuryTransaction.status == TreasuryTransactionStatus.POSTED,
+            StripeTreasuryTransaction.amount > 0,
+            StripeTreasuryTransaction.posted_at >= org_created_naive,
+            StripeTreasuryTransaction.posted_at <= now_naive,
+        ).scalar()
+        return float(tsum or 0) / 100.0
+    cents = db.query(func.coalesce(func.sum(StripePayment.amount_cents), 0)).filter(
+        StripePayment.org_id == org_id,
+        StripePayment.status == "succeeded",
+        StripePayment.created_at >= org_created_naive,
+        StripePayment.created_at <= now_naive,
+    ).scalar()
+    return float(cents or 0) / 100.0
+
+
+def _org_cash_all_time(
+    db: Session,
+    org_id: UUID,
+    uses_treasury: bool,
+    now_naive: datetime,
+) -> float:
+    """Canonical all-time cash for one org (Treasury if present, else Stripe), through now."""
+    if uses_treasury:
+        tsum = db.query(func.coalesce(func.sum(StripeTreasuryTransaction.amount), 0)).filter(
+            StripeTreasuryTransaction.org_id == org_id,
+            StripeTreasuryTransaction.status == TreasuryTransactionStatus.POSTED,
+            StripeTreasuryTransaction.amount > 0,
+            StripeTreasuryTransaction.posted_at <= now_naive,
+        ).scalar()
+        return float(tsum or 0) / 100.0
+    cents = db.query(func.coalesce(func.sum(StripePayment.amount_cents), 0)).filter(
+        StripePayment.org_id == org_id,
+        StripePayment.status == "succeeded",
+        StripePayment.created_at <= now_naive,
+    ).scalar()
+    return float(cents or 0) / 100.0
+
+
+def _org_manual_cash_all_time(db: Session, org_id: UUID) -> float:
+    cents = db.query(func.coalesce(func.sum(ManualPayment.amount_cents), 0)).filter(
+        ManualPayment.org_id == org_id,
+    ).scalar()
+    return float(cents or 0) / 100.0
+
+
+def _global_stripe_rev_month_post_onboarding(
+    db: Session,
+    ps_naive: datetime,
+    pe_exclusive_naive: datetime,
+) -> float:
+    """Succeeded Stripe volume in window, only for payments at/after each organization's created_at."""
+    cents = (
+        db.query(func.coalesce(func.sum(StripePayment.amount_cents), 0))
+        .join(Organization, Organization.id == StripePayment.org_id)
+        .filter(
+            StripePayment.status == "succeeded",
+            StripePayment.created_at >= ps_naive,
+            StripePayment.created_at < pe_exclusive_naive,
+            StripePayment.created_at >= Organization.created_at,
+        )
+        .scalar()
+        or 0
+    )
+    return float(cents) / 100.0
+
+
+def _first_of_month_n_months_ago(now_utc: datetime, n: int) -> datetime:
+    cur = _utc_month_start(now_utc)
+    for _ in range(n):
+        y, m = cur.year, cur.month
+        if m == 1:
+            cur = cur.replace(year=y - 1, month=12)
+        else:
+            cur = cur.replace(month=m - 1)
+    return cur
+
+
+def _month_series_global_start(db: Session, now_utc: datetime, max_months: int) -> datetime:
+    """UTC-aware first-of-month for trend grid (earliest org vs capped lookback)."""
+    earliest_month = _utc_month_start(now_utc)
+    row = db.query(func.min(Organization.created_at)).scalar()
+    if row is not None:
+        anchor = row.replace(tzinfo=timezone.utc) if row.tzinfo is None else row.astimezone(timezone.utc)
+        earliest_month = _utc_month_start(anchor)
+    capped = _first_of_month_n_months_ago(now_utc, max(0, max_months - 1))
+    return max(earliest_month, capped)
 
 
 # Organizations Management
@@ -472,6 +693,31 @@ def get_global_health(
         db.rollback()
         treasury_30 = 0.0
 
+    treasury_all_time_usd = 0.0
+    try:
+        tsum_all = db.query(func.coalesce(func.sum(StripeTreasuryTransaction.amount), 0)).filter(
+            StripeTreasuryTransaction.status == TreasuryTransactionStatus.POSTED,
+            StripeTreasuryTransaction.amount > 0,
+        ).scalar()
+        treasury_all_time_usd = float(tsum_all or 0) / 100.0
+    except Exception:
+        db.rollback()
+        treasury_all_time_usd = 0.0
+
+    cash_collected_all_time_combined_usd = total_revenue_stripe + treasury_all_time_usd
+
+    manual_cash_all_time_usd = 0.0
+    try:
+        msum = db.query(func.coalesce(func.sum(ManualPayment.amount_cents), 0)).scalar() or 0
+        manual_cash_all_time_usd = float(msum) / 100.0
+    except Exception:
+        db.rollback()
+        manual_cash_all_time_usd = 0.0
+
+    total_processor_revenue_all_time_usd = (
+        cash_collected_all_time_combined_usd + manual_cash_all_time_usd
+    )
+
     # First funnel step = event rows matching each funnel's lowest step_order (PostgreSQL DISTINCT ON)
     funnel_first_all = 0
     funnel_first_30d = 0
@@ -532,20 +778,19 @@ def get_global_health(
 
     sixty_days_ago = now - timedelta(days=30) * 2
 
-    # Stripe revenue from tenured clients (client record created before the last 30d window)
-    existing_rev_cents = (
+    # Succeeded Stripe (all time) at/after each org's platform onboarding
+    stripe_post_onboarding_cents = (
         db.query(func.coalesce(func.sum(StripePayment.amount_cents), 0))
-        .join(Client, Client.id == StripePayment.client_id)
+        .join(Organization, Organization.id == StripePayment.org_id)
         .filter(
             StripePayment.status == "succeeded",
-            StripePayment.created_at >= thirty_days_ago,
+            StripePayment.created_at >= Organization.created_at,
             StripePayment.created_at <= now,
-            Client.created_at < thirty_days_ago,
         )
         .scalar()
         or 0
     )
-    revenue_from_existing_clients_last_30d_usd = float(existing_rev_cents) / 100.0
+    stripe_revenue_post_onboarding_usd = float(stripe_post_onboarding_cents) / 100.0
 
     invitation_emails_sent_last_30d = (
         db.query(func.count(OrganizationInvitation.id))
@@ -602,68 +847,54 @@ def get_global_health(
         or 0
     )
 
-    # Six rolling 30-day buckets, oldest first (≈180d lookback)
+    show_up_rate_last_30d_pct = _global_show_up_rate_pct(db, thirty_utc, now_utc, now_utc)
+    close_rate_last_30d_pct = _global_close_rate_pct(db, thirty_utc, now_utc, now_utc)
+
+    # Calendar months since first org onboarding (cap 36 months): monthly show-up, close rate, Stripe post-onboarding
     health_trend_periods: List[HealthTrendPeriod] = []
-    show_up_rate_last_30d_pct: Optional[float] = None
-    close_rate_last_30d_pct: Optional[float] = None
+    MAX_HEALTH_MONTHS = 36
+    grid_start = _month_series_global_start(db, now_utc, MAX_HEALTH_MONTHS)
+    month_cursor = grid_start
+    while month_cursor <= now_utc:
+        month_end_exclusive = min(_add_one_calendar_month_first(month_cursor), now_utc)
+        ps_naive = _utc_naive(month_cursor)
+        pe_naive_exclusive = _utc_naive(month_end_exclusive)
 
-    for i in range(5, -1, -1):
-        period_end = now_utc - timedelta(days=30 * i)
-        period_start = period_end - timedelta(days=30)
-        ps_naive = _utc_naive(period_start)
-        pe_naive = _utc_naive(period_end)
+        period_label = month_cursor.strftime("%b %Y")
 
-        period_label = (
-            f"{period_start.strftime('%b %d')} – {period_end.strftime('%b %d, %Y')}"
-        )
-
-        rev_bucket = (
-            db.query(func.coalesce(func.sum(StripePayment.amount_cents), 0))
-            .filter(
-                StripePayment.status == "succeeded",
-                StripePayment.created_at >= ps_naive,
-                StripePayment.created_at < pe_naive,
-            )
-            .scalar()
-            or 0
-        )
-        stripe_rev = float(rev_bucket) / 100.0
+        stripe_rev = _global_stripe_rev_month_post_onboarding(db, ps_naive, pe_naive_exclusive)
 
         calls_ct = (
             db.query(func.count(ClientCheckIn.id))
             .filter(
-                ClientCheckIn.start_time >= period_start,
-                ClientCheckIn.start_time < period_end,
+                ClientCheckIn.start_time >= month_cursor,
+                ClientCheckIn.start_time < month_end_exclusive,
             )
             .scalar()
             or 0
         )
 
         cum_clients = (
-            db.query(func.count(Client.id)).filter(Client.created_at < pe_naive).scalar() or 0
+            db.query(func.count(Client.id)).filter(Client.created_at < pe_naive_exclusive).scalar() or 0
         )
         active_cohort = (
             db.query(func.count(Client.id))
             .filter(
                 Client.lifecycle_state == LifecycleState.ACTIVE,
-                Client.created_at < pe_naive,
+                Client.created_at < pe_naive_exclusive,
             )
             .scalar()
             or 0
         )
 
-        sup = _global_show_up_rate_pct(db, period_start, period_end, now_utc)
-        cr = _global_close_rate_pct(db, period_start, period_end, now_utc)
-
-        if i == 0:
-            show_up_rate_last_30d_pct = sup
-            close_rate_last_30d_pct = cr
+        sup = _global_show_up_rate_pct(db, month_cursor, month_end_exclusive, now_utc)
+        cr = _global_close_rate_pct(db, month_cursor, month_end_exclusive, now_utc)
 
         health_trend_periods.append(
             HealthTrendPeriod(
                 period_label=period_label,
-                period_start=period_start.isoformat(),
-                period_end=period_end.isoformat(),
+                period_start=month_cursor.isoformat(),
+                period_end=month_end_exclusive.isoformat(),
                 show_up_rate_pct=sup,
                 close_rate_pct=cr,
                 stripe_revenue_usd=stripe_rev,
@@ -672,6 +903,10 @@ def get_global_health(
                 active_clients_cohort=active_cohort,
             )
         )
+
+        if month_end_exclusive >= now_utc:
+            break
+        month_cursor = _add_one_calendar_month_first(month_cursor)
 
     return GlobalHealthResponse(
         total_organizations=total_orgs,
@@ -690,6 +925,10 @@ def get_global_health(
         total_revenue_stripe_succeeded_usd=total_revenue_stripe,
         last_30_days_revenue_stripe_usd=last_30_stripe,
         treasury_posted_last_30_days_usd=treasury_30,
+        treasury_posted_all_time_usd=treasury_all_time_usd,
+        cash_collected_all_time_combined_usd=cash_collected_all_time_combined_usd,
+        manual_cash_all_time_usd=manual_cash_all_time_usd,
+        total_processor_revenue_all_time_usd=total_processor_revenue_all_time_usd,
         funnel_first_step_views_all_time=funnel_first_all,
         funnel_first_step_views_last_30_days=funnel_first_30d,
         unique_visitors_all_time=unique_visitors_all,
@@ -697,7 +936,7 @@ def get_global_health(
         orgs_with_stripe_connected=orgs_stripe,
         orgs_with_brevo_connected=orgs_brevo,
         pending_invitations=pending_inv,
-        revenue_from_existing_clients_last_30d_usd=revenue_from_existing_clients_last_30d_usd,
+        stripe_revenue_post_onboarding_usd=stripe_revenue_post_onboarding_usd,
         invitation_emails_sent_last_30d=invitation_emails_sent_last_30d,
         invitation_emails_sent_previous_30d=invitation_emails_sent_previous_30d,
         calls_booked_last_30d=calls_booked_last_30d,
@@ -930,6 +1169,96 @@ def get_organization_dashboard(
             step_counts=step_counts_list
         ))
 
+    # Owner modal: cash + monthly coaching metrics since org onboarding (calendar months)
+    uses_treasury = treasury_count is not None
+    org_created_naive = org.created_at.replace(tzinfo=None) if org.created_at else datetime.utcnow()
+    now_naive = datetime.utcnow()
+    now_utc_dash = datetime.now(timezone.utc)
+    cash_collected_since_onboarding_usd = _org_cash_total_since_onboarding(
+        db, org_id, org_created_naive, uses_treasury, now_naive
+    )
+    cash_collected_all_time_usd = _org_cash_all_time(db, org_id, uses_treasury, now_naive)
+    manual_cash_all_time_usd = _org_manual_cash_all_time(db, org_id)
+    total_processor_revenue_all_time_usd = cash_collected_all_time_usd + manual_cash_all_time_usd
+
+    monthly_health_since_onboarding: List[HealthTrendPeriod] = []
+    if org.created_at:
+        oc_anchor = (
+            org.created_at.replace(tzinfo=timezone.utc)
+            if org.created_at.tzinfo is None
+            else org.created_at.astimezone(timezone.utc)
+        )
+    else:
+        oc_anchor = now_utc_dash
+    month_cursor = _utc_month_start(oc_anchor)
+    cap_month = _first_of_month_n_months_ago(now_utc_dash, 35)
+    if month_cursor < cap_month:
+        month_cursor = cap_month
+
+    while month_cursor <= now_utc_dash:
+        month_end_exclusive = min(_add_one_calendar_month_first(month_cursor), now_utc_dash)
+        ps_naive = _utc_naive(month_cursor)
+        pe_naive_exclusive = _utc_naive(month_end_exclusive)
+
+        cash_m = _org_cash_usd_window(
+            db,
+            org_id,
+            org_created_naive,
+            ps_naive,
+            pe_naive_exclusive,
+            uses_treasury,
+            now_naive,
+        )
+
+        calls_ct = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(
+                ClientCheckIn.org_id == org_id,
+                ClientCheckIn.start_time >= month_cursor,
+                ClientCheckIn.start_time < month_end_exclusive,
+            )
+            .scalar()
+            or 0
+        )
+
+        cum_clients = (
+            db.query(func.count(Client.id))
+            .filter(Client.org_id == org_id, Client.created_at < pe_naive_exclusive)
+            .scalar()
+            or 0
+        )
+        active_cohort = (
+            db.query(func.count(Client.id))
+            .filter(
+                Client.org_id == org_id,
+                Client.lifecycle_state == LifecycleState.ACTIVE,
+                Client.created_at < pe_naive_exclusive,
+            )
+            .scalar()
+            or 0
+        )
+
+        sup = _org_show_up_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+        cr = _org_close_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+
+        monthly_health_since_onboarding.append(
+            HealthTrendPeriod(
+                period_label=month_cursor.strftime("%b %Y"),
+                period_start=month_cursor.isoformat(),
+                period_end=month_end_exclusive.isoformat(),
+                show_up_rate_pct=sup,
+                close_rate_pct=cr,
+                stripe_revenue_usd=cash_m,
+                calls_booked_count=calls_ct,
+                cumulative_total_clients=cum_clients,
+                active_clients_cohort=active_cohort,
+            )
+        )
+
+        if month_end_exclusive >= now_utc_dash:
+            break
+        month_cursor = _add_one_calendar_month_first(month_cursor)
+
     return OrganizationDashboardSummary(
         organization_id=org_id,
         organization_name=org.name,
@@ -948,7 +1277,13 @@ def get_organization_dashboard(
         last_30_days_revenue=last_30_days_revenue,
         brevo_connected=brevo_connected,
         funnel_conversion_metrics=funnel_conversion_metrics,
-        recent_funnels=all_funnels_data
+        recent_funnels=all_funnels_data,
+        organization_onboarded_at=org.created_at.isoformat() if org.created_at else None,
+        cash_collected_since_onboarding_usd=cash_collected_since_onboarding_usd,
+        cash_collected_all_time_usd=cash_collected_all_time_usd,
+        manual_cash_all_time_usd=manual_cash_all_time_usd,
+        total_processor_revenue_all_time_usd=total_processor_revenue_all_time_usd,
+        monthly_health_since_onboarding=monthly_health_since_onboarding,
     )
 
 

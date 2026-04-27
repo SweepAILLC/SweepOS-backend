@@ -50,12 +50,15 @@ def login(
     # Get all users with this email (across all orgs) using raw SQL to avoid enum conversion
     from sqlalchemy import text
     users_result = db.execute(
-        text("""
+        text(
+            """
             SELECT id, org_id, email, hashed_password, role, is_admin, created_at
             FROM users
             WHERE LOWER(email) = LOWER(:email)
-        """),
-        {"email": normalized_email}
+            ORDER BY created_at ASC
+        """
+        ),
+        {"email": normalized_email},
     ).fetchall()
     
     if not users_result:
@@ -92,7 +95,9 @@ def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Use first matching user as primary
+    # Use oldest matching user row as canonical "primary" for linking orgs.
+    # Without a deterministic order, dev DBs can flip which org becomes "primary" across restarts.
+    matching_users.sort(key=lambda u: (u.created_at or datetime.min))
     user = matching_users[0]
     
     # Check if user belongs to multiple organizations
@@ -107,8 +112,10 @@ def login(
         # User exists in multiple orgs with same password - link them
         all_org_ids = [u.org_id for u in matching_users]
         unique_org_ids = list(set(all_org_ids))
+        primary_org_id = user.org_id
         
-        # Create UserOrganization records for the primary user to access all orgs
+        # Create UserOrganization records for the canonical user to access all orgs
+        # and ensure exactly one "is_primary" org (the canonical org).
         for org_id in unique_org_ids:
             existing_uo = db.query(UserOrganization).filter(
                 UserOrganization.user_id == user.id,
@@ -118,9 +125,15 @@ def login(
                 user_org = UserOrganization(
                     user_id=user.id,
                     org_id=org_id,
-                    is_primary=(org_id == user.org_id)  # Current user's org is primary
+                    is_primary=(org_id == primary_org_id),
                 )
                 db.add(user_org)
+            else:
+                # Repair drift: if we already have rows but the wrong org is marked primary, fix it.
+                if org_id == primary_org_id and not existing_uo.is_primary:
+                    existing_uo.is_primary = True
+                if org_id != primary_org_id and existing_uo.is_primary:
+                    existing_uo.is_primary = False
         
         db.commit()
         
@@ -414,8 +427,13 @@ def get_user_organizations(
     # Normalize email
     normalized_email = email.lower().strip()
     
-    # Find user by email
-    user = db.query(User).filter(func.lower(User.email) == normalized_email).first()
+    # Find canonical user by email (oldest row) so org lists are stable in dev.
+    user = (
+        db.query(User)
+        .filter(func.lower(User.email) == normalized_email)
+        .order_by(User.created_at.asc())
+        .first()
+    )
     if not user:
         # Don't reveal if user exists for security
         return []

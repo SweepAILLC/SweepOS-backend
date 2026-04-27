@@ -24,6 +24,13 @@ class CallInsightPerCallOut(BaseModel):
     failure_reason: Optional[str] = None
 
 
+class FrameworkReviewOut(BaseModel):
+    """Latest sales-framework critique for the most recent sales-relevant call."""
+
+    summary: str = ""
+    meeting_at: str = ""
+
+
 class CallInsightsRollupOut(BaseModel):
     """Aggregated call context for the intelligence UI (not per-call sections)."""
 
@@ -34,6 +41,18 @@ class CallInsightsRollupOut(BaseModel):
     accumulated_wins: List[str] = Field(default_factory=list)
     accumulated_testimonial_stories: List[str] = Field(default_factory=list)
     prospect_voice_profile: Dict[str, Any] = Field(default_factory=dict)
+    latest_framework_review: Optional[FrameworkReviewOut] = None
+
+
+class OfferSuggestionOut(BaseModel):
+    """Deterministic offer prescription drawn from the org's offer ladder."""
+
+    kind: str = ""
+    kind_label: str = ""
+    name: str = ""
+    promise: str = ""
+    rationale: str = ""
+    script_hint: str = ""
 
 
 class ClientCallInsightsResponse(BaseModel):
@@ -41,6 +60,7 @@ class ClientCallInsightsResponse(BaseModel):
     summary: Optional[ClientInsightSummaryOut] = None
     insights: List[CallInsightPerCallOut] = Field(default_factory=list)
     rollup: Optional[CallInsightsRollupOut] = None
+    offer_suggestion: Optional[OfferSuggestionOut] = None
 
 
 class CallInsightTagEntry(BaseModel):

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.models.client import find_client_by_email
 from app.models.fathom_call_record import FathomCallRecord
@@ -59,6 +60,62 @@ def summary_to_markdown(summary_payload: Any) -> str:
     return str(summary_payload)
 
 
+_fathom_media_columns_ensured = False
+
+
+def _ensure_fathom_media_columns(db: Session) -> None:
+    """Idempotent ADD COLUMN for deploys where DB migrations haven't been applied yet."""
+    global _fathom_media_columns_ensured
+    if _fathom_media_columns_ensured:
+        return
+    try:
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS share_url TEXT"))
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS video_url TEXT"))
+        db.commit()
+        _fathom_media_columns_ensured = True
+    except Exception:
+        db.rollback()
+        # Soft-fail: the app can still ingest without these columns.
+        _fathom_media_columns_ensured = True
+
+
+def _extract_media_urls(meeting: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Best-effort pull of share/video URLs from list API or webhook payloads."""
+    share = None
+    video = None
+    for k in ("share_link_url", "share_url", "shareUrl", "shareLinkUrl"):
+        v = meeting.get(k)
+        if isinstance(v, str) and v.strip().startswith("http"):
+            share = v.strip()[:2000]
+            break
+    for k in ("video_url", "videoUrl", "recording_video_url", "recordingVideoUrl"):
+        v = meeting.get(k)
+        if isinstance(v, str) and v.strip().startswith("http"):
+            video = v.strip()[:2000]
+            break
+    return {"share_url": share, "video_url": video}
+
+
+def _action_items_to_markdown(action_items: Any) -> str:
+    if not isinstance(action_items, list) or not action_items:
+        return ""
+    lines: List[str] = ["## Action items"]
+    for it in action_items[:20]:
+        if not isinstance(it, dict):
+            continue
+        desc = str(it.get("description") or "").strip()
+        if not desc:
+            continue
+        ts = str(it.get("recording_timestamp") or "").strip()
+        url = str(it.get("recording_playback_url") or "").strip()
+        meta = " · ".join([x for x in (ts, url) if x])
+        if meta:
+            lines.append(f"- {desc} ({meta})")
+        else:
+            lines.append(f"- {desc}")
+    return "\n".join(lines).strip()
+
+
 def find_client_for_invitees(db: Session, org_id: uuid.UUID, meeting: Dict[str, Any]) -> Optional[uuid.UUID]:
     emails: List[str] = []
     for inv in meeting.get("calendar_invitees") or []:
@@ -92,9 +149,12 @@ def upsert_call_record(
     meeting_at: Optional[datetime],
     *,
     recording_url: Optional[str] = None,
+    share_url: Optional[str] = None,
+    video_url: Optional[str] = None,
     attendees_json: Optional[List[Dict[str, Any]]] = None,
     related_client_ids: Optional[List[str]] = None,
 ) -> FathomCallRecord:
+    _ensure_fathom_media_columns(db)
     row = (
         db.query(FathomCallRecord)
         .filter(
@@ -117,6 +177,16 @@ def upsert_call_record(
     row.meeting_at = meeting_at
     if recording_url:
         row.recording_url = recording_url[:2000]
+    if share_url:
+        try:
+            row.share_url = share_url[:2000]
+        except Exception:
+            pass
+    if video_url:
+        try:
+            row.video_url = video_url[:2000]
+        except Exception:
+            pass
     if attendees_json is not None:
         row.attendees_json = attendees_json
     if related_client_ids is not None:
@@ -185,7 +255,11 @@ def ingest_meeting_payload(
     summary_md = ""
     if meeting.get("default_summary"):
         summary_md = summary_to_markdown(meeting["default_summary"])
+    action_items_md = _action_items_to_markdown(meeting.get("action_items"))
+    if action_items_md:
+        summary_md = (summary_md.strip() + "\n\n" + action_items_md).strip() if summary_md else action_items_md
     transcript_text = transcript_to_text(meeting.get("transcript"))
+    media = _extract_media_urls(meeting)
 
     meeting_at = None
     for key in ("recording_start_time", "scheduled_start_time", "created_at"):
@@ -214,6 +288,8 @@ def ingest_meeting_payload(
 
     common_upsert_kwargs = dict(
         recording_url=recording_url or None,
+        share_url=media.get("share_url"),
+        video_url=media.get("video_url"),
         attendees_json=attendees_payload,
         related_client_ids=related_strs,
     )
@@ -306,3 +382,16 @@ def sync_recent_meetings_for_org(
         "pending_library_record_ids": [str(x) for x in pending_library_record_ids],
         "library_reports_queued": len(pending_library_record_ids),
     }
+
+
+def queue_fathom_sync_followups(background_tasks: Any, org_id: uuid.UUID, sync_result: Dict[str, Any]) -> None:
+    """Queue call-insight and call-library background jobs after sync (shared with integrations + Content Studio)."""
+    from app.long_jobs import schedule_background_work
+    from app.services.call_insight_service import run_call_insight_background
+    from app.services.call_library_service import run_call_library_report_background
+
+    oid_str = str(org_id)
+    for rid in sync_result.get("pending_insight_record_ids") or []:
+        schedule_background_work(run_call_insight_background, background_tasks, oid_str, str(rid))
+    for rid in sync_result.get("pending_library_record_ids") or []:
+        schedule_background_work(run_call_library_report_background, background_tasks, oid_str, str(rid))

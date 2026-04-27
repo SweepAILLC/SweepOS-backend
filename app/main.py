@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio, call_library
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio, call_library
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
+import logging
 
 app = FastAPI(title="Sweep Coach OS API", version="1.0.0")
 
@@ -60,12 +61,57 @@ app.include_router(users.router, prefix="/users", tags=["users"])
 app.include_router(organizations.router, prefix="/organizations", tags=["organizations"])
 app.include_router(oauth.router, prefix="/oauth", tags=["oauth"])
 app.include_router(integrations.router, prefix="/integrations", tags=["integrations"])
+app.include_router(finances.router, prefix="/integrations/finances", tags=["finances"])
+app.include_router(whop.router, prefix="/integrations/whop", tags=["whop"])
 app.include_router(stripe.router, prefix="/integrations/stripe", tags=["stripe"])
 app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 app.include_router(fathom_webhooks.router, prefix="/webhooks", tags=["fathom"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])
+
+@app.on_event("startup")
+def _ensure_schema_columns_on_startup() -> None:
+    """
+    Safety net for local/dev deployments without alembic migrations applied.
+
+    We occasionally add columns to ORM models and rely on runtime `ALTER TABLE ... IF NOT EXISTS`
+    to keep the app bootable. If these columns don't exist, *any* query touching the model
+    (including login) can 500 due to UndefinedColumn.
+    """
+    from sqlalchemy import text
+    from app.db.session import SessionLocal
+
+    log = logging.getLogger("app")
+    db = SessionLocal()
+    try:
+        # organizations: fathom webhook fields
+        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
+        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))
+        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_url TEXT"))
+
+        # fathom_call_records: media URLs from payload
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS share_url TEXT"))
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS video_url TEXT"))
+
+        # call_library_reports: media URLs for embedding
+        db.execute(text("ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS share_url TEXT"))
+        db.execute(text("ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS video_url TEXT"))
+
+        # Calendar tab: speed up GET /integrations/calendar/synced-bookings (org + provider + time range)
+        db.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_client_check_ins_org_provider_start "
+                "ON client_check_ins (org_id, provider, start_time)"
+            )
+        )
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        log.warning("startup schema ensure failed: %s", e)
+    finally:
+        db.close()
 
 
 @app.get("/")

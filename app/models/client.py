@@ -3,10 +3,19 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import enum
 from app.db.session import Base
+
+
+def _as_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Avoid TypeError comparing tz-aware program dates with naive utcnow()."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 class LifecycleState(str, enum.Enum):
@@ -46,33 +55,40 @@ class Client(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     
-    def calculate_progress(self) -> float:
+    def calculate_progress(self) -> Optional[float]:
         """
         Calculate program progress percentage based on current date.
         Returns 0-100, or None if program not set.
         """
-        if not self.program_start_date or not self.program_duration_days:
+        start = _as_naive_utc(self.program_start_date)
+        if not start or not self.program_duration_days:
             return None
-        
+
         now = datetime.utcnow()
-        if self.program_end_date:
-            end_date = self.program_end_date
-        else:
-            end_date = self.program_start_date + timedelta(days=self.program_duration_days)
-        
-        if now < self.program_start_date:
+        end_date = _as_naive_utc(self.program_end_date)
+        if end_date is None:
+            end_date = start + timedelta(days=self.program_duration_days)
+
+        if now < start:
             return 0.0
         if now >= end_date:
             return 100.0
-        
-        total_duration = (end_date - self.program_start_date).total_seconds()
-        elapsed = (now - self.program_start_date).total_seconds()
+
+        total_duration = (end_date - start).total_seconds()
+        elapsed = (now - start).total_seconds()
+        if total_duration <= 0:
+            return None
         progress = (elapsed / total_duration) * 100.0
-        
+
         return min(100.0, max(0.0, progress))
     
     def update_program_dates(self):
         """Update program dates based on start_date and end_date or duration."""
+        if self.program_start_date is not None:
+            self.program_start_date = _as_naive_utc(self.program_start_date)
+        if self.program_end_date is not None:
+            self.program_end_date = _as_naive_utc(self.program_end_date)
+
         if self.program_start_date and self.program_end_date:
             # Calculate duration from start and end dates
             duration = (self.program_end_date - self.program_start_date).days

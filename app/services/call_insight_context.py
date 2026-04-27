@@ -22,6 +22,32 @@ def _lifecycle_str(client: Client) -> str:
     return str(ls)
 
 
+def _display_name(client: Client) -> str:
+    parts = [p.strip() for p in [client.first_name or "", client.last_name or ""] if p and str(p).strip()]
+    if parts:
+        return " ".join(parts)
+    if client.email and str(client.email).strip():
+        return str(client.email).strip()
+    return ""
+
+
+def _all_emails_for_context(client: Client, max_n: int = 12) -> List[str]:
+    """Deduped emails from primary + emails[] — matches what operators see on the client card."""
+    seen = set()
+    out: List[str] = []
+    for raw in [client.email, *((client.emails or []) if isinstance(client.emails, list) else [])]:
+        if not raw or not str(raw).strip():
+            continue
+        e = str(raw).strip().lower()
+        if e in seen:
+            continue
+        seen.add(e)
+        out.append(str(raw).strip())
+        if len(out) >= max_n:
+            break
+    return out
+
+
 def _truncate_notes(notes: Optional[str], max_len: int = 1200) -> str:
     if not notes:
         return ""
@@ -98,9 +124,35 @@ def assemble_context_pack(
     trans = fathom_record.transcript_snippet or ""
     combined_len = len(summary) + len(trans)
 
+    display = _display_name(client)
+    emails_ctx = _all_emails_for_context(client)
+    try:
+        mrr_val = float(client.estimated_mrr) if client.estimated_mrr is not None else 0.0
+    except (TypeError, ValueError):
+        mrr_val = 0.0
+    try:
+        lifetime_usd = round((int(client.lifetime_revenue_cents or 0) / 100.0), 2)
+    except (TypeError, ValueError):
+        lifetime_usd = 0.0
+
     pack = {
         "client": {
             "lifecycle_state": _lifecycle_str(client),
+            # Authoritative CRM / card identity (so the LLM does not guess names from transcript alone).
+            "identity": {
+                "display_name": display or None,
+                "first_name": (client.first_name or "").strip() or None,
+                "last_name": (client.last_name or "").strip() or None,
+                "primary_email": (client.email or "").strip() or None,
+                "all_emails": emails_ctx,
+                "phone": (client.phone or "").strip() or None,
+                "instagram": (client.instagram or "").strip() or None,
+                "stripe_customer_id_suffix": (
+                    str(client.stripe_customer_id)[-8:] if getattr(client, "stripe_customer_id", None) else None
+                ),
+            },
+            "estimated_mrr_usd": mrr_val,
+            "lifetime_revenue_usd": lifetime_usd,
             "notes_excerpt": _truncate_notes(client.notes),
             "program_start": client.program_start_date.isoformat() if client.program_start_date else None,
             "program_end": client.program_end_date.isoformat() if client.program_end_date else None,

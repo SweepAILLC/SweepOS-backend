@@ -354,6 +354,15 @@ def _expert_email_system_prompt() -> str:
         "cares about most right now (e.g. 'testimonials', 'revenue', 'retention', 'referrals'). Lean the email's angle, "
         "CTA, and framing toward the highest-ranked priority that is relevant to this client's lifecycle stage and context. "
         "Do not force an irrelevant priority — pick the best natural match from their list. "
+        "OFFER LADDER (REQUIRED WHEN PRESENT): If sender_ai_profile.offer_ladder exists, every email must propose ONE concrete "
+        "next move toward ROI drawn from that ladder — never invent products outside it. Pick the rung that matches the "
+        "recipient's lifecycle, ROI signals, and the highest-ranked relevant pipeline_priority: "
+        "for leads, default to the core offer (or a downsell when budget/risk is the obvious blocker); "
+        "for active clients with momentum, default to an upsell or a testimonial ask; "
+        "for offboarding/post-win clients, default to a referral ask or alumni path. "
+        "If DATA.task or DATA.task.offer_suggestion explicitly names an offer, use exactly that one and let "
+        "task.offer_suggestion.script_hint shape the language (psychology, framing). "
+        "Make the CTA the next step toward that offer (book a call, reply to start, see a one-pager) — never end with a vague check-in. "
         "\n\n"
         "Language mirroring: combine prospect_voice_profile with recipient_language_sample—align formality, pacing, and word choice; "
         "avoid patterns listed in avoid_phrasing; do not copy long phrases verbatim. "
@@ -448,3 +457,130 @@ def build_recommendation_email_draft(
     if not out:
         out = _template_draft(db, client, org_id, action)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Performance-tab task drafts
+# ---------------------------------------------------------------------------
+
+
+def _perf_task_template_draft(
+    db: Session, client: Client, org_id: uuid.UUID, task: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Send-ready fallback when LLM is unavailable for a Performance task email."""
+    org_name = _org_display_name(db, org_id)
+    first = (client.first_name or "").strip()
+    name = first if first else "there"
+    title = str(task.get("title") or "Quick follow up").split(":", 1)[-1].strip() or "Quick follow up"
+    why = str(task.get("why") or "").strip()
+    presc = str(task.get("prescription") or "").strip()
+    nxt = str(task.get("next_step") or "").strip()
+    ev = task.get("evidence") or {}
+    offer = ev.get("offer_suggestion") if isinstance(ev, dict) else None
+    offer_line = ""
+    if isinstance(offer, dict) and offer.get("name"):
+        kind = str(offer.get("kind_label") or "next step")
+        offer_line = (
+            f" When you're ready, the natural {kind} from here is "
+            f"{offer.get('name')}{' — ' + offer.get('promise') if offer.get('promise') else ''}."
+        )
+    summary = presc or why or title
+    cta = nxt or "Reply with a time that works this week and I'll take it from there."
+    body_plain = (
+        f"Hi {name},\n\n"
+        f"{summary}{offer_line}\n\n"
+        f"{cta}\n\n"
+        f"Best regards,\n{org_name}"
+    )
+    return {
+        "subject": f"Quick note — {title[:60]}",
+        "body_plain": body_plain[:8000],
+        "body_html": _plain_to_simple_html(body_plain[:8000]),
+        "source": "template",
+    }
+
+
+def build_performance_task_email_draft(
+    db: Session,
+    client: Client,
+    task: Dict[str, Any],
+    org_id: uuid.UUID,
+    *,
+    sender_user: Optional[User] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Generate a send-ready email for a Performance-tab priority task.
+
+    Reuses the conversion email pipeline (rich context + sender voice + offer ladder + pipeline priorities)
+    but seeds the prompt with the task's own intent, ROI tags, and deterministic offer suggestion.
+    """
+    if client is None:
+        return None
+
+    if not llm_available():
+        return _perf_task_template_draft(db, client, org_id, task)
+
+    ev = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
+    roi_tags = list(ev.get("roi_tags") or []) if isinstance(ev, dict) else []
+    offer = ev.get("offer_suggestion") if isinstance(ev, dict) else None
+    if isinstance(offer, dict):
+        offer_compact = {
+            "kind": offer.get("kind"),
+            "kind_label": offer.get("kind_label"),
+            "name": offer.get("name"),
+            "promise": offer.get("promise"),
+            "rationale": offer.get("rationale"),
+            "script_hint": offer.get("script_hint"),
+        }
+    else:
+        offer_compact = None
+
+    title = str(task.get("title") or "").strip()
+    detail = str(task.get("prescription") or task.get("why") or "").strip()[:1200]
+    intent = (
+        "Performance-priority email: this task surfaced as a top ROI move from the operator's pipeline ranking + the "
+        "client's drawer signals. Lean into the highest-ranked relevant pipeline_priority and propose the offer in "
+        "task.offer_suggestion (when present) as the single next move toward ROI. Keep it specific, low-friction, and "
+        "in the operator's voice."
+    )
+
+    conversion_context = build_conversion_email_context(db, client, org_id, sender_user=sender_user)
+
+    task_block = {
+        "recommendation_title": title,
+        "recommendation_detail": detail,
+        "category": "performance_priority",
+        "intent": intent,
+        "perf_task": True,
+        "roi_tags": roi_tags,
+        "offer_suggestion": offer_compact,
+        "task_why": str(task.get("why") or "")[:1200],
+        "task_next_step": str(task.get("next_step") or "")[:400],
+    }
+
+    user_payload = {
+        "conversion_context": conversion_context,
+        "task": task_block,
+    }
+    system = _expert_email_system_prompt()
+    user = "DATA:\n" + truncate_for_tokens(json.dumps(user_payload, default=str), 36000)
+
+    try:
+        raw = chat_json(system, user, temperature=0.42, timeout=90.0, org_id=org_id)
+    except Exception:
+        return _perf_task_template_draft(db, client, org_id, task)
+
+    org_name = _org_display_name(db, org_id)
+    subj = str(raw.get("subject") or "Following up").strip()[:200]
+    body = str(raw.get("body_plain") or raw.get("body") or "").strip()
+    if len(body) < 80:
+        return _perf_task_template_draft(db, client, org_id, task)
+    body = _sanitize_send_ready_body(body, org_name)
+    body = _append_sign_off_if_missing(body, org_name)
+    body = body[:8000]
+    return {
+        "subject": subj,
+        "body_plain": body,
+        "body_html": _plain_to_simple_html(body),
+        "source": "llm",
+    }

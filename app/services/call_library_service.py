@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 # ORM includes call_title_override; DB may lag migrations — add column once per process if missing.
 _call_title_override_column_ensured = False
+_call_media_columns_ensured = False
 
 
 def _ensure_call_title_override_column(db: Session) -> None:
@@ -41,6 +42,22 @@ def _ensure_call_title_override_column(db: Session) -> None:
     except Exception as e:
         db.rollback()
         logger.warning("call_library: ensure call_title_override column failed: %s", e)
+
+
+def _ensure_call_media_columns(db: Session) -> None:
+    """Idempotent ADD COLUMN for share/video URLs on call_library_reports."""
+    global _call_media_columns_ensured
+    if _call_media_columns_ensured:
+        return
+    try:
+        db.execute(text("ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS share_url TEXT"))
+        db.execute(text("ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS video_url TEXT"))
+        db.commit()
+        _call_media_columns_ensured = True
+    except Exception as e:
+        db.rollback()
+        logger.warning("call_library: ensure media columns failed: %s", e)
+        _call_media_columns_ensured = True
 
 
 def _derive_call_title(rec: FathomCallRecord, db: Session, org_id: uuid.UUID) -> str:
@@ -67,6 +84,7 @@ def generate_and_persist_report(
     Returns status: 'ok' | 'skipped' | 'failed'.
     """
     _ensure_call_title_override_column(db)
+    _ensure_call_media_columns(db)
     rec = (
         db.query(FathomCallRecord)
         .filter(
@@ -185,6 +203,11 @@ def _upsert_report(
     row.call_title = call_title or row.call_title
     row.call_score = call_score
     row.recording_url = (rec.recording_url or "")[:2000] or None
+    try:
+        row.share_url = (getattr(rec, "share_url", None) or "")[:2000] or None
+        row.video_url = (getattr(rec, "video_url", None) or "")[:2000] or None
+    except Exception:
+        pass
     row.attendees_json = rec.attendees_json
     row.computed_at = datetime.now(timezone.utc)
     row.updated_at = datetime.now(timezone.utc)
@@ -219,6 +242,7 @@ def get_call_library_for_org(
 ) -> Dict[str, Any]:
     """Return paginated call library items for the org."""
     _ensure_call_title_override_column(db)
+    _ensure_call_media_columns(db)
     total = (
         db.query(func.count(CallLibraryReport.id))
         .filter(CallLibraryReport.org_id == org_id)
@@ -258,6 +282,8 @@ def get_call_library_for_org(
             fathom_rec.attendees_json if fathom_rec else None
         )
         recording_url = row.recording_url or (fathom_rec.recording_url if fathom_rec else None)
+        share_url = getattr(row, "share_url", None) or (getattr(fathom_rec, "share_url", None) if fathom_rec else None)
+        video_url = getattr(row, "video_url", None) or (getattr(fathom_rec, "video_url", None) if fathom_rec else None)
 
         derived_title = row.call_title or f"Call #{fathom_rec.fathom_recording_id if fathom_rec else '?'}"
         display_title = (getattr(row, "call_title_override", None) or "").strip() or derived_title
@@ -273,6 +299,8 @@ def get_call_library_for_org(
                 "client_name": client_name,
                 "call_score": row.call_score,
                 "recording_url": recording_url,
+                "share_url": share_url,
+                "video_url": video_url,
                 "attendees": attendees,
                 "report": row.report_json,
                 "computed_at": row.computed_at.isoformat() if row.computed_at else None,

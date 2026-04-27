@@ -1,6 +1,6 @@
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, Request, Body
 from sqlalchemy.orm import Session
-from sqlalchemy import func, case, and_, exists
+from sqlalchemy import func, case, and_, exists, or_
 from app.db.session import get_db
 from app.schemas.integration import (
     BrevoStatus, CalComStatus, CalComBooking, CalComEventType,
@@ -261,6 +261,19 @@ def get_brevo_status(
 def test_calcom_route():
     return {"message": "Cal.com routes are working", "route": "/integrations/calcom/test-route"}
 
+
+def _delete_calendar_oauth_token_row(db: Session, token_id: Any, log_prefix: str, reason: str) -> None:
+    """Drop a token row so GET status and POST connect-* agree (no 'ghost' Cal.com blocking Calendly)."""
+    from sqlalchemy import text
+    try:
+        db.execute(text("DELETE FROM oauth_tokens WHERE id = :id"), {"id": token_id})
+        db.commit()
+        print(f"{log_prefix} Deleted oauth_tokens.id={token_id} ({reason})")
+    except Exception as e:
+        db.rollback()
+        print(f"{log_prefix} Failed to delete stale token {token_id}: {e}")
+
+
 @router.get("/calcom/status", response_model=CalComStatus)
 def get_calcom_status(
     db: Session = Depends(get_db),
@@ -320,6 +333,9 @@ def get_calcom_status(
     # Check if token is expired (only for OAuth tokens, not API keys)
     is_expired = calcom_token.expires_at and calcom_token.expires_at < datetime.utcnow()
     if is_expired:
+        _delete_calendar_oauth_token_row(
+            db, calcom_token.id, "[CALCOM STATUS]", "expired OAuth token",
+        )
         return CalComStatus(
             connected=False,
             message="Cal.com token has expired. Please reconnect your account."
@@ -328,17 +344,27 @@ def get_calcom_status(
     # Fetch real account info from Cal.com API
     try:
         # Decrypt the access token (could be OAuth token or API key)
-        access_token = decrypt_token(
-            calcom_token.access_token,
-            audit_context={
-                "db": db,
-                "org_id": org_id,
-                "user_id": current_user.id,
-                "resource_type": "calcom_token",
-                "resource_id": str(calcom_token.id)
-            }
-        )
-        
+        try:
+            access_token = decrypt_token(
+                calcom_token.access_token,
+                audit_context={
+                    "db": db,
+                    "org_id": org_id,
+                    "user_id": current_user.id,
+                    "resource_type": "calcom_token",
+                    "resource_id": str(calcom_token.id)
+                }
+            )
+        except Exception as dec_err:
+            print(f"[CALCOM STATUS] decrypt failed: {dec_err}")
+            _delete_calendar_oauth_token_row(
+                db, calcom_token.id, "[CALCOM STATUS]", "stored token could not be decrypted",
+            )
+            return CalComStatus(
+                connected=False,
+                message="Cal.com connection data was invalid and was cleared. Connect Cal.com again or use Calendly.",
+            )
+
         # Call Cal.com API v2 to get user info
         # According to Cal.com API v2 docs: https://cal.com/docs/api-reference/v2/introduction
         # Authentication: Authorization: Bearer {API_KEY}
@@ -366,18 +392,24 @@ def get_calcom_status(
                 message="Cal.com connected successfully."
             )
         elif response.status_code == 401:
-            # Invalid API key
+            # Invalid / revoked credential — remove row or UI shows "not connected" but Calendly connect still blocks
+            _delete_calendar_oauth_token_row(
+                db, calcom_token.id, "[CALCOM STATUS]", "Cal.com API returned 401",
+            )
             return CalComStatus(
                 connected=False,
-                message="Cal.com API key is invalid. Please reconnect with a valid API key."
+                message="Cal.com API key is invalid or was revoked. Connect again, or use Calendly below."
             )
         else:
-            # Other API error
+            # Transient or unexpected API error — token is stored for this org; keep UI "connected"
             error_text = response.text[:200] if response.text else "Unknown error"
             print(f"[CALCOM STATUS] API error {response.status_code}: {error_text}")
             return CalComStatus(
-                connected=False,
-                message=f"Failed to fetch Cal.com account information (HTTP {response.status_code}). Please reconnect."
+                connected=True,
+                message=(
+                    f"Cal.com is connected, but account details could not be refreshed right now "
+                    f"(HTTP {response.status_code}). Try again later."
+                ),
             )
             
     except httpx.HTTPError as e:
@@ -1094,6 +1126,9 @@ def get_calendly_status(
     # Check if token is expired (only for OAuth tokens, not API keys)
     is_expired = calendly_token.expires_at and calendly_token.expires_at < datetime.utcnow()
     if is_expired:
+        _delete_calendar_oauth_token_row(
+            db, calendly_token.id, "[CALENDLY STATUS]", "expired OAuth token",
+        )
         return CalendlyStatus(
             connected=False,
             message="Calendly token has expired. Please reconnect your account."
@@ -1101,17 +1136,27 @@ def get_calendly_status(
     
     # Fetch real account info from Calendly API
     try:
-        access_token = decrypt_token(
-            calendly_token.access_token,
-            audit_context={
-                "db": db,
-                "org_id": org_id,
-                "user_id": current_user.id,
-                "resource_type": "calendly_token",
-                "resource_id": str(calendly_token.id)
-            }
-        )
-        
+        try:
+            access_token = decrypt_token(
+                calendly_token.access_token,
+                audit_context={
+                    "db": db,
+                    "org_id": org_id,
+                    "user_id": current_user.id,
+                    "resource_type": "calendly_token",
+                    "resource_id": str(calendly_token.id)
+                }
+            )
+        except Exception as dec_err:
+            print(f"[CALENDLY STATUS] decrypt failed: {dec_err}")
+            _delete_calendar_oauth_token_row(
+                db, calendly_token.id, "[CALENDLY STATUS]", "stored token could not be decrypted",
+            )
+            return CalendlyStatus(
+                connected=False,
+                message="Calendly connection data was invalid and was cleared. Connect Calendly again or use Cal.com.",
+            )
+
         # Call Calendly API to get current user info
         # According to Calendly API docs: GET /users/me
         # Docs: https://developer.calendly.com/api-docs/d7755e2f9e5fe-calendly-api
@@ -1137,16 +1182,22 @@ def get_calendly_status(
                 message="Calendly connected successfully."
             )
         elif response.status_code == 401:
+            _delete_calendar_oauth_token_row(
+                db, calendly_token.id, "[CALENDLY STATUS]", "Calendly API returned 401",
+            )
             return CalendlyStatus(
                 connected=False,
-                message="Calendly API key is invalid. Please reconnect with a valid API key."
+                message="Calendly API key is invalid or was revoked. Connect again, or use Cal.com above."
             )
         else:
             error_text = response.text[:200] if response.text else "Unknown error"
             print(f"[CALENDLY STATUS] API error {response.status_code}: {error_text}")
             return CalendlyStatus(
-                connected=False,
-                message=f"Failed to fetch Calendly account information (HTTP {response.status_code}). Please reconnect."
+                connected=True,
+                message=(
+                    f"Calendly is connected, but account details could not be refreshed right now "
+                    f"(HTTP {response.status_code}). Try again later."
+                ),
             )
             
     except httpx.HTTPError as e:
@@ -3487,6 +3538,10 @@ def _calendar_row_display_status(ci: ClientCheckIn, now_utc: datetime) -> str:
 def get_calendar_synced_bookings(
     upcoming_limit: int = Query(100, ge=1, le=300),
     past_limit: int = Query(100, ge=1, le=300),
+    provider: Optional[str] = Query(
+        None,
+        description="If set, only rows for this provider (calcom or calendly). Omit to return both.",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -3501,6 +3556,17 @@ def get_calendar_synced_bookings(
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
     now = datetime.now(timezone.utc)
 
+    if provider is not None:
+        p = provider.strip().lower()
+        if p not in ("calcom", "calendly"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="provider must be calcom or calendly",
+            )
+        provider_filter = p
+    else:
+        provider_filter = None
+
     base = (
         db.query(ClientCheckIn)
         .options(joinedload(ClientCheckIn.client))
@@ -3509,6 +3575,8 @@ def get_calendar_synced_bookings(
             ClientCheckIn.provider.in_(["calcom", "calendly"]),
         )
     )
+    if provider_filter is not None:
+        base = base.filter(ClientCheckIn.provider == provider_filter)
 
     upcoming_rows = (
         base.filter(ClientCheckIn.start_time >= now)
@@ -3658,7 +3726,12 @@ def get_calendar_sales_close_rate(
             .scalar()
         ) or 0
 
-        # Closed = sales calls whose client (client_id) has at least one succeeded payment
+        # Closed = sales calls where either:
+        # - operator explicitly marked the call as closed (sale_closed == true), OR
+        # - the client has at least one succeeded Stripe payment.
+        #
+        # This makes the Calendar tab feel responsive: toggling "Sale closed" updates close rate
+        # immediately, while still supporting the "derive from Stripe" behavior when the flag is unset.
         has_succeeded_payment = exists().where(
             and_(
                 StripePayment.client_id == ClientCheckIn.client_id,
@@ -3666,12 +3739,13 @@ def get_calendar_sales_close_rate(
                 StripePayment.status == "succeeded",
             )
         )
+        is_marked_closed = (getattr(ClientCheckIn, "sale_closed") == True)  # noqa: E712
 
         closed_all_time = (
             db.query(func.count(ClientCheckIn.id))
             .filter(
                 past_filter,
-                has_succeeded_payment,
+                or_(is_marked_closed, has_succeeded_payment),
             )
             .scalar()
         ) or 0
@@ -3680,7 +3754,7 @@ def get_calendar_sales_close_rate(
             .filter(
                 past_filter,
                 ClientCheckIn.start_time >= start_30d,
-                has_succeeded_payment,
+                or_(is_marked_closed, has_succeeded_payment),
             )
             .scalar()
         ) or 0
@@ -3705,6 +3779,95 @@ def get_calendar_sales_close_rate(
             "all_time": {"total_sales_calls": 0, "closed_count": 0, "close_rate_pct": 0},
             "last_30d": {"total_sales_calls": 0, "closed_count": 0, "close_rate_pct": 0},
         }
+
+
+@router.get("/calendar/platform-sales-close-rate")
+def get_platform_calendar_sales_close_rate(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Platform-wide rollup of the same sales close-rate logic as GET /calendar/sales-close-rate
+    (each org's Calendar tab). Weighted across all workspaces: total closed / total past sales calls.
+
+    Admin-only. Used by the owner Health tab KPI so it matches calendar definitions (sale_closed or
+    succeeded Stripe on the same org + client).
+    """
+    if not getattr(current_user, "is_admin", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Platform calendar close rate is only available to administrators",
+        )
+    try:
+        from datetime import timezone
+
+        now = datetime.now(timezone.utc)
+        start_30d = now - timedelta(days=30)
+
+        base_filter = (
+            (ClientCheckIn.is_sales_call == True)  # noqa: E712
+            & (ClientCheckIn.cancelled == False)  # noqa: E712
+            & (ClientCheckIn.provider.in_(["calcom", "calendly"]))
+        )
+        past_filter = base_filter & (ClientCheckIn.start_time < now)
+
+        total_all_time = (
+            db.query(func.count(ClientCheckIn.id)).filter(past_filter).scalar()
+        ) or 0
+        total_last_30d = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(past_filter, ClientCheckIn.start_time >= start_30d)
+            .scalar()
+        ) or 0
+
+        has_succeeded_payment = exists().where(
+            and_(
+                StripePayment.client_id == ClientCheckIn.client_id,
+                StripePayment.org_id == ClientCheckIn.org_id,
+                StripePayment.status == "succeeded",
+            )
+        )
+        is_marked_closed = getattr(ClientCheckIn, "sale_closed") == True  # noqa: E712
+
+        closed_all_time = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(past_filter, or_(is_marked_closed, has_succeeded_payment))
+            .scalar()
+        ) or 0
+        closed_last_30d = (
+            db.query(func.count(ClientCheckIn.id))
+            .filter(
+                past_filter,
+                ClientCheckIn.start_time >= start_30d,
+                or_(is_marked_closed, has_succeeded_payment),
+            )
+            .scalar()
+        ) or 0
+
+        close_rate_pct_all_time = (
+            round((closed_all_time / total_all_time) * 100) if total_all_time else 0
+        )
+        close_rate_pct_last_30d = (
+            round((closed_last_30d / total_last_30d) * 100) if total_last_30d else 0
+        )
+        return {
+            "all_time": {
+                "total_sales_calls": total_all_time,
+                "closed_count": closed_all_time,
+                "close_rate_pct": close_rate_pct_all_time,
+            },
+            "last_30d": {
+                "total_sales_calls": total_last_30d,
+                "closed_count": closed_last_30d,
+                "close_rate_pct": close_rate_pct_last_30d,
+            },
+        }
+    except Exception as e:
+        print(f"[CALENDAR SALES] Platform close rate failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not compute platform calendar close rate",
+        ) from e
 
 
 @router.patch("/calendar/bookings/sales")
@@ -4122,9 +4285,7 @@ def sync_fathom_meetings(
     Response includes ingested, skipped_no_client_match, meetings_seen.
     """
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    from app.services.fathom_ingest import sync_recent_meetings_for_org
-    from app.services.call_insight_service import run_call_insight_background
-    from app.services.call_library_service import run_call_library_report_background
+    from app.services.fathom_ingest import queue_fathom_sync_followups, sync_recent_meetings_for_org
 
     try:
         result = sync_recent_meetings_for_org(db, org_id, user=current_user)
@@ -4171,10 +4332,212 @@ def sync_fathom_meetings(
             detail=f"Fathom sync failed: {e!s}",
         ) from e
 
-    oid_str = str(org_id)
-    for rid in result.get("pending_insight_record_ids") or []:
-        background_tasks.add_task(run_call_insight_background, oid_str, rid)
-    for rid in result.get("pending_library_record_ids") or []:
-        background_tasks.add_task(run_call_library_report_background, oid_str, rid)
+    queue_fathom_sync_followups(background_tasks, org_id, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Fathom webhooks (API key + webhook ingestion)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_org_fathom_webhook_columns(db: Session) -> None:
+    """Idempotent ADD COLUMN for org webhook config (for DBs without alembic)."""
+    try:
+        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
+        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))
+        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_url TEXT"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+@router.post("/fathom/webhook/setup")
+def setup_fathom_webhook(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Create (or recreate) a Fathom webhook using the org's API key.
+
+    Uses BACKEND_PUBLIC_URL as the destination base. The webhook endpoint is:
+      POST /integrations/fathom/webhook/{org_id}
+
+    Webhook includes transcript + summary + action_items for LLM context.
+    """
+    from app.services.fathom_client import create_webhook, resolve_fathom_api_key
+    from app.models.organization import Organization
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    _ensure_org_fathom_webhook_columns(db)
+
+    key = resolve_fathom_api_key(db, org_id, user=current_user)
+    if not key:
+        raise HTTPException(status_code=400, detail="Fathom API key not configured for this organization.")
+
+    public = (getattr(settings, "BACKEND_PUBLIC_URL", None) or "").strip().rstrip("/")
+    if not public:
+        raise HTTPException(
+            status_code=400,
+            detail="BACKEND_PUBLIC_URL is not set on the server; cannot create webhook destination URL.",
+        )
+
+    destination = f"{public}/integrations/fathom/webhook/{org_id}"
+
+    try:
+        wh = create_webhook(
+            destination_url=destination,
+            include_transcript=True,
+            include_summary=True,
+            include_action_items=True,
+            db=db,
+            org_id=org_id,
+            api_key=key,
+        )
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 401:
+            raise HTTPException(
+                status_code=400,
+                detail="Fathom rejected the API key (401). Regenerate it in Fathom → Settings → API Access and try again.",
+            ) from e
+        raise HTTPException(
+            status_code=502,
+            detail=f"Fathom webhook create failed (HTTP {e.response.status_code if e.response else 'unknown'}).",
+        ) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Webhook setup failed: {e!s}") from e
+
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if org:
+        try:
+            org.fathom_webhook_id = str(wh.get("id") or "")[:200] or None
+            org.fathom_webhook_secret = str(wh.get("secret") or "")[:500] or None
+            org.fathom_webhook_url = str(wh.get("url") or destination)[:2000] or destination
+        except Exception:
+            pass
+        db.commit()
+
+    return {
+        "success": True,
+        "destination_url": destination,
+        "webhook_id": wh.get("id"),
+        "webhook_url": wh.get("url"),
+        "include_transcript": wh.get("include_transcript"),
+        "include_summary": wh.get("include_summary"),
+        "include_action_items": wh.get("include_action_items"),
+        "triggered_for": wh.get("triggered_for"),
+    }
+
+
+def _verify_fathom_webhook_signature(secret: str, headers: Dict[str, str], raw_body: bytes) -> bool:
+    """
+    Verify Fathom webhook signature per docs:
+    https://developers.fathom.ai/webhooks
+    """
+    import base64
+    import hashlib
+    import hmac
+    import time
+
+    webhook_id = headers.get("webhook-id") or headers.get("Webhook-Id")
+    webhook_ts = headers.get("webhook-timestamp") or headers.get("Webhook-Timestamp")
+    webhook_sig = headers.get("webhook-signature") or headers.get("Webhook-Signature")
+    if not webhook_id or not webhook_ts or not webhook_sig:
+        return False
+    try:
+        ts = int(str(webhook_ts))
+    except Exception:
+        return False
+    now = int(time.time())
+    if abs(now - ts) > 300:
+        return False
+
+    signed = f"{webhook_id}.{webhook_ts}.{raw_body.decode('utf-8')}"
+    try:
+        # Secret is whsec_<base64>; decode the part after whsec_
+        parts = str(secret).split("_", 1)
+        sec_b64 = parts[1] if len(parts) > 1 else ""
+        sec_bytes = base64.b64decode(sec_b64)
+    except Exception:
+        return False
+
+    expected = base64.b64encode(
+        hmac.new(sec_bytes, signed.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+
+    # webhook-signature can contain multiple versions: "v1,BASE64 v1,BASE64"
+    candidates: List[str] = []
+    for chunk in str(webhook_sig).split(" "):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(",", 1)
+        candidates.append(parts[1] if len(parts) > 1 else parts[0])
+
+    return any(hmac.compare_digest(expected, c) for c in candidates if c)
+
+
+@router.post("/fathom/webhook/{org_id}")
+async def receive_fathom_webhook(
+    org_id: uuid.UUID,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Webhook receiver for Fathom meeting content.
+
+    Uses org_id in the path to resolve the stored webhook secret for verification.
+    """
+    from app.models.organization import Organization
+    from app.services.fathom_ingest import ingest_meeting_payload
+    from app.services.fathom_ingest import queue_fathom_sync_followups
+
+    _ensure_org_fathom_webhook_columns(db)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Org not found")
+
+    raw = await request.body()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+
+    # Prefer per-org stored secret; fall back to env secret (legacy).
+    secret = (getattr(org, "fathom_webhook_secret", None) or getattr(settings, "FATHOM_WEBHOOK_SECRET", None) or "").strip()
+    if secret:
+        ok = _verify_fathom_webhook_signature(secret, headers, raw)
+        if not ok:
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # Some senders wrap meeting under a key; accept both.
+    meeting = None
+    if isinstance(payload, dict):
+        for k in ("meeting", "recording", "data", "item"):
+            v = payload.get(k)
+            if isinstance(v, dict) and ("recording_id" in v or "calendar_invitees" in v or "transcript" in v):
+                meeting = v
+                break
+    if meeting is None:
+        meeting = payload if isinstance(payload, dict) else None
+    if not isinstance(meeting, dict):
+        raise HTTPException(status_code=400, detail="Missing meeting payload")
+
+    status_str, _cid, fathom_row_id = ingest_meeting_payload(db, org_id, meeting)
+
+    # Queue follow-up jobs (call insights + library report) when we ingested a matched client call.
+    if status_str == "ok" and fathom_row_id:
+        queue_fathom_sync_followups(
+            background_tasks,
+            org_id,
+            {
+                "pending_insight_record_ids": [str(fathom_row_id)],
+                "pending_library_record_ids": [str(fathom_row_id)],
+            },
+        )
+
+    return {"success": True, "status": status_str, "fathom_call_record_id": str(fathom_row_id) if fathom_row_id else None}
 

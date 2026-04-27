@@ -30,6 +30,9 @@ class FathomCallRecord(Base):
     meeting_at = Column(DateTime(timezone=True), nullable=True)
 
     recording_url = Column(Text, nullable=True)
+    # Optional extra URLs from the meeting payload (webhook/list API) for embedding.
+    share_url = Column(Text, nullable=True)
+    video_url = Column(Text, nullable=True)
     attendees_json = Column(JSON, nullable=True)
     related_client_ids = Column(JSON, nullable=True)
 

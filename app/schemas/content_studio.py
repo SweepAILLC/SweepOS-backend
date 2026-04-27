@@ -123,3 +123,13 @@ class BootstrapResponse(BaseModel):
     content_bundle: Optional[ContentStudioBundleOut] = None
     completed_idea_ids: List[str] = Field(default_factory=list)
     batch_id: Optional[str] = None
+
+
+class ReanalyzeResponse(BaseModel):
+    """POST /content-studio/reanalyze — Fathom pull + intelligence cache bust + bundle regen queued."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    fathom_sync: Dict[str, Any] = Field(default_factory=dict)
+    bundle_regenerating: bool = True
+    health_clients_invalidated: int = 0
