@@ -219,9 +219,33 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
     )
     
     db.execute(stmt)
-    
-    # Note: Client lifetime revenue is recalculated during reconciliation to avoid double-counting
-    # This prevents double-counting when webhooks and sync both process the same payment
+
+    # Determine "is this the client's first succeeded payment?" BEFORE the row is committed —
+    # we exclude this charge_id when counting so a redelivered webhook still reports first=true.
+    first_payment_signal = False
+    if client and amount_cents > 0:
+        from app.models.client import Client as _Client
+        existing_succeeded = db.query(StripePayment).filter(
+            StripePayment.org_id == org_id,
+            StripePayment.client_id == client.id,
+            StripePayment.status == "succeeded",
+            StripePayment.stripe_id != payment_id,
+        ).count()
+        from app.models.whop_payment import WhopPayment as _WhopPayment
+        whop_succeeded = db.query(_WhopPayment).filter(
+            _WhopPayment.org_id == org_id,
+            _WhopPayment.client_id == client.id,
+            _WhopPayment.status.in_(("paid", "succeeded", "completed", "successful")),
+        ).count()
+        first_payment_signal = (existing_succeeded == 0 and whop_succeeded == 0)
+
+        # Keep client.lifetime_revenue_cents in sync on webhook ingest. The previous
+        # comment about "recalculated during reconciliation" left this field stale
+        # whenever sync wasn't run, breaking audience filters and Performance views.
+        try:
+            client.lifetime_revenue_cents = int(client.lifetime_revenue_cents or 0) + int(amount_cents)
+        except (TypeError, ValueError):
+            pass
     
     # If invoice has subscription, ensure subscription exists with MRR
     # Test events might not trigger subscription.created, so create/update from invoice
@@ -278,6 +302,25 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
                 _mark_latest_sales_call_closed(db, org_id, client)
             except Exception as sales_err:
                 print(f"[SALES_CLOSE] ⚠️  Error marking sales call closed: {str(sales_err)}")
+
+            # Enqueue first-payment automation jobs (worker handles draft+send asynchronously
+            # so the webhook handler stays fast and survives API restarts).
+            if first_payment_signal:
+                try:
+                    from app.services.automation_engine import on_payment_received
+                    on_payment_received(
+                        db,
+                        org_id=org_id,
+                        client_id=client.id,
+                        payment_source="stripe",
+                        payment_external_id=payment_id,
+                        amount_cents=int(amount_cents or 0),
+                        paid_at=created_at,
+                    )
+                    db.commit()
+                except Exception as automation_error:
+                    print(f"[AUTOMATION_ENGINE] ⚠️ Error enqueueing first-payment jobs: {automation_error}")
+                    db.rollback()
     except Exception as commit_error:
         print(f"❌ ERROR committing payment {payment_id}: {str(commit_error)}")
         db.rollback()
@@ -675,7 +718,7 @@ def _process_customer_created(db: Session, data: Dict[str, Any], org_id: uuid.UU
                 last_name=last_name,
                 email=email,
                 stripe_customer_id=customer_id,
-                lifecycle_state="cold_lead"  # New customers start as cold leads
+                lifecycle_state="active"  # New Stripe customers start as active clients
             )
             db.add(client)
             db.flush()  # Flush to get the client ID

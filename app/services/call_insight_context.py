@@ -216,3 +216,10 @@ def is_thin_transcript(pack: Dict[str, Any]) -> bool:
     if len(lines) < min_lines and len(combined) < min_chars * 2:
         return True
     return False
+
+
+def is_meeting_snapshot_thin(summary: Optional[str], transcript: Optional[str]) -> bool:
+    """Same thresholds as insights: use plain summary + transcript strings (e.g. Fathom DB row)."""
+    s = (summary or "").strip()
+    t = (transcript or "").strip()
+    return is_thin_transcript({"call_text": {"summary": s, "transcript": t}})

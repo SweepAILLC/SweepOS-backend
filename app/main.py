@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio, call_library
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio, call_library, automations, outreach, calendar_webhooks
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
 import logging
@@ -53,6 +53,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(clients.router, prefix="/clients", tags=["clients"])
 app.include_router(performance.router, prefix="/performance", tags=["performance"])
+app.include_router(automations.router, prefix="/automations", tags=["automations"])
+app.include_router(outreach.router, prefix="/outreach", tags=["outreach"])
 app.include_router(content_studio.router, prefix="/content-studio", tags=["content-studio"])
 app.include_router(call_library.router, prefix="/call-library", tags=["call-library"])
 app.include_router(events.router, prefix="/events", tags=["events"])
@@ -66,6 +68,7 @@ app.include_router(whop.router, prefix="/integrations/whop", tags=["whop"])
 app.include_router(stripe.router, prefix="/integrations/stripe", tags=["stripe"])
 app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 app.include_router(fathom_webhooks.router, prefix="/webhooks", tags=["fathom"])
+app.include_router(calendar_webhooks.router, prefix="/webhooks", tags=["calendar-webhooks"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])

@@ -52,6 +52,14 @@ Schema:
   "overall_impression": "One paragraph (4-6 sentences) summarizing whether the call succeeded at \
 moving the deal forward toward closing or completing the sale or failed. Be direct, analytical, and honest.",
   "call_score": integer 0-100 estimating sales call quality (discovery, next steps, objection handling, clarity). Not a lead score.,
+  "deal_outcome": {
+    "closed": boolean — true ONLY when it is unambiguously clear from the DATA that the sale was closed on this call (verbal commitment to buy, payment confirmed, contract acceptance, "let's get you signed up" / "send the invoice" / "I'm in"). Default to false on any doubt — interest, hesitation, "I'll think about it", "let me check with my partner", or scheduling another call all mean closed=false,
+    "amount": number | null — total deal value in the deal_outcome.currency (use whole units, e.g. 4500 for $4,500; do not store cents). Pull only from explicit price/figure stated or agreed in the transcript or summary. Use null when the figure is not stated even if closed=true,
+    "currency": "USD" | "EUR" | "GBP" | "CAD" | "AUD" | other ISO 4217 — default "USD" when unclear,
+    "billing": "one_time" | "recurring_monthly" | "recurring_annual" | "unknown" — derive from how the sale was framed (e.g. monthly retainer vs lump sum); use "unknown" if not stated,
+    "confidence": "high" | "medium" | "low" — your confidence that the close happened on this call,
+    "evidence": "Short verbatim quote (or close paraphrase if the transcript only summarizes) from DATA that proves the close happened. Empty string when closed=false."
+  },
   "low_signal": boolean indicating if the call was so thin or lacked enough substance that it was not possible to generate a meaningful analysis,
   "low_signal_reason": string explaining why the call was so thin or lacked enough substance that it was not possible to generate a meaningful analysis"
 }
@@ -59,6 +67,9 @@ moving the deal forward toward closing or completing the sale or failed. Be dire
 RULES:
 - Use ONLY information from the DATA block. Do not invent names, quotes, or events.
 - call_score: integer 0-100 estimating sales call quality (discovery, next steps, objection handling, clarity). Not a lead score.
+- deal_outcome.closed defaults to FALSE. Only flip it to true when the DATA contains an unambiguous close signal — explicit verbal yes ("let's do it", "I'm in", "sign me up"), a stated payment ("I'll send the invoice", "card on file", "payment processed"), a contract/agreement acceptance, or the salesperson confirming next-step onboarding for a now-paying client. Interest, soft yeses, scheduling another call, "I'll think about it", or pricing discussions without commitment are NOT closes.
+- deal_outcome.amount must come from a number actually stated in the DATA (transcript or summary). Never guess or interpolate. If closed=true but no figure is stated, leave amount=null.
+- deal_outcome.evidence must quote (or tightly paraphrase) the line in DATA that proves the close. If closed=false, return an empty string.
 - If the transcript is too short or empty to analyze, set low_signal=true and explain in low_signal_reason.
 - strengths and weaknesses: include 2-4 bullets each when evidence exists. Empty arrays if no evidence.
 - Write "detail" as 2-4 sentences in a coaching tone, like a written report (not terse bullets only).
@@ -97,6 +108,60 @@ def generate_call_library_report(
     return _normalize_report(raw)
 
 
+_ALLOWED_BILLING = {"one_time", "recurring_monthly", "recurring_annual", "unknown"}
+_ALLOWED_CONFIDENCE = {"high", "medium", "low"}
+
+
+def _empty_deal_outcome() -> Dict[str, Any]:
+    return {
+        "closed": False,
+        "amount": None,
+        "currency": "USD",
+        "billing": "unknown",
+        "confidence": "low",
+        "evidence": "",
+    }
+
+
+def _normalize_deal_outcome(raw: Any) -> Dict[str, Any]:
+    """Coerce the LLM-emitted deal_outcome into a strict, safe shape.
+
+    Important: `closed` defaults to False on any ambiguity so a missing field
+    or an LLM hiccup never falsely marks a deal as closed.
+    """
+    out = _empty_deal_outcome()
+    if not isinstance(raw, dict):
+        return out
+
+    out["closed"] = bool(raw.get("closed"))
+
+    amount_raw = raw.get("amount")
+    try:
+        if amount_raw is not None and amount_raw != "":
+            amt = float(amount_raw)
+            if amt >= 0:
+                # cap at $1B to avoid garbage values poisoning the UI
+                out["amount"] = min(amt, 1_000_000_000.0)
+    except (TypeError, ValueError):
+        pass
+
+    currency = str(raw.get("currency") or "USD").upper().strip()
+    if 2 <= len(currency) <= 8 and currency.isalpha():
+        out["currency"] = currency
+    else:
+        out["currency"] = "USD"
+
+    billing = str(raw.get("billing") or "unknown").lower().strip()
+    out["billing"] = billing if billing in _ALLOWED_BILLING else "unknown"
+
+    confidence = str(raw.get("confidence") or "low").lower().strip()
+    out["confidence"] = confidence if confidence in _ALLOWED_CONFIDENCE else "low"
+
+    evidence = str(raw.get("evidence") or "")[:600]
+    out["evidence"] = evidence if out["closed"] else ""
+    return out
+
+
 def _normalize_report(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Validate and normalize the LLM output into a safe shape."""
     out: Dict[str, Any] = {
@@ -116,6 +181,7 @@ def _normalize_report(raw: Dict[str, Any]) -> Dict[str, Any]:
         },
         "overall_impression": "",
         "call_score": None,
+        "deal_outcome": _empty_deal_outcome(),
         "low_signal": bool(raw.get("low_signal")),
         "low_signal_reason": str(raw.get("low_signal_reason") or "")[:500],
     }
@@ -159,12 +225,16 @@ def _normalize_report(raw: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         pass
 
-    # If low_signal, zero out the meaningful content
+    out["deal_outcome"] = _normalize_deal_outcome(raw.get("deal_outcome"))
+
+    # If low_signal, zero out the meaningful content (incl. deal_outcome — we
+    # cannot trust a "closed" signal extracted from a thin transcript).
     if out["low_signal"]:
         out["strengths"] = []
         out["weaknesses"] = []
         out["overall_impression"] = ""
         out["call_score"] = None
+        out["deal_outcome"] = _empty_deal_outcome()
 
     return out
 

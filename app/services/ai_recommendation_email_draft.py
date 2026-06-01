@@ -26,7 +26,10 @@ from app.services.health_score_cache_service import (
     resolve_health_score,
 )
 from app.services.llm_client import chat_json, llm_available, truncate_for_tokens
-from app.services.user_ai_profile_context import extract_ai_profile_for_llm
+from app.services.user_ai_profile_context import (
+    extract_ai_profile_for_llm,
+    resolve_performance_campaign_templates_for_task,
+)
 
 
 def _ai_profile_context(user: Optional[User]) -> Optional[Dict[str, Any]]:
@@ -96,6 +99,116 @@ def _find_action(db: Session, client: Client, action_id: str) -> Optional[Dict[s
         if isinstance(a, dict) and str(a.get("id")) == str(action_id):
             return dict(a)
     return None
+
+
+def _apply_intelligence_html_template_tokens(
+    template: str,
+    *,
+    body_plain: str,
+    subject: str,
+    sender_name: str,
+    sender_email: str,
+) -> str:
+    """Replace {{BODY_HTML}}, {{SUBJECT}}, {{SENDER_*}} like the frontend email composer."""
+    inner = _plain_to_simple_html(body_plain)
+    out = template or ""
+    out = out.replace("{{BODY_HTML}}", inner)
+    out = out.replace("{{SUBJECT}}", html.escape(subject))
+    out = out.replace("{{SENDER_NAME}}", html.escape(sender_name))
+    out = out.replace("{{SENDER_EMAIL}}", html.escape(sender_email))
+    return out
+
+
+def _truncate_campaign_templates_for_prompt(
+    templates: List[Dict[str, str]], *, max_html: int = 4500
+) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for t in templates:
+        d = dict(t)
+        ht = d.get("html_template")
+        if isinstance(ht, str) and len(ht) > max_html:
+            d["html_template"] = ht[:max_html] + "\n<!-- truncated for prompt size -->"
+        out.append(d)
+    return out
+
+
+def _pick_primary_campaign_template_for_wrap(
+    templates: List[Dict[str, str]],
+    roi_tags: List[str],
+    lifecycle: str,
+) -> Optional[Dict[str, str]]:
+    """Choose which saved HTML shell to merge with the LLM plain body for the outgoing draft."""
+    tags = {str(t).lower().strip() for t in roi_tags}
+    ls = (lifecycle or "").lower().strip()
+
+    def first_with_html(kind: str) -> Optional[Dict[str, str]]:
+        for x in templates:
+            if x.get("kind") == kind and (str(x.get("html_template") or "").strip()):
+                return x
+        return None
+
+    if "referral" in tags:
+        x = first_with_html("referral_campaign")
+        if x:
+            return x
+    if "upsell" in tags:
+        x = first_with_html("upsell_campaign")
+        if x:
+            return x
+    if ls == "offboarding":
+        x = first_with_html("re_sign_campaign")
+        if x:
+            return x
+    for x in templates:
+        if str(x.get("html_template") or "").strip():
+            return x
+    return None
+
+
+def _performance_roi_campaign_templates_prompt_suffix() -> str:
+    return (
+        "\n\nPERFORMANCE ROI CAMPAIGN TEMPLATES (MANDATORY WHEN PRESENT): If DATA.task.performance_campaign_templates "
+        "is non-empty, the operator saved branded referral / upsell / re-sign campaign samples for Intelligence. "
+        "Those entries are selected because this task's roi_tags and lifecycle match (referral → referral_campaign, "
+        "upsell → upsell_campaign, offboarding re-commit → re_sign_campaign). "
+        "You MUST base body_plain on them: mirror section flow, headline intent, and CTA style; rewrite for this "
+        "recipient using only facts in DATA. Output readable plain text in body_plain — do not paste raw HTML tags. "
+        "If multiple templates are listed, prioritize the kind that matches the strongest ROI signal in task.roi_tags. "
+        "Even when using a campaign template, the REFERRAL TONE GUIDELINES and TESTIMONIAL / UPSELL HARD RULES below still "
+        "apply — the template informs structure; referral language must sound value-forward and relational, "
+        "not desperate; testimonial / upsell gating stays strict."
+    )
+
+
+def _performance_roi_intent_addendum(roi_tags: List[str], lifecycle: str) -> str:
+    """Sharper intent line for build_performance_task_email_draft based on ROI chip + lifecycle."""
+    tags = {str(t).lower().strip() for t in roi_tags}
+    ls = (lifecycle or "").lower().strip()
+    parts: List[str] = []
+    if "testimonial" in tags:
+        parts.append(
+            "PRIMARY INTENT: testimonial ask. Apply the TESTIMONIAL HARD RULES — gate on a concrete on-brand win, "
+            "congratulate it specifically, pitch a short client case-study interview, and attach a non-sales / check-in "
+            "scheduling link from sender_ai_profile.asset_links when present (never a sales/discovery link)."
+        )
+    if "referral" in tags:
+        parts.append(
+            "PRIMARY INTENT: referral or invite-only growth. Invite naturally as VALUE TO THE RECIPIENT FIRST — "
+            "affiliate/program onboarding frames, conditional free offers paired with referrals, "
+            "or congratulate a proven win before asking who else might benefit — never desperate, needy, or transactional."
+        )
+    if "upsell" in tags:
+        parts.append(
+            "PRIMARY INTENT: upsell. Apply the UPSELL HARD RULES — only proceed if DATA shows a real on-brand win, "
+            "sustained healthy engagement, AND visible enthusiasm / forward-looking goal language. Bridge their stated "
+            "future-paced goal to the matching offer_ladder rung. If those gates are not met, fall back to retention/check-in."
+        )
+    if ls == "offboarding" and "re_sign" not in tags:
+        parts.append(
+            "Lifecycle is offboarding: respect the re-sign / alumni framing in any matching campaign template, but the "
+            "above hard rules still govern wording for any embedded testimonial / referral / upsell ask."
+        )
+    return " ".join(parts)
 
 
 def _plain_to_simple_html(body: str) -> str:
@@ -321,14 +434,16 @@ def _llm_intent_instruction(client: Client, action: Dict[str, Any]) -> str:
         pri = 0
     if lifecycle == "active" and pri == 3:
         return (
-            "Conversion intent: invite a testimonial (written or short video). Use recent_wins from DATA if present. "
-            "Offer a simple prompt list; keep friction low."
+            "Conversion intent: TESTIMONIAL ASK — only proceed if DATA shows a concrete on-brand win (money, weight, "
+            "habit, milestone). Congratulate the specific win first, then ask if they're open to a short client case-study "
+            "interview to highlight their progress (not a sales pitch). Attach a non-sales / check-in scheduling link from "
+            "sender_ai_profile.asset_links when one exists; otherwise ask for 2-3 times. Do not include an upsell."
         )
-    if lifecycle in ("cold_lead", "warm_lead") and pri == 1:
+    if lifecycle in ("cold_lead", "nurturing", "qualified", "booked") and pri == 1:
         return (
             "Conversion intent: timely follow-up and call momentum. Reference sentiment and transcript cues if useful."
         )
-    if lifecycle in ("cold_lead", "warm_lead") and pri == 2:
+    if lifecycle in ("cold_lead", "nurturing", "qualified", "booked") and pri == 2:
         return "Conversion intent: onboarding—clear next step, scheduling, or concise options."
     if lifecycle == "offboarding" and pri == 2:
         return "Conversion intent: re-engagement / re-sign / alumni path—respectful, specific hook."
@@ -347,9 +462,27 @@ def _expert_email_system_prompt() -> str:
         "\n\n"
         "SENDER PERSONALIZATION: If DATA contains sender_ai_profile, treat it as the sender's own voice and brand directives — "
         "match their writing_style, writing_tone, and coaching_style; frame the message using their sales_framework / sales_tactics; "
-        "reference asset_links when relevant (e.g. link to a sales page or lead magnet). Weave in their business_description, "
+        "reference asset_links when relevant (e.g. link to a sales page, lead magnet, or scheduling link). Weave in their business_description, "
         "target_audience, and unique_selling_proposition naturally—do not quote them verbatim, absorb the voice. "
         "client_management_philosophy guides how empathetic vs. direct you should be. "
+        "ASSET / SCHEDULING LINK SELECTION: When you need to attach a link, scan sender_ai_profile.asset_links and pick by intent: "
+        "for testimonial / case-study / check-in asks, prefer a link whose label suggests a non-sales conversation "
+        "(e.g. 'check-in', 'Voxer', 'connect', 'catch-up', 'progress call'); for offer / upsell asks, prefer 'sales call', "
+        "'discovery', 'consult', 'book a call', or pricing pages; never repurpose a sales-call link for testimonial/check-in asks. "
+        "If no suitable link exists, ask for a reply with times instead of inventing a URL. "
+        "WRITING SAMPLES (HIGHEST PRIORITY FOR VOICE): If sender_ai_profile.writing_samples is a non-empty array, each "
+        "entry has kind (email | message | other | referral_campaign | upsell_campaign | re_sign_campaign), optional title, "
+        "body (plain text), and optional html_template (branded campaign HTML). Plain samples capture voice; "
+        "html_template captures layout sections, CTA placement, and promotional framing — translate structure into your "
+        "body_plain output (you output plain text JSON, not raw pasted HTML tags unless truly necessary). "
+        "CAMPAIGN MATCHING: For referral asks or referral_pipeline priorities, lean hardest on referral_campaign samples; "
+        "for upsell/revenue priorities or upsell signals, lean on upsell_campaign; for renewals, win-back, or re-commit "
+        "asks, lean on re_sign_campaign. When several apply, blend voice from plain samples with campaign intent from "
+        "the matching campaign kind. "
+        "Study greeting and sign-off habits, paragraph length, punctuation, warmth vs. directness, and typical phrasing. "
+        "Write the new email in that same authorial voice. Do NOT copy situational details, client names, dates, or "
+        "private specifics from the samples; only imitate style and structure. If samples conflict with writing_style "
+        "or writing_tone, prefer the samples. "
         "PIPELINE PRIORITIES: If sender_ai_profile.pipeline_priorities is present, it is an ordered list of what the sender "
         "cares about most right now (e.g. 'testimonials', 'revenue', 'retention', 'referrals'). Lean the email's angle, "
         "CTA, and framing toward the highest-ranked priority that is relevant to this client's lifecycle stage and context. "
@@ -363,6 +496,43 @@ def _expert_email_system_prompt() -> str:
         "If DATA.task or DATA.task.offer_suggestion explicitly names an offer, use exactly that one and let "
         "task.offer_suggestion.script_hint shape the language (psychology, framing). "
         "Make the CTA the next step toward that offer (book a call, reply to start, see a one-pager) — never end with a vague check-in. "
+        "\n\n"
+        "REFERRAL EMAILS (TONE GUIDELINES — apply when intent or roi_tags include 'referral'): "
+        "Frame the outreach as benefiting THE RECIPIENT first — not extracting a favor. Lead with onboarding them onto "
+        "a perk (affiliate/partner/student-referral program), a conditional free offer they'd want that also rewards "
+        "people they introduce, OR a genuine congratulations on THEIR win followed by widening impact naturally. "
+        "STYLE EXAMPLES (patterns only — pull concrete wins/perks verbatim from DATA, never invent): "
+        "'I'd love to get you onboarded on our affiliate program…'; "
+        "'Would you be interested in [free offer]? If so, here's what we're offering for anyone you refer…'; "
+        "'Congrats on [specific WIN from DATA]… I'd love to help share that with more people. "
+        "Who else do you know who could benefit from [same WIN]?'. "
+        "ABSOLUTE AVOID list: desperation, needy one-liners, guilt, vague 'anything helps', "
+        "'we really need referrals', cold asks with zero relational runway, or begging for names "
+        "before you've given them anything. "
+        "Do not stack groveling 'please' phrases. Light politeness is fine. Never invent perks, URLs, or wins — pull from "
+        "sender_ai_profile.offer_ladder.referral_offer / asset_links / recent_wins. "
+        "One clear CTA (reply interest, reply with who comes to mind, or use the referral link)."
+        "\n\n"
+        "TESTIMONIAL EMAILS (HARD RULES — apply when intent or roi_tags include 'testimonial' or pipeline_priorities lead with testimonials): "
+        "1) Send ONLY when DATA shows a concrete on-brand win that maps to the business's outcome (e.g. money made, weight lost, "
+        "habit installed, milestone hit). The win must be present in recent_wins, ai_call_insights, prospect_voice_profile, or CRM notes. "
+        "If no qualifying win is present, do NOT pitch a testimonial — pivot to the next-best lifecycle move (check-in, retention, etc.). "
+        "2) Open by congratulating that specific win in plain language (1-2 lines, not gushing). "
+        "3) Then ask if they'd be open to a short client case-study interview to highlight their progress — frame it as celebrating "
+        "their result, not promoting the business. "
+        "4) CTA: attach the most appropriate non-sales scheduling link from sender_ai_profile.asset_links (check-in / Voxer / "
+        "progress-call style — never a sales/discovery call link). If none exists, ask for 2-3 times this/next week. "
+        "5) Do not bundle an upsell or pricing in the same email. "
+        "UPSELL EMAILS (HARD RULES — apply when intent or roi_tags include 'upsell' or pipeline_priorities lead with revenue): "
+        "1) Send ONLY when the client clearly meets all of: (a) a concrete win/result on-brand for the business in DATA, "
+        "(b) sustained healthy engagement (health_snapshot.score in upper range, positive sentiment, no churn risk in factors/notes), "
+        "and (c) enthusiasm or forward-looking intent visible in prospect_voice_profile, ai_call_insights, latest_call_text, or CRM notes "
+        "(language about wanting more, next phase, bigger goals). If those are not all present, do NOT upsell — fall back to retention, "
+        "testimonial (if win is present), or simple check-in. "
+        "2) Frame the upsell as the logical bridge to a future-paced goal the client themselves voiced (paraphrase from DATA — "
+        "never invent the goal). Lead with their goal, then the rung from offer_ladder that bridges to it. "
+        "3) The ask is a low-friction conversation about that next phase — not a hard pitch. CTA can be a sales/discovery call link "
+        "from asset_links, a brief reply, or a one-pager. "
         "\n\n"
         "Language mirroring: combine prospect_voice_profile with recipient_language_sample—align formality, pacing, and word choice; "
         "avoid patterns listed in avoid_phrasing; do not copy long phrases verbatim. "
@@ -465,7 +635,13 @@ def build_recommendation_email_draft(
 
 
 def _perf_task_template_draft(
-    db: Session, client: Client, org_id: uuid.UUID, task: Dict[str, Any]
+    db: Session,
+    client: Client,
+    org_id: uuid.UUID,
+    task: Dict[str, Any],
+    *,
+    campaign_templates: Optional[List[Dict[str, str]]] = None,
+    sender_user: Optional[User] = None,
 ) -> Dict[str, Any]:
     """Send-ready fallback when LLM is unavailable for a Performance task email."""
     org_name = _org_display_name(db, org_id)
@@ -492,10 +668,37 @@ def _perf_task_template_draft(
         f"{cta}\n\n"
         f"Best regards,\n{org_name}"
     )
+    subj_out = f"Quick note — {title[:60]}"
+    ev2 = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
+    roi_tags_fb = list(ev2.get("roi_tags") or []) if isinstance(ev2, dict) else []
+    lifecycle_fb = (
+        getattr(client.lifecycle_state, "value", str(client.lifecycle_state or "")) or ""
+    ).lower()
+    primary_tpl = _pick_primary_campaign_template_for_wrap(
+        list(campaign_templates or []),
+        [str(x) for x in roi_tags_fb],
+        lifecycle_fb,
+    )
+    tpl_html = (
+        str(primary_tpl.get("html_template") or "").strip()
+        if isinstance(primary_tpl, dict)
+        else ""
+    )
+    sender_email_str = str(getattr(sender_user, "email", "") or "").strip()
+    if tpl_html:
+        body_html_out = _apply_intelligence_html_template_tokens(
+            tpl_html,
+            body_plain=body_plain[:8000],
+            subject=subj_out,
+            sender_name=org_name,
+            sender_email=sender_email_str or org_name,
+        )[:24000]
+    else:
+        body_html_out = _plain_to_simple_html(body_plain[:8000])
     return {
-        "subject": f"Quick note — {title[:60]}",
+        "subject": subj_out,
         "body_plain": body_plain[:8000],
-        "body_html": _plain_to_simple_html(body_plain[:8000]),
+        "body_html": body_html_out,
         "source": "template",
     }
 
@@ -517,11 +720,33 @@ def build_performance_task_email_draft(
     if client is None:
         return None
 
-    if not llm_available():
-        return _perf_task_template_draft(db, client, org_id, task)
-
     ev = task.get("evidence") if isinstance(task.get("evidence"), dict) else {}
     roi_tags = list(ev.get("roi_tags") or []) if isinstance(ev, dict) else []
+    lifecycle_str = (
+        getattr(client.lifecycle_state, "value", str(client.lifecycle_state or "")) or ""
+    ).lower()
+
+    raw_profile = getattr(sender_user, "ai_profile", None) if sender_user else None
+    if not isinstance(raw_profile, dict):
+        raw_profile = {}
+    campaign_templates_full = resolve_performance_campaign_templates_for_task(
+        raw_profile,
+        roi_tags,
+        lifecycle=lifecycle_str,
+    )
+    campaign_templates_prompt = _truncate_campaign_templates_for_prompt(
+        campaign_templates_full
+    )
+
+    if not llm_available():
+        return _perf_task_template_draft(
+            db,
+            client,
+            org_id,
+            task,
+            campaign_templates=campaign_templates_full,
+            sender_user=sender_user,
+        )
     offer = ev.get("offer_suggestion") if isinstance(ev, dict) else None
     if isinstance(offer, dict):
         offer_compact = {
@@ -543,6 +768,16 @@ def build_performance_task_email_draft(
         "task.offer_suggestion (when present) as the single next move toward ROI. Keep it specific, low-friction, and "
         "in the operator's voice."
     )
+    if campaign_templates_prompt:
+        intent += (
+            " Use task.performance_campaign_templates as the structural blueprint when present — they match this "
+            "client's ROI tags / lifecycle."
+        )
+    roi_intent_extra = _performance_roi_intent_addendum(
+        [str(x) for x in roi_tags], lifecycle_str
+    )
+    if roi_intent_extra:
+        intent = f"{intent} {roi_intent_extra}".strip()
 
     conversion_context = build_conversion_email_context(db, client, org_id, sender_user=sender_user)
 
@@ -553,34 +788,76 @@ def build_performance_task_email_draft(
         "intent": intent,
         "perf_task": True,
         "roi_tags": roi_tags,
+        "client_lifecycle": lifecycle_str or None,
         "offer_suggestion": offer_compact,
         "task_why": str(task.get("why") or "")[:1200],
         "task_next_step": str(task.get("next_step") or "")[:400],
     }
+    if campaign_templates_prompt:
+        task_block["performance_campaign_templates"] = campaign_templates_prompt
 
     user_payload = {
         "conversion_context": conversion_context,
         "task": task_block,
     }
     system = _expert_email_system_prompt()
+    if campaign_templates_prompt:
+        system += _performance_roi_campaign_templates_prompt_suffix()
     user = "DATA:\n" + truncate_for_tokens(json.dumps(user_payload, default=str), 36000)
 
     try:
         raw = chat_json(system, user, temperature=0.42, timeout=90.0, org_id=org_id)
     except Exception:
-        return _perf_task_template_draft(db, client, org_id, task)
+        return _perf_task_template_draft(
+            db,
+            client,
+            org_id,
+            task,
+            campaign_templates=campaign_templates_full,
+            sender_user=sender_user,
+        )
 
     org_name = _org_display_name(db, org_id)
     subj = str(raw.get("subject") or "Following up").strip()[:200]
     body = str(raw.get("body_plain") or raw.get("body") or "").strip()
     if len(body) < 80:
-        return _perf_task_template_draft(db, client, org_id, task)
+        return _perf_task_template_draft(
+            db,
+            client,
+            org_id,
+            task,
+            campaign_templates=campaign_templates_full,
+            sender_user=sender_user,
+        )
     body = _sanitize_send_ready_body(body, org_name)
     body = _append_sign_off_if_missing(body, org_name)
     body = body[:8000]
+
+    sender_email_str = str(getattr(sender_user, "email", "") or "").strip()
+    primary_tpl = _pick_primary_campaign_template_for_wrap(
+        campaign_templates_full,
+        [str(x) for x in roi_tags],
+        lifecycle_str,
+    )
+    tpl_html = (
+        str(primary_tpl.get("html_template") or "").strip()
+        if isinstance(primary_tpl, dict)
+        else ""
+    )
+    if tpl_html:
+        body_html_out = _apply_intelligence_html_template_tokens(
+            tpl_html,
+            body_plain=body,
+            subject=subj,
+            sender_name=org_name,
+            sender_email=sender_email_str or org_name,
+        )[:24000]
+    else:
+        body_html_out = _plain_to_simple_html(body)
+
     return {
         "subject": subj,
         "body_plain": body,
-        "body_html": _plain_to_simple_html(body),
+        "body_html": body_html_out,
         "source": "llm",
     }

@@ -13,6 +13,7 @@ class HealthTrendPeriod(BaseModel):
     show_up_rate_pct: Optional[float] = None
     close_rate_pct: Optional[float] = None
     stripe_revenue_usd: float = 0.0
+    combined_revenue_usd: Optional[float] = None
     calls_booked_count: int = 0
     cumulative_total_clients: int = 0
     active_clients_cohort: int = 0

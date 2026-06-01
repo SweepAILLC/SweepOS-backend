@@ -1,4 +1,4 @@
-"""Structured Content Studio bundle: 4 data sections + voice/marketing section, fingerprinting, LLM draft."""
+"""Content Studio bundle: TOF/MOF/BOF video-concept generator from Fathom data + ICP."""
 from __future__ import annotations
 
 import hashlib
@@ -18,34 +18,37 @@ from app.services.user_ai_profile_context import extract_ai_profile_for_llm
 
 logger = logging.getLogger(__name__)
 
-BUNDLE_VERSION = 2
+# Bumped to invalidate every previously-generated bundle (4-section + voice_marketing shape).
+BUNDLE_VERSION = 3
 
-SECTION_SPECS: List[Tuple[str, str, str]] = [
+# Each entry: (stage, default title, default intro hint shown when LLM cannot run).
+STAGE_SPECS: List[Tuple[str, str, str]] = [
     (
-        "common_objections",
-        "Most common objections",
-        "Patterns from recorded calls: objections, hesitations, and pushback prospects raise before they buy.",
+        "TOF",
+        "Top of funnel — trending hooks for new viewers",
+        "Curiosity-triggering hooks pulled from the most attention-grabbing pains, objections, "
+        "and surprising moments inside recent sales calls. Goal: stop the scroll, plant the brand.",
     ),
     (
-        "active_client_issues",
-        "Issues for currently active clients",
-        "Friction, adherence, expectations, or delivery themes showing up for people already inside your program.",
+        "MOF",
+        "Middle of funnel — education concepts from sales calls",
+        "Frameworks, decisions, and reframes the founder uses when teaching prospects on calls. "
+        "Goal: install belief and pre-handle the next objection so MOF viewers self-qualify forward.",
     ),
     (
-        "testimonials_wins",
-        "Testimonials & wins",
-        "Proof moments, wins, and language you can recycle into authority and trust content.",
-    ),
-    (
-        "pain_points_and_dream_outcomes",
-        "Core pain points & dream outcomes",
-        "Recurring pains prospects want gone and outcomes they say they want—anchors for hooks and promises.",
+        "BOF",
+        "Bottom of funnel — client wins & case studies",
+        "Real client transformations, win quotes, and case-study breakdowns surfaced in calls. "
+        "Goal: convert warm viewers by showing on-brand outcomes the ICP wants for themselves.",
     ),
 ]
 
+STAGE_SET = frozenset(s for s, _, _ in STAGE_SPECS)
+ALLOWED_FORMATS = frozenset({"long", "short"})
 
-def _sales_data_grounding_block(signals: Dict[str, Any]) -> str:
-    """Instructions so each bundle section maps to the right Fathom / sales-behavior fields when present."""
+
+def _stage_grounding_block(signals: Dict[str, Any]) -> str:
+    """Per-stage Fathom field mapping the model must use; explicit ban on inventing data."""
     has_any = bool(signals.get("has_any"))
     themes = signals.get("themes") or []
     insights = signals.get("insights") or []
@@ -67,49 +70,39 @@ def _sales_data_grounding_block(signals: Dict[str, Any]) -> str:
 
     if not has_any:
         return (
-            "DATA_AVAILABILITY: No Fathom or sales-behavior payload in SIGNALS yet.\n"
-            "Use strong expert-default hooks per section; say once that syncing Fathom and call insights will sharpen these."
+            "DATA_AVAILABILITY: No Fathom or call-insight payload yet.\n"
+            "Use sensible expert defaults grounded in the INTELLIGENCE_PROFILE (ICP, offer, USP). "
+            "Mention once at the top of each stage that ideas will sharpen as Fathom calls sync."
         )
 
-    lines = [
-        "DATA_AVAILABILITY: Fathom and/or sales-behavior signals are present. Build every section on the pillar→source mapping below. "
-        "Do not invent private facts; paraphrase and avoid full names.",
-        "",
-        "SECTION → DATA PILLARS (each segment uses different fields—do not reuse the same paragraph across sections):",
-        "- common_objections (section_id common_objections): Ground in `themes` (labels, occurrence_count, sample_quotes), "
-        "`insights[].objection_quotes`, and hesitation/pushback language in `meeting_summaries`.",
-        "- active_client_issues (section_id active_client_issues): Primary source is `active_client_insights` only "
-        "(client_state_synthesis, priorities, next_steps, wins). These reflect ACTIVE clients. "
-        "If `active_client_insights` is empty, acknowledge that gap in the body—do not substitute generic objections here.",
-        "- testimonials_wins (section_id testimonials_wins): Ground in `insights[].wins`, `insights[].testimonial_stories`, "
-        "proof-oriented lines in `themes`/`meeting_summaries` when they describe outcomes or credibility.",
-        "- pain_points_and_dream_outcomes (section_id pain_points_and_dream_outcomes): Ground in `themes`, "
-        "`insights[].priorities`, `insights[].client_state_synthesis`, and pains/desired outcomes in `meeting_summaries`.",
-        "",
-        f"Counts for calibration: themes={len(themes)}, call_insight_rows={len(insights)}, "
-        f"active_client_insight_rows={len(active)}, meeting_summaries={len(summaries)}, "
-        f"objection_quote_lines≈{n_obj}, wins_lines≈{n_wins}, testimonial_story_lines≈{n_test}.",
-        "",
-        "REQUIREMENTS when data exists:",
-        "- Each section `body` must clearly reflect its pillar sources (paraphrase; short quotes OK).",
-        "- Each TOF/MOF/BOF idea in a section must tie hook + concept + why_it_works to that section’s pillar—"
-        "reference the concrete objection, active-client friction, win, or pain/outcome the data suggests.",
-        "- voice_marketing: Synthesize language, hook structures, and what works from `insights` "
-        "(phrases_that_resonated, tone_notes, avoid_phrasing) plus `meeting_summaries` when they show phrasing that converts.",
-    ]
-    if active:
-        lines.append(
-            "- active_client_insights is non-empty: active_client_issues MUST cite delivery/retention themes from those rows."
-        )
-    else:
-        lines.append(
-            "- active_client_insights is empty: keep active_client_issues honest—short body, no fake delivery detail."
-        )
-    return "\n".join(lines)
+    return (
+        "DATA_AVAILABILITY: Fathom + call-insight signals are present. Mine them — do not invent facts, "
+        "do not name clients, paraphrase quotes.\n"
+        "\n"
+        "STAGE → FATHOM SOURCE MAPPING (each stage uses different fields):\n"
+        "- TOF (Top of funnel — trending hooks for cold viewers): Mine the most attention-grabbing pains, "
+        "  shocks, polarizing beliefs, surprising stats, and emotional one-liners visible in `themes` "
+        "  (sample_quotes), `insights[].priorities`, `insights[].client_state_synthesis`, and the most vivid "
+        "  language inside `meeting_summaries`. Concepts must feel scroll-stopping for someone who has never "
+        "  heard of the brand. Tie each one back to the ICP's surface-level pain in INTELLIGENCE_PROFILE.\n"
+        "- MOF (Middle of funnel — education concepts from sales calls): Mine education and reframes the "
+        "  founder uses on calls — `insights[].phrases_that_resonated`, `insights[].priorities`, "
+        "  `insights[].client_state_synthesis`, `meeting_summaries` where teaching/explaining happens, and "
+        "  `themes` describing decision-making patterns or objections to pre-handle. Concepts must teach a "
+        "  framework, decision rule, or myth-bust — not pitch.\n"
+        "- BOF (Bottom of funnel — client wins & case studies): Mine ONLY `insights[].wins`, "
+        "  `insights[].testimonial_stories`, and `active_client_insights[].wins` for outcomes that match the "
+        "  business's promise. If those arrays are empty, say so honestly in the stage intro and produce "
+        "  fewer concepts (or 0). Never fabricate a result.\n"
+        "\n"
+        f"Counts for calibration: themes={len(themes)}, insights={len(insights)}, "
+        f"active_client_insights={len(active)}, meeting_summaries={len(summaries)}, "
+        f"objection_quotes≈{n_obj}, wins≈{n_wins}, testimonial_stories≈{n_test}."
+    )
 
 
 def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
-    """Stable hash when underlying Fathom/insight data meaningfully changes."""
+    """Stable hash that flips when underlying Fathom / insight data meaningfully changes."""
     sig = collect_fathom_sales_signals(db, org_id)
     transcript_analyses_count = (
         db.query(ContentStudioTranscriptAnalysis)
@@ -118,13 +111,14 @@ def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
     )
     themes = sig.get("themes") or []
     tk = sorted(
-        f"{(t.get('theme_key') or '')}:{int(t.get('occurrence_count') or 0)}" for t in themes if isinstance(t, dict)
+        f"{(t.get('theme_key') or '')}:{int(t.get('occurrence_count') or 0)}"
+        for t in themes
+        if isinstance(t, dict)
     )
     insights = sig.get("insights") or []
     ic = len(insights)
     ac = len(sig.get("active_client_insights") or [])
     ms = len(sig.get("meeting_summaries") or [])
-    # Hash last few insight payloads lightly so new call insights move the needle
     tail = hash(
         tuple(
             hash(json.dumps(x, sort_keys=True, default=str)[:400])
@@ -132,6 +126,7 @@ def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
         )
     )
     payload = {
+        "v": BUNDLE_VERSION,
         "tk": tk[:50],
         "ic": ic,
         "ac": ac,
@@ -144,59 +139,46 @@ def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def _ensure_idea_ids(ideas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for row in ideas:
-        if not isinstance(row, dict):
-            continue
-        rid = str(row.get("id") or "").strip() or str(uuid.uuid4())
-        st = str(row.get("stage") or "").upper()
-        if st not in ("TOF", "MOF", "BOF"):
-            continue
-        out.append(
-            {
-                "id": rid,
-                "stage": st,
-                "hook": str(row.get("hook") or "")[:2000],
-                "concept": str(row.get("concept") or row.get("reel_concept") or "")[:2000],
-                "why_it_works": str(row.get("why_it_works") or row.get("personalized_rationale") or "")[:3000],
-                "format": str(row.get("format") or "reel")[:64],
-            }
-        )
-    return out
-
-
-def _normalize_section(raw: Dict[str, Any], fallback_id: str, fallback_title: str, fallback_hint: str) -> Dict[str, Any]:
-    ideas = _ensure_idea_ids(raw.get("ideas") if isinstance(raw.get("ideas"), list) else [])
-    # enforce one per stage if possible
-    by_stage = {"TOF": None, "MOF": None, "BOF": None}
-    for x in ideas:
-        s = x.get("stage")
-        if s in by_stage and by_stage[s] is None:
-            by_stage[s] = x
-    ordered: List[Dict[str, Any]] = []
-    for st in ("TOF", "MOF", "BOF"):
-        if by_stage[st]:
-            ordered.append(by_stage[st])
-    if len(ordered) < 3:
-        # pad with placeholders
-        for st in ("TOF", "MOF", "BOF"):
-            if not any(i.get("stage") == st for i in ordered):
-                ordered.append(
-                    {
-                        "id": str(uuid.uuid4()),
-                        "stage": st,
-                        "hook": f"[Add hook for {st}]",
-                        "concept": "Short vertical video; talking head or b-roll illustrating this theme.",
-                        "why_it_works": "Addresses this section’s theme using patterns from your calls.",
-                        "format": "reel",
-                    }
-                )
+def _normalize_concept(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Coerce a raw concept dict from the LLM into the strict on-disk shape."""
+    if not isinstance(raw, dict):
+        return None
+    fmt = str(raw.get("format") or "short").lower().strip()
+    if fmt not in ALLOWED_FORMATS:
+        fmt = "short"
+    title = str(raw.get("title") or raw.get("hook") or "").strip()
+    if not title:
+        return None
+    bullets_in = raw.get("bullets") if isinstance(raw.get("bullets"), list) else []
+    bullets: List[str] = []
+    for b in bullets_in[:8]:
+        s = str(b).strip()
+        if s:
+            bullets.append(s[:400])
+    why = str(raw.get("why_for_icp") or raw.get("why_it_works") or "").strip()[:1200]
+    funnel = str(raw.get("funnel_path_to_sale") or raw.get("path_to_sale") or "").strip()[:600]
     return {
-        "id": str(raw.get("section_id") or raw.get("id") or fallback_id),
-        "title": str(raw.get("title") or fallback_title)[:200],
-        "body": str(raw.get("body") or raw.get("paragraph") or fallback_hint)[:4000],
-        "ideas": ordered[:3],
+        "id": str(raw.get("id") or uuid.uuid4()),
+        "format": fmt,
+        "title": title[:240],
+        "bullets": bullets,
+        "why_for_icp": why,
+        "funnel_path_to_sale": funnel,
+    }
+
+
+def _normalize_stage(raw: Dict[str, Any], stage: str, fallback_title: str, fallback_intro: str) -> Dict[str, Any]:
+    concepts_in = raw.get("concepts") if isinstance(raw.get("concepts"), list) else []
+    concepts_out: List[Dict[str, Any]] = []
+    for c in concepts_in:
+        norm = _normalize_concept(c)
+        if norm:
+            concepts_out.append(norm)
+    return {
+        "id": stage,
+        "title": str(raw.get("title") or fallback_title)[:240],
+        "intro": str(raw.get("intro") or raw.get("body") or fallback_intro)[:1200],
+        "concepts": concepts_out[:8],
     }
 
 
@@ -207,6 +189,7 @@ def draft_content_studio_bundle_llm(
     signals: Dict[str, Any],
     fingerprint: str,
 ) -> Optional[Dict[str, Any]]:
+    """LLM-only TOF / MOF / BOF concept generator grounded in Fathom + ICP."""
     if not llm_available():
         return None
     profile = extract_ai_profile_for_llm(user_row) or {}
@@ -215,63 +198,48 @@ def draft_content_studio_bundle_llm(
     if len(data_block) > 48000:
         data_block = data_block[:48000] + "\n…[truncated]"
 
-    grounding = _sales_data_grounding_block(signals)
+    grounding = _stage_grounding_block(signals)
 
     system = """You are a short-form video content strategist for coaches and service businesses.
 Return ONLY valid JSON (no markdown) with this exact top-level shape:
 {
-  "sections": [
+  "stages": [
     {
-      "section_id": "common_objections",
-      "title": "string (use or improve the suggested title)",
-      "body": "string — one focused paragraph (3-6 sentences) grounded ONLY in DATA for THIS theme: recurring objections and hesitation from calls.",
-      "ideas": [
-        { "stage": "TOF", "hook": "string", "concept": "string — reel/visual approach only, no caption/post text", "why_it_works": "string — 2-4 sentences" },
-        { "stage": "MOF", "hook": "string", "concept": "string", "why_it_works": "string" },
-        { "stage": "BOF", "hook": "string", "concept": "string", "why_it_works": "string" }
+      "id": "TOF",
+      "title": "string",
+      "intro": "string — 1-2 sentence description of this stage's role for THIS business",
+      "concepts": [
+        {
+          "format": "long" | "short",
+          "title": "string — concept headline (NOT a script line, NOT a hook to be read on camera)",
+          "bullets": ["string — concrete shot/structure beat"],
+          "why_for_icp": "string — 2-3 sentences tying this concept to the ICP from INTELLIGENCE_PROFILE (who they are, what they want, why this lands)",
+          "funnel_path_to_sale": "string — 1 sentence: how this piece intentionally moves the viewer one step closer to a sale of the operator's offer"
+        }
       ]
     },
-    {
-      "section_id": "active_client_issues",
-      "title": "string",
-      "body": "paragraph for active-client friction, adherence, expectations (from DATA).",
-      "ideas": [ same 3 objects TOF, MOF, BOF ]
-    },
-    {
-      "section_id": "testimonials_wins",
-      "title": "string",
-      "body": "paragraph for wins, proof, stories to amplify.",
-      "ideas": [ TOF, MOF, BOF ]
-    },
-    {
-      "section_id": "pain_points_and_dream_outcomes",
-      "title": "string",
-      "body": "paragraph for pains and desired outcomes prospects repeat.",
-      "ideas": [ TOF, MOF, BOF ]
-    }
-  ],
-  "voice_marketing": {
-    "title": "string — e.g. Language, tonality & what is working on calls",
-    "body": "string — one paragraph on tone, hook structures, phrases that land, what to mirror vs avoid",
-    "bullets": ["string", "..."] 
-  }
+    { "id": "MOF", "title": "string", "intro": "string", "concepts": [ ... ] },
+    { "id": "BOF", "title": "string", "intro": "string", "concepts": [ ... ] }
+  ]
 }
-Rules:
-- Each section's ideas MUST include exactly one TOF, one MOF, one BOF in that order.
-- No captions or social post copy. Hooks + reel concepts + why_it_works only.
-- When SIGNALS contain Fathom/sales-behavior data, each section MUST follow the pillar→source mapping in GROUNDING (same section_id). Do not copy one generic paragraph into all four sections.
-- common_objections: objections/hesitation from themes + insights + meeting_summaries—not active-client delivery issues.
-- active_client_issues: prioritize `active_client_insights` only; if that array is empty, acknowledge thin data—do not relabel prospect objections as active-client issues.
-- testimonials_wins: wins, proof, testimonial_stories—different angle than objections.
-- pain_points_and_dream_outcomes: recurring pains and desired outcomes from themes, priorities, synthesis, summaries.
-- If DATA is thin for one pillar only, say so briefly in that section's body and use sensible expert defaults for that section alone.
-- No PII: no full names; paraphrase.
-- Deeper patterns for mirroring in marketing: voice_marketing (prospect_voice + summaries)."""
 
-    user = f"""INTELLIGENCE_PROFILE:
+HARD RULES:
+- Output ONLY the three stages: TOF, MOF, BOF — in that order.
+- Each stage gives 4-6 concepts. Mix `format`: at least one "long" and at least one "short" per stage when data supports it.
+- NEVER write scripts, captions, hooks-as-VO, voiceover lines, or social copy. `bullets` describe structure / shots / beats only.
+- Concepts must be PURELY grounded in Fathom signals + INTELLIGENCE_PROFILE. Do not invent facts, names, numbers, or claims.
+- Stage purpose:
+  - TOF: trending, scroll-stopping concepts that mine the most attention-grabbing pains/shocks/beliefs from Fathom data and tie back to the ICP's surface-level pain.
+  - MOF: education concepts the operator already teaches on sales calls (frameworks, reframes, decision rules, myth-busts). Pre-handles objections.
+  - BOF: client wins & case study breakdowns from `insights[].wins`, `insights[].testimonial_stories`, `active_client_insights[].wins`. If those are empty, return fewer or 0 BOF concepts and say so in the stage intro — never fabricate.
+- Every concept MUST include `funnel_path_to_sale`. The piece is intentionally curated to bring the viewer one step closer to buying the operator's offer.
+- Every concept MUST include `why_for_icp` referencing the ICP fields in INTELLIGENCE_PROFILE (target_audience, business_description, unique_selling_proposition, pipeline_priorities, offer_ladder).
+- No PII (no full names). Paraphrase any quotes."""
+
+    user = f"""INTELLIGENCE_PROFILE (ICP, offer ladder, USP, voice — anchor every concept to this):
 {profile_block}
 
-GROUNDING (mandatory pillar mapping—follow when building sections):
+GROUNDING (mandatory stage → Fathom field mapping):
 {grounding}
 
 SIGNALS (Fathom meeting summaries, org themes, call insights, active-client insights):
@@ -281,39 +249,28 @@ Fingerprint (opaque): {fingerprint}
 """
 
     try:
-        raw = chat_json(system, user, temperature=0.35, org_id=org_id)
+        raw = chat_json(system, user, temperature=0.4, org_id=org_id)
     except Exception as e:
         logger.exception("content studio bundle LLM: %s", e)
         return None
 
     if not isinstance(raw, dict):
         return None
-    secs_in = raw.get("sections")
-    if not isinstance(secs_in, list):
+    stages_in = raw.get("stages")
+    if not isinstance(stages_in, list):
         return None
 
-    sections_out: List[Dict[str, Any]] = []
-    for i, spec in enumerate(SECTION_SPECS):
-        sid, default_title, hint = spec
-        src = secs_in[i] if i < len(secs_in) and isinstance(secs_in[i], dict) else {}
-        merged = dict(src)
-        merged.setdefault("section_id", sid)
-        merged.setdefault("title", default_title)
-        sections_out.append(_normalize_section(merged, sid, default_title, hint))
+    by_stage: Dict[str, Dict[str, Any]] = {}
+    for entry in stages_in:
+        if isinstance(entry, dict):
+            sid = str(entry.get("id") or "").upper().strip()
+            if sid in STAGE_SET and sid not in by_stage:
+                by_stage[sid] = entry
 
-    vm = raw.get("voice_marketing")
-    if not isinstance(vm, dict):
-        vm = {}
-    bullets = vm.get("bullets")
-    if not isinstance(bullets, list):
-        bullets = []
-    bullets = [str(b)[:500] for b in bullets[:12] if str(b).strip()]
-
-    voice_out = {
-        "title": str(vm.get("title") or "Language, tonality & what is working on calls")[:200],
-        "body": str(vm.get("body") or "")[:5000],
-        "bullets": bullets,
-    }
+    stages_out: List[Dict[str, Any]] = []
+    for stage, default_title, default_intro in STAGE_SPECS:
+        src = by_stage.get(stage, {})
+        stages_out.append(_normalize_stage(src, stage, default_title, default_intro))
 
     batch_id = str(uuid.uuid4())
     return {
@@ -322,54 +279,71 @@ Fingerprint (opaque): {fingerprint}
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "batch_id": batch_id,
         "source": "llm",
-        "sections": sections_out,
-        "voice_marketing": voice_out,
+        "stages": stages_out,
     }
 
 
 def default_bundle_placeholder(fingerprint: str) -> Dict[str, Any]:
-    """When LLM unavailable: minimal structure so UI still renders."""
+    """Minimal v3 bundle when LLM is unavailable so the UI still renders the new shape."""
     batch_id = str(uuid.uuid4())
-    sections: List[Dict[str, Any]] = []
-    for sid, title, hint in SECTION_SPECS:
-        ideas = []
-        for st in ("TOF", "MOF", "BOF"):
-            ideas.append(
-                {
-                    "id": str(uuid.uuid4()),
-                    "stage": st,
-                    "hook": f"[{st}] Hook tied to: {title}",
-                    "concept": "15–30s vertical: talking head or simple b-roll; one clear visual metaphor.",
-                    "why_it_works": "Connects this funnel stage to the theme; refine when call data is synced.",
-                    "format": "reel",
-                }
-            )
-        sections.append({"id": sid, "title": title, "body": hint, "ideas": ideas})
+    stages: List[Dict[str, Any]] = []
+    for stage, title, intro in STAGE_SPECS:
+        concept_seeds = (
+            (
+                "long",
+                "Concept idea will draft here once Fathom calls sync",
+                ["Connect Fathom to mine real call moments for this stage."],
+            ),
+            (
+                "short",
+                "Concept idea will draft here once Fathom calls sync",
+                ["Once calls are present, the LLM will mine signals tied to your ICP."],
+            ),
+        )
+        stages.append(
+            {
+                "id": stage,
+                "title": title,
+                "intro": intro,
+                "concepts": [
+                    {
+                        "id": str(uuid.uuid4()),
+                        "format": fmt,
+                        "title": ttl,
+                        "bullets": list(b),
+                        "why_for_icp": (
+                            "Once Fathom calls + Intelligence ICP are populated, this section will tie each "
+                            "concept to the audience and offer described in your Intelligence profile."
+                        ),
+                        "funnel_path_to_sale": (
+                            "Will explain the exact next funnel step (consume more → DM/comment → book "
+                            "discovery → buy) once data is available."
+                        ),
+                    }
+                    for (fmt, ttl, b) in concept_seeds
+                ],
+            }
+        )
     return {
         "version": BUNDLE_VERSION,
         "signals_fingerprint": fingerprint,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "batch_id": batch_id,
         "source": "default",
-        "sections": sections,
-        "voice_marketing": {
-            "title": "Language, tonality & what is working on calls",
-            "body": (
-                "Configure Fathom and sync calls to populate tone, hook structures, and phrases that convert. "
-                "Until then: keep hooks concrete, speak in second person, lead with tension then relief, "
-                "and mirror prospect language from your Intelligence profile."
-            ),
-            "bullets": [
-                "Short hooks: tension → specific promise → proof cue.",
-                "Match energy to your audience: calm authority vs. high-energy motivation.",
-                "Reuse exact phrases prospects use once you have transcripts.",
-            ],
-        },
+        "stages": stages,
     }
 
 
 def flatten_bundle_idea_ids(bundle: Dict[str, Any]) -> List[str]:
+    """Used for completion-tracking validation — walk the v3 stages.concepts shape."""
     ids: List[str] = []
+    for stage in bundle.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        for concept in stage.get("concepts") or []:
+            if isinstance(concept, dict) and concept.get("id"):
+                ids.append(str(concept["id"]))
+    # Backwards-compat: tolerate v2 sections-shape rows that still contain ideas.
     for sec in bundle.get("sections") or []:
         if not isinstance(sec, dict):
             continue

@@ -1,6 +1,8 @@
 from pydantic import BaseModel
 from typing import List, Optional
 
+from app.schemas.admin import HealthTrendPeriod
+
 
 class CalendarMonthlyRateRow(BaseModel):
     """Monthly show-up and sales-close rates for an org's calendar tab."""
@@ -14,3 +16,9 @@ class CalendarMonthlyRateRow(BaseModel):
 
 class CalendarMonthlyCoachingResponse(BaseModel):
     periods: List[CalendarMonthlyRateRow]
+
+
+class TerminalMonthlyTrendsResponse(BaseModel):
+    """Monthly org health trends for the unified Terminal dashboard."""
+
+    periods: List[HealthTrendPeriod]

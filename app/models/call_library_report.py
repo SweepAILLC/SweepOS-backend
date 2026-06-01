@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, String, DateTime, Text, ForeignKey, Index, Float
+from sqlalchemy import BigInteger, Boolean, Column, String, DateTime, Text, ForeignKey, Index, Float
 from sqlalchemy.dialects.postgresql import UUID, JSON
 from sqlalchemy.orm import relationship
 
@@ -30,6 +30,14 @@ class CallLibraryReport(Base):
     call_title_override = Column(Text, nullable=True)  # user-defined display name (wins in UI)
 
     call_score = Column(Float, nullable=True)  # 0-100 sales effectiveness (LLM)
+
+    # Deal outcome surfaced when the LLM is confident the sale closed on this call.
+    # Stored in minor units (cents) to keep arithmetic exact; UI divides by 100.
+    deal_closed = Column(Boolean, nullable=False, default=False, server_default="false")
+    deal_value_cents = Column(BigInteger, nullable=True)
+    deal_currency = Column(String(8), nullable=True)  # ISO 4217 (e.g. "USD")
+    deal_billing = Column(String(32), nullable=True)  # one_time | recurring_monthly | recurring_annual
+
     recording_url = Column(Text, nullable=True)  # snapshot; no video bytes stored
     share_url = Column(Text, nullable=True)  # share link URL (when present)
     video_url = Column(Text, nullable=True)  # direct/streaming video URL (when present)

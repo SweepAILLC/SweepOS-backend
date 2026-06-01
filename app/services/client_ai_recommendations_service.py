@@ -148,7 +148,9 @@ def action_supports_email_draft(client: Client, action: Dict[str, Any]) -> bool:
         pri = 0
 
     cold = LifecycleState.COLD_LEAD.value
-    warm = LifecycleState.WARM_LEAD.value
+    nurturing = LifecycleState.NURTURING.value
+    qualified = LifecycleState.QUALIFIED.value
+    booked = LifecycleState.BOOKED.value
     active = LifecycleState.ACTIVE.value
     off = LifecycleState.OFFBOARDING.value
     dead = LifecycleState.DEAD.value
@@ -156,8 +158,12 @@ def action_supports_email_draft(client: Client, action: Dict[str, Any]) -> bool:
     eligible = {
         (cold, 1),
         (cold, 2),
-        (warm, 1),
-        (warm, 2),
+        (nurturing, 1),
+        (nurturing, 2),
+        (qualified, 1),
+        (qualified, 2),
+        (booked, 1),
+        (booked, 2),
         (active, 3),
         (off, 2),
         (dead, 1),
@@ -238,19 +244,27 @@ def _personalized_detail_for_action(client: Client, action: Dict[str, Any]) -> s
     # Per (lifecycle, priority) — matches default_actions_for_client ordering
     if ls == LifecycleState.COLD_LEAD.value:
         if pri == 1:
-            return f"Reach {d} while your last touch is still fresh—reference what they said they want next.{nh}"
+            return f"Re-engage {d} with a specific hook—the follow-up window has elapsed.{nh}"
         if pri == 2:
-            return f"Reduce friction for {d}: one calendar link or concrete offer beats a vague “let me know.”{nh}"
-        if pri == 3:
-            return f"If {d} mentioned how they found you, log it—best leads often come from the same channels."
+            return f"Offer {d} one low-friction next step (content, audit, or short call) before archiving.{nh}"
 
-    if ls == LifecycleState.WARM_LEAD.value:
+    if ls == LifecycleState.QUALIFIED.value:
         if pri == 1:
-            return f"On your next message to {d}, confirm fit on goals, timeline, and budget so nothing stalls quietly.{nh}"
+            return f"Reach {d} while interest is fresh—reference what they opted in for.{nh}"
         if pri == 2:
-            return f"Send {d} a tight recap of options and a single CTA—decision energy fades fast.{nh}"
-        if pri == 3:
-            return f"Warm leads like {d} often know peers in the same situation—plant a soft referral seed after value lands."
+            return f"Move {d} toward a booked sales call with one calendar link or concrete offer.{nh}"
+
+    if ls == LifecycleState.BOOKED.value:
+        if pri == 1:
+            return f"Confirm goals, timeline, and budget with {d} before the sales call.{nh}"
+        if pri == 2:
+            return f"Send {d} a tight pre-call recap and what to prepare.{nh}"
+
+    if ls == LifecycleState.NURTURING.value:
+        if pri == 1:
+            return f"The sales call did not close—ask {d} what blocked the decision and address it directly.{nh}"
+        if pri == 2:
+            return f"Send {d} a nurture sequence with one new angle (case study, offer tweak, or deadline).{nh}"
 
     if ls == LifecycleState.ACTIVE.value:
         if pri == 1:
@@ -316,20 +330,34 @@ def default_actions_for_client(client: Client) -> tuple[Optional[str], List[Dict
 
     if ls == LifecycleState.COLD_LEAD.value:
         return (
-            "Move this lead toward a booked conversation",
+            "Re-engage after follow-up timer expired",
+            [
+                _new_action("Send a low-pressure check-in with a specific hook", category="win_back", priority=1),
+                _new_action("Offer one simple way to restart (call, audit, or trial)", category="conversion", priority=2),
+            ],
+        )
+    if ls == LifecycleState.QUALIFIED.value:
+        return (
+            "Move this opt-in toward a booked conversation",
             [
                 _new_action("Send a personalized follow-up within 24–48 hours", category="conversion", priority=1),
                 _new_action("Offer a clear next step (short call, audit, or trial)", category="conversion", priority=2),
-                _new_action("Capture referral source if they mentioned how they found you", category="referral", priority=3),
             ],
         )
-    if ls == LifecycleState.WARM_LEAD.value:
+    if ls == LifecycleState.BOOKED.value:
         return (
-            "Convert interest into a committed start",
+            "Prepare for the sales conversation",
             [
-                _new_action("Confirm goals, timeline, and budget fit on the next touchpoint", category="conversion", priority=1),
-                _new_action("Send program/options summary and booking link", category="conversion", priority=2),
-                _new_action("Ask who else they train with or know (referral seed)", category="referral", priority=3),
+                _new_action("Confirm goals, timeline, and budget fit before the call", category="conversion", priority=1),
+                _new_action("Send program/options summary and pre-call prep", category="conversion", priority=2),
+            ],
+        )
+    if ls == LifecycleState.NURTURING.value:
+        return (
+            "Recover the deal after a no-close sales call",
+            [
+                _new_action("Ask what blocked the decision and address objections directly", category="conversion", priority=1),
+                _new_action("Send a nurture follow-up with one new angle or offer tweak", category="conversion", priority=2),
             ],
         )
     if ls == LifecycleState.ACTIVE.value:

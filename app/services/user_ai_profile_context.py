@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,104 @@ _SALES_LENS_KEYS = (
     "coaching_style",
     "client_management_philosophy",
 )
+
+_WRITING_SAMPLE_KINDS = frozenset(
+    {
+        "email",
+        "message",
+        "other",
+        # Campaign-style samples (carry HTML template + auto-resolve in playbooks).
+        "onboarding_email",
+        "referral_campaign",
+        "upsell_campaign",
+        "re_sign_campaign",
+    }
+)
+_MAX_WRITING_SAMPLES = 12
+_MAX_WRITING_SAMPLE_BODY = 3500
+_MAX_WRITING_SAMPLE_HTML = 12000
+_MAX_WRITING_SAMPLE_TITLE = 120
+
+
+def normalize_writing_samples_for_llm(raw: Any) -> Optional[List[Dict[str, str]]]:
+    """
+    Sanitize user-provided writing examples for prompt injection.
+
+    Each item: kind (email | message | other | onboarding_email | referral_campaign |
+    upsell_campaign | re_sign_campaign), optional title, body and/or html_template
+    (at least one required).
+    """
+    if not isinstance(raw, list):
+        return None
+    out: List[Dict[str, str]] = []
+    for item in raw:
+        if len(out) >= _MAX_WRITING_SAMPLES:
+            break
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "other").strip().lower()
+        if kind not in _WRITING_SAMPLE_KINDS:
+            kind = "other"
+        body = str(item.get("body") or "").strip()
+        html_t = str(item.get("html_template") or "").strip()
+        if not body and not html_t:
+            continue
+        title = str(item.get("title") or "").strip()[:_MAX_WRITING_SAMPLE_TITLE]
+        rec: Dict[str, str] = {"kind": kind}
+        if body:
+            rec["body"] = body[:_MAX_WRITING_SAMPLE_BODY]
+        if html_t:
+            rec["html_template"] = html_t[:_MAX_WRITING_SAMPLE_HTML]
+        if title:
+            rec["title"] = title
+        out.append(rec)
+    return out or None
+
+
+def resolve_performance_campaign_templates_for_task(
+    ai_profile: Any,
+    roi_tags: Any,
+    *,
+    lifecycle: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """
+    Pick Intelligence writing samples that match Performance ROI tags / lifecycle for campaign HTML tools.
+
+    referral tag → referral_campaign sample; upsell → upsell_campaign;
+    offboarding lifecycle (re-commit / re-sign) → re_sign_campaign.
+    At most one sample per campaign kind (first in saved order wins).
+    """
+    if not isinstance(ai_profile, dict):
+        return []
+    samples = normalize_writing_samples_for_llm(ai_profile.get("writing_samples"))
+    if not samples:
+        return []
+    tags: Set[str] = set()
+    if isinstance(roi_tags, list):
+        tags = {str(t).lower().strip() for t in roi_tags if str(t).strip()}
+    ls = (lifecycle or "").lower().strip()
+    out: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    def take(kind: str) -> None:
+        if kind in seen:
+            return
+        for s in samples:
+            if s.get("kind") == kind:
+                out.append(dict(s))
+                seen.add(kind)
+                break
+
+    if "referral" in tags:
+        take("referral_campaign")
+    if "upsell" in tags:
+        take("upsell_campaign")
+    # Re-sign / renewal / recommit — ops often save templates under re_sign_campaign
+    if ls == "offboarding":
+        take("re_sign_campaign")
+
+    return out[:3]
+
 
 _SALES_LENS_CAPS = {
     "sales_framework": 200,
@@ -75,6 +173,37 @@ def resolve_org_sales_lens(db: Session, org_id: uuid.UUID) -> Optional[Dict[str,
     return None
 
 
+_EMAIL_TEMPLATE_SNIPPET_MAX = 2500
+
+
+def extract_intelligence_profile_for_automation_llm(user: Any) -> Optional[Dict[str, Any]]:
+    """Per-org Intelligence export for automation email AI drafts (worker + preview).
+
+    Includes the same sanitized fields as :func:`extract_ai_profile_for_llm`, plus
+    email-branding metadata and a truncated HTML-template snippet so the model knows
+    what exists in Intelligence without dumping an entire multi-kB wrapper into every
+    prompt. Outer branding is still applied server-side when sending.
+    """
+    base = extract_ai_profile_for_llm(user)
+    raw = getattr(user, "ai_profile", None) if user else None
+    if not isinstance(raw, dict):
+        raw = {}
+    tpl = str(raw.get("email_html_template") or "").strip()
+    if base is None and not tpl:
+        return None
+    out: Dict[str, Any] = dict(base) if base else {}
+    out["email_html_template_enabled"] = bool(raw.get("email_html_template_enabled"))
+    if tpl:
+        if len(tpl) > _EMAIL_TEMPLATE_SNIPPET_MAX:
+            out["email_html_template_snippet"] = (
+                tpl[:_EMAIL_TEMPLATE_SNIPPET_MAX]
+                + "\n… [truncated; full wrapper is applied automatically when the email is sent]"
+            )
+        else:
+            out["email_html_template_snippet"] = tpl
+    return out
+
+
 def extract_ai_profile_for_llm(user: Any) -> Optional[Dict[str, Any]]:
     """Return a sanitized dict of Intelligence personalization fields, or None if empty."""
     if not user:
@@ -114,4 +243,7 @@ def extract_ai_profile_for_llm(user: Any) -> Optional[Dict[str, Any]]:
     ladder = offer_ladder_for_llm(extract_offer_ladder(raw))
     if ladder:
         out["offer_ladder"] = ladder
+    samples = normalize_writing_samples_for_llm(raw.get("writing_samples"))
+    if samples:
+        out["writing_samples"] = samples
     return out if out else None

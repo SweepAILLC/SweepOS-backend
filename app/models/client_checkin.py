@@ -30,6 +30,12 @@ class ClientCheckIn(Base):
     # Attendee information (for matching)
     attendee_email = Column(String, nullable=False, index=True)  # Email used to match with client
     attendee_name = Column(String, nullable=True)
+
+    # Provider event-type identity (Cal.com eventType.id as string, Calendly event_type URI).
+    # Captured at sync / webhook time so automation rules can target a specific event type
+    # (e.g. "Discovery Call") without re-parsing raw_event_data on every trigger.
+    event_type_id = Column(String, nullable=True, index=True)
+    event_type_label = Column(String, nullable=True)
     
     # Status
     completed = Column(Boolean, default=False, nullable=False)  # True if meeting has passed

@@ -382,7 +382,9 @@ def build_roi_signal_tasks(
                 (
                     LifecycleState.ACTIVE,
                     LifecycleState.OFFBOARDING,
-                    LifecycleState.WARM_LEAD,
+                    LifecycleState.BOOKED,
+                    LifecycleState.QUALIFIED,
+                    LifecycleState.NURTURING,
                     LifecycleState.COLD_LEAD,
                 )
             ),
@@ -686,9 +688,11 @@ def build_diagnosis(
     failed_count: int,
 ) -> Dict[str, str]:
     cold = lifecycle.get("cold_lead", 0)
-    warm = lifecycle.get("warm_lead", 0)
+    nurturing = lifecycle.get("nurturing", 0)
+    qualified = lifecycle.get("qualified", 0)
+    booked = lifecycle.get("booked", 0)
     active = lifecycle.get("active", 0)
-    total_leads = cold + warm
+    total_leads = cold + nurturing + qualified + booked
     total_visitors = sum(f.get("total_visitors", 0) or 0 for f in funnel_summaries)
     worst_conv = 0.0
     if funnel_summaries:
@@ -704,12 +708,13 @@ def build_diagnosis(
         traffic = "ok"
         traffic_hint = "Traffic volume looks workable vs. your current base."
 
-    if warm > 0 and active > 0 and warm > active * 4:
+    pipeline_leads = nurturing + qualified + booked
+    if pipeline_leads > 0 and active > 0 and pipeline_leads > active * 4:
         nurture = "risk"
-        nurture_hint = "Many warm leads vs. actives — nurture or sales follow-up may be bottlenecked."
-    elif warm > 12 and active < 5:
+        nurture_hint = "Many pre-active leads vs. actives — nurture or sales follow-up may be bottlenecked."
+    elif pipeline_leads > 12 and active < 5:
         nurture = "watch"
-        nurture_hint = "Warm inventory is high relative to active clients."
+        nurture_hint = "Lead inventory is high relative to active clients."
     else:
         nurture = "ok"
         nurture_hint = "Warm/active balance is within a normal range."
@@ -748,7 +753,9 @@ def _pct_change(prev: float, curr: float) -> Optional[float]:
 def _pipeline_strip_from_lifecycle(lifecycle: Dict[str, int]) -> Dict[str, Any]:
     columns = [
         ("cold_lead", "Cold"),
-        ("warm_lead", "Warm"),
+        ("nurturing", "Nurture"),
+        ("qualified", "Qualified"),
+        ("booked", "Booked"),
         ("active", "Active"),
         ("offboarding", "Offboarding"),
         ("dead", "Dead"),
@@ -800,7 +807,7 @@ def build_signals_insights(
     cash_mtd: float,
     cash_mtd_prev: float,
     mrr: float,
-    warm: int,
+    pipeline_leads: int,
     active: int,
 ) -> List[str]:
     insights: List[str] = []
@@ -856,9 +863,9 @@ def build_signals_insights(
                 "— protect pipeline quality and avoid slowing follow-ups."
             )
 
-    if warm > 0 and active > 0 and warm > active * 3:
+    if pipeline_leads > 0 and active > 0 and pipeline_leads > active * 3:
         insights.append(
-            f"Warm leads ({warm}) outweigh actives ({active}) — focus on moving warm to started/paid this week."
+            f"Pipeline leads ({pipeline_leads}) outweigh actives ({active}) — focus on moving booked/nurturing to paid this week."
         )
 
     if mrr > 0 and cash_pct is not None and cash_pct < -10.0:
@@ -880,7 +887,10 @@ def build_tasks(
     lifecycle = snapshot.get("pipeline") or {}
     counts = lifecycle.get("lifecycle_counts") or {}
     cold = int(counts.get("cold_lead", 0) or 0)
-    warm = int(counts.get("warm_lead", 0) or 0)
+    nurturing = int(counts.get("nurturing", 0) or 0)
+    qualified = int(counts.get("qualified", 0) or 0)
+    booked = int(counts.get("booked", 0) or 0)
+    pipeline_leads = cold + nurturing + qualified + booked
     active = int(counts.get("active", 0) or 0)
     revenue = snapshot.get("revenue") or {}
     mrr = float(revenue.get("mrr", 0) or 0)
@@ -888,39 +898,44 @@ def build_tasks(
     failed = snapshot.get("failed_payments") or {}
     failed_count = int(failed.get("count", 0) or 0)
 
-    if cold + warm < 5:
+    if pipeline_leads < 5:
         tasks.append(
             {
                 "id": "pipeline.low_lead_inventory",
                 "title": "Grow lead inventory",
                 "category": "pipeline",
                 "impact_score": 72.0,
-                "evidence": {"cold_lead": cold, "warm_lead": warm},
+                "evidence": {
+                    "cold_lead": cold,
+                    "nurturing": nurturing,
+                    "qualified": qualified,
+                    "booked": booked,
+                },
                 "recommended_actions": [
                     "Run one list-building or outbound block this week",
                     "Ensure every inbound lead lands in Terminal within 24h",
                 ],
-                "why": f"You have {cold + warm} combined cold/warm leads — thin pipeline for growth.",
+                "why": f"You have {pipeline_leads} combined pipeline leads — thin inventory for growth.",
                 "prescription": "Pick a single channel (referral, content, or paid) and add 10 qualified conversations.",
                 "next_step": "Book 2h for prospecting; log new leads in Terminal.",
             }
         )
 
-    if warm >= 8 and active < max(3, warm // 6):
+    if booked + nurturing >= 8 and active < max(3, (booked + nurturing) // 6):
         tasks.append(
             {
-                "id": "pipeline.warm_to_active_gap",
-                "title": "Convert warm leads to active clients",
+                "id": "pipeline.booked_to_active_gap",
+                "title": "Convert booked/nurturing leads to active clients",
                 "category": "pipeline",
                 "impact_score": 78.0,
-                "evidence": {"warm_lead": warm, "active": active},
+                "evidence": {"booked": booked, "nurturing": nurturing, "active": active},
                 "recommended_actions": [
-                    "Review stalled warm leads older than 14 days",
-                    "Send a direct booking or offer message to top 5 warm leads",
+                    "Review stalled booked leads older than 14 days",
+                    "Send a direct booking or offer message to top 5 booked leads",
                 ],
-                "why": f"{warm} warm leads vs {active} active — activation may be stalling.",
+                "why": f"{booked + nurturing} booked/nurturing vs {active} active — activation may be stalling.",
                 "prescription": "Tighten follow-up SLA and add one clear CTA (book / pay / start).",
-                "next_step": "Open Terminal warm column and message the oldest 5 leads today.",
+                "next_step": "Open Terminal booked column and message the oldest 5 leads today.",
             }
         )
 
@@ -1083,13 +1098,18 @@ def build_performance_snapshot(
         .scalar()
         or 0
     )
-    warm_inventory = max(1, int(lifecycle.get("warm_lead", 0) or 0))
-    warm_to_active_rate_30d = round((activated_approx / warm_inventory) * 100.0, 2)
-    new_warm_7d = (
+    lead_inventory = max(
+        1,
+        int(lifecycle.get("qualified", 0) or 0)
+        + int(lifecycle.get("booked", 0) or 0)
+        + int(lifecycle.get("nurturing", 0) or 0),
+    )
+    lead_to_active_rate_30d = round((activated_approx / lead_inventory) * 100.0, 2)
+    new_booked_7d = (
         db.query(func.count(Client.id))
         .filter(
             Client.org_id == org_id,
-            Client.lifecycle_state == LifecycleState.WARM_LEAD,
+            Client.lifecycle_state == LifecycleState.BOOKED,
             Client.created_at >= seven_ago,
         )
         .scalar()
@@ -1129,8 +1149,11 @@ def build_performance_snapshot(
     pipeline_block = {
         "lifecycle_counts": lifecycle,
         "total_clients": total_clients,
-        "warm_to_active_rate_30d": warm_to_active_rate_30d,
-        "new_warm_leads_7d": int(new_warm_7d),
+        "lead_to_active_rate_30d": lead_to_active_rate_30d,
+        "new_booked_leads_7d": int(new_booked_7d),
+        # Back-compat aliases for older clients
+        "warm_to_active_rate_30d": lead_to_active_rate_30d,
+        "new_warm_leads_7d": int(new_booked_7d),
     }
     revenue_block = {
         "mrr": round(mrr, 2),
@@ -1149,7 +1172,11 @@ def build_performance_snapshot(
     v_prior = int(agg_prior["visitors"])
     c_last = float(agg_last["conversion_rate_pct"])
     c_prior = float(agg_prior["conversion_rate_pct"])
-    warm_n = int(lifecycle.get("warm_lead", 0) or 0)
+    pipeline_leads_n = (
+        int(lifecycle.get("qualified", 0) or 0)
+        + int(lifecycle.get("booked", 0) or 0)
+        + int(lifecycle.get("nurturing", 0) or 0)
+    )
     active_n = int(lifecycle.get("active", 0) or 0)
     pct_cash_30 = _pct_change(cash_prior_30, cash_30)
     pct_mtd = _pct_change(cash_mtd_prev, cash_mtd)
@@ -1189,7 +1216,7 @@ def build_performance_snapshot(
                 cash_mtd=cash_mtd,
                 cash_mtd_prev=cash_mtd_prev,
                 mrr=mrr,
-                warm=warm_n,
+                pipeline_leads=pipeline_leads_n,
                 active=active_n,
             ),
         }

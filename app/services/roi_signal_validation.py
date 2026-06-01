@@ -13,6 +13,12 @@ OFFBOARDING_WINDOW_AFTER_END_DAYS = 21
 # for expansion tags when testimonial_trigger_at is missing (legacy rows). Set to 2 for stricter policy.
 MIN_LIFETIME_WINS_FOR_EXPANSION = 1
 
+LEAD_PIPELINE_LIFECYCLES = frozenset({"cold_lead", "nurturing", "qualified", "booked"})
+
+
+def _is_lead_pipeline(lifecycle: str) -> bool:
+    return (lifecycle or "").lower().strip() in LEAD_PIPELINE_LIFECYCLES
+
 
 def _dt_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
     if dt is None:
@@ -175,7 +181,7 @@ def normalize_display_tags_for_client(
     has_past = bool(pipe.get("has_past_sales_call"))
     open_deal = bool(pipe.get("open_sales_deal"))
 
-    if ls in ("cold_lead", "warm_lead"):
+    if _is_lead_pipeline(ls):
         out = [
             t
             for t in base
@@ -241,7 +247,7 @@ def _referral_variant_allowed(variant: Optional[str], lifecycle: str) -> bool:
         return False
     ls = (lifecycle or "").lower().strip()
     if variant == "new_lead":
-        return ls in ("cold_lead", "warm_lead")
+        return _is_lead_pipeline(ls)
     if variant == "offboarding":
         return ls == "offboarding"
     if variant == "post_testimonial":
@@ -358,7 +364,7 @@ def apply_roi_validation(
         ls = (lifecycle or "").lower().strip()
         if ls == "offboarding":
             vs = "offboarding"
-        elif ls in ("cold_lead", "warm_lead"):
+        elif _is_lead_pipeline(ls):
             vs = "new_lead"
         elif (
             testimonial_triggered
@@ -397,8 +403,8 @@ def apply_roi_validation(
 
     has_past_sales = bool(pipe.get("has_past_sales_call"))
     open_deal = bool(pipe.get("open_sales_deal"))
-    conversion_tag = ls in ("cold_lead", "warm_lead") and not has_past_sales
-    deal_follow_tag = ls in ("cold_lead", "warm_lead") and has_past_sales and open_deal
+    conversion_tag = _is_lead_pipeline(ls) and not has_past_sales
+    deal_follow_tag = _is_lead_pipeline(ls) and has_past_sales and open_deal
 
     new_tags: List[str] = []
     if roi_client:
@@ -410,7 +416,7 @@ def apply_roi_validation(
             new_tags.append("referral")
     if ls == "dead" and revive_tag:
         new_tags.append("revive")
-    if ls in ("cold_lead", "warm_lead"):
+    if _is_lead_pipeline(ls):
         if deal_follow_tag:
             new_tags.append("deal_follow_up")
         elif conversion_tag:

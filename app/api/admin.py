@@ -998,12 +998,14 @@ def get_organization_dashboard(
         if key not in email_to_clients:
             email_to_clients[key] = []
         email_to_clients[key].append(c)
-    # Priority for merged state (match frontend: active > warm_lead > cold_lead > offboarding > dead)
+    # Priority for merged state (match frontend kanban merge priority)
     state_priority = {
-        LifecycleState.ACTIVE: 5,
-        LifecycleState.WARM_LEAD: 4,
-        LifecycleState.COLD_LEAD: 3,
-        LifecycleState.OFFBOARDING: 2,
+        LifecycleState.ACTIVE: 7,
+        LifecycleState.OFFBOARDING: 6,
+        LifecycleState.BOOKED: 5,
+        LifecycleState.QUALIFIED: 4,
+        LifecycleState.NURTURING: 3,
+        LifecycleState.COLD_LEAD: 2,
         LifecycleState.DEAD: 1,
     }
     total_clients = len(email_to_clients)

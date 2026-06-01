@@ -20,6 +20,7 @@ from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
 from app.models.client import Client
+from app.models.manual_payment import ManualPayment
 from app.models.recommendation import Recommendation, RecommendationStatus
 from app.utils.stripe_ids import normalize_stripe_id, normalize_stripe_id_for_dedup
 from app.utils.stripe_helpers import collect_email_from_raw_events, extract_email_from_payment_raw
@@ -55,6 +56,72 @@ def _stripe_date_range(scope: Optional[str], range_days: int):
     else:
         start_date = end_date - timedelta(days=range_days)
     return start_date, end_date
+
+
+def _payments_window_from_params(
+    scope: Optional[str], range_days: Optional[int]
+) -> tuple[Optional[datetime], Optional[datetime]]:
+    if scope == "mtd" or range_days is not None:
+        return _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
+    return None, None
+
+
+def _manual_payment_stripe_responses(
+    db: Session,
+    org_id: uuid.UUID,
+    start_date: Optional[datetime],
+    end_date: Optional[datetime],
+    status_filter: Optional[str],
+) -> List[StripePaymentResponse]:
+    """Org manual payments as StripePaymentResponse rows (for Terminal recent transactions)."""
+    if status_filter and status_filter not in ("succeeded",):
+        return []
+
+    query = db.query(ManualPayment).filter(ManualPayment.org_id == org_id)
+    if start_date is not None and end_date is not None:
+        query = query.filter(
+            and_(
+                ManualPayment.payment_date >= start_date,
+                ManualPayment.payment_date <= end_date,
+            )
+        )
+
+    rows = query.order_by(desc(ManualPayment.payment_date)).all()
+    result: List[StripePaymentResponse] = []
+    for mp in rows:
+        client = db.query(Client).filter(Client.id == mp.client_id).first()
+        disp_name, disp_email = _payment_display_client_info(client)
+        pay_dt = mp.payment_date or mp.created_at
+        created_ts = int(pay_dt.timestamp()) if pay_dt else 0
+        method = (mp.payment_method or "manual").replace("_", " ").title()
+        result.append(
+            StripePaymentResponse(
+                id=str(mp.id),
+                stripe_id=f"manual:{mp.id}",
+                client_id=str(mp.client_id),
+                client_name=disp_name,
+                client_email=disp_email,
+                amount_cents=mp.amount_cents or 0,
+                currency=mp.currency or "usd",
+                status="succeeded",
+                subscription_id=f"Manual · {method}",
+                receipt_url=mp.receipt_url,
+                created_at=created_ts,
+            )
+        )
+    return result
+
+
+def _paginate_merged_payment_responses(
+    stripe_rows: List[StripePaymentResponse],
+    manual_rows: List[StripePaymentResponse],
+    page: int,
+    page_size: int,
+) -> List[StripePaymentResponse]:
+    merged = stripe_rows + manual_rows
+    merged.sort(key=lambda p: p.created_at or 0, reverse=True)
+    start = (page - 1) * page_size
+    return merged[start : start + page_size]
 
 
 def _extract_invoice_id_from_treasury_raw(raw_data) -> Optional[str]:
@@ -1659,39 +1726,37 @@ def get_payments(
 
         deduplicated = list(by_canonical.values())
         deduplicated.sort(key=lambda t: (t.posted_at or t.created).timestamp() if (t.posted_at or t.created) else 0, reverse=True)
-        
-        # Apply pagination after deduplication
-        total = len(deduplicated)
-        transactions = deduplicated[(page - 1) * page_size:page * page_size]
-        
-        result = []
-        for transaction in transactions:
+
+        start_date, end_date = _payments_window_from_params(scope, range_days)
+        stripe_result = []
+        for transaction in deduplicated:
             client = db.query(Client).filter(Client.id == transaction.client_id).first() if transaction.client_id else None
-            
-            # Map Treasury transaction to payment response
-            # Use flow_id or transaction_id for subscription column
+
             display_id = transaction.flow_id or transaction.stripe_transaction_id
             if transaction.flow_type and transaction.flow_type.value in ['received_credit', 'inbound_transfer']:
                 display_id = f"Flow: {display_id}"
             else:
                 display_id = f"Transaction: {display_id}"
-            
+
             disp_name, disp_email = _payment_display_client_info(client, transaction_email=transaction.customer_email)
-            result.append(StripePaymentResponse(
+            stripe_result.append(StripePaymentResponse(
                 id=str(transaction.id),
                 stripe_id=transaction.stripe_transaction_id,
                 client_id=str(transaction.client_id) if transaction.client_id else None,
                 client_name=disp_name,
                 client_email=disp_email,
-                amount_cents=abs(transaction.amount),  # Use absolute value for display
+                amount_cents=abs(transaction.amount),
                 currency=transaction.currency or "usd",
                 status="succeeded" if str(transaction.status) == "posted" else str(transaction.status),
                 subscription_id=display_id,
-                receipt_url=None,  # Treasury transactions don't have receipt URLs
+                receipt_url=None,
                 created_at=int((transaction.posted_at or transaction.created).timestamp()) if (transaction.posted_at or transaction.created) else 0
             ))
-        
-        return result
+
+        manual_result = _manual_payment_stripe_responses(
+            db, org_id, start_date, end_date, status_filter
+        )
+        return _paginate_merged_payment_responses(stripe_result, manual_result, page, page_size)
     
     # Fallback to old payment system (when use_treasury=False)
     # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
@@ -1773,29 +1838,22 @@ def get_payments(
             existing_payment = payment_map[key]
             print(f"[PAYMENTS] Skipping duplicate payment {payment.stripe_id} (type: {payment.type}) - keeping {existing_payment.stripe_id} (type: {existing_payment.type}) for {key[0]} {key[1]}")
     
-    # Sort deduplicated payments by date (most recent first) before pagination
     deduplicated.sort(key=lambda p: p.created_at.timestamp() if p.created_at else 0, reverse=True)
-    
-    # Apply pagination after deduplication
-    total = len(deduplicated)
-    payments = deduplicated[(page - 1) * page_size:page * page_size]
-    
-    result = []
-    for payment in payments:
+
+    start_date, end_date = _payments_window_from_params(scope, range_days)
+    stripe_result = []
+    for payment in deduplicated:
         client = db.query(Client).filter(Client.id == payment.client_id).first() if payment.client_id else None
-        
-        # For subscription_id field: use subscription_id if available, otherwise invoice_id, otherwise stripe_id
+
         display_subscription_id = payment.subscription_id
         if not display_subscription_id:
-            # If no subscription_id, show invoice_id if available
             if payment.invoice_id:
                 display_subscription_id = f"Invoice: {payment.invoice_id}"
             else:
-                # If no invoice_id either, show the payment ID
                 display_subscription_id = f"Payment: {payment.stripe_id}"
-        
+
         disp_name, disp_email = _payment_display_client_info(client, payment_raw_event=payment.raw_event)
-        result.append(StripePaymentResponse(
+        stripe_result.append(StripePaymentResponse(
             id=str(payment.id),
             stripe_id=payment.stripe_id,
             client_id=str(payment.client_id) if payment.client_id else None,
@@ -1808,8 +1866,11 @@ def get_payments(
             receipt_url=payment.receipt_url,
             created_at=int(payment.created_at.timestamp()) if payment.created_at else 0
         ))
-    
-    return result
+
+    manual_result = _manual_payment_stripe_responses(
+        db, org_id, start_date, end_date, status_filter
+    )
+    return _paginate_merged_payment_responses(stripe_result, manual_result, page, page_size)
 
 
 def _merge_treasury_and_stripe_failed_queues(
@@ -2042,10 +2103,31 @@ def _build_failed_payments_from_stripe_payment_table(
     return result
 
 
+def _filter_failed_payments_by_window(
+    rows: List[StripeFailedPaymentResponse],
+    scope: Optional[str],
+    range_days: Optional[int],
+) -> List[StripeFailedPaymentResponse]:
+    if scope != "mtd" and range_days is None:
+        return rows
+    start_date, end_date = _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
+
+    def in_window(r: StripeFailedPaymentResponse) -> bool:
+        ts = r.latest_attempt_at or r.created_at or 0
+        if not ts:
+            return False
+        dt = datetime.utcfromtimestamp(ts)
+        return start_date <= dt <= end_date
+
+    return [r for r in rows if in_window(r)]
+
+
 @router.get("/failed-payments", response_model=List[StripeFailedPaymentResponse])
 def get_failed_payments(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    range_days: Optional[int] = Query(None, alias="range", ge=1),
+    scope: Optional[str] = Query(None, description="Use 'mtd' for month-to-date"),
     use_treasury: bool = Query(True, description="Use Treasury Transactions API as source of truth"),
     exclude_resolved: bool = Query(False, description="Exclude resolved payments (for terminal queue)"),
     current_user: User = Depends(get_current_user),
@@ -2210,10 +2292,12 @@ def get_failed_payments(
         stripe_only = _build_failed_payments_from_stripe_payment_table(db, org_id, exclude_resolved)
         merged = _merge_treasury_and_stripe_failed_queues(result, stripe_only)
         merged.sort(key=lambda r: r.latest_attempt_at, reverse=True)
+        merged = _filter_failed_payments_by_window(merged, scope, range_days)
         return merged[(page - 1) * page_size:page * page_size]
     
     # Fallback: StripePayment table only (no Treasury rows or use_treasury=False)
     result = _build_failed_payments_from_stripe_payment_table(db, org_id, exclude_resolved)
+    result = _filter_failed_payments_by_window(result, scope, range_days)
     return result[(page - 1) * page_size:page * page_size]
 
 

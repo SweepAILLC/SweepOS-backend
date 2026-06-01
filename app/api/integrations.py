@@ -2440,8 +2440,8 @@ def create_clients_from_brevo_contacts(
                     
                     # Update lifecycle_state to cold_lead if it's currently null or if we want to reset it
                     # Only update if it's not already in a more advanced state
-                    if existing_client.lifecycle_state is None or existing_client.lifecycle_state == LifecycleState.COLD_LEAD:
-                        existing_client.lifecycle_state = LifecycleState.COLD_LEAD
+                    if existing_client.lifecycle_state is None or existing_client.lifecycle_state == LifecycleState.QUALIFIED:
+                        existing_client.lifecycle_state = LifecycleState.QUALIFIED
                         if "lifecycle_state" not in updated_fields:
                             updated_fields.append("lifecycle_state")
                     
@@ -2475,7 +2475,7 @@ def create_clients_from_brevo_contacts(
                     first_name=first_name,
                     last_name=last_name,
                     phone=phone,
-                    lifecycle_state=LifecycleState.COLD_LEAD,
+                    lifecycle_state=LifecycleState.QUALIFIED,
                     notes=f"Created from Brevo contact ID: {contact_id}"
                 )
                 
@@ -2677,35 +2677,38 @@ def send_brevo_transactional_email(
         if request.attachments:
             email_payload["attachment"] = request.attachments
         
-        # Send email(s) - handle batches if more than 100 recipients
+        # Send email(s) - handle batches if more than 100 recipients via shared helper
+        # so the worker and API path stay byte-for-byte identical (single source of truth).
+        from app.services.brevo_client import send_email as _brevo_send_email, BrevoSendError
+
         total_sent = 0
         message_ids = []
-        
+
         for i in range(0, len(recipient_emails), 100):
-            batch_recipients = recipient_emails[i:i+100]
-            batch_payload = email_payload.copy()
-            batch_payload["to"] = batch_recipients
-            
-            response = httpx.post(
-                "https://api.brevo.com/v3/smtp/email",
-                headers=headers,
-                json=batch_payload,
-                timeout=30.0
-            )
-            
-            if response.status_code in [201, 200]:
-                data = response.json()
-                message_id = data.get("messageId")
-                if message_id:
-                    message_ids.append(message_id)
-                total_sent += len(batch_recipients)
-            else:
-                error_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-                error_msg = error_data.get("message", f"HTTP {response.status_code}: {response.text}")
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Failed to send email batch: {error_msg}"
+            batch_recipients = recipient_emails[i:i + 100]
+            try:
+                data = _brevo_send_email(
+                    headers=headers,
+                    sender=email_payload.get("sender"),
+                    to=batch_recipients,
+                    subject=email_payload.get("subject", ""),
+                    html_content=email_payload.get("htmlContent"),
+                    text_content=email_payload.get("textContent"),
+                    template_id=email_payload.get("templateId"),
+                    params=email_payload.get("params"),
+                    reply_to=email_payload.get("replyTo"),
+                    tags=email_payload.get("tags"),
+                    attachments=email_payload.get("attachment"),
                 )
+            except BrevoSendError as e:
+                raise HTTPException(
+                    status_code=e.status_code or 500,
+                    detail=f"Failed to send email batch: {str(e)}",
+                )
+            message_id = data.get("messageId") if isinstance(data, dict) else None
+            if message_id:
+                message_ids.append(message_id)
+            total_sent += len(batch_recipients)
         
         return BrevoSendEmailResponse(
             success=True,
@@ -3400,12 +3403,12 @@ def get_calendar_upcoming_summary(
         # Sort all upcoming bookings by start_time
         upcoming_bookings.sort(key=lambda b: b.get("start_datetime") or datetime.fromisoformat(b["start_time"].replace('Z', '+00:00')))
         
-        # Find most upcoming appointment and get up to 2 upcoming appointments
+        # Find most upcoming appointment and get up to 3 upcoming appointments
         most_upcoming = None
         upcoming_appointments_list = []
         
         if upcoming_bookings:
-            # Get up to 2 upcoming appointments
+            # Get up to 3 upcoming appointments
             top_upcoming = upcoming_bookings[:2]
             
             for booking in top_upcoming:
@@ -4491,7 +4494,7 @@ async def receive_fathom_webhook(
     """
     from app.models.organization import Organization
     from app.services.fathom_ingest import ingest_meeting_payload
-    from app.services.fathom_ingest import queue_fathom_sync_followups
+    from app.services.fathom_ingest import queue_fathom_webhook_record_followups
 
     _ensure_org_fathom_webhook_columns(db)
     org = db.query(Organization).filter(Organization.id == org_id).first()
@@ -4530,14 +4533,7 @@ async def receive_fathom_webhook(
 
     # Queue follow-up jobs (call insights + library report) when we ingested a matched client call.
     if status_str == "ok" and fathom_row_id:
-        queue_fathom_sync_followups(
-            background_tasks,
-            org_id,
-            {
-                "pending_insight_record_ids": [str(fathom_row_id)],
-                "pending_library_record_ids": [str(fathom_row_id)],
-            },
-        )
+        queue_fathom_webhook_record_followups(background_tasks, org_id, fathom_row_id)
 
     return {"success": True, "status": status_str, "fathom_call_record_id": str(fathom_row_id) if fathom_row_id else None}
 

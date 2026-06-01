@@ -96,7 +96,7 @@ def ensure_client_for_booking_attendee(
 ) -> Optional[Client]:
     """
     Find a client by attendee email (normalized; checks primary email and emails list).
-    If none exists, create a new client as warm_lead so booking data can populate the client board.
+    If none exists, create a new client as booked so booking data can populate the client board.
     """
     from app.models.client import find_client_by_email
     existing = find_client_by_email(db, org_id, email)
@@ -121,19 +121,28 @@ def ensure_client_for_booking_attendee(
         email=email.strip(),
         first_name=first_name,
         last_name=last_name,
-        lifecycle_state=LifecycleState.WARM_LEAD,
+            lifecycle_state=LifecycleState.BOOKED,
         notes="Created from calendar booking (attendee)",
     )
     db.add(client)
     db.flush()
-    print(f"[CHECKIN SYNC] Created new warm lead client for booking attendee: {email}")
+    print(f"[CHECKIN SYNC] Created new booked client for booking attendee: {email}")
     return client
 
 
-def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> int:
+def sync_calcom_bookings(
+    db: Session,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    new_bookings_out: Optional[List[Dict[str, Any]]] = None,
+) -> int:
     """
     Sync Cal.com bookings with clients by matching attendee emails.
     Returns the number of check-ins created/updated.
+
+    When ``new_bookings_out`` is provided, freshly inserted (not updated) bookings are
+    appended as dicts so the caller can fire post-sync automation triggers
+    (e.g. pre-sale post-booking emails) after the DB commit succeeds.
     
     NEW APPROACH: Also check existing check-ins in database for past events
     that may have been synced previously, and ensure they're up to date.
@@ -298,6 +307,11 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
         synced_count = 0
         bookings_without_attendees = 0
         bookings_without_matching_clients = 0
+        # Tracks rows we just *created* (not updated) so the caller can fire
+        # post-booking automation triggers after the commit succeeds.
+        new_calcom_bookings: List[Dict[str, Any]] = (
+            new_bookings_out if new_bookings_out is not None else []
+        )
         
         for idx, booking in enumerate(bookings):
             try:
@@ -398,6 +412,7 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                     # Sales call flags from calendar_booking_sales or event_type_sales_calls
                     et = booking.get("eventType") or {}
                     event_type_id = str(et.get("id") or booking.get("eventTypeId") or "")
+                    event_type_label = str(et.get("title") or et.get("slug") or booking.get("title") or "") or None
                     is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calcom", event_id, event_type_id or None)
                     
                     if existing_checkin:
@@ -408,6 +423,12 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         existing_checkin.end_time = end_time
                         existing_checkin.location = location
                         existing_checkin.meeting_url = meeting_url
+                        # Backfill event-type identity onto pre-existing rows so the new
+                        # post-booking automation can match them on subsequent runs.
+                        if event_type_id and not getattr(existing_checkin, "event_type_id", None):
+                            existing_checkin.event_type_id = event_type_id
+                        if event_type_label and not getattr(existing_checkin, "event_type_label", None):
+                            existing_checkin.event_type_label = event_type_label
                         # Cancelled / no-show: provider True always wins; never overwrite CRM True with
                         # provider False (Event Details modal / board edits persist across sync).
                         if cancelled:
@@ -445,6 +466,8 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                             meeting_url=meeting_url,
                             attendee_email=attendee_email,
                             attendee_name=attendee_name,
+                            event_type_id=event_type_id or None,
+                            event_type_label=event_type_label,
                             completed=completed,
                             cancelled=cancelled,
                             no_show=no_show,
@@ -454,6 +477,15 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         )
                         db.add(checkin)
                         synced_count += 1
+                        # Track new bookings for post-commit automation triggers.
+                        new_calcom_bookings.append({
+                            "client_id": matching_client.id,
+                            "external_booking_id": event_id,
+                            "event_type_id": event_type_id or None,
+                            "event_type_label": event_type_label,
+                            "attendee_email": attendee_email,
+                            "start_time": start_time,
+                        })
                 
             except Exception as e:
                 print(f"[CHECKIN SYNC] [CALCOM] ❌ Error processing booking {idx}: {str(e)}")
@@ -490,10 +522,19 @@ def sync_calcom_bookings(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
         return 0
 
 
-def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> int:
+def sync_calendly_events(
+    db: Session,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    new_bookings_out: Optional[List[Dict[str, Any]]] = None,
+) -> int:
     """
     Sync Calendly events with clients by matching invitee emails.
     Returns the number of check-ins created/updated.
+
+    When ``new_bookings_out`` is provided, freshly inserted (not updated) events are
+    appended as dicts so the caller can fire post-sync automation triggers
+    (e.g. pre-sale post-booking emails) after the DB commit succeeds.
     """
     print(f"[CHECKIN SYNC] [CALENDLY] Starting Calendly sync for org {org_id}")
     
@@ -611,6 +652,9 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
         synced_count = 0
         events_without_invitees = 0
         events_without_matching_clients = 0
+        new_calendly_bookings: List[Dict[str, Any]] = (
+            new_bookings_out if new_bookings_out is not None else []
+        )
 
         for event in events:
             try:
@@ -679,6 +723,11 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                     event_type_uri = event.get("event_type") or ""
                     if isinstance(event_type_uri, dict):
                         event_type_uri = event_type_uri.get("uri") or ""
+                    event_type_uri = str(event_type_uri or "") or None
+                    # Calendly's scheduled-event JSON carries the event-type *uri* but not the
+                    # human title; we use the scheduled event's name (already extracted as
+                    # `name`) so the operator can read "Discovery Call" instead of a uri tail.
+                    event_type_label_value = name or None
                     is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calendly", event_uuid, event_type_uri or None)
                     
                     if existing_checkin:
@@ -689,6 +738,10 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         existing_checkin.end_time = end_time
                         existing_checkin.location = meeting_url
                         existing_checkin.meeting_url = meeting_url
+                        if event_type_uri and not getattr(existing_checkin, "event_type_id", None):
+                            existing_checkin.event_type_id = event_type_uri
+                        if event_type_label_value and not getattr(existing_checkin, "event_type_label", None):
+                            existing_checkin.event_type_label = event_type_label_value
                         if cancelled:
                             existing_checkin.cancelled = True
                         elif not getattr(existing_checkin, "cancelled", False):
@@ -721,6 +774,8 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                             meeting_url=meeting_url,
                             attendee_email=invitee_email,
                             attendee_name=invitee_name,
+                            event_type_id=event_type_uri,
+                            event_type_label=event_type_label_value,
                             completed=completed,
                             cancelled=cancelled,
                             no_show=no_show,
@@ -730,6 +785,14 @@ def sync_calendly_events(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> 
                         )
                         db.add(checkin)
                         synced_count += 1
+                        new_calendly_bookings.append({
+                            "client_id": matching_client.id,
+                            "external_booking_id": event_uuid,
+                            "event_type_id": event_type_uri,
+                            "event_type_label": event_type_label_value,
+                            "attendee_email": invitee_email,
+                            "start_time": start_time,
+                        })
                 
             except Exception as e:
                 print(f"[CHECKIN SYNC] Error processing Calendly event: {e}")
@@ -783,6 +846,9 @@ def _ensure_client_check_ins_table(db: Session) -> None:
         "ALTER TABLE client_check_ins ADD COLUMN IF NOT EXISTS no_show BOOLEAN NOT NULL DEFAULT false",
         "ALTER TABLE client_check_ins ADD COLUMN IF NOT EXISTS is_sales_call BOOLEAN NOT NULL DEFAULT false",
         "ALTER TABLE client_check_ins ADD COLUMN IF NOT EXISTS sale_closed BOOLEAN",
+        # Migration 044: event-type identity for the post-booking automation trigger.
+        "ALTER TABLE client_check_ins ADD COLUMN IF NOT EXISTS event_type_id VARCHAR",
+        "ALTER TABLE client_check_ins ADD COLUMN IF NOT EXISTS event_type_label VARCHAR",
     ):
         try:
             db.execute(text(col_sql))
@@ -822,8 +888,14 @@ def _ensure_client_check_ins_table(db: Session) -> None:
         print(f"[CHECKIN SYNC] ensure client_check_ins unique: {uq_e}")
 
 
-def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dict[str, Any]:
-    """Sync check-ins from all connected calendar providers"""
+def sync_all_checkins(
+    db: Session,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    *,
+    apply_pipeline_lifecycle_rules: bool = True,
+) -> Dict[str, Any]:
+    """Sync check-ins from all connected calendar providers."""
     from datetime import datetime, timezone
 
     sync_start_time = datetime.now(timezone.utc)
@@ -837,7 +909,12 @@ def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dic
         "total": 0,
         "affected_client_ids": []
     }
-    
+
+    # Collected per-provider so the post-commit hook can fire pre-sale post-booking
+    # automation triggers for *newly inserted* bookings only (not updates).
+    new_calcom_bookings: List[Dict[str, Any]] = []
+    new_calendly_bookings: List[Dict[str, Any]] = []
+
     try:
         # Ensure table (and optional columns) exist so sync works even if migrations weren't run
         print(f"[CHECKIN SYNC] Ensuring client_check_ins table exists...")
@@ -845,11 +922,11 @@ def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dic
         print(f"[CHECKIN SYNC] ✅ Table ready")
         
         print(f"[CHECKIN SYNC] Syncing Cal.com bookings...")
-        results["calcom"] = sync_calcom_bookings(db, org_id, user_id)
+        results["calcom"] = sync_calcom_bookings(db, org_id, user_id, new_calcom_bookings)
         print(f"[CHECKIN SYNC] Cal.com sync complete: {results['calcom']} check-ins")
 
         print(f"[CHECKIN SYNC] Syncing Calendly events...")
-        results["calendly"] = sync_calendly_events(db, org_id, user_id)
+        results["calendly"] = sync_calendly_events(db, org_id, user_id, new_calendly_bookings)
         print(f"[CHECKIN SYNC] Calendly sync complete: {results['calendly']} check-ins")
         
         results["total"] = results["calcom"] + results["calendly"]
@@ -863,6 +940,54 @@ def sync_all_checkins(db: Session, org_id: uuid.UUID, user_id: uuid.UUID) -> Dic
         ).all()
         results["affected_client_ids"] = list({str(r[0]) for r in affected if r[0]})
         results["sync_org_id"] = str(org_id)
+
+        # Fire pre-sale post-booking automation triggers for newly created rows. Done
+        # AFTER the sync commit above so a failed enqueue can never roll back the
+        # ClientCheckIn rows. Each call is independently committed; one failure does
+        # not poison the others. Imported lazily to avoid an import cycle on cold
+        # start (engine -> models -> session).
+        try:
+            from app.services.automation_engine import on_booking_created_pre_sale
+
+            def _fire(provider: str, rows: List[Dict[str, Any]]) -> None:
+                for row in rows:
+                    try:
+                        on_booking_created_pre_sale(
+                            db,
+                            org_id=org_id,
+                            client_id=row["client_id"],
+                            provider=provider,
+                            external_booking_id=str(row["external_booking_id"]),
+                            event_type_id=row.get("event_type_id"),
+                            event_type_label=row.get("event_type_label"),
+                            attendee_email=row.get("attendee_email"),
+                            start_time=row.get("start_time"),
+                        )
+                        db.commit()
+                    except Exception as fire_err:
+                        db.rollback()
+                        print(
+                            f"[CHECKIN SYNC] post-booking automation enqueue failed "
+                            f"({provider} {row.get('external_booking_id')}): {fire_err}"
+                        )
+
+            _fire("calcom", new_calcom_bookings)
+            _fire("calendly", new_calendly_bookings)
+            results["new_bookings_calcom"] = len(new_calcom_bookings)
+            results["new_bookings_calendly"] = len(new_calendly_bookings)
+        except Exception as auto_err:
+            print(f"[CHECKIN SYNC] post-booking automation pass skipped: {auto_err}")
+
+        if apply_pipeline_lifecycle_rules:
+            try:
+                from app.services.client_automation import run_pipeline_lifecycle_for_org
+
+                pipeline_changes = run_pipeline_lifecycle_for_org(db, org_id)
+                results["pipeline_lifecycle_changes"] = pipeline_changes
+            except Exception as pipe_err:
+                print(f"[CHECKIN SYNC] pipeline lifecycle pass skipped: {pipe_err}")
+        else:
+            results["pipeline_lifecycle_changes"] = 0
 
         print(f"[CHECKIN SYNC] ===== SYNC COMPLETE ======")
         print(f"[CHECKIN SYNC] Total: {results['total']} check-ins (Cal.com: {results['calcom']}, Calendly: {results['calendly']})")

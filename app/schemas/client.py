@@ -1,9 +1,14 @@
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+import re
+import uuid
+from decimal import Decimal
 from datetime import datetime, timezone
 from typing import List, Optional, Union
-from decimal import Decimal
-import uuid
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
 from app.models.client import LifecycleState
+
+_OFFER_SLOT_RE = re.compile(r"^(core|referral|upsell:\d+|downsell:\d+)$")
 
 
 def _naive_utc_program(dt: datetime) -> datetime:
@@ -39,7 +44,7 @@ class ClientBase(BaseModel):
     emails: Optional[List[str]] = None  # Additional emails; client can have multiple
     phone: Optional[str] = None
     instagram: Optional[str] = None
-    lifecycle_state: LifecycleState = LifecycleState.COLD_LEAD
+    lifecycle_state: LifecycleState = LifecycleState.QUALIFIED
     stripe_customer_id: Optional[str] = None
     estimated_mrr: Optional[Union[float, Decimal]] = 0.0
     notes: Optional[str] = None
@@ -96,6 +101,50 @@ class MergeClientsRequest(BaseModel):
     client_ids: List[uuid.UUID]
 
 
+class ClientOfferEnrollmentPatch(BaseModel):
+    """Maps a client to an Intelligence offer-ladder slot + optional payment-plan amounts (cents)."""
+
+    slot: str = Field(..., min_length=3, max_length=48)
+    name_snapshot: Optional[str] = Field(None, max_length=220)
+    total_cents: int = Field(0, ge=0, le=1_000_000_000)
+    paid_cents: int = Field(0, ge=0, le=1_000_000_000)
+    currency: str = Field(default="usd", max_length=8)
+    notes: Optional[str] = Field(None, max_length=2000)
+
+    @field_validator("slot")
+    @classmethod
+    def validate_slot(cls, v: str) -> str:
+        s = (v or "").strip()
+        if not _OFFER_SLOT_RE.match(s):
+            raise ValueError(
+                "slot must be core, referral, upsell:N, or downsell:N (e.g. upsell:0)"
+            )
+        return s
+
+
+class ClientOfferEnrollmentPublic(BaseModel):
+    """Stored enrollment plus computed balance (total − paid)."""
+
+    slot: str
+    name_snapshot: Optional[str] = None
+    total_cents: int = 0
+    paid_cents: int = 0
+    currency: str = "usd"
+    notes: Optional[str] = None
+    balance_cents: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def compute_balance(cls, data):
+        if isinstance(data, dict):
+            d = dict(data)
+            t = int(d.get("total_cents") or 0)
+            p = int(d.get("paid_cents") or 0)
+            d["balance_cents"] = t - p
+            return d
+        return data
+
+
 class ClientUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -107,16 +156,24 @@ class ClientUpdate(BaseModel):
     stripe_customer_id: Optional[str] = None
     estimated_mrr: Optional[float] = None
     notes: Optional[str] = None
+    # Operator bump (e.g. after outreach); stored naive UTC like program dates.
+    last_activity_at: Optional[datetime] = None
     meta: Optional[dict] = None  # e.g. sort_orders: { cold_lead: 0, warm_lead: 1 } for column ordering
     # Program tracking fields
     program_start_date: Optional[datetime] = None
     program_duration_days: Optional[int] = None
     program_end_date: Optional[datetime] = None
     program_progress_percent: Optional[float] = None
-    
+    offer_enrollment: Optional[ClientOfferEnrollmentPatch] = None
+
     @field_validator("program_start_date", "program_end_date", mode="before")
     @classmethod
     def parse_program_dates_update(cls, v):
+        return parse_optional_program_datetime(v)
+
+    @field_validator("last_activity_at", mode="before")
+    @classmethod
+    def parse_last_activity_update(cls, v):
         return parse_optional_program_datetime(v)
 
 
@@ -127,11 +184,24 @@ class Client(ClientBase):
     lifetime_revenue_cents: Optional[int] = 0
     notes: Optional[str] = None
     meta: Optional[dict] = None
+    offer_enrollment: Optional[ClientOfferEnrollmentPublic] = None
     # Program tracking fields (read-only, calculated)
     program_end_date: Optional[datetime] = None
     program_progress_percent: Optional[Union[float, Decimal]] = None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("offer_enrollment", mode="before")
+    @classmethod
+    def coerce_offer_enrollment(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            try:
+                return ClientOfferEnrollmentPublic.model_validate(v)
+            except Exception:
+                return None
+        return v
 
     @field_validator('program_progress_percent', mode='before')
     @classmethod

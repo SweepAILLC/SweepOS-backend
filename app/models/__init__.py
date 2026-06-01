@@ -30,6 +30,14 @@ from app.models.content_studio_knowledge_item import ContentStudioKnowledgeItem
 from app.models.content_studio_generation import ContentStudioGeneration
 from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
 from app.models.call_library_report import CallLibraryReport
+from app.models.automation import (
+    AutomationRule,
+    AutomationEmailJob,
+    AutomationWorkerHeartbeat,
+    Playbook,
+    JobState,
+    ContentMode,
+)
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -47,5 +55,11 @@ __all__ = [
     "ContentStudioGeneration",
     "ContentStudioTranscriptAnalysis",
     "CallLibraryReport",
+    "AutomationRule",
+    "AutomationEmailJob",
+    "AutomationWorkerHeartbeat",
+    "Playbook",
+    "JobState",
+    "ContentMode",
 ]
 

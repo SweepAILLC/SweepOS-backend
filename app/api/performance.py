@@ -33,6 +33,7 @@ from app.services.performance_service import build_performance_snapshot
 from app.services.llm_client import llm_available, chat_json
 from app.services.offer_ladder import extract_offer_ladder, offer_ladder_for_llm
 from app.services.ai_recommendation_email_draft import build_performance_task_email_draft
+from app.services.user_ai_profile_context import extract_ai_profile_for_llm
 
 router = APIRouter()
 
@@ -287,6 +288,10 @@ def post_performance_prescription(
     if compact_ladder:
         profile_compact["offer_ladder"] = compact_ladder
 
+    llm_profile = extract_ai_profile_for_llm(user_row)
+    if llm_profile and isinstance(llm_profile.get("writing_samples"), list):
+        profile_compact["writing_samples"] = llm_profile["writing_samples"]
+
     system = """You personalize performance coaching copy for a SaaS coach/operator.
 Return ONLY a JSON object with key "tasks" array. Each element: {"id": "<exact id>", "why": "...", "prescription": "...", "next_step": "..."}.
 Rules:
@@ -294,6 +299,9 @@ Rules:
 - why: 1-2 sentences grounded in evidence numbers.
 - prescription: 1-2 sentences, actionable, aligned with the user's business profile when provided.
 - next_step: one short imperative the user can do today.
+- Voice / campaigns: When user_ai_profile.writing_samples is present, phrase prescription and next_step like those examples
+  (greeting habits, directness, sentence length). Prefer referral_campaign / upsell_campaign / re_sign_campaign samples
+  when the task matches those intents; html_template entries inform structure and CTA style without copying private details.
 - ROI ladder + pipeline priorities (REQUIRED): Every prescription and next_step must propose one concrete next move toward ROI
   drawn from user_ai_profile.offer_ladder when present (core, downsell, upsell, or referral as fits the lifecycle and the
   highest-ranked relevant entry of user_ai_profile.pipeline_priorities). Never invent offers outside the ladder.

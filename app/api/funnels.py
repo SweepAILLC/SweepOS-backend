@@ -542,7 +542,7 @@ def create_lead_from_funnel(
             phone=phone or None,
             instagram=instagram or None,
             notes=notes or None,
-            lifecycle_state=LifecycleState.COLD_LEAD,
+            lifecycle_state=LifecycleState.QUALIFIED,
         )
         _apply_prospect_meta(client)
         db.add(client)

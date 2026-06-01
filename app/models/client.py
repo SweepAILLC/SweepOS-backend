@@ -20,10 +20,26 @@ def _as_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 class LifecycleState(str, enum.Enum):
     COLD_LEAD = "cold_lead"
-    WARM_LEAD = "warm_lead"
+    NURTURING = "nurturing"
+    QUALIFIED = "qualified"
+    BOOKED = "booked"
     ACTIVE = "active"
     OFFBOARDING = "offboarding"
     DEAD = "dead"
+
+
+# Pre-payment pipeline stages (funnel → qualified → booked → active).
+PRE_PAYMENT_LIFECYCLE_STATES = frozenset(
+    {
+        LifecycleState.COLD_LEAD,
+        LifecycleState.NURTURING,
+        LifecycleState.QUALIFIED,
+        LifecycleState.BOOKED,
+    }
+)
+
+# Stages that show follow-up urgency bars and receive lead call-insight rules.
+LEAD_PIPELINE_LIFECYCLE_STATES = PRE_PAYMENT_LIFECYCLE_STATES
 
 
 class Client(Base):
@@ -38,13 +54,19 @@ class Client(Base):
     emails = Column(JSON, nullable=True)  # Additional emails: list of strings, e.g. ["a@x.com", "b@x.com"]
     phone = Column(String, nullable=True)
     instagram = Column(String, nullable=True)
-    lifecycle_state = Column(SQLEnum(LifecycleState), default=LifecycleState.COLD_LEAD, nullable=False)
+    lifecycle_state = Column(
+        SQLEnum(LifecycleState, values_callable=lambda obj: [e.value for e in obj]),
+        default=LifecycleState.QUALIFIED,
+        nullable=False,
+    )
     last_activity_at = Column(DateTime, nullable=True)
     stripe_customer_id = Column(String, nullable=True, index=True)
     estimated_mrr = Column(Numeric(10, 2), default=0, nullable=False)
     lifetime_revenue_cents = Column(Integer, default=0, nullable=False)  # Lifetime revenue in cents
     notes = Column(Text, nullable=True)  # Client notes
     meta = Column(JSON, nullable=True)
+    # Intelligence offer ladder slot + payment-plan tracking (total/paid in cents)
+    offer_enrollment = Column(JSON, nullable=True)
     
     # Program tracking fields
     program_start_date = Column(DateTime, nullable=True)  # When the program started

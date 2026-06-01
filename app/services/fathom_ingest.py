@@ -1,7 +1,9 @@
 """Ingest Fathom meetings/webhooks: match clients, store records, run required sentiment step."""
 from __future__ import annotations
 
+import logging
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +20,8 @@ from app.services.fathom_sentiment import default_neutral, derive_sentiment
 from app.services.health_score_cache_service import invalidate_health_score_cache
 from app.core.config import settings as app_settings
 from app.services.llm_client import llm_available, truncate_for_tokens
+
+logger = logging.getLogger(__name__)
 
 
 def _norm_email(e: Optional[str]) -> Optional[str]:
@@ -395,3 +399,144 @@ def queue_fathom_sync_followups(background_tasks: Any, org_id: uuid.UUID, sync_r
         schedule_background_work(run_call_insight_background, background_tasks, oid_str, str(rid))
     for rid in sync_result.get("pending_library_record_ids") or []:
         schedule_background_work(run_call_library_report_background, background_tasks, oid_str, str(rid))
+
+
+def _refresh_fathom_row_from_api(db: Session, rec: FathomCallRecord, api_key: Optional[str]) -> bool:
+    """Pull summary/transcript from Fathom API when combined text still looks thin. Returns True if row text changed."""
+    from app.services.call_insight_context import is_meeting_snapshot_thin
+
+    if not api_key:
+        return False
+    prev_sum = (rec.summary_text or "").strip()
+    prev_tr = (rec.transcript_snippet or "").strip()
+    if not is_meeting_snapshot_thin(prev_sum, prev_tr):
+        return False
+    rid = int(rec.fathom_recording_id)
+    changed = False
+    try:
+        s = get_recording_summary(rid, api_key=api_key)
+        new_md = summary_to_markdown(s.get("summary") or s).strip()
+        if len(new_md) > len(prev_sum):
+            rec.summary_text = new_md[:50000]
+            changed = True
+        t = get_recording_transcript(rid, api_key=api_key)
+        tt_full = transcript_to_text(t.get("transcript") or t)
+        tt_trunc = truncate_for_tokens(tt_full, 24000) if tt_full else ""
+        if len(tt_trunc.strip()) > len(prev_tr):
+            rec.transcript_snippet = tt_trunc or None
+            changed = True
+    except Exception:
+        logger.exception(
+            "Fathom webhook enrichment API pull failed recording_id=%s org=%s",
+            rec.fathom_recording_id,
+            rec.org_id,
+        )
+    if changed:
+        rec.updated_at = datetime.now(timezone.utc)
+    return changed
+
+
+def run_fathom_webhook_enrichment_and_followups(
+    org_id_str: str, fathom_record_uuid_str: str, attempt_str: str = "1"
+) -> None:
+    """
+    Webhooks often arrive before full summary/transcript exist. Re-fetch with bounded retries,
+    then enqueue call insight + call library jobs (one recording at a time; avoids hammering list-sync).
+    """
+    from app.db.session import SessionLocal
+    from app.long_jobs import schedule_background_work
+    from app.services.call_insight_context import is_meeting_snapshot_thin
+    from app.services.call_insight_service import run_call_insight_background
+    from app.services.call_library_service import run_call_library_report_background
+
+    max_att = int(getattr(app_settings, "FATHOM_WEBHOOK_ENRICH_MAX_ATTEMPTS", 8) or 8)
+    delay = float(getattr(app_settings, "FATHOM_WEBHOOK_ENRICH_DELAY_SEC", 90) or 90)
+
+    try:
+        org_id = uuid.UUID(org_id_str)
+        rec_id = uuid.UUID(fathom_record_uuid_str)
+        attempt = max(1, int(attempt_str or "1"))
+    except ValueError:
+        logger.warning(
+            "fathom webhook enrichment bad uuid org=%s record=%s",
+            org_id_str,
+            fathom_record_uuid_str,
+        )
+        return
+
+    db = SessionLocal()
+    try:
+        rec = (
+            db.query(FathomCallRecord)
+            .filter(FathomCallRecord.id == rec_id, FathomCallRecord.org_id == org_id)
+            .first()
+        )
+        if not rec or not rec.client_id:
+            return
+
+        api_key = resolve_fathom_api_key(db, org_id)
+        _refresh_fathom_row_from_api(db, rec, api_key)
+        apply_sentiment_to_record(db, rec)
+        invalidate_health_score_cache(db, rec.client_id, org_id, do_commit=False)
+        db.commit()
+        db.refresh(rec)
+
+        still_thin = is_meeting_snapshot_thin(rec.summary_text, rec.transcript_snippet)
+        sent_ok = rec.sentiment_status == "complete"
+        defer = (still_thin or not sent_ok) and attempt < max_att
+
+        if defer:
+            logger.info(
+                "fathom webhook enrichment defer org=%s record=%s attempt=%s/%s thin=%s sentiment=%s delay_s=%s",
+                org_id,
+                rec_id,
+                attempt,
+                max_att,
+                still_thin,
+                rec.sentiment_status,
+                delay,
+            )
+
+            def _reschedule() -> None:
+                schedule_background_work(
+                    run_fathom_webhook_enrichment_and_followups,
+                    None,
+                    org_id_str,
+                    fathom_record_uuid_str,
+                    str(attempt + 1),
+                )
+
+            t = threading.Timer(delay, _reschedule)
+            t.daemon = True
+            t.start()
+            return
+
+        schedule_background_work(run_call_insight_background, None, org_id_str, fathom_record_uuid_str)
+        schedule_background_work(run_call_library_report_background, None, org_id_str, fathom_record_uuid_str)
+        logger.info(
+            "fathom webhook followups queued org=%s record=%s attempts_used=%s",
+            org_id,
+            rec_id,
+            attempt,
+        )
+    except Exception:
+        logger.exception(
+            "fathom webhook enrichment failed org=%s record=%s", org_id_str, fathom_record_uuid_str
+        )
+    finally:
+        db.close()
+
+
+def queue_fathom_webhook_record_followups(
+    background_tasks: Any, org_id: uuid.UUID, fathom_call_record_id: uuid.UUID
+) -> None:
+    """Prefer this for single-meeting webhooks instead of immediate queue_fathom_sync_followups."""
+    from app.long_jobs import schedule_background_work
+
+    schedule_background_work(
+        run_fathom_webhook_enrichment_and_followups,
+        background_tasks,
+        str(org_id),
+        str(fathom_call_record_id),
+        "1",
+    )

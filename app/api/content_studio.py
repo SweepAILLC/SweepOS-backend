@@ -23,22 +23,22 @@ from app.schemas.content_studio import (
     BootstrapResponse,
     CompletePatchBody,
     CompletePatchResponse,
-    ContentSectionOut,
     ContentStudioBundleOut,
     KnowledgeOut,
     KnowledgePutBody,
     ReanalyzeResponse,
     SalesPlaybookOut,
-    SectionIdeaOut,
+    StageConceptOut,
+    StageOut,
     TranscriptAnalyzeBody,
     TranscriptAnalyzeResponse,
     TranscriptListItem,
     TranscriptListResponse,
-    VoiceMarketingOut,
 )
 from app.services import content_studio_service as css
 from app.services.content_studio_bundle import (
     BUNDLE_VERSION,
+    STAGE_SET,
     compute_signals_fingerprint,
     default_bundle_placeholder,
     draft_content_studio_bundle_llm,
@@ -83,42 +83,48 @@ def _user_orm(db: Session, user: User) -> User:
 
 
 def _parse_bundle_dict(raw: Dict[str, Any]) -> ContentStudioBundleOut:
-    sections_out: list[ContentSectionOut] = []
-    for sec in raw.get("sections") or []:
-        if not isinstance(sec, dict):
+    """Walk the v3 bundle shape: top-level `stages` of TOF/MOF/BOF, each with bulleted concepts."""
+    stages_out: list[StageOut] = []
+    for stage_raw in raw.get("stages") or []:
+        if not isinstance(stage_raw, dict):
             continue
-        ideas_out: list[SectionIdeaOut] = []
-        for idea in sec.get("ideas") or []:
-            if not isinstance(idea, dict):
+        sid = str(stage_raw.get("id") or "").upper().strip()
+        if sid not in STAGE_SET:
+            continue
+        concepts_out: list[StageConceptOut] = []
+        for concept in stage_raw.get("concepts") or []:
+            if not isinstance(concept, dict):
                 continue
-            st = idea.get("stage")
-            if st not in css.STAGE_SET:
-                st = "TOF"
-            iid = str(idea.get("id") or "").strip()
-            if not iid:
+            cid = str(concept.get("id") or "").strip()
+            if not cid:
                 continue
-            ideas_out.append(
-                SectionIdeaOut(
-                    id=iid,
-                    stage=st,
-                    hook=str(idea.get("hook") or ""),
-                    concept=str(idea.get("concept") or ""),
-                    why_it_works=str(idea.get("why_it_works") or ""),
-                    format=str(idea.get("format") or "reel"),
+            fmt = str(concept.get("format") or "short").lower().strip()
+            if fmt not in ("long", "short"):
+                fmt = "short"
+            bullets = [
+                str(b).strip()
+                for b in (concept.get("bullets") or [])
+                if isinstance(b, (str, int, float)) and str(b).strip()
+            ]
+            concepts_out.append(
+                StageConceptOut(
+                    id=cid,
+                    format=fmt,  # type: ignore[arg-type]
+                    title=str(concept.get("title") or ""),
+                    bullets=bullets,
+                    why_for_icp=str(concept.get("why_for_icp") or ""),
+                    funnel_path_to_sale=str(concept.get("funnel_path_to_sale") or ""),
                 )
             )
-        sid = str(sec.get("id") or "").strip()
-        if not sid:
-            continue
-        sections_out.append(
-            ContentSectionOut(
-                id=sid,
-                title=str(sec.get("title") or ""),
-                body=str(sec.get("body") or ""),
-                ideas=ideas_out,
+        stages_out.append(
+            StageOut(
+                id=sid,  # type: ignore[arg-type]
+                title=str(stage_raw.get("title") or ""),
+                intro=str(stage_raw.get("intro") or stage_raw.get("body") or ""),
+                concepts=concepts_out,
             )
         )
-    vm = raw.get("voice_marketing") if isinstance(raw.get("voice_marketing"), dict) else {}
+
     src = raw.get("source")
     if src not in ("llm", "default", "fathom"):
         src = "llm"
@@ -127,13 +133,8 @@ def _parse_bundle_dict(raw: Dict[str, Any]) -> ContentStudioBundleOut:
         signals_fingerprint=str(raw.get("signals_fingerprint") or ""),
         batch_id=str(raw.get("batch_id") or ""),
         generated_at=raw.get("generated_at") if isinstance(raw.get("generated_at"), str) else None,
-        source=src,
-        sections=sections_out,
-        voice_marketing=VoiceMarketingOut(
-            title=str(vm.get("title") or ""),
-            body=str(vm.get("body") or ""),
-            bullets=[str(b) for b in (vm.get("bullets") or []) if str(b).strip()],
-        ),
+        source=src,  # type: ignore[arg-type]
+        stages=stages_out,
     )
 
 

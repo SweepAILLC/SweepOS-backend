@@ -13,10 +13,16 @@ ALLOWED_TAGS = frozenset(
 )
 CLIP_KINDS = frozenset({"testimonial", "win", "objection", "other"})
 
+LEAD_PIPELINE_LIFECYCLES = frozenset({"cold_lead", "nurturing", "qualified", "booked"})
+
+
+def _is_lead_pipeline(lifecycle: str) -> bool:
+    return (lifecycle or "").lower().strip() in LEAD_PIPELINE_LIFECYCLES
+
 
 def _lifecycle_block(lifecycle: str) -> str:
     ls = (lifecycle or "").lower().strip()
-    if ls in ("cold_lead", "warm_lead"):
+    if _is_lead_pipeline(ls):
         return (
             "LIFECYCLE=LEAD: Use DATA.context.pipeline. "
             "If pipeline.has_past_sales_call is false: focus on CONVERSION—email nurture, objection-precontent, "
@@ -63,7 +69,7 @@ def _client_state_synthesis_rules(lifecycle: str) -> str:
         "(e.g. external locus of control, fear- or approval-based hesitation) ONLY if the transcript supports it. "
         "End with one concrete coaching direction for the next conversation (not generic platitudes). "
     )
-    if ls in ("cold_lead", "warm_lead"):
+    if _is_lead_pipeline(ls):
         return base + (
             "LIFECYCLE=LEAD: Include sales-relevant psychology and objection dynamics when evidenced "
             "(e.g. repeatedly involving a partner may signal externalized decision-making—suggest helping them own the "
@@ -125,7 +131,8 @@ SYSTEM_PROMPT = (
     '"due_date_iso": string or null (YYYY-MM-DD or full ISO8601 end-of-day implied for date-only), '
     '"evidence_quote": string or null (verbatim substring from transcript when confirmed_on_call is true, else null) '
     "}, "
-    "LEAD_FOLLOW_UP_TOOL RULES: Only for lifecycle cold_lead or warm_lead in DATA.lifecycle. "
+    "LEAD_FOLLOW_UP_TOOL RULES: Only for pre-payment pipeline lifecycles "
+    "(cold_lead, nurturing, qualified, booked) in DATA.lifecycle. "
     "If the transcript explicitly confirms a specific calendar date or unambiguous day for the next follow-up "
     "(e.g. they agree to reconnect Tuesday, next Friday the 15th), set confirmed_on_call true and due_date_iso to that date. "
     "If the call only says vague timing ('soon', 'next week' without a date), or no follow-up date was agreed, "

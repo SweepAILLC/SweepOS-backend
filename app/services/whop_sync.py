@@ -6,7 +6,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -98,6 +98,7 @@ def sync_whop_incremental(db: Session, org_id: uuid.UUID, force_full: bool = Fal
     total_upserted = 0
     cursor: Optional[str] = None
     pages = 0
+    new_first_payment_signals: List[Dict[str, Any]] = []
 
     while True:
         pages += 1
@@ -131,6 +132,7 @@ def sync_whop_incremental(db: Session, org_id: uuid.UUID, force_full: bool = Fal
                 .filter(WhopPayment.org_id == org_id, WhopPayment.whop_id == whop_id)
                 .first()
             )
+            is_new_paid = False
             if existing:
                 existing.amount_cents = amount_cents
                 existing.currency = currency
@@ -153,6 +155,21 @@ def sync_whop_incremental(db: Session, org_id: uuid.UUID, force_full: bool = Fal
                         updated_at=datetime.utcnow(),
                     )
                 )
+                is_new_paid = client_id is not None and status in (
+                    "paid",
+                    "succeeded",
+                    "completed",
+                    "successful",
+                )
+            if is_new_paid:
+                new_first_payment_signals.append(
+                    {
+                        "client_id": client_id,
+                        "whop_id": whop_id,
+                        "amount_cents": amount_cents,
+                        "paid_at": created_at,
+                    }
+                )
             total_upserted += 1
 
         db.flush()
@@ -164,6 +181,26 @@ def sync_whop_incremental(db: Session, org_id: uuid.UUID, force_full: bool = Fal
 
     token.last_sync_at = datetime.utcnow()
     db.commit()
+
+    # Enqueue first-payment automation jobs for newly synced Whop payments. The
+    # automation_engine guards on idempotency_key so re-running a full sync is safe.
+    if new_first_payment_signals:
+        try:
+            from app.services.automation_engine import on_payment_received
+
+            for sig in new_first_payment_signals:
+                on_payment_received(
+                    db,
+                    org_id=org_id,
+                    client_id=sig["client_id"],
+                    payment_source="whop",
+                    payment_external_id=sig["whop_id"],
+                    amount_cents=int(sig["amount_cents"] or 0),
+                    paid_at=sig.get("paid_at"),
+                )
+            db.commit()
+        except Exception:
+            db.rollback()
 
     return {
         "payments_upserted": total_upserted,

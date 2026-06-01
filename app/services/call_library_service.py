@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # ORM includes call_title_override; DB may lag migrations — add column once per process if missing.
 _call_title_override_column_ensured = False
 _call_media_columns_ensured = False
+_call_deal_columns_ensured = False
 
 
 def _ensure_call_title_override_column(db: Session) -> None:
@@ -60,6 +61,83 @@ def _ensure_call_media_columns(db: Session) -> None:
         _call_media_columns_ensured = True
 
 
+def _ensure_call_deal_columns(db: Session) -> None:
+    """Idempotent ADD COLUMN for the deal outcome fields surfaced next to call_score."""
+    global _call_deal_columns_ensured
+    if _call_deal_columns_ensured:
+        return
+    try:
+        db.execute(
+            text(
+                "ALTER TABLE call_library_reports "
+                "ADD COLUMN IF NOT EXISTS deal_closed BOOLEAN NOT NULL DEFAULT false"
+            )
+        )
+        db.execute(
+            text(
+                "ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS deal_value_cents BIGINT"
+            )
+        )
+        db.execute(
+            text(
+                "ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS deal_currency VARCHAR(8)"
+            )
+        )
+        db.execute(
+            text(
+                "ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS deal_billing VARCHAR(32)"
+            )
+        )
+        db.commit()
+        _call_deal_columns_ensured = True
+    except Exception as e:
+        db.rollback()
+        logger.warning("call_library: ensure deal columns failed: %s", e)
+        _call_deal_columns_ensured = True
+
+
+def _coerce_deal_outcome(report_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pull the persisted columns out of an LLM report's deal_outcome block."""
+    fallback = {
+        "closed": False,
+        "value_cents": None,
+        "currency": None,
+        "billing": None,
+    }
+    if not isinstance(report_json, dict):
+        return fallback
+    raw = report_json.get("deal_outcome")
+    if not isinstance(raw, dict):
+        return fallback
+
+    closed = bool(raw.get("closed"))
+    if not closed:
+        return fallback
+
+    amount = raw.get("amount")
+    value_cents: Optional[int] = None
+    try:
+        if amount is not None and amount != "":
+            amt = float(amount)
+            if amt > 0:
+                value_cents = int(round(amt * 100))
+    except (TypeError, ValueError):
+        value_cents = None
+
+    currency_raw = str(raw.get("currency") or "USD").upper().strip()
+    currency = currency_raw if 2 <= len(currency_raw) <= 8 and currency_raw.isalpha() else "USD"
+
+    billing_raw = str(raw.get("billing") or "").lower().strip()
+    billing = billing_raw if billing_raw in {"one_time", "recurring_monthly", "recurring_annual"} else None
+
+    return {
+        "closed": True,
+        "value_cents": value_cents,
+        "currency": currency,
+        "billing": billing,
+    }
+
+
 def _derive_call_title(rec: FathomCallRecord, db: Session, org_id: uuid.UUID) -> str:
     """Build a human-readable title from the call record."""
     if rec.client_id:
@@ -85,6 +163,7 @@ def generate_and_persist_report(
     """
     _ensure_call_title_override_column(db)
     _ensure_call_media_columns(db)
+    _ensure_call_deal_columns(db)
     rec = (
         db.query(FathomCallRecord)
         .filter(
@@ -208,6 +287,25 @@ def _upsert_report(
         row.video_url = (getattr(rec, "video_url", None) or "")[:2000] or None
     except Exception:
         pass
+
+    # Hoist the closed-deal metric out of the LLM report so the list view can
+    # filter / sort on it without re-parsing report_json. Reset on failed runs
+    # so a previously closed deal does not stick around with stale data.
+    deal = _coerce_deal_outcome(report_json) if status == "complete" else {
+        "closed": False,
+        "value_cents": None,
+        "currency": None,
+        "billing": None,
+    }
+    try:
+        row.deal_closed = bool(deal["closed"])
+        row.deal_value_cents = deal["value_cents"]
+        row.deal_currency = deal["currency"] if deal["closed"] else None
+        row.deal_billing = deal["billing"]
+    except Exception as e:
+        # Schema may still be migrating in older deploys; log and continue.
+        logger.warning("call_library: persist deal_outcome failed: %s", e)
+
     row.attendees_json = rec.attendees_json
     row.computed_at = datetime.now(timezone.utc)
     row.updated_at = datetime.now(timezone.utc)
@@ -243,6 +341,7 @@ def get_call_library_for_org(
     """Return paginated call library items for the org."""
     _ensure_call_title_override_column(db)
     _ensure_call_media_columns(db)
+    _ensure_call_deal_columns(db)
     total = (
         db.query(func.count(CallLibraryReport.id))
         .filter(CallLibraryReport.org_id == org_id)
@@ -298,6 +397,10 @@ def get_call_library_for_org(
                 "failure_reason": row.failure_reason,
                 "client_name": client_name,
                 "call_score": row.call_score,
+                "deal_closed": bool(getattr(row, "deal_closed", False) or False),
+                "deal_value_cents": getattr(row, "deal_value_cents", None),
+                "deal_currency": getattr(row, "deal_currency", None),
+                "deal_billing": getattr(row, "deal_billing", None),
                 "recording_url": recording_url,
                 "share_url": share_url,
                 "video_url": video_url,

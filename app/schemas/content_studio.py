@@ -29,44 +29,39 @@ class KnowledgeOut(BaseModel):
     reframes: List[str] = Field(default_factory=list)
 
 
-class SectionIdeaOut(BaseModel):
+class StageConceptOut(BaseModel):
+    """Single video concept (long-form or short-form). Bulleted concept only — never a script."""
+
     model_config = ConfigDict(extra="ignore")
 
     id: str
-    stage: Literal["TOF", "MOF", "BOF"]
-    hook: str
-    concept: str
-    why_it_works: str
-    format: str = "reel"
-
-
-class ContentSectionOut(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    id: str
+    format: Literal["long", "short"] = "short"
     title: str
-    body: str
-    ideas: List[SectionIdeaOut] = Field(default_factory=list)
-
-
-class VoiceMarketingOut(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    title: str
-    body: str
     bullets: List[str] = Field(default_factory=list)
+    why_for_icp: str = ""
+    funnel_path_to_sale: str = ""
+
+
+class StageOut(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: Literal["TOF", "MOF", "BOF"]
+    title: str
+    intro: str = ""
+    concepts: List[StageConceptOut] = Field(default_factory=list)
 
 
 class ContentStudioBundleOut(BaseModel):
+    """v3 bundle: TOF/MOF/BOF video concepts grounded purely in Fathom + ICP."""
+
     model_config = ConfigDict(extra="ignore")
 
-    version: int = 2
+    version: int = 3
     signals_fingerprint: str = ""
     batch_id: str = ""
     generated_at: Optional[str] = None
     source: Literal["llm", "default", "fathom"] = "llm"
-    sections: List[ContentSectionOut] = Field(default_factory=list)
-    voice_marketing: VoiceMarketingOut = Field(default_factory=lambda: VoiceMarketingOut(title="", body=""))
+    stages: List[StageOut] = Field(default_factory=list)
 
 
 class CompletePatchBody(BaseModel):

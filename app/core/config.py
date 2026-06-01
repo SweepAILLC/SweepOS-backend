@@ -18,6 +18,9 @@ _DEFAULT_CORS_ORIGINS = [
     "http://127.0.0.1:3001",
     "http://127.0.0.1:3002",
     "http://127.0.0.1:3003",
+    # VS Code / Cursor “Live Server” / Go Live default
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
 ]
 
 
@@ -89,6 +92,13 @@ class Settings(BaseSettings):
     # Secret from Fathom webhook create response; if unset, signature verification is skipped
     FATHOM_WEBHOOK_SECRET: Optional[str] = None
 
+    # Calendly + Cal.com booking webhooks (optional — when set, we verify
+    # HMAC-SHA256 of the raw body against the provider's signature header before
+    # firing the pre_sale_post_booking automation. Leaving these unset matches the
+    # Fathom posture: warn-and-accept, fine for local dev, lock down in prod).
+    CALENDLY_WEBHOOK_SECRET: Optional[str] = None
+    CALCOM_WEBHOOK_SECRET: Optional[str] = None
+
     # LLM for Fathom sentiment + AI health score (optional — falls back to logic score)
     # Use Gemini: set GOOGLE_API_KEY (or LLM_API_KEY) and HEALTH_SCORE_LLM_MODEL e.g. gemini-2.0-flash
     # Or OpenAI: set OPENAI_API_KEY and model e.g. gpt-4o-mini
@@ -118,6 +128,11 @@ class Settings(BaseSettings):
     FATHOM_SYNC_MAX_PAGES: int = 5
     # Hard wall-clock cap per sync (seconds) to avoid very long requests on huge accounts
     FATHOM_SYNC_MAX_SECONDS: int = 90
+
+    # Webhook path: recording often arrives before Fathom exposes full transcript/summary.
+    # Re-pull API with backoff, then enqueue insight + library jobs (bounded; avoids noisy bulk rescans).
+    FATHOM_WEBHOOK_ENRICH_MAX_ATTEMPTS: int = 8
+    FATHOM_WEBHOOK_ENRICH_DELAY_SEC: int = 90
 
     # Call insights (LLM per matched Fathom recording; safeguards for cost)
     CALL_INSIGHT_MIN_INPUT_CHARS: int = 400

@@ -101,10 +101,10 @@ def apply_lead_follow_up_from_insight(client: Client, insight_json: Dict[str, An
     """
     Persist follow-up due date from call-insight lead_follow_up (LLM structured field).
 
-    Only cold_lead / warm_lead: when confirmed_on_call and due_date_iso parse, set meta.follow_up_due_at;
-    otherwise clear so the UI falls back to a 14-day window from last activity.
+    Only pre-payment pipeline stages (cold_lead, nurturing, qualified, booked): when confirmed_on_call
+    and due_date_iso parse, set meta.follow_up_due_at;
     """
-    if _lifecycle_str(client) not in ("cold_lead", "warm_lead"):
+    if _lifecycle_str(client) not in ("cold_lead", "nurturing", "qualified", "booked"):
         return
     lf = insight_json.get("lead_follow_up")
     if not isinstance(lf, dict):
@@ -446,6 +446,22 @@ def run_call_insight_for_fathom_record(
         record_from_completed_insight(db, row)
     except Exception as e:
         logger.warning("org_sales_theme record_from_completed_insight skipped: %s", e)
+
+    # Enqueue win_combined_ask automation jobs (worker handles draft+send asynchronously
+    # so the call-insight handler stays fast and survives API restarts).
+    try:
+        from app.services.automation_engine import on_call_insight_processed
+
+        on_call_insight_processed(
+            db,
+            org_id=org_id,
+            client_id=rec.client_id,
+            insight_id=row.id,
+        )
+        db.commit()
+    except Exception as e:
+        logger.warning("automation_engine on_call_insight_processed failed: %s", e)
+        db.rollback()
 
     try:
         from app.services.client_ai_recommendations_service import (

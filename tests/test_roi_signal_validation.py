@@ -23,7 +23,7 @@ def test_normalize_display_tags_lead_strips_roi_trio_and_adds_conversion():
 
 def test_normalize_display_tags_lead_open_deal():
     tags = normalize_display_tags_for_client(
-        "warm_lead",
+        "qualified",
         {"has_past_sales_call": True, "open_sales_deal": True},
         ["testimonial", "referral"],
     )
@@ -382,7 +382,7 @@ def test_apply_roi_deal_follow_up_when_open_deal():
     out, _ = apply_roi_validation(
         dict(insight),
         trans,
-        "warm_lead",
+        "qualified",
         {},
         None,
         {"has_past_sales_call": True, "open_sales_deal": True},

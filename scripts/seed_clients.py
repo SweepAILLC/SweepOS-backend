@@ -36,7 +36,7 @@ def seed_clients():
                 last_name="Smith",
                 email="jane.smith@example.com",
                 phone="+1-555-0102",
-                lifecycle_state=LifecycleState.WARM_LEAD,
+                lifecycle_state=LifecycleState.BOOKED,
                 estimated_mrr=0.0,
                 last_activity_at=datetime.utcnow() - timedelta(days=2)
             ),
