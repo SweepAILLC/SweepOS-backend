@@ -10,14 +10,9 @@ ENV/
 .venv
 pip-log.txt
 pip-delete-this-directory.txt
-.pytest_cache/
-.coverage
-htmlcov/
 *.egg-info/
 dist/
 build/
-.tox/
-.hypothesis/
 
 # Environment variables
 .env
