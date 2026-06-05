@@ -6,6 +6,9 @@ import re
 import uuid
 from typing import Any, Dict, List, Optional
 
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -13,6 +16,7 @@ from app.models.client import Client
 from app.models.client_checkin import ClientCheckIn
 from app.models.fathom_call_record import FathomCallRecord
 from app.services.llm_client import truncate_for_tokens
+from app.services.roi_signal_validation import _check_in_row_progress_signal
 
 
 def _lifecycle_str(client: Client) -> str:
@@ -86,6 +90,83 @@ def extract_booking_fields(raw_event: Dict[str, Any]) -> Dict[str, Any]:
                 if q and a:
                     out[str(q)[:80]] = str(a)[:500]
     return out
+
+
+def build_client_engagement_snapshot(
+    db: Session,
+    org_id: uuid.UUID,
+    client: Client,
+    *,
+    prior_roi_state: Optional[Dict[str, Any]] = None,
+    lookback: int = 14,
+    days: int = 120,
+) -> Dict[str, Any]:
+    """
+    Recent check-ins + program context for ROI/testimonial LLM prompts and server validation.
+    """
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
+    rows = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.client_id == client.id,
+            ClientCheckIn.cancelled.is_(False),
+            ClientCheckIn.start_time >= since,
+        )
+        .order_by(desc(ClientCheckIn.start_time))
+        .limit(lookback)
+        .all()
+    )
+    history: List[Dict[str, Any]] = []
+    completed_non_sales_90d = 0
+    since_90 = now - timedelta(days=90)
+    for ci in rows:
+        raw = _parse_raw_event(ci.raw_event_data)
+        fields = extract_booking_fields(raw)
+        row = {
+            "title": (ci.title or "")[:300],
+            "start_time": ci.start_time.isoformat() if ci.start_time else None,
+            "end_time": ci.end_time.isoformat() if ci.end_time else None,
+            "completed": bool(ci.completed),
+            "no_show": bool(getattr(ci, "no_show", False)),
+            "is_sales_call": bool(ci.is_sales_call),
+            "cancelled": bool(ci.cancelled),
+            "provider": ci.provider,
+            "event_type_label": (getattr(ci, "event_type_label", None) or "")[:120] or None,
+            "booking_fields_excerpt": fields,
+        }
+        row["progress_signal"] = _check_in_row_progress_signal(row)
+        history.append(row)
+        if (
+            ci.completed
+            and not ci.is_sales_call
+            and ci.start_time
+            and ci.start_time >= since_90
+        ):
+            completed_non_sales_90d += 1
+
+    prior: Dict[str, Any] = {}
+    if isinstance(prior_roi_state, dict):
+        prior = {
+            "testimonial_trigger_at": prior_roi_state.get("testimonial_trigger_at"),
+            "lifetime_win_moments_count": prior_roi_state.get("lifetime_win_moments_count"),
+            "testimonial_best_quote_excerpt": str(prior_roi_state.get("testimonial_best_quote") or "")[:400],
+        }
+
+    try:
+        progress = float(client.program_progress_percent) if client.program_progress_percent is not None else None
+    except (TypeError, ValueError):
+        progress = None
+
+    return {
+        "check_in_history": history,
+        "completed_non_sales_last_90d": completed_non_sales_90d,
+        "program_progress_percent": progress,
+        "program_start": client.program_start_date.isoformat() if client.program_start_date else None,
+        "program_end": client.program_end_date.isoformat() if client.program_end_date else None,
+        "prior_roi": prior,
+    }
 
 
 def build_check_in_context(db: Session, check_in_id: Optional[uuid.UUID]) -> Dict[str, Any]:
@@ -173,6 +254,14 @@ def assemble_context_pack(
             "meeting_at": fathom_record.meeting_at.isoformat() if fathom_record.meeting_at else None,
         },
         "check_in": check_ctx,
+        "engagement": build_client_engagement_snapshot(
+            db,
+            fathom_record.org_id,
+            client,
+            prior_roi_state=(
+                (meta.get("roi_state") if isinstance(meta.get("roi_state"), dict) else None)
+            ),
+        ),
         "call_text": {
             "summary": truncate_for_tokens(summary, 12000),
             "transcript": truncate_for_tokens(trans, 20000),

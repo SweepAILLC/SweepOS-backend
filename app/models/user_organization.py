@@ -1,5 +1,5 @@
 from sqlalchemy import Column, ForeignKey, DateTime, Boolean
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSON
 import uuid
 from datetime import datetime
 from app.db.session import Base
@@ -16,6 +16,8 @@ class UserOrganization(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
     is_primary = Column(Boolean, default=False, nullable=False)  # Primary org for backward compatibility
+    # Per-org Intelligence bank when the user has no dedicated users row in that org.
+    ai_profile = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     
     # Composite unique constraint: one record per user-org pair

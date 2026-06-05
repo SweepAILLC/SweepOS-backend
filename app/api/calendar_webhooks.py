@@ -37,6 +37,7 @@ from app.services.checkin_sync import (
     ensure_client_for_booking_attendee,
     normalize_email,
 )
+from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
 LOG = logging.getLogger(__name__)
 router = APIRouter()
@@ -275,6 +276,7 @@ async def calendly_webhook(
         raw_payload=body,
     )
     db.commit()
+    invalidate_terminal_monthly_trends_cache(org_uuid)
 
     fired_jobs: list[str] = []
     if is_new and not cancelled:
@@ -403,6 +405,7 @@ async def calcom_webhook(
         raw_payload=body,
     )
     db.commit()
+    invalidate_terminal_monthly_trends_cache(org_uuid)
 
     fired_jobs: list[str] = []
     if is_new and not cancelled:

@@ -14,10 +14,85 @@ OFFBOARDING_WINDOW_AFTER_END_DAYS = 21
 MIN_LIFETIME_WINS_FOR_EXPANSION = 1
 
 LEAD_PIPELINE_LIFECYCLES = frozenset({"cold_lead", "nurturing", "qualified", "booked"})
+# Testimonial chip + tag only for paying-client lifecycles (never leads).
+TESTIMONIAL_ELIGIBLE_LIFECYCLES = frozenset({"active", "offboarding", "dead"})
+EXPANSION_ROI_LIFECYCLES = frozenset({"active", "offboarding"})
 
 
 def _is_lead_pipeline(lifecycle: str) -> bool:
     return (lifecycle or "").lower().strip() in LEAD_PIPELINE_LIFECYCLES
+
+
+def _lifecycle_lc(lifecycle: str) -> str:
+    return (lifecycle or "").lower().strip()
+
+
+def _insight_wins_are_substantial(insight: Dict[str, Any]) -> bool:
+    for w in insight.get("wins") or []:
+        if is_substantial_outcome(str(w), ""):
+            return True
+    for st in insight.get("testimonial_stories") or []:
+        if is_substantial_outcome(str(st), ""):
+            return True
+    return False
+
+
+def _check_in_row_progress_signal(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    parts: List[str] = []
+    title = str(row.get("title") or "").strip()
+    if title:
+        parts.append(title)
+    fields = row.get("booking_fields_excerpt")
+    if isinstance(fields, dict):
+        parts.extend(str(v) for v in fields.values() if v)
+    text = " ".join(parts)
+    if not text.strip():
+        return False
+    return is_substantial_outcome(text, "check_in_progress")
+
+
+def engagement_win_or_progress_basis(engagement: Optional[Dict[str, Any]]) -> bool:
+    """
+    True when check-in history or stored roi_state shows the client had a win or sustained progress.
+    Used to corroborate LLM testimonial tags (not a substitute for transcript quotes when those exist).
+    """
+    eng = engagement if isinstance(engagement, dict) else {}
+    prior = eng.get("prior_roi") if isinstance(eng.get("prior_roi"), dict) else {}
+    if prior.get("testimonial_trigger_at"):
+        return True
+    try:
+        if int(prior.get("lifetime_win_moments_count") or 0) >= MIN_LIFETIME_WINS_FOR_EXPANSION:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    history = eng.get("check_in_history") if isinstance(eng.get("check_in_history"), list) else []
+    progress_hits = 0
+    completed_non_sales = 0
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        if row.get("progress_signal"):
+            progress_hits += 1
+        elif _check_in_row_progress_signal(row):
+            progress_hits += 1
+        if row.get("completed") and not row.get("is_sales_call") and not row.get("cancelled"):
+            completed_non_sales += 1
+
+    if progress_hits > 0:
+        return True
+    try:
+        completed_90 = int(eng.get("completed_non_sales_last_90d") or 0)
+    except (TypeError, ValueError):
+        completed_90 = completed_non_sales
+    if completed_90 >= 2 and progress_hits == 0:
+        # Sustained attendance without explicit progress text — still weak; require at least one signal.
+        return False
+    if completed_90 >= 3:
+        return True
+    return False
 
 
 def _dt_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -199,14 +274,15 @@ def normalize_display_tags_for_client(
         rest = [
             t
             for t in base
-            if t not in ROI_TRIO_TAGS
+            if t not in ("upsell", "referral")
             and t not in LEAD_PIPELINE_TAGS
-            and t not in ("win_back", "revive")
+            and t not in ("win_back", "conversion", "deal_follow_up")
         ]
-        wants_revive = any(t in ("win_back", "revive") for t in base)
         out = rest[:]
-        if wants_revive:
+        if "revive" not in out:
             out.append("revive")
+        if has_expansion_win_basis and "testimonial" not in out:
+            out.insert(0, "testimonial")
         return list(dict.fromkeys(out))[:12]
 
     # active, offboarding
@@ -228,16 +304,12 @@ def normalize_display_tags_for_client(
         out = [t for t in out if t not in ("upsell", "referral")]
     # Wins recorded in roi_state imply a testimonial-class signal for active/offboarding chips.
     if (
-        ls in ("active", "offboarding")
+        ls in TESTIMONIAL_ELIGIBLE_LIFECYCLES
         and testimonial_gate_bypass is not None
         and has_expansion_win_basis is not None
         and has_expansion_win_basis
         and "testimonial" not in out
     ):
-        out.insert(0, "testimonial")
-    # Product policy: active clients should always see the testimonial flag as the first ROI step,
-    # even when the current call transcript didn't include a strict "substantial outcome" quote.
-    if ls == "active" and "testimonial" not in out:
         out.insert(0, "testimonial")
     return list(dict.fromkeys(out))[:12]
 
@@ -264,6 +336,7 @@ def apply_roi_validation(
     pipeline: Optional[Dict[str, Any]] = None,
     *,
     testimonial_gate_bypass: bool = False,
+    engagement: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Mutates insight: sets opportunity_tags (ROI tags gated), roi_signals validated shape.
@@ -271,8 +344,10 @@ def apply_roi_validation(
     Returns (insight, roi_state_delta) for merging into client.meta["roi_state"].
     """
     pipe = pipeline if isinstance(pipeline, dict) else {}
-    ls = (lifecycle or "").lower().strip()
-    roi_client = ls in ("active", "offboarding")
+    ls = _lifecycle_lc(lifecycle)
+    expansion_client = ls in EXPANSION_ROI_LIFECYCLES
+    testimonial_lifecycle_ok = ls in TESTIMONIAL_ELIGIBLE_LIFECYCLES
+    check_in_basis = engagement_win_or_progress_basis(engagement)
 
     prior = prior_roi_state if isinstance(prior_roi_state, dict) else {}
     prior_testimonial = bool(prior.get("testimonial_trigger_at"))
@@ -314,7 +389,12 @@ def apply_roi_validation(
         )
 
     this_call_testimonial = len(validated_moments) > 0
-    testimonial_triggered = prior_testimonial or this_call_testimonial
+    insight_wins_ok = _insight_wins_are_substantial(insight)
+    this_call_new_win = this_call_testimonial or insight_wins_ok
+    has_first_win_already = prior_testimonial or prior_win_moments >= MIN_LIFETIME_WINS_FOR_EXPANSION
+    establishing_first_win = this_call_new_win and not has_first_win_already
+
+    testimonial_triggered = prior_testimonial or this_call_testimonial or insight_wins_ok
     effective_win_for_expansion = (
         testimonial_gate_bypass
         or testimonial_triggered
@@ -328,11 +408,15 @@ def apply_roi_validation(
     us_future = bool(us.get("future_goal_language"))
     us_quotes_ok = any(quote_in_transcript(str(q), transcript) for q in (us.get("evidence_quotes") or []) if q)
     us_rationale_ok = bool(str(us.get("rationale") or "").strip())
-    strong_upsell_evidence = roi_client and us_active and us_quotes_ok and us_rationale_ok
+    strong_upsell_evidence = expansion_client and us_active and us_quotes_ok and us_rationale_ok
+    # Upsell only after the first win is on record, on a later call with a new win + forward-looking goals.
+    progression_upsell = us_active and us_future and (us_quotes_ok or us_rationale_ok)
     upsell_ok = (
-        (effective_win_for_expansion or strong_upsell_evidence)
-        and us_active
-        and (us_future or us_quotes_ok or us_rationale_ok)
+        expansion_client
+        and not establishing_first_win
+        and has_first_win_already
+        and this_call_new_win
+        and (progression_upsell or (strong_upsell_evidence and us_future))
     )
 
     rf = raw_rs.get("referral_signal")
@@ -342,14 +426,14 @@ def apply_roi_validation(
         quote_in_transcript(str(q), transcript) for q in (rf.get("evidence_quotes") or []) if q
     )
     ref_rationale_nonempty = bool(str(rf.get("rationale") or "").strip())
-    strong_referral_evidence = roi_client and ref_evidence_quotes_ok and ref_rationale_nonempty
+    strong_referral_evidence = expansion_client and ref_evidence_quotes_ok and ref_rationale_nonempty
     # Treat substantiated referral_signal (quotes in transcript + rationale) like upsell: models often
     # describe referral intent in wins/synthesis but leave active=false or use the wrong variant.
     ref_active = (
         bool(rf.get("active"))
         or ("referral" in llm_tags)
         or (
-            roi_client
+            expansion_client
             and (effective_win_for_expansion or strong_referral_evidence)
             and ref_evidence_quotes_ok
             and ref_rationale_nonempty
@@ -373,33 +457,34 @@ def apply_roi_validation(
         ):
             vs = "post_testimonial"
     # new_lead is only valid for lead lifecycles; remap when the model mis-tags active/offboarding clients.
-    if roi_client and effective_win_for_expansion and vs == "new_lead":
+    if expansion_client and effective_win_for_expansion and vs == "new_lead":
         vs = "post_testimonial"
     referral_ok = ref_active and vs and _referral_variant_allowed(vs, lifecycle)
     # Keep ROI hygiene (avoid spam), but do not suppress clear transcript-backed triggers.
-    if roi_client and not effective_win_for_expansion and not strong_referral_evidence:
+    if expansion_client and not effective_win_for_expansion and not strong_referral_evidence:
         referral_ok = False
-    if roi_client and not effective_win_for_expansion and not strong_upsell_evidence:
+    if expansion_client and not effective_win_for_expansion and not strong_upsell_evidence:
         upsell_ok = False
-    if not roi_client:
+    if not expansion_client:
         referral_ok = False
         upsell_ok = False
 
-    validated_moments_out = validated_moments if roi_client else []
-    # Testimonial tag only when this call has a validated client-substantial moment (active/offboarding only).
-    testimonial_tag = len(validated_moments_out) > 0
-    upsell_tag = upsell_ok and roi_client
-    referral_tag = referral_ok and roi_client
+    validated_moments_out = validated_moments if testimonial_lifecycle_ok else []
+    has_transcript_win = len(validated_moments_out) > 0
+    llm_wants_testimonial = "testimonial" in llm_tags
+    # Testimonial: paying-client lifecycles when this call documents a concrete win (transcript or wins[]).
+    testimonial_tag = testimonial_lifecycle_ok and (
+        has_transcript_win
+        or insight_wins_ok
+        or (check_in_basis and llm_wants_testimonial)
+    )
+    upsell_tag = upsell_ok and expansion_client
+    referral_tag = referral_ok and expansion_client
 
     revive_pb_in = raw_rs.get("revive_playbook") if isinstance(raw_rs.get("revive_playbook"), dict) else {}
     revive_rationale = str(revive_pb_in.get("rationale") or "").strip()
     revive_angles = revive_pb_in.get("offer_angles") if isinstance(revive_pb_in.get("offer_angles"), list) else []
-    revive_tag = ls == "dead" and (
-        "revive" in llm_tags
-        or "win_back" in llm_tags
-        or bool(revive_rationale)
-        or any(str(x).strip() for x in revive_angles[:3])
-    )
+    revive_tag = ls == "dead"
 
     has_past_sales = bool(pipe.get("has_past_sales_call"))
     open_deal = bool(pipe.get("open_sales_deal"))
@@ -407,9 +492,9 @@ def apply_roi_validation(
     deal_follow_tag = _is_lead_pipeline(ls) and has_past_sales and open_deal
 
     new_tags: List[str] = []
-    if roi_client:
-        if testimonial_tag:
-            new_tags.append("testimonial")
+    if testimonial_tag:
+        new_tags.append("testimonial")
+    if expansion_client:
         if upsell_tag:
             new_tags.append("upsell")
         if referral_tag:
@@ -442,12 +527,15 @@ def apply_roi_validation(
     revive_playbook_out: Dict[str, Any] = {"rationale": "", "offer_angles": [], "outreach_hooks": []}
     if ls == "dead" and isinstance(revive_pb_in, dict):
         revive_playbook_out = {
-            "rationale": str(revive_pb_in.get("rationale") or "")[:1200] if revive_tag else "",
+            "rationale": str(revive_pb_in.get("rationale") or "")[:1200],
             "offer_angles": [str(x)[:400] for x in (revive_pb_in.get("offer_angles") or [])[:10] if str(x).strip()],
             "outreach_hooks": [str(x)[:400] for x in (revive_pb_in.get("outreach_hooks") or [])[:10] if str(x).strip()],
         }
-        if not revive_tag:
-            revive_playbook_out = {"rationale": "", "offer_angles": [], "outreach_hooks": []}
+        if revive_tag and not str(revive_playbook_out.get("rationale") or "").strip():
+            revive_playbook_out["rationale"] = (
+                "Client is in Dead — prioritize respectful win-back and re-enrollment paths "
+                "grounded in past calls and program context."
+            )[:1200]
 
     insight["roi_signals"] = {
         "testimonial_moments": validated_moments_out[:5],
@@ -465,6 +553,18 @@ def apply_roi_validation(
         if validated_moments_out:
             roi_delta["testimonial_best_quote"] = validated_moments_out[0].get("quote", "")[:800]
             roi_delta["testimonial_best_timestamp"] = validated_moments_out[0].get("start_timestamp", "")
+        elif insight_wins_ok:
+            for w in insight.get("wins") or []:
+                ws = str(w).strip()
+                if is_substantial_outcome(ws, ""):
+                    roi_delta["testimonial_best_quote"] = ws[:800]
+                    break
+            if not roi_delta.get("testimonial_best_quote"):
+                for st in insight.get("testimonial_stories") or []:
+                    ss = str(st).strip()
+                    if is_substantial_outcome(ss, ""):
+                        roi_delta["testimonial_best_quote"] = ss[:800]
+                        break
     if upsell_tag:
         roi_delta["last_upsell_signal_at"] = now_iso
     if referral_tag:
@@ -476,6 +576,8 @@ def apply_roi_validation(
         roi_delta["last_revive_signal_at"] = now_iso
     if validated_moments_out:
         roi_delta["lifetime_win_moments_increment"] = len(validated_moments_out)
+    elif testimonial_tag and insight_wins_ok:
+        roi_delta["lifetime_win_moments_increment"] = 1
 
     return insight, roi_delta
 

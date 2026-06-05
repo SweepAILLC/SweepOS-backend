@@ -52,6 +52,7 @@ from app.models.user import User
 from app.models.whop_payment import WhopPayment
 from app.utils.stripe_helpers import extract_email_from_payment_raw
 from app.utils.stripe_ids import normalize_stripe_id_for_dedup
+from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
 router = APIRouter()
 
@@ -475,7 +476,8 @@ def create_manual_payment(
     db.add(manual_payment)
     db.commit()
     db.refresh(manual_payment)
-    
+    invalidate_terminal_monthly_trends_cache(org_id)
+
     return {
         "id": str(manual_payment.id),
         "client_id": client_id,
@@ -488,6 +490,88 @@ def create_manual_payment(
         "receipt_url": manual_payment.receipt_url,
         "status": "succeeded",
         "type": "manual_payment"
+    }
+
+
+@router.patch("/{client_id}/manual-payment/{payment_id}")
+def update_manual_payment(
+    client_id: str,
+    payment_id: str,
+    amount: float = Query(..., ge=0.01, description="Payment amount in dollars"),
+    payment_date: Optional[str] = Query(None, description="Payment date (ISO format). Defaults to existing."),
+    description: Optional[str] = Query(None, description="Payment description/notes"),
+    payment_method: Optional[str] = Query(None, description="Payment method (e.g., cash, check, bank_transfer)"),
+    receipt_url: Optional[str] = Query(None, description="Optional receipt/document URL"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update a manual payment transaction."""
+    from datetime import timezone
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+
+    try:
+        client_uuid = UUID(client_id)
+        payment_uuid = UUID(payment_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid client ID or payment ID format",
+        )
+
+    client = db.query(Client).filter(
+        Client.id == client_uuid,
+        Client.org_id == org_id,
+    ).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Client not found")
+
+    manual_payment = db.query(ManualPayment).filter(
+        ManualPayment.id == payment_uuid,
+        ManualPayment.client_id == client_uuid,
+        ManualPayment.org_id == org_id,
+    ).first()
+    if not manual_payment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Manual payment not found")
+
+    if payment_date:
+        try:
+            if payment_date.endswith("Z"):
+                payment_date = payment_date.replace("Z", "+00:00")
+            payment_datetime = datetime.fromisoformat(payment_date)
+            if payment_datetime.tzinfo is None:
+                payment_datetime = payment_datetime.replace(tzinfo=timezone.utc)
+            manual_payment.payment_date = payment_datetime
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid payment_date format: {str(e)}",
+            )
+
+    manual_payment.amount_cents = int(round(amount * 100))
+    if description is not None:
+        manual_payment.description = description or None
+    if payment_method is not None:
+        manual_payment.payment_method = payment_method or None
+    if receipt_url is not None:
+        manual_payment.receipt_url = receipt_url or None
+
+    db.commit()
+    db.refresh(manual_payment)
+    invalidate_terminal_monthly_trends_cache(org_id)
+
+    return {
+        "id": str(manual_payment.id),
+        "client_id": client_id,
+        "amount_cents": manual_payment.amount_cents,
+        "amount": manual_payment.amount_cents / 100.0,
+        "currency": manual_payment.currency,
+        "payment_date": manual_payment.payment_date.isoformat(),
+        "description": manual_payment.description,
+        "payment_method": manual_payment.payment_method,
+        "receipt_url": manual_payment.receipt_url,
+        "status": "succeeded",
+        "type": "manual_payment",
     }
 
 
@@ -541,6 +625,7 @@ def delete_manual_payment(
     
     db.delete(manual_payment)
     db.commit()
+    invalidate_terminal_monthly_trends_cache(org_id)
     
     return None
 

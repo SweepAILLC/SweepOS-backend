@@ -24,7 +24,7 @@ from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.core.encryption import decrypt_token
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple, Dict, Any
 import json
 import logging
@@ -1005,10 +1005,19 @@ def get_calcom_event_types(
                     # Transform Cal.com API fields to our schema format
                     # Cal.com uses 'lengthInMinutes', we use 'length'
                     length_value = et.get("lengthInMinutes") or et.get("length")
+                    booking_url = (
+                        et.get("bookingUrl")
+                        or et.get("link")
+                        or et.get("url")
+                        or et.get("bookingLink")
+                    )
+                    if not booking_url and username and et.get("slug"):
+                        booking_url = f"https://cal.com/{username}/{et['slug']}"
                     transformed_event_type = {
                         **et,
                         "length": length_value,  # Map 'lengthInMinutes' to 'length'
-                        "lengthInMinutes": et.get("lengthInMinutes")  # Keep original field too
+                        "lengthInMinutes": et.get("lengthInMinutes"),  # Keep original field too
+                        "bookingUrl": booking_url,
                     }
                     
                     # Ensure required fields have defaults if missing
@@ -3377,28 +3386,19 @@ def get_calendar_upcoming_summary(
         elif len(last_month_bookings) > 0:
             last_month_change = 100.0  # 100% increase (from 0)
         
-        # Show-up rate: % of past appointments (last 30 days) that were not cancelled and not no-show
+        # Show-up rate: past sales calls (last 30 days), excluding cancellations.
+        # Only no-shows reduce the rate — other event types are out of scope.
         show_up_rate = None
-        if last_month_bookings:
-            showed_up = 0
-            for b in last_month_bookings:
-                if b.get("provider") == "manual":
-                    continue  # Manual check-ins: exclude from rate or count as showed; skip for consistency
-                if provider == "calcom":
-                    if b.get("status") != "accepted":
-                        continue
-                    if b.get("absentHost"):
-                        continue
-                    attendees = b.get("attendees") or []
-                    if any(a.get("absent") for a in attendees):
-                        continue
-                    showed_up += 1
-                else:  # calendly
-                    if b.get("status") == "active":
-                        showed_up += 1
-            total_past = len([b for b in last_month_bookings if b.get("provider") != "manual"])
-            if total_past > 0:
-                show_up_rate = round((showed_up / total_past) * 100, 1)
+        try:
+            from app.api import admin as admin_api
+
+            now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+            one_month_ago_naive = one_month_ago.replace(tzinfo=None) if one_month_ago.tzinfo else one_month_ago
+            show_up_rate = admin_api._org_show_up_rate_pct(
+                db, org_id, one_month_ago_naive, now_naive, now_naive
+            )
+        except Exception as show_up_err:
+            print(f"[CALENDAR SUMMARY] Could not compute sales-call show-up rate: {show_up_err}")
         
         # Sort all upcoming bookings by start_time
         upcoming_bookings.sort(key=lambda b: b.get("start_datetime") or datetime.fromisoformat(b["start_time"].replace('Z', '+00:00')))
@@ -3537,10 +3537,81 @@ def _calendar_row_display_status(ci: ClientCheckIn, now_utc: datetime) -> str:
     return "completed"
 
 
+@router.get("/calendar/trend-summary")
+def get_calendar_trend_summary(
+    scope: Optional[str] = Query(
+        None,
+        description="Window preset: mtd (UTC month-to-date) or all (all recorded history).",
+    ),
+    range_days: Optional[int] = Query(
+        None,
+        ge=1,
+        le=365,
+        description="Rolling day window when scope is omitted (e.g. 30).",
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Scoped calendar KPIs from synced check-ins (full DB scan — not limited to recent-bookings cap).
+    Show-up: past sales calls in window that are not no-shows / all past sales calls (cancellations excluded).
+    """
+    from app.schemas.calendar_metrics import CalendarTrendSummaryResponse
+    from app.services.calendar_trend_summary import compute_calendar_trend_summary
+
+    if scope is not None and scope not in ("mtd", "all"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="scope must be mtd or all",
+        )
+    if scope is None and range_days is None:
+        range_days = 30
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    payload = compute_calendar_trend_summary(
+        db,
+        org_id,
+        scope=scope,
+        range_days=range_days,
+    )
+    return CalendarTrendSummaryResponse(**payload)
+
+
+@router.get("/calendar/last-updated")
+def get_calendar_last_updated(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Lightweight marker for when Cal.com / Calendly check-ins last changed (webhook or sync).
+    Terminal polls this to refetch bookings, KPIs, and trend charts without a manual refresh.
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    latest = (
+        db.query(func.max(ClientCheckIn.updated_at))
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+        )
+        .scalar()
+    )
+    if latest is None:
+        return {"last_updated": None, "last_updated_ms": None}
+
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=timezone.utc)
+    ms = int(latest.timestamp() * 1000)
+    return {"last_updated": latest.isoformat().replace("+00:00", "Z"), "last_updated_ms": ms}
+
+
 @router.get("/calendar/synced-bookings")
 def get_calendar_synced_bookings(
-    upcoming_limit: int = Query(100, ge=1, le=300),
-    past_limit: int = Query(100, ge=1, le=300),
+    upcoming_limit: int = Query(100, ge=1, le=500),
+    past_limit: int = Query(100, ge=1, le=500),
+    past_since: Optional[str] = Query(
+        None,
+        description="ISO datetime — only return past rows with start_time on or after this instant.",
+    ),
     provider: Optional[str] = Query(
         None,
         description="If set, only rows for this provider (calcom or calendly). Omit to return both.",
@@ -3587,12 +3658,20 @@ def get_calendar_synced_bookings(
         .limit(upcoming_limit)
         .all()
     )
-    past_rows = (
-        base.filter(ClientCheckIn.start_time < now)
-        .order_by(ClientCheckIn.start_time.desc())
-        .limit(past_limit)
-        .all()
-    )
+    past_q = base.filter(ClientCheckIn.start_time < now)
+    if past_since:
+        try:
+            since_raw = past_since.replace("Z", "+00:00") if past_since.endswith("Z") else past_since
+            since_dt = datetime.fromisoformat(since_raw)
+            if since_dt.tzinfo is not None:
+                since_dt = since_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            past_q = past_q.filter(ClientCheckIn.start_time >= since_dt)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid past_since; use ISO-8601 datetime.",
+            )
+    past_rows = past_q.order_by(ClientCheckIn.start_time.desc()).limit(past_limit).all()
 
     def serialize(ci: ClientCheckIn) -> Dict[str, Any]:
         client_name = None

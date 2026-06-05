@@ -392,6 +392,33 @@ def default_actions_for_client(client: Client) -> tuple[Optional[str], List[Dict
     return ("Suggested next steps", [_new_action("Schedule next touchpoint and log outcome in notes", category="general", priority=1)])
 
 
+def reset_recommendation_state_for_lifecycle(db: Session, client: Client) -> ClientAIRecommendationState:
+    """Replace checklist with defaults for the client's current lifecycle (e.g. after entering Dead)."""
+    headline, actions = default_actions_for_client(client)
+    now = datetime.now(timezone.utc)
+    row = (
+        db.query(ClientAIRecommendationState)
+        .filter(ClientAIRecommendationState.client_id == client.id)
+        .first()
+    )
+    if row is None:
+        row = ClientAIRecommendationState(
+            client_id=client.id,
+            org_id=client.org_id,
+            headline=headline,
+            actions=actions,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+    else:
+        row.headline = headline
+        row.actions = actions
+        row.updated_at = now
+    db.flush()
+    return row
+
+
 def ensure_recommendation_state(db: Session, client: Client) -> ClientAIRecommendationState:
     row = (
         db.query(ClientAIRecommendationState)

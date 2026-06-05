@@ -24,11 +24,13 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.services.call_insight_ai import compute_call_insight_json, headline_from_insight, validate_and_normalize_insight_json
 from app.services.offer_ladder import resolve_org_offer_ladder
 from app.services.roi_signal_validation import (
+    TESTIMONIAL_ELIGIBLE_LIFECYCLES,
     apply_roi_validation,
     client_has_expansion_win_basis,
     merge_client_roi_meta,
     normalize_display_tags_for_client,
     upsell_referral_testimonial_gate_bypass,
+    _insight_wins_are_substantial,
 )
 from app.services.user_ai_profile_context import resolve_org_sales_lens
 from app.services.call_insight_context import assemble_context_pack, is_thin_transcript
@@ -204,6 +206,62 @@ def _fallback_opportunity_tags_from_insights(
         if tags:
             return tags
     return []
+
+
+def _client_should_show_testimonial_chip(db: Session, org_id: uuid.UUID, client: Client) -> bool:
+    """Board chip when roi_state or latest insight documents a concrete win."""
+    ls_lc = _lifecycle_str(client).lower().strip()
+    if ls_lc not in TESTIMONIAL_ELIGIBLE_LIFECYCLES:
+        return False
+    if client_has_expansion_win_basis(client):
+        return True
+    rows = (
+        db.query(ClientCallInsight)
+        .filter(
+            ClientCallInsight.org_id == org_id,
+            ClientCallInsight.client_id == client.id,
+            ClientCallInsight.status == "complete",
+        )
+        .order_by(desc(ClientCallInsight.computed_at))
+        .limit(6)
+        .all()
+    )
+    for r in rows:
+        tags = _opportunity_tags_from_insight_row(r)
+        if "testimonial" in tags:
+            return True
+        ij = r.insight_json if isinstance(r.insight_json, dict) else {}
+        if _insight_wins_are_substantial(ij):
+            return True
+    return False
+
+
+def _resolve_client_board_tags(
+    db: Session,
+    org_id: uuid.UUID,
+    client: Client,
+    *,
+    stored_tags: Optional[List[str]] = None,
+    fallback_tags: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Kanban/drawer tag chips: merge persisted summary, latest insight tags, and win-based testimonial.
+    """
+    stored = [str(t).lower().strip() for t in (stored_tags or []) if str(t).strip()]
+    fb = [str(t).lower().strip() for t in (fallback_tags or []) if str(t).strip()]
+    merged = list(dict.fromkeys(stored + fb))
+    if _client_should_show_testimonial_chip(db, org_id, client) and "testimonial" not in merged:
+        merged.insert(0, "testimonial")
+    pipe = _lead_pipeline_snapshot(db, org_id, client.id)
+    bypass = upsell_referral_testimonial_gate_bypass(client)
+    win_basis = client_has_expansion_win_basis(client)
+    return normalize_display_tags_for_client(
+        _lifecycle_str(client),
+        pipe,
+        merged,
+        testimonial_gate_bypass=bypass,
+        has_expansion_win_basis=win_basis,
+    )
 
 
 def _batch_fallback_opportunity_tags(
@@ -408,6 +466,7 @@ def run_call_insight_for_fathom_record(
         meeting_iso,
         pipeline,
         testimonial_gate_bypass=gate_bypass,
+        engagement=pack.get("engagement") if isinstance(pack.get("engagement"), dict) else None,
     )
     merge_client_roi_meta(client, roi_delta)
     try:
@@ -731,24 +790,13 @@ def get_client_insights_response(db: Session, org_id: uuid.UUID, client_id: uuid
         if summ.tags:
             raw_tags = [str(t).lower().strip() for t in summ.tags if str(t).strip()]
         fb_tags = _fallback_opportunity_tags_from_insights(db, org_id, client_id)
-        ls_lc = _lifecycle_str(client).lower().strip()
-        if ls_lc in ("active", "offboarding") and not raw_tags and fb_tags:
-            raw_tags = list(fb_tags)
-        tags = normalize_display_tags_for_client(
-            _lifecycle_str(client),
-            pipeline,
-            raw_tags,
-            testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(client),
-            has_expansion_win_basis=client_has_expansion_win_basis(client),
+        tags = _resolve_client_board_tags(
+            db,
+            org_id,
+            client,
+            stored_tags=raw_tags,
+            fallback_tags=fb_tags,
         )
-        if ls_lc in ("active", "offboarding") and not tags and fb_tags:
-            tags = normalize_display_tags_for_client(
-                _lifecycle_str(client),
-                pipeline,
-                list(fb_tags),
-                testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(client),
-                has_expansion_win_basis=client_has_expansion_win_basis(client),
-            )
         summary_out = {
             "headline": summ.headline,
             "tags": tags,
@@ -852,26 +900,14 @@ def get_call_insight_tags_batch(db: Session, org_id: uuid.UUID, client_ids: List
         stored_tags: List[str] = []
         if summ and summ.tags:
             stored_tags = [str(t).lower().strip() for t in summ.tags if str(t).strip()]
-        ls_lc = _lifecycle_str(c).lower().strip()
         fb_tags = fallback_map.get(cid) or []
-        if ls_lc in ("active", "offboarding") and not stored_tags and fb_tags:
-            stored_tags = list(fb_tags)
-        pipe = _lead_pipeline_snapshot(db, org_id, cid)
-        tags = normalize_display_tags_for_client(
-            _lifecycle_str(c),
-            pipe,
-            stored_tags,
-            testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(c),
-            has_expansion_win_basis=client_has_expansion_win_basis(c),
+        tags = _resolve_client_board_tags(
+            db,
+            org_id,
+            c,
+            stored_tags=stored_tags,
+            fallback_tags=fb_tags,
         )
-        if ls_lc in ("active", "offboarding") and not tags and fb_tags:
-            tags = normalize_display_tags_for_client(
-                _lifecycle_str(c),
-                pipe,
-                list(fb_tags),
-                testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(c),
-                has_expansion_win_basis=client_has_expansion_win_basis(c),
-            )
         headline = (summ.headline or "")[:120] if summ else ""
         out[str(cid)] = {"tags": tags, "headline": headline}
     return out
@@ -1021,3 +1057,96 @@ def refresh_insight_summary_from_latest_stored_insight(
         "score": float(cache_row.score) if cache_row and cache_row.score is not None else None,
     }
     _upsert_summary(db, org_id, client, fj, row.insight_json, health)
+
+
+def reconcile_call_insights_for_dead_lifecycle(
+    db: Session, org_id: uuid.UUID, client: Client
+) -> None:
+    """
+    When a client enters Dead (kanban or automation): stamp revive on the board summary,
+    re-validate the latest stored insight for dead lifecycle, and reset the win-back checklist.
+    """
+    from app.services.client_ai_recommendations_service import reset_recommendation_state_for_lifecycle
+
+    reset_recommendation_state_for_lifecycle(db, client)
+
+    summ = db.query(ClientInsightSummary).filter(ClientInsightSummary.client_id == client.id).first()
+    if summ is None:
+        summ = ClientInsightSummary(client_id=client.id, org_id=org_id, tags=[], headline="")
+        db.add(summ)
+    tags = [str(t).lower().strip() for t in (summ.tags or []) if str(t).strip()]
+    if "revive" not in tags:
+        tags.append("revive")
+    summ.tags = list(dict.fromkeys(tags))[:12]
+    summ.last_lifecycle_state = _lifecycle_str(client)
+
+    row = (
+        db.query(ClientCallInsight)
+        .filter(
+            ClientCallInsight.org_id == org_id,
+            ClientCallInsight.client_id == client.id,
+            ClientCallInsight.status == "complete",
+        )
+        .order_by(desc(ClientCallInsight.computed_at))
+        .first()
+    )
+    if not row or not row.insight_json or not isinstance(row.insight_json, dict):
+        db.flush()
+        return
+
+    fj = db.query(FathomCallRecord).filter(FathomCallRecord.id == row.fathom_call_record_id).first()
+    if not fj:
+        refresh_insight_summary_from_latest_stored_insight(db, org_id, client.id)
+        db.flush()
+        return
+
+    transcript = str(fj.transcript_text or "")
+    meeting_at_iso = fj.meeting_at.isoformat() if fj.meeting_at else None
+    ij = dict(row.insight_json)
+    pipe = _lead_pipeline_snapshot(db, org_id, client.id)
+    prior_roi = (client.meta or {}).get("roi_state") if isinstance(client.meta, dict) else {}
+    from app.services.call_insight_context import build_client_engagement_snapshot
+
+    engagement = build_client_engagement_snapshot(db, org_id, client, prior_roi_state=prior_roi)
+    ij, roi_delta = apply_roi_validation(
+        ij,
+        transcript,
+        _lifecycle_str(client),
+        prior_roi,
+        meeting_at_iso,
+        pipe,
+        testimonial_gate_bypass=upsell_referral_testimonial_gate_bypass(client),
+        engagement=engagement,
+    )
+    if roi_delta:
+        merge_client_roi_meta(client, roi_delta)
+        flag_modified(client, "meta")
+    row.insight_json = ij
+    flag_modified(row, "insight_json")
+
+    from app.models.client_health_score_cache import ClientHealthScoreCache
+
+    cache_row = db.query(ClientHealthScoreCache).filter(ClientHealthScoreCache.client_id == client.id).first()
+    health: Dict[str, Any] = {
+        "grade": (cache_row.grade if cache_row else "") or "",
+        "score": float(cache_row.score) if cache_row and cache_row.score is not None else None,
+    }
+    _upsert_summary(db, org_id, client, fj, ij, health)
+    db.flush()
+
+
+def on_client_became_dead(db: Session, org_id: uuid.UUID, client: Client) -> bool:
+    """Sync reconcile + optional background LLM refresh when Fathom data exists."""
+    reconcile_call_insights_for_dead_lifecycle(db, org_id, client)
+    has_fathom = (
+        db.query(FathomCallRecord.id)
+        .filter(
+            FathomCallRecord.org_id == org_id,
+            FathomCallRecord.client_id == client.id,
+            FathomCallRecord.sentiment_status == "complete",
+        )
+        .limit(1)
+        .first()
+        is not None
+    )
+    return has_fathom

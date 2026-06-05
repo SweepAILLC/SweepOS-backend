@@ -75,11 +75,12 @@ def _org_id(user: User) -> uuid.UUID:
 
 
 def _user_orm(db: Session, user: User) -> User:
-    uid = user.id if isinstance(user.id, uuid.UUID) else uuid.UUID(str(user.id))
-    row = db.query(User).filter(User.id == uid).first()
-    if not row:
+    from app.services.org_intelligence_profile import resolve_org_intelligence_user_row
+
+    try:
+        return resolve_org_intelligence_user_row(db, user)
+    except ValueError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return row
 
 
 def _parse_bundle_dict(raw: Dict[str, Any]) -> ContentStudioBundleOut:
@@ -185,7 +186,17 @@ def _regenerate_bundle_outside_session(
         bid = uuid.UUID(str(bundle["batch_id"]))
         css.upsert_generation(db2, org_id, urow.id if urow else user_id, bid, bundle)
         if urow:
-            css.set_user_content_studio_batch_and_completions(db2, urow, str(bid), [])
+            from types import SimpleNamespace
+
+            auth_proxy = SimpleNamespace(
+                id=urow.id,
+                email=urow.email,
+                org_id=org_id,
+                selected_org_id=org_id,
+            )
+            css.set_user_content_studio_batch_and_completions(
+                db2, urow, str(bid), [], auth_user=auth_proxy
+            )
     except Exception:
         logger.exception("Content studio bundle regen failed for org %s", org_id)
     finally:
@@ -385,7 +396,9 @@ def patch_ideas_complete(
     valid = css.valid_idea_ids_from_ideas_json(gen_row.ideas_json)
     filtered = [x for x in body.completed_idea_ids if x in valid]
     batch_id = str(gen_row.batch_id)
-    updated_at = css.set_user_content_studio_batch_and_completions(db, urow, batch_id, filtered)
+    updated_at = css.set_user_content_studio_batch_and_completions(
+        db, urow, batch_id, filtered, auth_user=current_user
+    )
 
     return CompletePatchResponse(
         completed_idea_ids=filtered,

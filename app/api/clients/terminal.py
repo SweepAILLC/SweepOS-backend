@@ -70,10 +70,8 @@ from app.schemas.client import (
 )
 from app.services.terminal_metrics_service import (
     build_calendar_monthly_coaching_periods,
-    build_terminal_monthly_trends,
+    get_or_build_terminal_monthly_trends,
     org_whop_cash_usd_window,
-    terminal_monthly_trends_cache_get,
-    terminal_monthly_trends_cache_set,
 )
 @router.get(
     "/calendar/monthly-coaching-metrics",
@@ -101,15 +99,10 @@ def get_terminal_monthly_trends(
 ):
     """Monthly combined cash, calendar rates, and sales calls booked since onboarding."""
     org_id = scope_org_id(current_user)
-    cached = terminal_monthly_trends_cache_get(org_id)
-    if cached is not None:
-        return cached
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-    response = build_terminal_monthly_trends(db, org)
-    terminal_monthly_trends_cache_set(org_id, response)
-    return response
+    return get_or_build_terminal_monthly_trends(db, org)
 
 
 @router.get("/terminal-summary", response_model=TerminalSummaryResponse)

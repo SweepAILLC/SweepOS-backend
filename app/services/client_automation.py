@@ -91,6 +91,14 @@ def apply_manual_lifecycle_change(client: Client, new_state: LifecycleState) -> 
     client.meta = meta
     flag_modified(client, "meta")
 
+    # Without a program timeline, stale progress must not re-trigger auto-dead on sync/get.
+    if _lifecycle_str(new_state) != LifecycleState.DEAD.value:
+        if not client.program_start_date or not client.program_duration_days:
+            client.program_progress_percent = None
+            if not client.program_start_date:
+                client.program_end_date = None
+                client.program_duration_days = None
+
 
 def get_follow_up_due_at(client: Client) -> Optional[datetime]:
     """Effective follow-up due instant (naive UTC), mirroring frontend leadFollowUp.ts."""
@@ -271,6 +279,24 @@ def update_client_lifecycle_state(db: Session, client: Client, force: bool = Fal
             )
         except Exception as automation_error:
             print(f"[AUTOMATION_ENGINE] ⚠️  Error enqueueing offboarding job: {automation_error}")
+    if target_str == LifecycleState.DEAD.value:
+        try:
+            from app.long_jobs import schedule_background_work
+            from app.services.call_insight_service import (
+                on_client_became_dead,
+                refresh_latest_call_insight_background,
+            )
+
+            has_fathom = on_client_became_dead(db, client.org_id, client)
+            if has_fathom:
+                schedule_background_work(
+                    refresh_latest_call_insight_background,
+                    None,
+                    str(client.org_id),
+                    str(client.id),
+                )
+        except Exception as dead_hook_err:
+            print(f"[CLIENT_AUTOMATION] ⚠️  Dead lifecycle insight hook failed: {dead_hook_err}")
     return True
 
 

@@ -107,6 +107,8 @@ def _manual_payment_stripe_responses(
                 subscription_id=f"Manual · {method}",
                 receipt_url=mp.receipt_url,
                 created_at=created_ts,
+                description=mp.description,
+                payment_method=mp.payment_method,
             )
         )
     return result

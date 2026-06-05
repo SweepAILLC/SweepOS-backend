@@ -976,39 +976,47 @@ def resolve_ai_profile_context(
     legacy mixed-case ``users.role`` rows do not trip the strict PG enum reader.
     """
     role_rank = {"owner": 0, "admin": 1, "member": 2}
-    rows = db.execute(
+    from types import SimpleNamespace
+
+    candidates: list[tuple[int, Any, Any]] = []
+
+    user_rows = db.execute(
         text(
-            "SELECT id, role::text AS role, created_at FROM users "
+            "SELECT id, email, ai_profile, role::text AS role, created_at FROM users "
             "WHERE org_id = :org_id AND ai_profile IS NOT NULL"
         ),
         {"org_id": str(org_id)},
     ).fetchall()
-    if not rows:
+    for row in user_rows:
+        rank = role_rank.get(str(row.role or "").strip().lower(), 99)
+        candidates.append((rank, row.created_at or datetime.min, row))
+
+    uo_rows = db.execute(
+        text(
+            "SELECT u.id, u.email, uo.ai_profile, u.role::text AS role, u.created_at "
+            "FROM user_organizations uo "
+            "JOIN users u ON u.id = uo.user_id "
+            "WHERE uo.org_id = :org_id AND uo.ai_profile IS NOT NULL"
+        ),
+        {"org_id": str(org_id)},
+    ).fetchall()
+    seen_ids = {str(r.id) for r in user_rows}
+    for row in uo_rows:
+        if str(row.id) in seen_ids:
+            continue
+        rank = role_rank.get(str(row.role or "").strip().lower(), 99)
+        candidates.append((rank, row.created_at or datetime.min, row))
+
+    if not candidates:
         ladder = resolve_org_offer_ladder(db, org_id)
         return None, ladder
-    sorted_rows = sorted(
-        rows,
-        key=lambda r: (
-            role_rank.get(str(r.role or "").strip().lower(), 99),
-            r.created_at or datetime.min,
-        ),
-    )
-    profile: Optional[Dict[str, Any]] = None
-    for row in sorted_rows:
-        # Re-fetch the User row by id, but read ai_profile via raw SQL too so we
-        # never need the role column to map back to UserRole.
-        ai_row = db.execute(
-            text("SELECT id, email, ai_profile FROM users WHERE id = :uid"),
-            {"uid": str(row.id)},
-        ).fetchone()
-        if ai_row is None:
-            continue
-        # extract_intelligence_profile_for_automation_llm reads .ai_profile, so a
-        # SimpleNamespace works.
-        from types import SimpleNamespace
 
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    profile: Optional[Dict[str, Any]] = None
+    for _, _, row in candidates:
+        raw_profile = getattr(row, "ai_profile", None)
         candidate = extract_intelligence_profile_for_automation_llm(
-            SimpleNamespace(id=ai_row.id, email=ai_row.email, ai_profile=ai_row.ai_profile)
+            SimpleNamespace(id=row.id, email=row.email, ai_profile=raw_profile)
         )
         if candidate:
             profile = candidate

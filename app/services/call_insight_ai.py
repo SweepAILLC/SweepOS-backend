@@ -35,16 +35,20 @@ def _lifecycle_block(lifecycle: str) -> str:
         )
     if ls == "dead":
         return (
-            "LIFECYCLE=DEAD: REVIVE and re-enrollment only. Output roi_signals.revive_playbook with concrete offer tweaks, "
-            "new packaging/pricing angles, and respectful outreach hooks grounded in the transcript. "
-            "Tag revive when there is realistic win-back potential. Do NOT tag testimonial, upsell, referral, or conversion."
+            "LIFECYCLE=DEAD: Primary focus is REVIVE / win-back (roi_signals.revive_playbook). "
+            "Tag revive when there is realistic re-enrollment potential. "
+            "Tag testimonial ONLY when DATA.context.engagement shows a concrete past win or measurable progress "
+            "(completed check-ins, booking-field outcomes, program_progress_percent, prior_roi) AND the transcript or "
+            "wins[] supports asking for a post-program testimonial—never on speculation. "
+            "Do NOT tag upsell, referral, or conversion."
         )
     if ls in ("active", "offboarding"):
         return (
-            "Prioritize ROI: testimonials first when the client states a concrete win. Upsell/referral fit best when "
-            "they have described real progress or repeat wins—especially for longer-tenure clients—not only brand-new "
-            "joiners (early weeks still get relationship-appropriate asks) or clear offboarding/renewal windows where "
-            "referral or tier moves may apply without a fresh testimonial on this transcript. Tie tags to transcript evidence."
+            "Prioritize ROI for paying clients: on the FIRST documented concrete win, tag testimonial only—do NOT tag "
+            "upsell on that same call. Tag upsell only on a LATER call when DATA.context.engagement.prior_roi shows a "
+            "prior win AND this call adds a NEW win that exceeds or builds on the first while roi_signals.upsell_signal "
+            "shows future_goal_language (next phase, bigger goals, continuing the program). Referral after a win when "
+            "appropriate. Use engagement.check_in_history when the transcript is thin. Fill wins[] with measurable outcomes."
         )
     return (
         "Balance conversion signals with relationship and follow-up. "
@@ -95,7 +99,8 @@ def _client_state_synthesis_rules(lifecycle: str) -> str:
     if ls == "dead":
         return base + (
             "LIFECYCLE=DEAD: Psychographics for win-back (what went quiet, sensitivity). "
-            "next_steps toward respectful re-engagement, not full funnel conversion unless they behave like a new lead."
+            "Reference engagement.check_in_history and prior wins when known. "
+            "next_steps toward respectful re-engagement or testimonial capture only when a real outcome is documented."
         )
     return base + "Match tone to lifecycle in DATA.lifecycle."
 
@@ -151,12 +156,16 @@ SYSTEM_PROMPT = (
     '"revive_playbook": { "rationale": string, "offer_angles": string[], "outreach_hooks": string[] } '
     "(ONLY when lifecycle is dead: new offers, main-offer tweaks, re-enrollment paths—grounded in transcript). "
     "}. "
-    "ROI_SIGNALS RULES (critical): testimonial_candidates must ONLY include lines spoken by the CLIENT/prospect "
-    "(not the coach praising them). Each quote MUST be a verbatim substring of context.call_text.transcript. "
-    "Substantial wins: specific numbers (money, weight, %, days), named milestones, or concrete program outcomes—"
-    "not vague praise ('it went well'). "
-    "upsell_signal: only when language shows future goals, extending the program, sustainability, or continued momentum "
-    "with the offer—typically AFTER the client has stated a concrete win in this call or prior context. "
+    "ROI_SIGNALS RULES (critical): opportunity_tags testimonial is ONLY allowed when DATA.lifecycle is "
+    "active, offboarding, or dead (never leads). testimonial_candidates must ONLY include lines spoken by the "
+    "CLIENT/prospect (not the coach praising them). Each quote MUST be a verbatim substring of "
+    "context.call_text.transcript. Substantial wins: specific numbers (money, weight, %, days), named milestones, "
+    "or concrete program outcomes—not vague praise ('it went well'). When tagging testimonial without a fresh "
+    "transcript quote, wins[] and testimonial_stories must cite outcomes also reflected in "
+    "context.engagement.check_in_history or prior_roi. "
+    "upsell_signal.active true ONLY when prior_roi already shows a first win (testimonial_trigger_at or "
+    "lifetime_win_moments_count>=1) AND this call documents a NEW larger/advancing win toward future goals "
+    "(future_goal_language true). Never set upsell active on the same call as the client's first win. "
     "referral_signal: ONLY for active or offboarding lifecycle (not leads or dead). "
     "Set active true when the CLIENT offers to refer someone, names who to send, asks for a link/code, or clearly "
     "wants to share the program after a concrete win. Always include 1–2 evidence_quotes copied verbatim from the transcript. "

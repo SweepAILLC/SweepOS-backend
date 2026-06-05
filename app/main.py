@@ -88,6 +88,9 @@ def _ensure_schema_columns_on_startup() -> None:
     log = logging.getLogger("app")
     db = SessionLocal()
     try:
+        # user_organizations: per-org Intelligence bank
+        db.execute(text("ALTER TABLE user_organizations ADD COLUMN IF NOT EXISTS ai_profile JSONB"))
+
         # organizations: fathom webhook fields
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))

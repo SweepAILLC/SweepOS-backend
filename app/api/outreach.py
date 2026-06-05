@@ -58,7 +58,12 @@ def get_inbox(
     perf_count = 0
 
     if include_performance:
-        user_row = db.query(User).filter(User.id == current_user.id).first()
+        from app.services.org_intelligence_profile import resolve_org_intelligence_user_row
+
+        try:
+            user_row = resolve_org_intelligence_user_row(db, current_user)
+        except ValueError:
+            user_row = None
         if user_row is not None:
             profile = getattr(user_row, "ai_profile", None) or {}
             pstate = performance_state_from_ai_profile(profile)

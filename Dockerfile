@@ -1,25 +1,26 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    libpq-dev \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+COPY alembic.ini .
+COPY alembic/ ./alembic/
+COPY app/ ./app/
 
-# Expose port
 EXPOSE 8000
 
-# Single worker: in-memory rate limits are process-local. For multiple workers or replicas,
-# set REDIS_URL and use e.g. gunicorn with uvicorn workers:
-#   gunicorn app.main:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --workers 4
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-
+# Production: use gunicorn with uvicorn workers when REDIS_URL is set for shared rate limits.
+# Render/Railway set $PORT; default 8000 for local/docker.
+CMD gunicorn app.main:app \
+    -k uvicorn.workers.UvicornWorker \
+    --bind 0.0.0.0:${PORT:-8000} \
+    --workers ${WEB_CONCURRENCY:-2} \
+    --timeout 120

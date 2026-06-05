@@ -258,6 +258,14 @@ def require_admin_or_owner(
     )
 
 
+def _tab_scope_org_id(user: User) -> uuid.UUID:
+    """Org whose tab permissions apply — selected org from JWT, not the user's primary row."""
+    raw = getattr(user, "selected_org_id", None) or user.org_id
+    if isinstance(raw, uuid.UUID):
+        return raw
+    return uuid.UUID(str(raw))
+
+
 def check_tab_access(
     tab_name: str,
     user: User,
@@ -276,10 +284,12 @@ def check_tab_access(
     4. Check organization-level permissions
     5. Default: all tabs enabled for new orgs (except role-restricted tabs)
     """
+    scope_org_id = _tab_scope_org_id(user)
+
     # Role-based restrictions
     # 'owner' tab: Only OWNER role can access (unless in main org)
     if tab_name == 'owner':
-        if str(user.org_id) == str(MAIN_ORG_ID):
+        if str(scope_org_id) == str(MAIN_ORG_ID):
             return True  # Main org users always have access
         return user.role == UserRole.OWNER
     
@@ -289,7 +299,7 @@ def check_tab_access(
             return False
     
     # Main org users always have access to all other tabs
-    if str(user.org_id) == str(MAIN_ORG_ID):
+    if str(scope_org_id) == str(MAIN_ORG_ID):
         return True
 
     # Finances UI uses the same permission rows as the legacy "stripe" tab name in DB
@@ -307,7 +317,7 @@ def check_tab_access(
         
         # Check organization-level permissions
         org_permission = db.query(OrganizationTabPermission).filter(
-            OrganizationTabPermission.org_id == user.org_id,
+            OrganizationTabPermission.org_id == scope_org_id,
             OrganizationTabPermission.tab_name == lookup_tab
         ).first()
         

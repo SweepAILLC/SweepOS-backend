@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
-from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.deps import get_current_user
 from app.db.session import get_db
@@ -84,11 +83,13 @@ def _sync_client_perf_recommendations(
             set_action_completed(db, c, aid, False, user_id=user_id)
 
 
-def _user_row(db: Session, user_id: uuid.UUID) -> User:
-    u = db.query(User).filter(User.id == user_id).first()
-    if not u:
+def _user_row(db: Session, current_user: User) -> User:
+    from app.services.org_intelligence_profile import resolve_org_intelligence_user_row
+
+    try:
+        return resolve_org_intelligence_user_row(db, current_user)
+    except ValueError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return u
 
 
 def _normalize_completed_ids(incoming: List[str]) -> List[str]:
@@ -156,7 +157,7 @@ def get_performance_snapshot(
     current_user: User = Depends(get_current_user),
 ):
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    user_row = _user_row(db, current_user.id)
+    user_row = _user_row(db, current_user)
     profile = getattr(user_row, "ai_profile", None) or {}
     pstate = performance_state_from_ai_profile(profile)
     completed = pstate.get("completed_task_ids")
@@ -177,8 +178,10 @@ def patch_performance_tasks(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    from app.services.org_intelligence_profile import set_org_ai_profile
+
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    user_row = _user_row(db, current_user.id)
+    user_row = _user_row(db, current_user)
     profile = dict(user_row.ai_profile) if isinstance(user_row.ai_profile, dict) else {}
     pstate = dict(performance_state_from_ai_profile(profile))
     old_raw = pstate.get("completed_task_ids") or []
@@ -188,8 +191,7 @@ def patch_performance_tasks(
     pstate["completed_task_ids"] = merged
     pstate["updated_at"] = datetime.now(timezone.utc).isoformat()
     profile["performance_state"] = pstate
-    user_row.ai_profile = profile
-    flag_modified(user_row, "ai_profile")
+    set_org_ai_profile(db, current_user, profile)
     db.commit()
     _sync_client_perf_recommendations(db, org_id, old_ids, new_ids, current_user.id)
     return PerformanceTasksPatchResponse(
@@ -218,7 +220,7 @@ def post_performance_prescription(
         endpoint_name="post_performance_prescription",
     )
 
-    user_row = _user_row(db, current_user.id)
+    user_row = _user_row(db, current_user)
     profile = getattr(user_row, "ai_profile", None) or {}
     pstate = performance_state_from_ai_profile(profile)
     completed_raw = pstate.get("completed_task_ids")
@@ -416,7 +418,9 @@ def post_performance_email_drafts(
         endpoint_name="post_performance_email_drafts",
     )
 
-    user_row = _user_row(db, current_user.id)
+    from app.services.org_intelligence_profile import set_org_ai_profile
+
+    user_row = _user_row(db, current_user)
     profile_raw = getattr(user_row, "ai_profile", None) or {}
     profile = dict(profile_raw) if isinstance(profile_raw, dict) else {}
     pstate = dict(performance_state_from_ai_profile(profile))
@@ -520,8 +524,7 @@ def post_performance_email_drafts(
     if drafts_out:
         pstate["updated_at"] = datetime.now(timezone.utc).isoformat()
         profile["performance_state"] = pstate
-        user_row.ai_profile = profile
-        flag_modified(user_row, "ai_profile")
+        set_org_ai_profile(db, current_user, profile)
         db.commit()
 
     source = "llm" if any(d.source == "llm" for d in drafts_out) else "deterministic"

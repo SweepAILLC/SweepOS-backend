@@ -346,9 +346,9 @@ def update_user_settings(
         org.fathom_api_key = normalize_fathom_api_key(settings_data.fathom_api_key)
 
     if settings_data.ai_profile is not None:
-        user_row.ai_profile = settings_data.ai_profile
-        from sqlalchemy.orm.attributes import flag_modified
-        flag_modified(user_row, "ai_profile")
+        from app.services.org_intelligence_profile import set_org_ai_profile
+
+        set_org_ai_profile(db, current_user, settings_data.ai_profile)
 
     db.commit()
     db.refresh(user_row)
@@ -377,8 +377,10 @@ def get_user_settings(
     Returns user info and default privacy settings.
     ai_profile is read from the database row — UserProxy from JWT auth does not include JSON columns.
     """
+    from app.services.org_intelligence_profile import get_org_ai_profile
+
     user_row = db.query(User).filter(User.id == current_user.id).first()
-    ai_profile = getattr(user_row, "ai_profile", None) if user_row else None
+    ai_profile = get_org_ai_profile(db, current_user)
     org_id_settings = getattr(current_user, "selected_org_id", current_user.org_id)
     org_row = db.query(Organization).filter(Organization.id == org_id_settings).first()
     fathom_key = None

@@ -131,6 +131,8 @@ class StripePaymentResponse(BaseModel):
     subscription_id: Optional[str] = None
     receipt_url: Optional[str] = None
     created_at: int  # Unix timestamp
+    description: Optional[str] = None  # Manual payments only
+    payment_method: Optional[str] = None  # Manual payments only
 
     class Config:
         from_attributes = True

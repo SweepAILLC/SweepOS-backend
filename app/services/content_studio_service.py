@@ -150,6 +150,8 @@ def set_user_content_studio_batch_and_completions(
     user_row: User,
     batch_id: str,
     completed_ids: List[str],
+    *,
+    auth_user: Any = None,
 ) -> str:
     profile = dict(user_row.ai_profile) if isinstance(user_row.ai_profile, dict) else {}
     cs = {}
@@ -157,10 +159,15 @@ def set_user_content_studio_batch_and_completions(
     cs["completed_idea_ids"] = normalize_completed_idea_ids(completed_ids)
     cs["updated_at"] = datetime.now(timezone.utc).isoformat()
     profile["content_studio_state"] = cs
-    user_row.ai_profile = profile
-    from sqlalchemy.orm.attributes import flag_modified
+    if auth_user is not None:
+        from app.services.org_intelligence_profile import set_org_ai_profile
 
-    flag_modified(user_row, "ai_profile")
+        set_org_ai_profile(db, auth_user, profile)
+    else:
+        user_row.ai_profile = profile
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(user_row, "ai_profile")
     db.commit()
     return cs["updated_at"]
 

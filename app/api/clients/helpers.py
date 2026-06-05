@@ -54,6 +54,7 @@ def sync_check_ins_in_worker(token: str, *, apply_pipeline_lifecycle_rules: bool
     """Short auth session, then one org-serialized sync with its own session (no route-level get_db)."""
     from app.api.deps import resolve_org_and_user_ids_for_checkin_sync
     from app.services.checkin_sync import sync_all_checkins
+    from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
     db_auth = SessionLocal()
     try:
@@ -67,12 +68,14 @@ def sync_check_ins_in_worker(token: str, *, apply_pipeline_lifecycle_rules: bool
     try:
         db_sync = SessionLocal()
         try:
-            return sync_all_checkins(
+            result = sync_all_checkins(
                 db_sync,
                 org_id,
                 user_id,
                 apply_pipeline_lifecycle_rules=apply_pipeline_lifecycle_rules,
             )
+            invalidate_terminal_monthly_trends_cache(org_id)
+            return result
         finally:
             db_sync.close()
     finally:

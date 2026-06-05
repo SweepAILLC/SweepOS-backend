@@ -757,7 +757,7 @@ def _pipeline_strip_from_lifecycle(lifecycle: Dict[str, int]) -> Dict[str, Any]:
         ("qualified", "Qualified"),
         ("booked", "Booked"),
         ("active", "Active"),
-        ("offboarding", "Offboarding"),
+        ("offboarding", "Offboard"),
         ("dead", "Dead"),
     ]
     segments = [

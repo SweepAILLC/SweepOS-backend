@@ -15,12 +15,14 @@ class FinancesCombinedSummary(BaseModel):
     combined: FinancesSourceSlice
     stripe: FinancesSourceSlice
     whop: FinancesSourceSlice
+    manual: FinancesSourceSlice = Field(default_factory=FinancesSourceSlice)
 
 
 class FinancesTimelinePoint(BaseModel):
     date: str
     stripe_revenue: float = 0.0
     whop_revenue: float = 0.0
+    manual_revenue: float = 0.0
     total_revenue: float = 0.0
 
 

@@ -66,7 +66,12 @@ from app.services.client_automation import (
     run_pipeline_lifecycle_for_org,
 )
 from app.services.health_score_cache_service import invalidate_health_score_cache
-from app.services.call_insight_service import reconcile_call_insights_for_client_merge
+from app.services.call_insight_service import (
+    on_client_became_dead,
+    reconcile_call_insights_for_client_merge,
+    refresh_latest_call_insight_background,
+)
+from app.services.client_delete_service import purge_client_dependencies
 
 def list_clients(
     lifecycle_state: Optional[LifecycleState] = Query(None),
@@ -234,6 +239,7 @@ def update_client(
 
         # Manual kanban / drawer column moves: persist to DB and reset follow-up clock
         # so the next calendar sync does not auto-revert the card.
+        entered_dead = False
         if "lifecycle_state" in update_data:
             raw_state = update_data.pop("lifecycle_state")
             try:
@@ -243,9 +249,23 @@ def update_client(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"Invalid lifecycle_state: {raw_state}",
                 )
+            prev_lc = (
+                client.lifecycle_state.value
+                if hasattr(client.lifecycle_state, "value")
+                else str(client.lifecycle_state or "")
+            )
+            entered_dead = new_state == LifecycleState.DEAD and prev_lc != LifecycleState.DEAD.value
             apply_manual_lifecycle_change(client, new_state)
 
-        # Apply remaining updates
+        # JSON columns need flag_modified so SQLAlchemy persists nested dict updates.
+        if "offer_enrollment" in update_data:
+            client.offer_enrollment = update_data.pop("offer_enrollment")
+            flag_modified(client, "offer_enrollment")
+        if "meta" in update_data:
+            client.meta = update_data.pop("meta")
+            flag_modified(client, "meta")
+
+        # Apply remaining scalar updates
         for field, value in update_data.items():
             setattr(client, field, value)
         
@@ -308,11 +328,32 @@ def update_client(
         # Handle explicit program_progress_percent updates
         if 'program_progress_percent' in update_data:
             client.program_progress_percent = update_data['program_progress_percent']
+
+        # Keep program progress in sync with timeline (cleared dates must not leave 100% → auto-dead).
+        if not client.program_start_date or not client.program_duration_days:
+            client.program_progress_percent = None
+            if not client.program_start_date:
+                client.program_end_date = None
+                client.program_duration_days = None
         
+        schedule_dead_llm_refresh = False
+        if entered_dead:
+            try:
+                schedule_dead_llm_refresh = on_client_became_dead(db, org_id, client)
+            except Exception as dead_hook_err:
+                print(f"[UPDATE_CLIENT] Dead lifecycle hook failed for {client.id}: {dead_hook_err}")
+
         db.commit()
         db.refresh(client)
         invalidate_health_score_cache(db, client.id, org_id)
-        return client
+        if schedule_dead_llm_refresh:
+            schedule_background_work(
+                refresh_latest_call_insight_background,
+                None,
+                str(org_id),
+                str(client.id),
+            )
+        return ClientSchema.model_validate(client, from_attributes=True)
     except HTTPException:
         raise
     except Exception as e:
@@ -528,80 +569,52 @@ def delete_client(
             client_ids_to_delete = [str(c.id) for c in clients_with_same_email]
             print(f"[DELETE_CLIENT] Deleting {len(clients_with_same_email)} clients with email '{normalized_email}': {client_ids_to_delete}")
     
-    # Before deleting, set client_id to NULL in all related records to avoid foreign key violations
-    from app.models.stripe_subscription import StripeSubscription
-    from app.models.event import Event
-    from app.models.funnel import Funnel
-    from app.models.recommendation import Recommendation
-    
     deleted_count = 0
     for cid in client_ids_to_delete:
         try:
             client_uuid = UUID(cid)
-            client_to_delete = db.query(Client).filter(
-                Client.id == client_uuid,
-                Client.org_id == org_id
-            ).first()
-            
-            if not client_to_delete:
-                continue
-            
-            # Set client_id to NULL in related tables
-            # Stripe Payments
-            db.query(StripePayment).filter(
-                StripePayment.client_id == client_uuid,
-                StripePayment.org_id == org_id
-            ).update({StripePayment.client_id: None}, synchronize_session=False)
-            
-            # Stripe Subscriptions
-            db.query(StripeSubscription).filter(
-                StripeSubscription.client_id == client_uuid,
-                StripeSubscription.org_id == org_id
-            ).update({StripeSubscription.client_id: None}, synchronize_session=False)
-            
-            # Events
-            db.query(Event).filter(
-                Event.client_id == client_uuid,
-                Event.org_id == org_id
-            ).update({Event.client_id: None}, synchronize_session=False)
-            
-            # Funnels
-            db.query(Funnel).filter(
-                Funnel.client_id == client_uuid,
-                Funnel.org_id == org_id
-            ).update({Funnel.client_id: None}, synchronize_session=False)
-            
-            # Recommendations
-            db.query(Recommendation).filter(
-                Recommendation.client_id == client_uuid,
-                Recommendation.org_id == org_id
-            ).update({Recommendation.client_id: None}, synchronize_session=False)
-            
-            # Client check-ins (client_id is NOT NULL; delete rows instead of nullifying)
-            db.query(ClientCheckIn).filter(
-                ClientCheckIn.client_id == client_uuid,
-                ClientCheckIn.org_id == org_id
-            ).delete(synchronize_session=False)
-            
-            # Now delete the client
-            db.delete(client_to_delete)
-            deleted_count += 1
-            print(f"[DELETE_CLIENT] Set client_id to NULL in related records and deleted client {cid}")
-            
         except ValueError:
             print(f"[DELETE_CLIENT] Invalid client ID: {cid}")
-        except Exception as e:
-            print(f"[DELETE_CLIENT] Error deleting client {cid}: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            continue
+
+        client_to_delete = db.query(Client).filter(
+            Client.id == client_uuid,
+            Client.org_id == org_id,
+        ).first()
+        if not client_to_delete:
+            continue
+
+        try:
+            purge_client_dependencies(db, org_id, client_uuid)
+            db.delete(client_to_delete)
+            deleted_count += 1
+            print(f"[DELETE_CLIENT] Deleted client {cid} and dependencies")
+        except IntegrityError as e:
             db.rollback()
+            print(f"[DELETE_CLIENT] Integrity error deleting client {cid}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Could not delete client because related records still reference it. "
+                    "Try again; if this persists, contact support."
+                ),
+            ) from e
+        except Exception as e:
+            db.rollback()
+            print(f"[DELETE_CLIENT] Error deleting client {cid}: {e}")
+            import traceback
+
+            traceback.print_exc()
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Error deleting client: {str(e)}"
-            )
-    
+                detail=f"Error deleting client: {str(e)}",
+            ) from e
+
+    if deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Client not found")
+
     db.commit()
     print(f"[DELETE_CLIENT] Successfully deleted {deleted_count} client(s)")
-    
+
     return None
 

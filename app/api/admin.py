@@ -64,9 +64,10 @@ def _global_show_up_rate_pct(
     period_end: datetime,
     now_utc: datetime,
 ) -> Optional[float]:
-    """Past Cal.com/Calendly check-ins in window: attended / scheduled (non-cancelled)."""
+    """Past sales-call check-ins in window: attended / scheduled (non-cancelled, sales calls only)."""
     q = db.query(ClientCheckIn).filter(
-        ClientCheckIn.cancelled == False,
+        ClientCheckIn.is_sales_call == True,  # noqa: E712
+        ClientCheckIn.cancelled == False,  # noqa: E712
         ClientCheckIn.provider.in_(["calcom", "calendly"]),
         ClientCheckIn.start_time >= period_start,
         ClientCheckIn.start_time < period_end,
@@ -75,7 +76,7 @@ def _global_show_up_rate_pct(
     rows = q.all()
     if not rows:
         return None
-    attended = sum(1 for c in rows if c.completed and not c.no_show)
+    attended = sum(1 for c in rows if not getattr(c, "no_show", False))
     total = len(rows)
     return round((attended / total) * 100.0, 1) if total else None
 
@@ -148,20 +149,26 @@ def _org_show_up_rate_pct(
     period_end: datetime,
     now_utc: datetime,
 ) -> Optional[float]:
-    q = db.query(ClientCheckIn).filter(
+    base_filters = (
         ClientCheckIn.org_id == org_id,
-        ClientCheckIn.cancelled == False,
+        ClientCheckIn.is_sales_call == True,  # noqa: E712
+        ClientCheckIn.cancelled == False,  # noqa: E712
         ClientCheckIn.provider.in_(["calcom", "calendly"]),
         ClientCheckIn.start_time >= period_start,
         ClientCheckIn.start_time < period_end,
         ClientCheckIn.start_time < now_utc,
     )
-    rows = q.all()
-    if not rows:
+    total = db.query(func.count(ClientCheckIn.id)).filter(*base_filters).scalar() or 0
+    if not total:
         return None
-    attended = sum(1 for c in rows if c.completed and not c.no_show)
-    total = len(rows)
-    return round((attended / total) * 100.0, 1) if total else None
+    no_shows = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(*base_filters, ClientCheckIn.no_show == True)  # noqa: E712
+        .scalar()
+        or 0
+    )
+    attended = total - no_shows
+    return round((attended / total) * 100.0, 1)
 
 
 def _org_close_rate_pct(

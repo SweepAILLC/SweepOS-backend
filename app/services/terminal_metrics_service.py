@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.models.client import Client, LifecycleState
 from app.models.client_checkin import ClientCheckIn
+from app.models.manual_payment import ManualPayment
 from app.models.organization import Organization
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction
 from app.models.whop_payment import WhopPayment
@@ -27,6 +28,17 @@ _WHOP_SUCCEEDED_STATUSES = ("paid", "succeeded", "completed", "successful")
 _terminal_monthly_trends_cache: dict[str, tuple[float, object]] = {}
 _terminal_monthly_trends_lock = ThreadingLock()
 TERMINAL_MONTHLY_TRENDS_TTL_SEC = 300
+
+_org_build_locks: dict[str, ThreadingLock] = {}
+_org_build_locks_guard = ThreadingLock()
+
+
+def _org_build_lock(org_id: UUID) -> ThreadingLock:
+    key = str(org_id)
+    with _org_build_locks_guard:
+        if key not in _org_build_locks:
+            _org_build_locks[key] = ThreadingLock()
+        return _org_build_locks[key]
 
 
 def _admin():
@@ -60,6 +72,33 @@ def org_whop_cash_usd_window(
             WhopPayment.created_at >= effective_start,
             WhopPayment.created_at < ce,
             WhopPayment.created_at >= org_created_naive,
+        )
+        .scalar()
+    )
+    return float(cents or 0) / 100.0
+
+
+def org_manual_cash_usd_window(
+    db: Session,
+    org_id: UUID,
+    org_created_naive: datetime,
+    period_start_utc: datetime,
+    period_end_exclusive_utc: datetime,
+) -> float:
+    """Manual payments in [period_start, period_end); clips start to org onboarding."""
+    if org_created_naive.tzinfo is None:
+        oc = org_created_naive.replace(tzinfo=timezone.utc)
+    else:
+        oc = org_created_naive.astimezone(timezone.utc)
+    effective_start = max(period_start_utc, oc)
+    if effective_start >= period_end_exclusive_utc:
+        return 0.0
+    cents = (
+        db.query(func.coalesce(func.sum(ManualPayment.amount_cents), 0))
+        .filter(
+            ManualPayment.org_id == org_id,
+            ManualPayment.payment_date >= effective_start,
+            ManualPayment.payment_date < period_end_exclusive_utc,
         )
         .scalar()
     )
@@ -127,6 +166,29 @@ def terminal_monthly_trends_cache_set(org_id: UUID, response: TerminalMonthlyTre
         _terminal_monthly_trends_cache[cache_key] = (now_ts, response)
 
 
+def invalidate_terminal_monthly_trends_cache(org_id: UUID) -> None:
+    """Drop cached monthly trends after calendar webhooks/sync or manual payment changes."""
+    cache_key = str(org_id)
+    with _terminal_monthly_trends_lock:
+        _terminal_monthly_trends_cache.pop(cache_key, None)
+
+
+def get_or_build_terminal_monthly_trends(db: Session, org: Organization) -> TerminalMonthlyTrendsResponse:
+    """Return cached trends or build once per org (concurrent requests wait on the same lock)."""
+    org_id = org.id
+    cached = terminal_monthly_trends_cache_get(org_id)
+    if cached is not None:
+        return cached
+
+    with _org_build_lock(org_id):
+        cached = terminal_monthly_trends_cache_get(org_id)
+        if cached is not None:
+            return cached
+        response = build_terminal_monthly_trends(db, org)
+        terminal_monthly_trends_cache_set(org_id, response)
+        return response
+
+
 def build_terminal_monthly_trends(db: Session, org: Organization) -> TerminalMonthlyTrendsResponse:
     admin_api = _admin()
     org_id = org.id
@@ -173,7 +235,10 @@ def build_terminal_monthly_trends(db: Session, org: Organization) -> TerminalMon
             now_naive,
         )
         whop_cash = org_whop_cash_usd_window(db, org_id, org_created_naive, ps_naive, pe_naive_exclusive)
-        combined_cash = stripe_cash + whop_cash
+        manual_cash = org_manual_cash_usd_window(
+            db, org_id, org_created_naive, month_cursor, month_end_exclusive
+        )
+        combined_cash = stripe_cash + whop_cash + manual_cash
 
         calls_ct = (
             db.query(func.count(ClientCheckIn.id))
