@@ -183,6 +183,9 @@ def update_job_state(
     if target == JobState.SCHEDULED.value:
         job.scheduled_at = datetime.utcnow()
         job.error_text = None
+    elif target == JobState.READY.value:
+        # Approval means "send now" — don't leave the row waiting on the original delay.
+        job.scheduled_at = datetime.utcnow()
     job.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(job)

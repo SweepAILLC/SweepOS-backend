@@ -11,8 +11,9 @@ Concurrency model:
 - Each job's render+send is performed in its own transaction. State transitions
   are: ``scheduled``/``ready``/``awaiting_approval`` -> ``sending`` -> ``sent``
   / ``failed`` / ``skipped``.
-- Recovery: on worker boot ``recover_in_flight`` resets any ``sending`` rows
-  back to ``scheduled`` so a hard crash doesn't strand mail.
+- Recovery: on worker boot ``recover_all_sending_on_boot`` resets every
+  ``sending`` row; during ticks ``recover_in_flight`` resets only stale ones
+  so multiple replicas don't double-claim.
 """
 from __future__ import annotations
 
@@ -138,31 +139,45 @@ def read_dispatcher_health(db: Session) -> dict:
 # Recovery
 # ---------------------------------------------------------------------------
 
-def recover_in_flight(db: Session) -> int:
-    """Reset stuck ``sending`` rows so a crashed worker doesn't strand mail.
-
-    Conservative: only resets rows older than STALE_SENDING_AFTER_SECONDS so two
-    workers running in parallel don't double-claim. Returns count reset.
-    """
-    cutoff = datetime.utcnow() - timedelta(seconds=STALE_SENDING_AFTER_SECONDS)
-    result = (
-        db.query(AutomationEmailJob)
-        .filter(
-            AutomationEmailJob.state == JobState.SENDING.value,
+def _reset_sending_rows(db: Session, *, only_if_last_attempt_before: Optional[datetime] = None) -> int:
+    """Move ``sending`` rows back to ``scheduled`` so the dispatcher can reclaim them."""
+    q = db.query(AutomationEmailJob).filter(
+        AutomationEmailJob.state == JobState.SENDING.value,
+    )
+    if only_if_last_attempt_before is not None:
+        q = q.filter(
             AutomationEmailJob.last_attempt_at.isnot(None),
-            AutomationEmailJob.last_attempt_at < cutoff,
+            AutomationEmailJob.last_attempt_at < only_if_last_attempt_before,
         )
-        .update(
-            {
-                "state": JobState.SCHEDULED.value,
-                "updated_at": datetime.utcnow(),
-            },
-            synchronize_session=False,
-        )
+    result = q.update(
+        {
+            "state": JobState.SCHEDULED.value,
+            "updated_at": datetime.utcnow(),
+        },
+        synchronize_session=False,
     )
     if result:
         db.commit()
     return int(result or 0)
+
+
+def recover_all_sending_on_boot(db: Session) -> int:
+    """On worker start, reclaim every in-flight row.
+
+    Safe for the typical single-worker Render deployment. A restarted process
+    cannot still be sending mail from the previous PID.
+    """
+    return _reset_sending_rows(db)
+
+
+def recover_in_flight(db: Session) -> int:
+    """Reset stale ``sending`` rows during normal ticks.
+
+    Conservative: only resets rows older than STALE_SENDING_AFTER_SECONDS so two
+    worker replicas running in parallel don't double-claim. Returns count reset.
+    """
+    cutoff = datetime.utcnow() - timedelta(seconds=STALE_SENDING_AFTER_SECONDS)
+    return _reset_sending_rows(db, only_if_last_attempt_before=cutoff)
 
 
 def expire_awaiting_approval(db: Session) -> int:
@@ -357,6 +372,7 @@ def _record_failure(db: Session, job: AutomationEmailJob, error_text: str) -> No
 def tick(db: Session, *, batch_size: int = BATCH_SIZE) -> int:
     """Process up to ``batch_size`` due jobs. Returns count attempted."""
     expire_awaiting_approval(db)
+    recover_in_flight(db)
     jobs = _claim_due(db, batch_size=batch_size)
     for job in jobs:
         try:

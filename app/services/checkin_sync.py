@@ -4,7 +4,7 @@ Service to sync calendar events (Cal.com/Calendly) with clients by email matchin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, text, func
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 import uuid
 import json
@@ -14,6 +14,16 @@ from app.models.client_checkin import ClientCheckIn
 from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.core.encryption import decrypt_token
+from app.services.calcom_auth import get_calcom_access_token_optional
+from app.services.calendar_booking_time import ensure_utc, format_calendly_api_time
+from app.services.calcom_bookings_client import (
+    extract_calcom_attendees,
+    fetch_all_calcom_bookings,
+    fetch_calcom_booking_attendees,
+    fetch_calcom_booking_detail,
+    resolve_calcom_participants,
+    _booking_uid,
+)
 import httpx
 
 
@@ -56,17 +66,216 @@ def _calendly_fetch_invitees_threadsafe(event_uri: str, headers: dict) -> tuple:
     if not event_uri:
         return ("", None, 0)
     try:
+        # Prefer documented path: GET /scheduled_events/{uuid}/invitees
+        invitees_url = event_uri.rstrip("/") + "/invitees"
         r = httpx.get(
-            "https://api.calendly.com/event_invitees",
+            invitees_url,
             headers=headers,
-            params={"event": event_uri},
+            params={"count": 100},
             timeout=httpx.Timeout(22.0, connect=8.0),
         )
+        if r.status_code != 200:
+            # Legacy fallback
+            r = httpx.get(
+                "https://api.calendly.com/event_invitees",
+                headers=headers,
+                params={"event": event_uri},
+                timeout=httpx.Timeout(22.0, connect=8.0),
+            )
         if r.status_code != 200:
             return (event_uri, None, r.status_code)
         return (event_uri, r.json().get("collection", []) or [], r.status_code)
     except Exception:
         return (event_uri, None, -1)
+
+
+def _fetch_calendly_scheduled_events(http: httpx.Client, headers: dict, user_uri: str) -> List[dict]:
+    """
+    Paginate Calendly scheduled_events with microsecond-precision datetimes.
+    Uses page_token for follow-up pages (next_page URLs can 400 when first-page times lack precision).
+    """
+    events: List[dict] = []
+    now_utc = datetime.now(timezone.utc)
+    min_start = format_calendly_api_time(now_utc - timedelta(days=365))
+    max_start = format_calendly_api_time(now_utc + timedelta(days=365))
+    page_token: Optional[str] = None
+
+    for page_idx in range(25):
+        if page_idx == 0:
+            params: Dict[str, Any] = {
+                "user": user_uri,
+                "count": 100,
+                "min_start_time": min_start,
+                "max_start_time": max_start,
+                "sort": "start_time:asc",
+            }
+            r = http.get("https://api.calendly.com/scheduled_events", headers=headers, params=params)
+        elif page_token:
+            r = http.get(
+                "https://api.calendly.com/scheduled_events",
+                headers=headers,
+                params={"page_token": page_token, "count": 100},
+            )
+        else:
+            break
+
+        if r.status_code != 200:
+            print(f"[CHECKIN SYNC] [CALENDLY] ❌ scheduled_events page={page_idx + 1} error: {r.status_code}")
+            print(f"[CHECKIN SYNC] [CALENDLY] Response: {r.text[:500]}")
+            break
+
+        payload = r.json()
+        batch = payload.get("collection", []) or []
+        events.extend(batch)
+        pagination = payload.get("pagination") or {}
+        page_token = pagination.get("next_page_token")
+        if not batch or not page_token:
+            break
+
+    return events
+
+
+def _apply_provider_completed_flag(
+    existing_checkin: ClientCheckIn,
+    completed: bool,
+    *,
+    times_changed: bool = False,
+) -> None:
+    """Sync completed from provider; reset to False when a booking is rescheduled into the future."""
+    if times_changed or not completed:
+        existing_checkin.completed = completed
+    elif completed and not existing_checkin.completed:
+        existing_checkin.completed = True
+
+
+def _calendar_placeholder_email(org_id: uuid.UUID) -> str:
+    return f"calendar-events-{org_id}@internal.sweep.local"
+
+
+def is_calendar_placeholder_email(email: Optional[str]) -> bool:
+    if not email:
+        return False
+    return email.startswith("calendar-events-") and email.endswith("@internal.sweep.local")
+
+
+def get_or_create_calendar_placeholder_client(db: Session, org_id: uuid.UUID) -> Client:
+    """Holder client for calendar events that have no external attendee email."""
+    email = _calendar_placeholder_email(org_id)
+    existing = (
+        db.query(Client)
+        .filter(Client.org_id == org_id, Client.email == email)
+        .first()
+    )
+    if existing:
+        return existing
+    client = Client(
+        org_id=org_id,
+        email=email,
+        first_name="Calendar",
+        last_name="Events",
+        lifecycle_state=LifecycleState.COLD_LEAD,
+        notes="Internal placeholder for synced calendar events without an attendee email",
+    )
+    db.add(client)
+    db.flush()
+    return client
+
+
+def _pick_primary_participant(
+    participants: List[Dict[str, Any]],
+    *,
+    placeholder_email: str,
+    fallback_name: str,
+) -> Dict[str, Any]:
+    """One row per calendar event — prefer first external attendee, else placeholder."""
+    for row in participants:
+        if row.get("email") and not row.get("_placeholder"):
+            return row
+    for row in participants:
+        if row.get("email"):
+            return row
+    return {
+        "email": placeholder_email,
+        "name": fallback_name or "Calendar event",
+        "_placeholder": True,
+    }
+
+
+def _find_calcom_checkin(
+    db: Session,
+    org_id: uuid.UUID,
+    event_id: str,
+    legacy_event_id: Optional[str],
+) -> Optional[ClientCheckIn]:
+    id_filters = [ClientCheckIn.event_id == event_id]
+    if legacy_event_id and legacy_event_id != event_id:
+        id_filters.append(ClientCheckIn.event_id == legacy_event_id)
+    return (
+        db.query(ClientCheckIn)
+        .filter(
+            and_(
+                ClientCheckIn.org_id == org_id,
+                ClientCheckIn.provider == "calcom",
+                or_(*id_filters),
+            )
+        )
+        .first()
+    )
+
+
+def extract_calendly_participants(event: dict, invitees: List[dict]) -> List[Dict[str, Any]]:
+    """Invitees from API plus event_guests embedded on scheduled_events rows."""
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    def add(email: Optional[str], name: Optional[str] = None) -> None:
+        if not email or not str(email).strip():
+            return
+        key = normalize_email(str(email))
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append({"email": str(email).strip(), "name": name})
+
+    for inv in invitees or []:
+        if isinstance(inv, dict):
+            email = inv.get("email")
+            if not email:
+                continue
+            key = normalize_email(str(email))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "email": str(email).strip(),
+                    "name": inv.get("name"),
+                    "status": inv.get("status"),
+                }
+            )
+
+    for guest in event.get("event_guests") or []:
+        if isinstance(guest, dict):
+            add(guest.get("email"))
+
+    return out
+
+
+def _calcom_enrich_participants_threadsafe(access_token: str, booking: dict) -> tuple:
+    """HTTP-only: detail + /attendees fallbacks for list rows missing participants."""
+    uid = _booking_uid(booking)
+    if not uid:
+        return ("", [])
+    detail = fetch_calcom_booking_detail(access_token, uid)
+    extra = fetch_calcom_booking_attendees(access_token, uid)
+    rows = resolve_calcom_participants(booking, detail=detail, extra_attendee_rows=extra)
+    return (uid, rows)
+
+
+def _calcom_fetch_attendees_threadsafe(access_token: str, booking_uid: str) -> tuple:
+    """Deprecated alias — prefer _calcom_enrich_participants_threadsafe."""
+    rows = fetch_calcom_booking_attendees(access_token, booking_uid)
+    return (booking_uid, rows)
 
 
 def get_sales_call_flags(
@@ -112,10 +321,9 @@ def ensure_client_for_booking_attendee(
         parts = name.strip().split(None, 1)
         first_name = parts[0]
         last_name = parts[1] if len(parts) > 1 else None
-    # Do not create an unnamed client card (email-only with no name)
     if not first_name and not last_name:
-        print(f"[CHECKIN SYNC] Skipping client creation for unnamed attendee: {email}")
-        return None
+        local = normalized.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+        first_name = local.title() if local else "Guest"
     client = Client(
         org_id=org_id,
         email=email.strip(),
@@ -127,6 +335,17 @@ def ensure_client_for_booking_attendee(
     db.add(client)
     db.flush()
     print(f"[CHECKIN SYNC] Created new booked client for booking attendee: {email}")
+    try:
+        from app.services.fathom_client_link import (
+            queue_fathom_relink_followups,
+            relink_fathom_records_for_client,
+        )
+
+        linked = relink_fathom_records_for_client(db, org_id, client)
+        if linked:
+            queue_fathom_relink_followups(None, org_id, linked)
+    except Exception as relink_err:
+        print(f"[CHECKIN SYNC] Fathom relink after booking client create skipped: {relink_err}")
     return client
 
 
@@ -162,140 +381,45 @@ def sync_calcom_bookings(
     )
     print(f"[CHECKIN SYNC] [CALCOM] Existing Cal.com check-ins in DB: {existing_calcom_n}")
 
-    # Get Cal.com OAuth token using raw SQL to bypass SQLAlchemy's enum name conversion
-    # SQLAlchemy converts enum values to names (CALCOM) but database has lowercase (calcom)
-    from sqlalchemy import text
-    result = db.execute(
-        text("""
-            SELECT id, access_token, expires_at FROM oauth_tokens 
-            WHERE provider = CAST('calcom' AS oauthprovider)
-            AND org_id = :org_id 
-            LIMIT 1
-        """),
-        {"org_id": org_id}
-    ).first()
-    
-    if not result:
+    # Prefer CALCOM_API_KEY env; fall back to org OAuth token in oauth_tokens.
+    access_token = get_calcom_access_token_optional(db, org_id, user_id)
+    if not access_token:
         print(f"[CHECKIN SYNC] [CALCOM] ❌ No Cal.com connection found for org {org_id}")
         return 0
-    
-    print(f"[CHECKIN SYNC] [CALCOM] ✅ Found Cal.com token")
-    
-    token_id, access_token_encrypted, expires_at = result[0], result[1], result[2]
-    
-    # Check if token is expired (only for OAuth tokens, not API keys)
-    if expires_at and expires_at < datetime.utcnow():
-        print(f"[CHECKIN SYNC] Cal.com token has expired for org {org_id}")
-        return 0
-    
-    try:
-        access_token = decrypt_token(
-            access_token_encrypted,
-            audit_context={
-                "db": db,
-                "org_id": org_id,
-                "user_id": user_id,
-                "resource_type": "calcom_token",
-                "resource_id": str(token_id)
-            }
-        )
-    except Exception as e:
-        print(f"[CHECKIN SYNC] Failed to decrypt Cal.com token: {e}")
-        return 0
-    
-    # Fetch bookings from Cal.com API
-    # According to Cal.com API v2 docs: https://cal.com/docs/api-reference/v2/bookings/get-all-bookings
-    # Must include cal-api-version header set to 2024-08-13, otherwise defaults to older version
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "cal-api-version": "2024-08-13"  # Required header for v2 API
-    }
 
+    print(f"[CHECKIN SYNC] [CALCOM] ✅ Cal.com credentials resolved")
+    
+    # Fetch bookings from Cal.com API (per-status requests — see calcom_bookings_client.py)
     email_index = _build_org_email_client_index(db, org_id)
 
     try:
-        print(f"[CHECKIN SYNC] [CALCOM] Fetching ALL bookings from Cal.com API (past and future)...")
-        # Cal.com API v2 defaults to only returning future/upcoming bookings
-        # We need to fetch past and future separately or use status filters
-        # Try fetching with status=all or without status filter to get all bookings
-        all_bookings = []
-        skip = 0
-        take = 100
-        max_iterations = 8  # Safety cap (8 * take bookings max per sync)
-
-        cal_timeout = httpx.Timeout(25.0, connect=10.0)
-        with httpx.Client(timeout=cal_timeout) as http_client:
-            for iteration in range(max_iterations):
-                print(f"[CHECKIN SYNC] [CALCOM] Fetching bookings batch {iteration + 1}: skip={skip}, take={take}")
-                params = {
-                    "take": take,
-                    "skip": skip,
-                    "status": "upcoming,past,cancelled",
-                }
-                response = http_client.get(
-                    "https://api.cal.com/v2/bookings",
-                    headers=headers,
-                    params=params,
-                )
-
-                print(f"[CHECKIN SYNC] [CALCOM] Batch API response status: {response.status_code}")
-
-                if response.status_code != 200:
-                    print(f"[CHECKIN SYNC] [CALCOM] ❌ API error: {response.status_code}")
-                    print(f"[CHECKIN SYNC] [CALCOM] Response: {response.text[:500]}")
-                    break
-
-                api_response = response.json()
-                bookings_data = api_response.get("data", [])
-
-                if isinstance(bookings_data, list):
-                    batch_bookings = bookings_data
-                elif isinstance(bookings_data, dict):
-                    batch_bookings = bookings_data.get("bookings", [])
-                else:
-                    batch_bookings = []
-
-                if not batch_bookings:
-                    print(f"[CHECKIN SYNC] [CALCOM] No more bookings in batch {iteration + 1}")
-                    break
-
-                all_bookings.extend(batch_bookings)
-                print(
-                    f"[CHECKIN SYNC] [CALCOM] Batch {iteration + 1}: +{len(batch_bookings)} "
-                    f"(total {len(all_bookings)})"
-                )
-
-                pagination = api_response.get("pagination", {})
-                has_more = pagination.get("hasMore", False)
-                if not has_more:
-                    break
-
-                skip += take
-
-        print(f"[CHECKIN SYNC] [CALCOM] ✅ Fetched {len(all_bookings)} total bookings from API")
+        print(f"[CHECKIN SYNC] [CALCOM] Fetching bookings (per-status Cal.com v2 API)...")
+        all_bookings = fetch_all_calcom_bookings(access_token)
         
-        # Check breakdown of past vs future bookings (same as calendar tab does client-side)
+        # Check breakdown of past vs future bookings
         past_count = 0
         future_count = 0
+        now_utc = datetime.now(timezone.utc)
         for booking in all_bookings:
-            # Use same field extraction as calendar tab: booking.get("start")
             start_time_str = booking.get("start") or booking.get("startTime")
+            end_time_str = booking.get("end") or booking.get("endTime")
             if start_time_str:
                 try:
-                    booking_date = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
-                    now = datetime.now(booking_date.tzinfo)
-                    if booking_date < now:
+                    start_time = ensure_utc(datetime.fromisoformat(start_time_str.replace('Z', '+00:00')))
+                    end_time = (
+                        ensure_utc(datetime.fromisoformat(end_time_str.replace('Z', '+00:00')))
+                        if end_time_str
+                        else start_time
+                    )
+                    if end_time < now_utc:
                         past_count += 1
                     else:
                         future_count += 1
-                except:
+                except Exception:
                     pass
         
         print(f"[CHECKIN SYNC] [CALCOM] Bookings breakdown: {past_count} past, {future_count} future")
-        print(f"[CHECKIN SYNC] [CALCOM] ✅ Processing {len(all_bookings)} total bookings (past and future)")
         
-        # Use all_bookings instead of fetching again
         bookings = all_bookings
         
         if len(bookings) == 0:
@@ -303,6 +427,29 @@ def sync_calcom_bookings(
             return 0
         
         print(f"[CHECKIN SYNC] [CALCOM] ✅ Processing {len(bookings)} total Cal.com bookings (past and future)")
+
+        # Prefetch participants for list rows that omit them (parallel detail + /attendees).
+        participants_by_uid: Dict[str, List[Dict[str, Any]]] = {}
+        bookings_needing_participants = [
+            b for b in bookings if isinstance(b, dict) and _booking_uid(b) and not extract_calcom_attendees(b)
+        ]
+        if bookings_needing_participants:
+            max_workers = min(12, max(1, len(bookings_needing_participants)))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(_calcom_enrich_participants_threadsafe, access_token, booking): _booking_uid(booking)
+                    for booking in bookings_needing_participants
+                }
+                for fut in as_completed(futures):
+                    uid, rows = fut.result()
+                    if uid and rows:
+                        participants_by_uid[uid] = rows
+            print(
+                f"[CHECKIN SYNC] [CALCOM] Enriched participants for "
+                f"{len(participants_by_uid)}/{len(bookings_needing_participants)} bookings"
+            )
+
+        placeholder_client = get_or_create_calendar_placeholder_client(db, org_id)
 
         synced_count = 0
         bookings_without_attendees = 0
@@ -321,8 +468,9 @@ def sync_calcom_bookings(
                     print(f"[CHECKIN SYNC] [CALCOM] Booking {idx} value: {str(booking)[:200]}")
                     continue
                 
-                # Extract event details
-                event_id = str(booking.get("id", ""))
+                # Cal.com v2 canonical id is uid (string); numeric id is legacy.
+                event_id = str(booking.get("uid") or booking.get("id") or "").strip()
+                legacy_event_id = str(booking.get("id") or "").strip() if booking.get("id") else None
                 if not event_id:
                     print(f"[CHECKIN SYNC] [CALCOM] ⚠️ Booking {idx} has no ID, skipping")
                     continue
@@ -338,49 +486,40 @@ def sync_calcom_bookings(
                     print(f"[CHECKIN SYNC] Skipping booking {event_id}: no start_time")
                     continue
                 
-                start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+                start_time = ensure_utc(datetime.fromisoformat(start_time_str.replace('Z', '+00:00')))
                 end_time = None
                 if end_time_str:
-                    end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+                    end_time = ensure_utc(datetime.fromisoformat(end_time_str.replace('Z', '+00:00')))
                 
-                # Extract attendee emails - Cal.com API structure
-                # Attendees can be in "attendees" field or might be in other fields
-                attendees = booking.get("attendees", [])
-                
-                # Also check for "guests" field which might contain emails
-                if not attendees or not isinstance(attendees, list):
-                    guests = booking.get("guests", [])
-                    if isinstance(guests, list) and len(guests) > 0:
-                        # Guests might be just email strings or dicts
-                        print(f"[CHECKIN SYNC] [CALCOM] No attendees field, but found {len(guests)} guests")
-                        attendees = [{"email": g} if isinstance(g, str) else g for g in guests]
-                
-                if not attendees or not isinstance(attendees, list) or len(attendees) == 0:
+                # All event types sync — sales flag is metadata only, never a filter.
+                attendees_list = extract_calcom_attendees(booking)
+                if not attendees_list:
+                    attendees_list = participants_by_uid.get(event_id, [])
+                if not attendees_list:
+                    attendees_list = [
+                        {
+                            "email": placeholder_client.email,
+                            "name": title or "Calendar event",
+                            "_placeholder": True,
+                        }
+                    ]
                     bookings_without_attendees += 1
+
+                attendee = _pick_primary_participant(
+                    attendees_list,
+                    placeholder_email=placeholder_client.email,
+                    fallback_name=title or "Calendar event",
+                )
+                use_placeholder = bool(attendee.get("_placeholder"))
+                attendee_email = attendee.get("email")
+                if not attendee_email:
                     continue
 
-                attendees_list = list(attendees)
-
-                # Process each attendee
-                for attendee_idx, attendee in enumerate(attendees_list):
-                    # Handle case where attendee might be a string (email)
-                    if isinstance(attendee, str):
-                        attendee_email = attendee
-                        attendee = {"email": attendee_email}
-                    elif not isinstance(attendee, dict):
-                        print(f"[CHECKIN SYNC] [CALCOM] ⚠️ Attendee {attendee_idx} is not a dict or string: {type(attendee)} - {str(attendee)[:100]}")
-                        continue
-                    else:
-                        attendee_email = attendee.get("email")
-                    
-                    if not attendee_email:
-                        print(f"[CHECKIN SYNC] [CALCOM] Attendee {attendee_idx} has no email field")
-                        print(f"[CHECKIN SYNC] [CALCOM] Attendee data: {attendee}")
-                        continue
-                    
-                    attendee_name = attendee.get("name")
+                attendee_name = attendee.get("name") or (title if use_placeholder else None)
+                if use_placeholder:
+                    matching_client = placeholder_client
+                else:
                     normalized_email = normalize_email(attendee_email)
-
                     matching_client = email_index.get(normalized_email)
                     if not matching_client:
                         matching_client = ensure_client_for_booking_attendee(
@@ -391,93 +530,86 @@ def sync_calcom_bookings(
                     if not matching_client:
                         bookings_without_matching_clients += 1
                         continue
-                    
-                    # Check if check-in already exists
-                    existing_checkin = db.query(ClientCheckIn).filter(
-                        and_(
-                            ClientCheckIn.org_id == org_id,
-                            ClientCheckIn.event_id == event_id,
-                            ClientCheckIn.provider == "calcom"
-                        )
-                    ).first()
-                    
-                    # Determine if completed (past event), cancelled, no-show
-                    now = datetime.now(timezone.utc)
-                    completed = start_time < now
-                    cancelled = booking.get("status") == "cancelled" or booking.get("cancelled", False)
-                    absent_host = booking.get("absentHost", False)
-                    raw_attendees = booking.get("attendees") or []
-                    attendee_absent = any(a.get("absent") for a in raw_attendees if isinstance(a, dict))
-                    no_show = bool(absent_host or attendee_absent)
-                    # Sales call flags from calendar_booking_sales or event_type_sales_calls
-                    et = booking.get("eventType") or {}
-                    event_type_id = str(et.get("id") or booking.get("eventTypeId") or "")
-                    event_type_label = str(et.get("title") or et.get("slug") or booking.get("title") or "") or None
-                    is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calcom", event_id, event_type_id or None)
-                    
-                    if existing_checkin:
-                        # Update existing check-in — preserve manually-edited
-                        # flags that the provider cannot know about.
-                        existing_checkin.title = title
-                        existing_checkin.start_time = start_time
-                        existing_checkin.end_time = end_time
-                        existing_checkin.location = location
-                        existing_checkin.meeting_url = meeting_url
-                        # Backfill event-type identity onto pre-existing rows so the new
-                        # post-booking automation can match them on subsequent runs.
-                        if event_type_id and not getattr(existing_checkin, "event_type_id", None):
-                            existing_checkin.event_type_id = event_type_id
-                        if event_type_label and not getattr(existing_checkin, "event_type_label", None):
-                            existing_checkin.event_type_label = event_type_label
-                        # Cancelled / no-show: provider True always wins; never overwrite CRM True with
-                        # provider False (Event Details modal / board edits persist across sync).
-                        if cancelled:
-                            existing_checkin.cancelled = True
-                        elif not getattr(existing_checkin, "cancelled", False):
-                            existing_checkin.cancelled = False
-                        if no_show:
-                            existing_checkin.no_show = True
-                        elif not getattr(existing_checkin, "no_show", False):
-                            existing_checkin.no_show = False
-                        # Only flip completed to True (past); never reset a
-                        # manually-completed event back to False.
-                        if completed and not existing_checkin.completed:
-                            existing_checkin.completed = True
-                        # Sales flags: keep the row's own values when they were
-                        # set directly (via the modal); fall back to the sales-
-                        # table / event-type lookup for new rows only.
-                        if not getattr(existing_checkin, "is_sales_call", False) and is_sales_call:
-                            existing_checkin.is_sales_call = True
-                        if getattr(existing_checkin, "sale_closed", None) is None and sale_closed is not None:
-                            existing_checkin.sale_closed = sale_closed
-                        existing_checkin.updated_at = datetime.now(timezone.utc)
-                        synced_count += 1
-                    else:
-                        # Create new check-in
-                        checkin = ClientCheckIn(
-                            org_id=org_id,
-                            client_id=matching_client.id,
-                            event_id=event_id,
-                            provider="calcom",
-                            title=title,
-                            start_time=start_time,
-                            end_time=end_time,
-                            location=location,
-                            meeting_url=meeting_url,
-                            attendee_email=attendee_email,
-                            attendee_name=attendee_name,
-                            event_type_id=event_type_id or None,
-                            event_type_label=event_type_label,
-                            completed=completed,
-                            cancelled=cancelled,
-                            no_show=no_show,
-                            is_sales_call=is_sales_call,
-                            sale_closed=sale_closed,
-                            raw_event_data=json.dumps(booking)
-                        )
-                        db.add(checkin)
-                        synced_count += 1
-                        # Track new bookings for post-commit automation triggers.
+
+                existing_checkin = _find_calcom_checkin(db, org_id, event_id, legacy_event_id)
+                if existing_checkin and existing_checkin.event_id != event_id:
+                    existing_checkin.event_id = event_id
+
+                now = datetime.now(timezone.utc)
+                effective_end = end_time if end_time else start_time
+                completed = effective_end < now
+                cancelled = (
+                    str(booking.get("status") or "").lower() in ("cancelled", "canceled", "rejected")
+                    or booking.get("cancelled", False)
+                )
+                absent_host = booking.get("absentHost", False)
+                raw_attendees = booking.get("attendees") or []
+                attendee_absent = any(a.get("absent") for a in raw_attendees if isinstance(a, dict))
+                no_show = bool(absent_host or attendee_absent)
+                et = booking.get("eventType") or {}
+                event_type_id = str(et.get("id") or booking.get("eventTypeId") or "")
+                event_type_label = str(et.get("title") or et.get("slug") or booking.get("title") or "") or None
+                is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calcom", event_id, event_type_id or None)
+
+                if existing_checkin:
+                    times_changed = (
+                        existing_checkin.start_time != start_time
+                        or existing_checkin.end_time != end_time
+                    )
+                    existing_checkin.client_id = matching_client.id
+                    existing_checkin.title = title
+                    existing_checkin.start_time = start_time
+                    existing_checkin.end_time = end_time
+                    existing_checkin.location = location
+                    existing_checkin.meeting_url = meeting_url
+                    existing_checkin.attendee_email = attendee_email
+                    existing_checkin.attendee_name = attendee_name
+                    if event_type_id and not getattr(existing_checkin, "event_type_id", None):
+                        existing_checkin.event_type_id = event_type_id
+                    if event_type_label and not getattr(existing_checkin, "event_type_label", None):
+                        existing_checkin.event_type_label = event_type_label
+                    if cancelled:
+                        existing_checkin.cancelled = True
+                    elif not getattr(existing_checkin, "cancelled", False):
+                        existing_checkin.cancelled = False
+                    if no_show:
+                        existing_checkin.no_show = True
+                    elif not getattr(existing_checkin, "no_show", False):
+                        existing_checkin.no_show = False
+                    _apply_provider_completed_flag(
+                        existing_checkin, completed, times_changed=times_changed
+                    )
+                    if not getattr(existing_checkin, "is_sales_call", False) and is_sales_call:
+                        existing_checkin.is_sales_call = True
+                    if getattr(existing_checkin, "sale_closed", None) is None and sale_closed is not None:
+                        existing_checkin.sale_closed = sale_closed
+                    existing_checkin.updated_at = datetime.now(timezone.utc)
+                    synced_count += 1
+                else:
+                    checkin = ClientCheckIn(
+                        org_id=org_id,
+                        client_id=matching_client.id,
+                        event_id=event_id,
+                        provider="calcom",
+                        title=title,
+                        start_time=start_time,
+                        end_time=end_time,
+                        location=location,
+                        meeting_url=meeting_url,
+                        attendee_email=attendee_email,
+                        attendee_name=attendee_name,
+                        event_type_id=event_type_id or None,
+                        event_type_label=event_type_label,
+                        completed=completed,
+                        cancelled=cancelled,
+                        no_show=no_show,
+                        is_sales_call=is_sales_call,
+                        sale_closed=sale_closed,
+                        raw_event_data=json.dumps(booking),
+                    )
+                    db.add(checkin)
+                    synced_count += 1
+                    if not use_placeholder:
                         new_calcom_bookings.append({
                             "client_id": matching_client.id,
                             "external_booking_id": event_id,
@@ -486,6 +618,8 @@ def sync_calcom_bookings(
                             "attendee_email": attendee_email,
                             "start_time": start_time,
                         })
+
+                db.flush()
                 
             except Exception as e:
                 print(f"[CHECKIN SYNC] [CALCOM] ❌ Error processing booking {idx}: {str(e)}")
@@ -600,32 +734,8 @@ def sync_calendly_events(
                 print(f"[CHECKIN SYNC] No user URI found in Calendly response")
                 return 0
 
-            print(f"[CHECKIN SYNC] [CALENDLY] Fetching scheduled events (paginated)...")
-            events: List[dict] = []
-            next_page_url: Optional[str] = None
-            for page_idx in range(6):
-                if page_idx == 0:
-                    r = http.get(
-                        "https://api.calendly.com/scheduled_events",
-                        headers=headers,
-                        params={"user": user_uri, "count": 100},
-                    )
-                else:
-                    if not next_page_url:
-                        break
-                    r = http.get(next_page_url, headers=headers)
-
-                if r.status_code != 200:
-                    print(f"[CHECKIN SYNC] [CALENDLY] ❌ scheduled_events error: {r.status_code}")
-                    print(f"[CHECKIN SYNC] [CALENDLY] Response: {r.text[:500]}")
-                    return 0
-
-                payload = r.json()
-                batch = payload.get("collection", []) or []
-                events.extend(batch)
-                next_page_url = (payload.get("pagination") or {}).get("next_page")
-                if not batch or not next_page_url:
-                    break
+            print(f"[CHECKIN SYNC] [CALENDLY] Fetching scheduled events (paginated, ±365d)...")
+            events = _fetch_calendly_scheduled_events(http, headers, user_uri)
 
             print(f"[CHECKIN SYNC] [CALENDLY] ✅ Loaded {len(events)} events")
 
@@ -649,6 +759,8 @@ def sync_calendly_events(
                 else:
                     invitees_by_uri[uri] = coll
 
+        placeholder_client = get_or_create_calendar_placeholder_client(db, org_id)
+
         synced_count = 0
         events_without_invitees = 0
         events_without_matching_clients = 0
@@ -669,10 +781,10 @@ def sync_calendly_events(
                 if not start_time_str:
                     continue
 
-                start_time = datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+                start_time = ensure_utc(datetime.fromisoformat(start_time_str.replace("Z", "+00:00")))
                 end_time = None
                 if end_time_str:
-                    end_time = datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
+                    end_time = ensure_utc(datetime.fromisoformat(end_time_str.replace("Z", "+00:00")))
 
                 meeting_url = None
                 if isinstance(location, dict):
@@ -681,20 +793,36 @@ def sync_calendly_events(
                     meeting_url = location
 
                 invitees = invitees_by_uri.get(event_uri, [])
-                if not invitees:
+                participants = extract_calendly_participants(event, invitees)
+                if not participants:
                     events_without_invitees += 1
+                    participants = [
+                        {
+                            "email": placeholder_client.email,
+                            "name": name or "Calendar event",
+                            "_placeholder": True,
+                        }
+                    ]
+
+                invitee = _pick_primary_participant(
+                    participants,
+                    placeholder_email=placeholder_client.email,
+                    fallback_name=name or "Calendar event",
+                )
+                use_placeholder = bool(invitee.get("_placeholder"))
+                invitee_email = invitee.get("email")
+                if not invitee_email:
                     continue
 
-                for invitee in invitees:
-                    invitee_email = invitee.get("email")
-                    if not invitee_email:
-                        continue
+                invitee_name = invitee.get("name") or (name if use_placeholder else None)
+                invitee_no_show = (
+                    str(invitee.get("status") or "").lower() == "no_show" if not use_placeholder else False
+                )
 
-                    invitee_name = invitee.get("name")
-                    invitee_status = str(invitee.get("status") or "").lower()
-                    invitee_no_show = invitee_status == "no_show"
+                if use_placeholder:
+                    matching_client = placeholder_client
+                else:
                     normalized_email = normalize_email(invitee_email)
-
                     matching_client = email_index.get(normalized_email)
                     if not matching_client:
                         matching_client = ensure_client_for_booking_attendee(
@@ -705,86 +833,94 @@ def sync_calendly_events(
                     if not matching_client:
                         events_without_matching_clients += 1
                         continue
-                    
-                    # Check if check-in already exists
-                    existing_checkin = db.query(ClientCheckIn).filter(
-                        and_(
-                            ClientCheckIn.org_id == org_id,
+
+                existing_checkin = db.query(ClientCheckIn).filter(
+                    and_(
+                        ClientCheckIn.org_id == org_id,
+                        ClientCheckIn.provider == "calendly",
+                        or_(
                             ClientCheckIn.event_uri == event_uri,
-                            ClientCheckIn.provider == "calendly"
-                        )
-                    ).first()
-                    
-                    # Determine if completed (past event), cancelled; no_show not available from Calendly event
-                    now = datetime.now(timezone.utc)
-                    completed = start_time < now
-                    cancelled = status == "canceled"
-                    no_show = invitee_no_show
-                    event_type_uri = event.get("event_type") or ""
-                    if isinstance(event_type_uri, dict):
-                        event_type_uri = event_type_uri.get("uri") or ""
-                    event_type_uri = str(event_type_uri or "") or None
-                    # Calendly's scheduled-event JSON carries the event-type *uri* but not the
-                    # human title; we use the scheduled event's name (already extracted as
-                    # `name`) so the operator can read "Discovery Call" instead of a uri tail.
-                    event_type_label_value = name or None
-                    is_sales_call, sale_closed = get_sales_call_flags(db, org_id, "calendly", event_uuid, event_type_uri or None)
-                    
-                    if existing_checkin:
-                        # Update existing check-in — preserve manually-edited
-                        # flags (same logic as Cal.com branch above).
-                        existing_checkin.title = name
-                        existing_checkin.start_time = start_time
-                        existing_checkin.end_time = end_time
-                        existing_checkin.location = meeting_url
-                        existing_checkin.meeting_url = meeting_url
-                        if event_type_uri and not getattr(existing_checkin, "event_type_id", None):
-                            existing_checkin.event_type_id = event_type_uri
-                        if event_type_label_value and not getattr(existing_checkin, "event_type_label", None):
-                            existing_checkin.event_type_label = event_type_label_value
-                        if cancelled:
-                            existing_checkin.cancelled = True
-                        elif not getattr(existing_checkin, "cancelled", False):
-                            existing_checkin.cancelled = False
-                        if no_show:
-                            existing_checkin.no_show = True
-                        elif not getattr(existing_checkin, "no_show", False):
-                            existing_checkin.no_show = False
-                        if completed and not existing_checkin.completed:
-                            existing_checkin.completed = True
-                        # Sales flags: keep row values when already set.
-                        if not getattr(existing_checkin, "is_sales_call", False) and is_sales_call:
-                            existing_checkin.is_sales_call = True
-                        if getattr(existing_checkin, "sale_closed", None) is None and sale_closed is not None:
-                            existing_checkin.sale_closed = sale_closed
-                        existing_checkin.updated_at = datetime.now(timezone.utc)
-                        synced_count += 1
-                    else:
-                        # Create new check-in
-                        checkin = ClientCheckIn(
-                            org_id=org_id,
-                            client_id=matching_client.id,
-                            event_id=event_uuid,
-                            event_uri=event_uri,
-                            provider="calendly",
-                            title=name,
-                            start_time=start_time,
-                            end_time=end_time,
-                            location=meeting_url,
-                            meeting_url=meeting_url,
-                            attendee_email=invitee_email,
-                            attendee_name=invitee_name,
-                            event_type_id=event_type_uri,
-                            event_type_label=event_type_label_value,
-                            completed=completed,
-                            cancelled=cancelled,
-                            no_show=no_show,
-                            is_sales_call=is_sales_call,
-                            sale_closed=sale_closed,
-                            raw_event_data=json.dumps(event)
-                        )
-                        db.add(checkin)
-                        synced_count += 1
+                            ClientCheckIn.event_id == event_uuid,
+                        ),
+                    )
+                ).first()
+
+                now = datetime.now(timezone.utc)
+                effective_end = end_time if end_time else start_time
+                completed = effective_end < now
+                cancelled = status == "canceled"
+                no_show = invitee_no_show
+                event_type_uri = event.get("event_type") or ""
+                if isinstance(event_type_uri, dict):
+                    event_type_uri = event_type_uri.get("uri") or ""
+                event_type_uri = str(event_type_uri or "") or None
+                event_type_label_value = name or None
+                is_sales_call, sale_closed = get_sales_call_flags(
+                    db, org_id, "calendly", event_uuid, event_type_uri or None
+                )
+
+                if existing_checkin:
+                    times_changed = (
+                        existing_checkin.start_time != start_time
+                        or existing_checkin.end_time != end_time
+                    )
+                    existing_checkin.client_id = matching_client.id
+                    existing_checkin.event_id = event_uuid
+                    existing_checkin.event_uri = event_uri
+                    existing_checkin.title = name
+                    existing_checkin.start_time = start_time
+                    existing_checkin.end_time = end_time
+                    existing_checkin.location = meeting_url
+                    existing_checkin.meeting_url = meeting_url
+                    existing_checkin.attendee_email = invitee_email
+                    existing_checkin.attendee_name = invitee_name
+                    if event_type_uri and not getattr(existing_checkin, "event_type_id", None):
+                        existing_checkin.event_type_id = event_type_uri
+                    if event_type_label_value and not getattr(existing_checkin, "event_type_label", None):
+                        existing_checkin.event_type_label = event_type_label_value
+                    if cancelled:
+                        existing_checkin.cancelled = True
+                    elif not getattr(existing_checkin, "cancelled", False):
+                        existing_checkin.cancelled = False
+                    if no_show:
+                        existing_checkin.no_show = True
+                    elif not getattr(existing_checkin, "no_show", False):
+                        existing_checkin.no_show = False
+                    _apply_provider_completed_flag(
+                        existing_checkin, completed, times_changed=times_changed
+                    )
+                    if not getattr(existing_checkin, "is_sales_call", False) and is_sales_call:
+                        existing_checkin.is_sales_call = True
+                    if getattr(existing_checkin, "sale_closed", None) is None and sale_closed is not None:
+                        existing_checkin.sale_closed = sale_closed
+                    existing_checkin.updated_at = datetime.now(timezone.utc)
+                    synced_count += 1
+                else:
+                    checkin = ClientCheckIn(
+                        org_id=org_id,
+                        client_id=matching_client.id,
+                        event_id=event_uuid,
+                        event_uri=event_uri,
+                        provider="calendly",
+                        title=name,
+                        start_time=start_time,
+                        end_time=end_time,
+                        location=meeting_url,
+                        meeting_url=meeting_url,
+                        attendee_email=invitee_email,
+                        attendee_name=invitee_name,
+                        event_type_id=event_type_uri,
+                        event_type_label=event_type_label_value,
+                        completed=completed,
+                        cancelled=cancelled,
+                        no_show=no_show,
+                        is_sales_call=is_sales_call,
+                        sale_closed=sale_closed,
+                        raw_event_data=json.dumps(event),
+                    )
+                    db.add(checkin)
+                    synced_count += 1
+                    if not use_placeholder:
                         new_calendly_bookings.append({
                             "client_id": matching_client.id,
                             "external_booking_id": event_uuid,
@@ -793,6 +929,8 @@ def sync_calendly_events(
                             "attendee_email": invitee_email,
                             "start_time": start_time,
                         })
+
+                db.flush()
                 
             except Exception as e:
                 print(f"[CHECKIN SYNC] Error processing Calendly event: {e}")

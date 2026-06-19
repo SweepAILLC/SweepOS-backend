@@ -5,7 +5,8 @@ Provides CRUD for funnels, steps, event ingestion, analytics, and health monitor
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi import Request
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_, or_, desc, asc, text
+from sqlalchemy import func, and_, or_, desc, asc, text, cast
+from sqlalchemy.dialects.postgresql import JSONB
 from typing import List, Optional, Union
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -394,11 +395,13 @@ def ingest_event(
                     detail="Client not found"
                 )
         
-        # Check idempotency if key provided
+        # Check idempotency if key provided (event_metadata is PG json, not jsonb — cast for @>)
         if event_data.idempotency_key:
             existing = db.query(Event).filter(
                 Event.org_id == org_id,
-                Event.event_metadata.contains({"idempotency_key": event_data.idempotency_key})
+                cast(Event.event_metadata, JSONB).contains(
+                    {"idempotency_key": event_data.idempotency_key}
+                ),
             ).first()
             if existing:
                 return EventResponse(event_id=existing.id, status="duplicate")
@@ -406,6 +409,10 @@ def ingest_event(
         # Create event
         event_timestamp = event_data.event_timestamp or datetime.utcnow()
         
+        event_metadata = dict(event_data.metadata or {})
+        if event_data.idempotency_key:
+            event_metadata["idempotency_key"] = event_data.idempotency_key
+
         event = Event(
             org_id=org_id,
             funnel_id=event_data.funnel_id,
@@ -414,16 +421,11 @@ def ingest_event(
             event_name=event_data.event_name,
             visitor_id=event_data.visitor_id,
             session_id=event_data.session_id,
-            event_metadata=event_data.metadata or {},
+            event_metadata=event_metadata,
             payload=event_data.metadata,  # Store metadata in payload for backward compatibility
             occurred_at=event_timestamp,
             received_at=datetime.utcnow()
         )
-        
-        # Add idempotency key to metadata if provided
-        if event_data.idempotency_key:
-            event.event_metadata = event.event_metadata or {}
-            event.event_metadata['idempotency_key'] = event_data.idempotency_key
         
         db.add(event)
         db.commit()

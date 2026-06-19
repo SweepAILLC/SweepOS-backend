@@ -20,7 +20,7 @@ from app.models.client import Client, LifecycleState
 from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
 from app.models.client_checkin import ClientCheckIn
 from app.models.stripe_payment import StripePayment
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_admin_or_owner
 from app.models.user import User
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.core.encryption import decrypt_token
@@ -434,67 +434,18 @@ def get_calcom_auth_headers(
     db: Session,
     org_id: uuid.UUID,
     user_id: uuid.UUID,
-    api_version: str = "2024-08-13"  # Default for bookings, can be overridden
+    api_version: str = "2026-05-01"  # Bookings list cursor pagination (Cal.com docs)
 ) -> dict:
-    """
-    Helper function to get Cal.com authentication headers.
-    Returns headers dict with API key in Authorization Bearer format.
-    
-    Args:
-        db: Database session
-        org_id: Organization ID
-        user_id: User ID
-        api_version: Cal.com API version (default: "2024-08-13" for bookings, "2024-06-14" for event types)
-    """
-    # Use raw SQL to bypass SQLAlchemy's enum name conversion
-    from sqlalchemy import text
-    result = db.execute(
-        text("""
-            SELECT id, access_token, expires_at FROM oauth_tokens 
-            WHERE provider = CAST('calcom' AS oauthprovider)
-            AND org_id = :org_id 
-            LIMIT 1
-        """),
-        {"org_id": org_id}
-    ).first()
-    
-    if not result:
-        raise HTTPException(
-            status_code=401,
-            detail="Cal.com not connected. Please connect your Cal.com account first."
-        )
-    
-    token_id, access_token_encrypted, expires_at = result[0], result[1], result[2]
-    
-    # Check if token is expired (only for OAuth tokens, not API keys)
-    if expires_at and expires_at < datetime.utcnow():
-        raise HTTPException(
-            status_code=401,
-            detail="Cal.com token has expired. Please reconnect your account."
-        )
-    
-    # Decrypt the access token
-    access_token = decrypt_token(
-        access_token_encrypted,
-        audit_context={
-            "db": db,
-            "org_id": org_id,
-            "user_id": user_id,
-            "resource_type": "calcom_token",
-            "resource_id": str(token_id)
-        }
-    )
-    
+    """Bearer headers for Cal.com v2 (prefers CALCOM_API_KEY env when set)."""
+    from app.services.calcom_auth import get_calcom_access_token
+
+    access_token = get_calcom_access_token(db, org_id, user_id)
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "cal-api-version": api_version  # Required by Cal.com API v2
+        "cal-api-version": api_version,
     }
-    
     print(f"[CALCOM AUTH] Headers prepared with API version: {api_version}")
-    print(f"[CALCOM AUTH] Authorization header present: {'Authorization' in headers}")
-    print(f"[CALCOM AUTH] API version header: {headers.get('cal-api-version')}")
-    
     return headers
 
 
@@ -770,140 +721,133 @@ def cancel_calcom_booking(
 
 @router.get("/calcom/bookings", response_model=CalComBookingsResponse)
 def get_calcom_bookings(
-    take: int = Query(50, ge=1, le=100, alias="limit"),  # Support both 'limit' and 'take' for backward compatibility
-    skip: int = Query(0, ge=0, alias="offset"),  # Support both 'offset' and 'skip' for backward compatibility
+    take: int = Query(50, ge=1, le=100, alias="limit"),
+    skip: int = Query(0, ge=0, alias="offset"),
+    status: Optional[str] = Query(
+        None,
+        description="Cal.com v2 status filter: upcoming, past, cancelled, unconfirmed, or recurring (one only)",
+    ),
+    cursor: Optional[str] = Query(None, description="Cal.com cursor from previous page nextCursor"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     """
     Get Cal.com bookings for the connected account.
-    According to Cal.com API v2: GET /bookings
-    Docs: https://cal.com/docs/api-reference/v2/bookings/get-all-bookings
-    
-    NOTE: This route MUST come AFTER /calcom/booking/{booking_id} to avoid route conflicts.
+
+    For ``status=upcoming`` and ``status=past`` we classify by effective end time
+    (same as GET /calendar/synced-bookings), not Cal.com's internal status labels.
     """
-    # Get selected org_id from user object (set by get_current_user)
-    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
-    print(f"[CALCOM BOOKINGS LIST] ===== ENDPOINT CALLED =====")
-    print(f"[CALCOM BOOKINGS LIST] This is the LIST endpoint, not the details endpoint")
-    headers = get_calcom_auth_headers(db, org_id, current_user.id)
-    
+    from datetime import timezone
+
+    from app.services.calcom_bookings_client import (
+        _fetch_calcom_status_pages,
+        _parse_bookings_payload,
+        fetch_all_calcom_bookings,
+    )
+    from app.services.calcom_auth import get_calcom_access_token
+    from app.services.calendar_booking_time import classify_booking_window
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    access_token = get_calcom_access_token(db, org_id, current_user.id)
+    headers = get_calcom_auth_headers(db, org_id, current_user.id, api_version="2026-05-01")
+
     try:
-        # Cal.com API v2: GET /bookings
-        # Query parameters: take (not limit), skip (not offset), status (upcoming, past, cancelled, etc.)
-        # Include cancelled so we can show cancellation status in the calendar tab.
-        # Docs: https://cal.com/docs/api-reference/v2/bookings/get-all-bookings
-        print(f"[CALCOM BOOKINGS] Making request to Cal.com API with take={take}, skip={skip}")
-        response = httpx.get(
-            "https://api.cal.com/v2/bookings",
-            headers=headers,
-            params={
-                "take": take,
-                "skip": skip,
-                "status": "upcoming,past,cancelled",  # Include cancelled events so status shows in calendar
-            },
-            timeout=30.0
-        )
-        
-        print(f"[CALCOM BOOKINGS] Response status: {response.status_code}")
-        print(f"[CALCOM BOOKINGS] Response headers: {dict(response.headers)}")
-        
-        if response.status_code == 200:
-            api_response = response.json()
-            print(f"[CALCOM BOOKINGS] Raw API response: {api_response}")
-            print(f"[CALCOM BOOKINGS] Response type: {type(api_response)}")
-            
-            # Cal.com API v2 returns: { "status": "success", "data": [...], "pagination": {...}, "error": {} }
-            # According to docs: https://cal.com/docs/api-reference/v2/bookings/get-all-bookings
-            if not isinstance(api_response, dict):
-                raise HTTPException(
-                    status_code=500,
-                    detail="Unexpected response format from Cal.com API"
-                )
-            
-            # Check status
-            if api_response.get("status") != "success":
-                error_msg = api_response.get("error", {}).get("message", "Unknown error from Cal.com API")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Cal.com API returned error status: {error_msg}"
-                )
-            
-            # Extract bookings from 'data' array (not 'bookings')
-            bookings_data = api_response.get("data", [])
-            print(f"[CALCOM BOOKINGS] Found {len(bookings_data)} bookings in 'data' array")
-            print(f"[CALCOM BOOKINGS] All keys in response: {list(api_response.keys())}")
-            
-            # Extract pagination info
-            pagination = api_response.get("pagination", {})
-            total_items = pagination.get("totalItems", len(bookings_data))
-            print(f"[CALCOM BOOKINGS] Pagination info: {pagination}")
-            
-            # Build booking keys for sales metadata (event_id, event_type_id)
-            booking_keys = []
-            for booking in bookings_data:
-                event_id = booking.get("uid") or str(booking.get("id", ""))
-                et = booking.get("eventType") or {}
-                event_type_id = str(et.get("id") or booking.get("eventTypeId") or "")
-                booking_keys.append((event_id, event_type_id))
-            sales_meta = get_calendar_booking_sales_metadata(db, org_id, "calcom", booking_keys)
-            
-            # Parse bookings, handling any validation errors gracefully
-            bookings = []
-            for idx, booking in enumerate(bookings_data):
-                try:
-                    event_id = booking.get("uid") or str(booking.get("id", ""))
-                    meta = sales_meta.get(event_id, {"is_sales_call": False, "sale_closed": None})
-                    # Transform Cal.com API fields to our schema format
-                    transformed_booking = {
-                        **booking,
-                        "startTime": booking.get("start"),
-                        "endTime": booking.get("end"),
-                        "user": booking.get("hosts", [{}])[0] if booking.get("hosts") else None,
-                        "eventType": booking.get("eventType", {}),
-                        "is_sales_call": meta["is_sales_call"],
-                        "sale_closed": meta["sale_closed"],
-                    }
-                    print(f"[CALCOM BOOKINGS] Parsing booking {idx}: {booking.get('id', 'unknown')}")
-                    bookings.append(CalComBooking(**transformed_booking))
-                except Exception as e:
-                    print(f"[CALCOM BOOKINGS] Warning: Failed to parse booking {booking.get('id', 'unknown')}: {e}")
-                    print(f"[CALCOM BOOKINGS] Booking data: {booking}")
-                    import traceback
-                    traceback.print_exc()
-                    # Continue with other bookings even if one fails
-            
-            print(f"[CALCOM BOOKINGS] Successfully parsed {len(bookings)} bookings")
-            
-            result = CalComBookingsResponse(
-                bookings=bookings,
-                total=total_items,
-                nextCursor=None  # Cal.com uses pagination object, not cursor
-            )
-            print(f"[CALCOM BOOKINGS] Returning response with {len(result.bookings)} bookings, total: {result.total}")
-            return result
-        else:
-            error_text = response.text[:200] if response.text else "Unknown error"
-            print(f"[CALCOM BOOKINGS] API returned error status {response.status_code}: {error_text}")
-            print(f"[CALCOM BOOKINGS] Full response text: {response.text}")
+        cal_status = status.strip().lower() if status else None
+        if cal_status and cal_status not in ("upcoming", "past", "cancelled", "unconfirmed", "recurring"):
             raise HTTPException(
-                status_code=response.status_code,
-                detail=f"Failed to fetch Cal.com bookings: {error_text}"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="status must be upcoming, past, cancelled, unconfirmed, or recurring",
             )
-            
+
+        now = datetime.now(timezone.utc)
+        next_cursor: Optional[str] = None
+
+        if cal_status in ("upcoming", "past") and not cursor:
+            all_rows = fetch_all_calcom_bookings(access_token)
+            filtered: List[dict] = []
+            for booking in all_rows:
+                bucket = classify_booking_window(
+                    booking.get("start") or booking.get("startTime"),
+                    booking.get("end") or booking.get("endTime"),
+                    now=now,
+                )
+                if bucket == cal_status:
+                    filtered.append(booking)
+            filtered.sort(
+                key=lambda b: b.get("start") or b.get("startTime") or "",
+                reverse=(cal_status == "past"),
+            )
+            total_items = len(filtered)
+            bookings_data = filtered[skip : skip + take]
+        elif cursor or cal_status:
+            with httpx.Client(timeout=30.0) as http_client:
+                params: Dict[str, Any] = {"take": take}
+                if cal_status:
+                    params["status"] = cal_status
+                if cursor:
+                    params["cursor"] = cursor
+                elif skip:
+                    params["skip"] = skip
+                response = http_client.get(
+                    "https://api.cal.com/v2/bookings",
+                    headers=headers,
+                    params=params,
+                )
+                if response.status_code != 200:
+                    raise HTTPException(status_code=response.status_code, detail=response.text[:300])
+                payload = response.json()
+                bookings_data, _ = _parse_bookings_payload(payload)
+                pagination = payload.get("pagination") or {}
+                next_cursor = pagination.get("nextCursor")
+                total_items = pagination.get("totalItems", len(bookings_data))
+        else:
+            with httpx.Client(timeout=30.0) as http_client:
+                bookings_data = _fetch_calcom_status_pages(
+                    http_client,
+                    headers,
+                    status=None,
+                    max_pages=3,
+                )
+            total_items = len(bookings_data)
+
+        booking_keys = []
+        for booking in bookings_data:
+            event_id = booking.get("uid") or str(booking.get("id", ""))
+            et = booking.get("eventType") or {}
+            event_type_id = str(et.get("id") or booking.get("eventTypeId") or "")
+            booking_keys.append((event_id, event_type_id))
+        sales_meta = get_calendar_booking_sales_metadata(db, org_id, "calcom", booking_keys)
+
+        bookings = []
+        for booking in bookings_data:
+            try:
+                event_id = booking.get("uid") or str(booking.get("id", ""))
+                meta = sales_meta.get(event_id, {"is_sales_call": False, "sale_closed": None})
+                transformed_booking = {
+                    **booking,
+                    "startTime": booking.get("start"),
+                    "endTime": booking.get("end"),
+                    "user": booking.get("hosts", [{}])[0] if booking.get("hosts") else None,
+                    "eventType": booking.get("eventType", {}),
+                    "is_sales_call": meta["is_sales_call"],
+                    "sale_closed": meta["sale_closed"],
+                }
+                bookings.append(CalComBooking(**transformed_booking))
+            except Exception as e:
+                print(f"[CALCOM BOOKINGS] Warning: Failed to parse booking: {e}")
+
+        return CalComBookingsResponse(
+            bookings=bookings,
+            total=total_items,
+            nextCursor=next_cursor,
+        )
     except HTTPException:
         raise
-    except httpx.HTTPError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Network error fetching Cal.com bookings: {str(e)}"
-        )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Cal.com API request timed out")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching Cal.com bookings: {str(e)}"
-        )
+        print(f"[CALCOM BOOKINGS] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching Cal.com bookings: {str(e)}")
 
 
 @router.get("/calcom/event-types", response_model=CalComEventTypesResponse)
@@ -3060,90 +3004,46 @@ def get_calendar_upcoming_summary(
         all_bookings = []
         
         if provider == "calcom":
-            # Use selected org_id from outer scope (set in get_calendar_upcoming_summary)
+            from app.services.calcom_bookings_client import fetch_all_calcom_bookings
+
             headers = get_calcom_auth_headers(db, org_id, current_user.id)
-            
-            # Fetch bookings with pagination - get more to ensure we have enough data
-            skip = 0
-            take = 100
-            total_fetched = 0
-            max_fetches = 2  # Limit to 200 bookings max to prevent timeout
-            
-            while skip < max_fetches * take:
-                print(f"[CALENDAR SUMMARY] Fetching Cal.com bookings: skip={skip}, take={take}")
+            access_token = headers["Authorization"].replace("Bearer ", "", 1).strip()
+            try:
+                raw_bookings = fetch_all_calcom_bookings(access_token, timeout=15.0)
+            except Exception as e:
+                print(f"[CALENDAR SUMMARY] Cal.com fetch error: {e}")
+                raw_bookings = []
+
+            print(f"[CALENDAR SUMMARY] Total Cal.com bookings fetched: {len(raw_bookings)}")
+
+            for booking in raw_bookings:
                 try:
-                    response = httpx.get(
-                        "https://api.cal.com/v2/bookings",
-                        headers=headers,
-                        params={"take": take, "skip": skip, "status": "upcoming,past,cancelled"},
-                        timeout=10.0  # Restored original timeout
-                    )
-                except httpx.TimeoutException:
-                    print(f"[CALENDAR SUMMARY] Cal.com API timeout at skip={skip}")
-                    break
-                except Exception as e:
-                    print(f"[CALENDAR SUMMARY] Cal.com API error: {str(e)}")
-                    break
-                
-                if response.status_code != 200:
-                    print(f"[CALENDAR SUMMARY] Cal.com API error: {response.status_code}")
-                    break
-                
-                api_response = response.json()
-                if api_response.get("status") != "success":
-                    print(f"[CALENDAR SUMMARY] Cal.com API returned error status")
-                    break
-                
-                bookings_data = api_response.get("data", [])
-                print(f"[CALENDAR SUMMARY] Fetched {len(bookings_data)} Cal.com bookings")
-                
-                if not bookings_data:
-                    break
-                
-                # Parse bookings using same logic as get_calcom_bookings
-                for booking in bookings_data:
-                    try:
-                        start_str = booking.get("start")
-                        if not start_str:
-                            continue
-                        
-                        # Parse the start time
-                        start_time = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-                        
-                        # Create unique ID for deduplication
-                        booking_id = str(booking.get("id")) or booking.get("uid", "")
-                        
-                        all_bookings.append({
-                            "id": booking_id,
-                            "title": booking.get("title") or booking.get("eventType", {}).get("title") or "Untitled Event",
-                            "start_time": start_str,
-                            "end_time": booking.get("end"),
-                            "link": f"https://cal.com/bookings/{booking.get('uid', booking.get('id'))}",
-                            "attendees": booking.get("attendees", []),
-                            "location": booking.get("location"),
-                            "start_datetime": start_time,  # Store parsed datetime for filtering
-                            "status": booking.get("status"),  # accepted | cancelled | rejected | pending (for show-up rate)
-                            "absentHost": booking.get("absentHost"),  # No-show: host absent
-                        })
-                    except Exception as e:
-                        print(f"[CALENDAR SUMMARY] Error parsing Cal.com booking: {e}")
-                        import traceback
-                        traceback.print_exc()
+                    start_str = booking.get("start") or booking.get("startTime")
+                    if not start_str:
                         continue
-                
-                total_fetched += len(bookings_data)
-                
-                # Check if there are more pages
-                pagination = api_response.get("pagination", {})
-                if not pagination.get("nextCursor") or len(bookings_data) < take:
-                    break
-                
-                skip += take
-            
-            print(f"[CALENDAR SUMMARY] Total Cal.com bookings fetched: {len(all_bookings)}")
+
+                    start_time = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
+                    booking_id = str(booking.get("uid") or booking.get("id") or "")
+
+                    all_bookings.append({
+                        "id": booking_id,
+                        "title": booking.get("title") or (booking.get("eventType") or {}).get("title") or "Untitled Event",
+                        "start_time": start_str,
+                        "end_time": booking.get("end") or booking.get("endTime"),
+                        "link": f"https://cal.com/bookings/{booking.get('uid', booking.get('id'))}",
+                        "attendees": booking.get("attendees", []),
+                        "location": booking.get("location"),
+                        "start_datetime": start_time,
+                        "status": booking.get("status"),
+                        "absentHost": booking.get("absentHost"),
+                    })
+                except Exception as e:
+                    print(f"[CALENDAR SUMMARY] Error parsing Cal.com booking: {e}")
+                    continue
         
         else:  # calendly
-            # Use selected org_id from outer scope (set in get_calendar_upcoming_summary)
+            from app.services.calendar_booking_time import format_calendly_api_time
+
             headers, stored_user_uri = get_calendly_auth_headers(db, org_id, current_user.id)
             
             if not stored_user_uri:
@@ -3163,19 +3063,27 @@ def get_calendar_upcoming_summary(
                     detail="Failed to get user URI from Calendly"
                 )
             
-            # Fetch scheduled events with pagination
+            # Fetch scheduled events with pagination (microsecond timestamps on page 1)
             page_token = None
             count = 100
-            max_pages = 2  # Limit to 200 events max to prevent timeout
-            
+            max_pages = 5
+            now_utc = datetime.now(timezone.utc)
+            min_start = format_calendly_api_time(now_utc - timedelta(days=365))
+            max_start = format_calendly_api_time(now_utc + timedelta(days=365))
+
             for page_num in range(max_pages):
-                params = {
-                    "count": count,
-                    "sort": "start_time:asc",
-                    "user": stored_user_uri
-                }
-                if page_token:
-                    params["page_token"] = page_token
+                if page_num == 0:
+                    params = {
+                        "count": count,
+                        "sort": "start_time:asc",
+                        "user": stored_user_uri,
+                        "min_start_time": min_start,
+                        "max_start_time": max_start,
+                    }
+                elif page_token:
+                    params = {"count": count, "page_token": page_token}
+                else:
+                    break
                 
                 print(f"[CALENDAR SUMMARY] Fetching Calendly events: page={page_num + 1}")
                 try:
@@ -3528,11 +3436,13 @@ def _calcom_uid_from_raw(raw_event_data: Optional[str]) -> Optional[str]:
 
 def _calendar_row_display_status(ci: ClientCheckIn, now_utc: datetime) -> str:
     """Human-readable status for calendar UI (aligned with synced check-in flags)."""
+    from app.services.calendar_booking_time import check_in_is_upcoming
+
     if ci.cancelled:
         return "cancelled"
     if getattr(ci, "no_show", False):
         return "no_show"
-    if ci.start_time and ci.start_time >= now_utc:
+    if check_in_is_upcoming(ci, now_utc):
         return "confirmed"
     return "completed"
 
@@ -3626,9 +3536,12 @@ def get_calendar_synced_bookings(
     """
     from sqlalchemy.orm import joinedload
     from datetime import timezone
+    from app.services.calendar_booking_time import effective_end_sql_expression, parse_utc_instant
+    from app.services.checkin_sync import is_calendar_placeholder_email
 
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
     now = datetime.now(timezone.utc)
+    effective_end = effective_end_sql_expression()
 
     if provider is not None:
         p = provider.strip().lower()
@@ -3653,19 +3566,16 @@ def get_calendar_synced_bookings(
         base = base.filter(ClientCheckIn.provider == provider_filter)
 
     upcoming_rows = (
-        base.filter(ClientCheckIn.start_time >= now)
+        base.filter(effective_end >= now)
         .order_by(ClientCheckIn.start_time.asc())
         .limit(upcoming_limit)
         .all()
     )
-    past_q = base.filter(ClientCheckIn.start_time < now)
+    past_q = base.filter(effective_end < now)
     if past_since:
         try:
-            since_raw = past_since.replace("Z", "+00:00") if past_since.endswith("Z") else past_since
-            since_dt = datetime.fromisoformat(since_raw)
-            if since_dt.tzinfo is not None:
-                since_dt = since_dt.astimezone(timezone.utc).replace(tzinfo=None)
-            past_q = past_q.filter(ClientCheckIn.start_time >= since_dt)
+            since_dt = parse_utc_instant(past_since)
+            past_q = past_q.filter(effective_end >= since_dt)
         except (ValueError, TypeError):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -3675,10 +3585,15 @@ def get_calendar_synced_bookings(
 
     def serialize(ci: ClientCheckIn) -> Dict[str, Any]:
         client_name = None
+        attendee_email = ci.attendee_email
         if ci.client:
-            client_name = (
-                f"{ci.client.first_name or ''} {ci.client.last_name or ''}".strip() or ci.client.email
-            )
+            if is_calendar_placeholder_email(ci.client.email):
+                client_name = (ci.attendee_name or ci.title or "Calendar event").strip() or "Calendar event"
+                attendee_email = None
+            else:
+                client_name = (
+                    f"{ci.client.first_name or ''} {ci.client.last_name or ''}".strip() or ci.client.email
+                )
         calcom_uid = _calcom_uid_from_raw(getattr(ci, "raw_event_data", None))
         return {
             "id": str(ci.id),
@@ -3692,7 +3607,7 @@ def get_calendar_synced_bookings(
             "end_time": ci.end_time.isoformat() if ci.end_time else None,
             "location": ci.location,
             "meeting_url": ci.meeting_url,
-            "attendee_email": ci.attendee_email,
+            "attendee_email": attendee_email,
             "attendee_name": ci.attendee_name,
             "completed": ci.completed,
             "cancelled": ci.cancelled,
@@ -4362,60 +4277,29 @@ def sync_fathom_meetings(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Poll Fathom for recent meetings (requires FATHOM_API_KEY in env). Use from cron or manually.
-    Only meetings whose invitee/transcript emails match a client in this org are ingested and analyzed.
-    Response includes ingested, skipped_no_client_match, meetings_seen.
+    Start Fathom import in the background (returns immediately).
+
+    Lists meeting metadata from Fathom, stores records, and queues summary/transcript
+    enrichment without blocking the HTTP request (avoids 502/503 from long Fathom retries).
     """
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    from app.services.fathom_ingest import queue_fathom_sync_followups, sync_recent_meetings_for_org
+    from app.long_jobs import schedule_background_work
+    from app.services.fathom_client import resolve_fathom_api_key
+    from app.services.fathom_ingest import run_fathom_sync_background
 
-    try:
-        result = sync_recent_meetings_for_org(db, org_id, user=current_user)
-    except httpx.HTTPStatusError as e:
-        if e.response is not None and e.response.status_code == 401:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "Fathom rejected the API key (401). Regenerate it at Fathom → Settings → API Access, "
-                    "then paste it under Integrations (organization key), save, and sync again. "
-                    "Alternatively set FATHOM_API_KEY in the server environment."
-                ),
-            ) from e
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Fathom API error ({e.response.status_code if e.response else 'unknown'}). Try again later.",
-        ) from e
-    except (RuntimeError, ValueError) as e:
-        msg = str(e)
-        logger.warning("fathom sync client/runtime error: %s", msg)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=msg if msg else "Fathom sync could not run (configuration or API response).",
-        ) from e
-    except json.JSONDecodeError as e:
-        logger.exception("fathom sync: unexpected JSON decode")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Fathom returned invalid JSON. Try again in a moment.",
-        ) from e
-    except SQLAlchemyError as e:
-        logger.exception("fathom sync database error")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Database error while syncing Fathom. Run database migrations "
-                "(`alembic upgrade head`) and ensure columns exist on `fathom_call_records`."
-            ),
-        ) from e
-    except Exception as e:
-        logger.exception("fathom sync failed")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Fathom sync failed: {e!s}",
-        ) from e
+    if not resolve_fathom_api_key(db, org_id, user=current_user):
+        return {"skipped": True, "reason": "no_fathom_key"}
 
-    queue_fathom_sync_followups(background_tasks, org_id, result)
-    return result
+    schedule_background_work(run_fathom_sync_background, background_tasks, str(org_id))
+    return {
+        "started": True,
+        "background": True,
+        "skipped": False,
+        "message": (
+            "Fathom sync started. Meeting metadata imports now; summaries and transcripts "
+            "continue in the background and may take several minutes."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4437,7 +4321,7 @@ def _ensure_org_fathom_webhook_columns(db: Session) -> None:
 @router.post("/fathom/webhook/setup")
 def setup_fathom_webhook(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin_or_owner),
 ):
     """
     Create (or recreate) a Fathom webhook using the org's API key.
@@ -4610,8 +4494,8 @@ async def receive_fathom_webhook(
 
     status_str, _cid, fathom_row_id = ingest_meeting_payload(db, org_id, meeting)
 
-    # Queue follow-up jobs (call insights + library report) when we ingested a matched client call.
-    if status_str == "ok" and fathom_row_id:
+    # Queue follow-up jobs when a call was ingested (linked or awaiting client match).
+    if status_str in ("ok", "ok_unlinked") and fathom_row_id:
         queue_fathom_webhook_record_followups(background_tasks, org_id, fathom_row_id)
 
     return {"success": True, "status": status_str, "fathom_call_record_id": str(fathom_row_id) if fathom_row_id else None}

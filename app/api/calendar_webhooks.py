@@ -31,12 +31,17 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import get_db
+from app.models.client import Client
 from app.models.client_checkin import ClientCheckIn
 from app.services.automation_engine import on_booking_created_pre_sale
+from app.services.calcom_bookings_client import extract_calcom_attendees
 from app.services.checkin_sync import (
     ensure_client_for_booking_attendee,
+    get_or_create_calendar_placeholder_client,
+    get_sales_call_flags,
     normalize_email,
 )
+from app.services.calendar_booking_time import ensure_utc
 from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
 LOG = logging.getLogger(__name__)
@@ -91,6 +96,15 @@ async def _read_body_async(request: Request) -> bytes:
     return raw_body
 
 
+def _booking_completed(start_time: datetime, end_time: Optional[datetime], *, now: Optional[datetime] = None) -> bool:
+    """Past when effective end (end_time or start_time) is before now."""
+    now_utc = ensure_utc(now or datetime.now(timezone.utc))
+    boundary = end_time if end_time is not None else start_time
+    if boundary is None:
+        return False
+    return ensure_utc(boundary) < now_utc
+
+
 def _upsert_check_in(
     db: Session,
     *,
@@ -112,6 +126,10 @@ def _upsert_check_in(
     raw_payload: Dict[str, Any],
 ) -> Tuple[ClientCheckIn, bool]:
     """Insert or refresh a ClientCheckIn row. Returns (row, is_new)."""
+    is_sales_call, sale_closed = get_sales_call_flags(
+        db, org_id, provider, event_id, event_type_id
+    )
+    completed = _booking_completed(start_time, end_time)
     existing = (
         db.query(ClientCheckIn)
         .filter(
@@ -124,6 +142,7 @@ def _upsert_check_in(
         .first()
     )
     if existing:
+        times_changed = existing.start_time != start_time or existing.end_time != end_time
         existing.title = title or existing.title
         existing.start_time = start_time
         existing.end_time = end_time
@@ -135,7 +154,14 @@ def _upsert_check_in(
             existing.event_type_label = event_type_label
         if cancelled:
             existing.cancelled = True
-        existing.completed = (start_time < datetime.now(timezone.utc))
+        if times_changed or not completed:
+            existing.completed = completed
+        elif completed and not existing.completed:
+            existing.completed = True
+        if not getattr(existing, "is_sales_call", False) and is_sales_call:
+            existing.is_sales_call = True
+        if getattr(existing, "sale_closed", None) is None and sale_closed is not None:
+            existing.sale_closed = sale_closed
         existing.updated_at = datetime.now(timezone.utc)
         existing.raw_event_data = json.dumps(raw_payload)
         return existing, False
@@ -155,15 +181,26 @@ def _upsert_check_in(
         attendee_name=attendee_name,
         event_type_id=event_type_id,
         event_type_label=event_type_label,
-        completed=start_time < datetime.now(timezone.utc),
+        completed=completed,
         cancelled=cancelled,
         no_show=False,
-        is_sales_call=False,
-        sale_closed=None,
+        is_sales_call=is_sales_call,
+        sale_closed=sale_closed,
         raw_event_data=json.dumps(raw_payload),
     )
     db.add(row)
     return row, True
+
+
+def _run_pipeline_after_webhook(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> None:
+    try:
+        from app.services.client_automation import process_pipeline_lifecycle_for_client
+
+        client = db.query(Client).filter(Client.id == client_id, Client.org_id == org_id).first()
+        if client and process_pipeline_lifecycle_for_client(db, client):
+            db.commit()
+    except Exception as exc:
+        LOG.warning("calendar webhook: pipeline lifecycle failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -222,16 +259,20 @@ async def calendly_webhook(
         return {"ok": True, "skipped": True, "reason": f"unsupported_event:{kind or 'unknown'}"}
 
     invitee_email = str(invitee.get("email") or "").strip()
-    if not invitee_email:
-        return {"ok": True, "skipped": True, "reason": "no_invitee_email"}
-    invitee_name = str(invitee.get("name") or "").strip() or None
+    title = scheduled.get("name") or invitee.get("name")
+    use_placeholder = not invitee_email
+    if use_placeholder:
+        placeholder = get_or_create_calendar_placeholder_client(db, org_uuid)
+        invitee_email = placeholder.email
+        invitee_name = str(title or "Calendar event").strip() or None
+    else:
+        invitee_name = str(invitee.get("name") or "").strip() or None
 
     event_uri = str(scheduled.get("uri") or "")
     event_uuid = event_uri.rsplit("/", 1)[-1] if event_uri else (str(invitee.get("uri") or "").rsplit("/", 1)[-1])
     if not event_uuid:
         return {"ok": True, "skipped": True, "reason": "no_event_id"}
 
-    title = scheduled.get("name") or invitee.get("name")
     start_time = _parse_iso_datetime(scheduled.get("start_time")) or datetime.now(timezone.utc)
     end_time = _parse_iso_datetime(scheduled.get("end_time"))
     location_raw = scheduled.get("location") or {}
@@ -249,7 +290,10 @@ async def calendly_webhook(
     cancelled = kind == "invitee.canceled" or str(invitee.get("status") or "").lower() in ("canceled", "cancelled")
 
     try:
-        client = ensure_client_for_booking_attendee(db, org_uuid, invitee_email, invitee_name)
+        if use_placeholder:
+            client = get_or_create_calendar_placeholder_client(db, org_uuid)
+        else:
+            client = ensure_client_for_booking_attendee(db, org_uuid, invitee_email, invitee_name)
     except Exception as e:  # pragma: no cover - defensive
         LOG.exception("calendly webhook: failed to resolve client for %s: %s", invitee_email, e)
         client = None
@@ -277,9 +321,10 @@ async def calendly_webhook(
     )
     db.commit()
     invalidate_terminal_monthly_trends_cache(org_uuid)
+    _run_pipeline_after_webhook(db, org_uuid, client.id)
 
     fired_jobs: list[str] = []
-    if is_new and not cancelled:
+    if is_new and not cancelled and not use_placeholder:
         try:
             ids = on_booking_created_pre_sale(
                 db,
@@ -356,17 +401,17 @@ async def calcom_webhook(
         if isinstance(meta, dict):
             meeting_url = meta.get("videoCallUrl")
 
-    attendees = payload.get("attendees") or []
-    primary = next((a for a in attendees if isinstance(a, dict) and a.get("email")), None)
+    attendees = extract_calcom_attendees(payload if isinstance(payload, dict) else {})
+    primary = attendees[0] if attendees else None
     attendee_email = (primary or {}).get("email")
-    if not attendee_email:
-        responses = payload.get("responses")
-        if isinstance(responses, dict):
-            attendee_email = responses.get("email")
-    if not attendee_email:
-        return {"ok": True, "skipped": True, "reason": "no_attendee_email"}
-    attendee_email = str(attendee_email).strip()
-    attendee_name = (primary or {}).get("name") if primary else None
+    use_placeholder = not attendee_email
+    if use_placeholder:
+        placeholder = get_or_create_calendar_placeholder_client(db, org_uuid)
+        attendee_email = placeholder.email
+        attendee_name = str(title or "Calendar event").strip() or None
+    else:
+        attendee_email = str(attendee_email).strip()
+        attendee_name = (primary or {}).get("name")
 
     event_type_id = (
         str(payload.get("eventTypeId"))
@@ -378,7 +423,10 @@ async def calcom_webhook(
     cancelled = trigger == "BOOKING_CANCELLED"
 
     try:
-        client = ensure_client_for_booking_attendee(db, org_uuid, attendee_email, attendee_name)
+        if use_placeholder:
+            client = get_or_create_calendar_placeholder_client(db, org_uuid)
+        else:
+            client = ensure_client_for_booking_attendee(db, org_uuid, attendee_email, attendee_name)
     except Exception as e:  # pragma: no cover - defensive
         LOG.exception("calcom webhook: failed to resolve client for %s: %s", attendee_email, e)
         client = None
@@ -406,9 +454,10 @@ async def calcom_webhook(
     )
     db.commit()
     invalidate_terminal_monthly_trends_cache(org_uuid)
+    _run_pipeline_after_webhook(db, org_uuid, client.id)
 
     fired_jobs: list[str] = []
-    if is_new and not cancelled:
+    if is_new and not cancelled and not use_placeholder:
         try:
             ids = on_booking_created_pre_sale(
                 db,

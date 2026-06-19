@@ -152,6 +152,62 @@ def _derive_call_title(rec: FathomCallRecord, db: Session, org_id: uuid.UUID) ->
     return f"Call #{rec.fathom_recording_id}"
 
 
+def ensure_pending_call_library_report(
+    db: Session,
+    org_id: uuid.UUID,
+    fathom_record_id: uuid.UUID,
+) -> Optional[CallLibraryReport]:
+    """Create or refresh a pending library row so the UI can show 'Analyzing…' immediately."""
+    _ensure_call_title_override_column(db)
+    _ensure_call_media_columns(db)
+    _ensure_call_deal_columns(db)
+    rec = (
+        db.query(FathomCallRecord)
+        .filter(
+            FathomCallRecord.id == fathom_record_id,
+            FathomCallRecord.org_id == org_id,
+        )
+        .first()
+    )
+    if not rec:
+        return None
+
+    row = (
+        db.query(CallLibraryReport)
+        .filter(CallLibraryReport.fathom_call_record_id == fathom_record_id)
+        .first()
+    )
+    call_title = _derive_call_title(rec, db, org_id)
+    if not row:
+        row = CallLibraryReport(
+            id=uuid.uuid4(),
+            org_id=org_id,
+            fathom_call_record_id=fathom_record_id,
+            status="pending",
+            call_title=call_title,
+        )
+        db.add(row)
+    elif row.status == "complete":
+        # Already analyzed — leave the finished report untouched.
+        return row
+    else:
+        row.status = "pending"
+        row.failure_reason = None
+        row.call_title = call_title or row.call_title
+
+    row.recording_url = (rec.recording_url or "")[:2000] or None
+    try:
+        row.share_url = (getattr(rec, "share_url", None) or "")[:2000] or None
+        row.video_url = (getattr(rec, "video_url", None) or "")[:2000] or None
+    except Exception:
+        pass
+    row.attendees_json = rec.attendees_json
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 def generate_and_persist_report(
     db: Session,
     org_id: uuid.UUID,

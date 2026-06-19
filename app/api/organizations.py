@@ -39,7 +39,11 @@ def _user_has_org_access(db: Session, user: User, org_id: UUID) -> bool:
 
 def _require_org_admin(db: Session, user: User, org_id: UUID) -> None:
     """Raise 403 if user is not admin/owner of the org."""
-    if user.role not in (UserRole.ADMIN, UserRole.OWNER) and not user.is_admin:
+    from app.services.org_user_context import user_can_manage_org_integrations
+
+    scoped = user
+    scoped.selected_org_id = org_id
+    if not user_can_manage_org_integrations(scoped, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only admins can perform this action",

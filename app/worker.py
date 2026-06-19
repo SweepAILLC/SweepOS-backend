@@ -10,8 +10,10 @@ Runs two jobs in one container so ops only has to deploy a single worker:
    ``sweep_long`` queue used by Fathom follow-ups, content studio bundle regen,
    etc. Lives in a daemon thread so a Redis hiccup can't take down the dispatcher.
 
-Crash recovery: on boot we sweep stale ``sending`` rows back to ``scheduled``,
-so a SIGKILL never strands an email. SIGTERM/SIGINT trigger a graceful drain.
+Crash recovery: on boot we sweep all ``sending`` rows back to ``scheduled``,
+so a SIGKILL never strands an email. During normal ticks, only rows stuck in
+``sending`` longer than STALE_SENDING_AFTER_SECONDS are reset (safe for multiple
+worker replicas). SIGTERM/SIGINT trigger a graceful drain.
 """
 from __future__ import annotations
 
@@ -67,7 +69,7 @@ def _start_rq_worker_thread() -> Optional[threading.Thread]:
 def _dispatcher_loop() -> None:
     """Tick the automation dispatcher every TICK_INTERVAL seconds."""
     from app.services.automation_dispatcher import (
-        recover_in_flight,
+        recover_all_sending_on_boot,
         tick,
         write_heartbeat,
     )
@@ -77,9 +79,9 @@ def _dispatcher_loop() -> None:
 
     with SessionLocal() as db:
         try:
-            n = recover_in_flight(db)
+            n = recover_all_sending_on_boot(db)
             if n:
-                LOG.info("recovered %d stuck 'sending' jobs on boot", n)
+                LOG.info("recovered %d in-flight 'sending' jobs on boot", n)
         except Exception:
             LOG.exception("recovery sweep failed on boot")
 

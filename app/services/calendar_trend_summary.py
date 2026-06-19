@@ -106,9 +106,12 @@ def _count_meetings_in_window(
     upcoming: bool,
     now_utc: datetime,
 ) -> int:
-    ws = window_start.replace(tzinfo=None) if window_start.tzinfo else window_start
-    we = window_end.replace(tzinfo=None) if window_end.tzinfo else window_end
-    now_naive = now_utc.replace(tzinfo=None) if now_utc.tzinfo else now_utc
+    from app.services.calendar_booking_time import effective_end_sql_expression, ensure_utc
+
+    ws = ensure_utc(window_start)
+    we = ensure_utc(window_end)
+    now = ensure_utc(now_utc)
+    effective_end = effective_end_sql_expression()
 
     q = db.query(ClientCheckIn).filter(
         ClientCheckIn.org_id == org_id,
@@ -116,14 +119,14 @@ def _count_meetings_in_window(
     )
     if upcoming:
         q = q.filter(
-            ClientCheckIn.start_time >= now_naive,
+            effective_end >= now,
             ClientCheckIn.start_time >= ws,
             ClientCheckIn.start_time <= we,
         )
     else:
         q = q.filter(
             ClientCheckIn.start_time >= ws,
-            ClientCheckIn.start_time < now_naive,
+            effective_end < now,
         )
     return q.count()
 

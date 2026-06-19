@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -12,7 +14,13 @@ from app.core.config import settings
 from app.models.organization import Organization
 from app.models.user import User
 
+logger = logging.getLogger(__name__)
+
 BASE = "https://api.fathom.ai/external/v1"
+
+# Fathom docs: heavy /meetings (include_summary|include_transcript) ≈ 30/min (can drop to 5/min).
+# Global authenticated limit ≈ 60/min. Wait full window on 429 when header missing.
+_RATE_LIMIT_DEFAULT_WAIT_SEC = 62.0
 
 
 def normalize_fathom_api_key(raw: Optional[str]) -> Optional[str]:
@@ -84,18 +92,49 @@ def fathom_configured_for_org(db: Session, org_id: uuid.UUID) -> bool:
 _RETRYABLE_STATUS = frozenset({429, 502, 503})
 
 
+def _parse_rate_limit_reset(response: httpx.Response) -> Optional[float]:
+    raw = response.headers.get("RateLimit-Reset") or response.headers.get("ratelimit-reset")
+    if not raw:
+        return None
+    try:
+        return max(0.0, min(float(raw), 120.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sleep_before_retry(response: Optional[httpx.Response], attempt: int, status_code: Optional[int]) -> None:
+    if status_code == 429:
+        wait = _parse_rate_limit_reset(response) if response is not None else None
+        if wait is None:
+            wait = _RATE_LIMIT_DEFAULT_WAIT_SEC
+        logger.info(
+            "Fathom rate limit (429); waiting %.1fs before retry (attempt %s)",
+            wait + 0.5,
+            attempt + 1,
+        )
+        time.sleep(wait + 0.5)
+        return
+    if status_code in (502, 503):
+        wait = min(4.0 * (2**attempt), 45.0)
+        logger.info(
+            "Fathom transient error (%s); waiting %.1fs before retry (attempt %s)",
+            status_code,
+            wait,
+            attempt + 1,
+        )
+        time.sleep(wait)
+        return
+    time.sleep(min(0.75 * (2**attempt), 8.0))
+
+
 def _get_with_retries(
     fn,
     *,
     timeout: float,
-    max_attempts: int = 3,
+    max_attempts: int = 8,
 ) -> Any:
     """
-    Small wrapper around httpx.Client.get with limited retries and backoff.
-
-    Fathom's API can sporadically time out or return transient 5xx/429s for large accounts.
-    Retrying a couple times on these cases dramatically reduces visible failures
-    without pushing undue load.
+    GET with retries. On 429, honor RateLimit-Reset (or wait ~62s) per Fathom docs.
     """
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
@@ -103,10 +142,7 @@ def _get_with_retries(
             with httpx.Client(timeout=timeout) as client:
                 r = fn(client)
                 if r.status_code in _RETRYABLE_STATUS and attempt < max_attempts - 1:
-                    # Simple exponential backoff with upper bound
-                    import time as _time
-
-                    _time.sleep(min(0.5 * (2**attempt), 4.0))
+                    _sleep_before_retry(r, attempt, r.status_code)
                     continue
                 r.raise_for_status()
                 try:
@@ -116,12 +152,17 @@ def _get_with_retries(
                     raise RuntimeError(
                         f"Fathom returned non-JSON response (HTTP {r.status_code}): {snippet!r}"
                     ) from e
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError) as e:
+        except httpx.HTTPStatusError as e:
+            last_exc = e
+            status = e.response.status_code if e.response is not None else None
+            if status in _RETRYABLE_STATUS and attempt < max_attempts - 1:
+                _sleep_before_retry(e.response, attempt, status)
+                continue
+            raise
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
             last_exc = e
             if attempt < max_attempts - 1:
-                import time as _time
-
-                _time.sleep(min(0.5 * (2**attempt), 4.0))
+                time.sleep(min(0.75 * (2**attempt), 8.0))
                 continue
             raise
     raise last_exc or RuntimeError("Fathom request exhausted retries")
@@ -158,6 +199,28 @@ def list_meetings(
         params["created_after"] = created_after
     return _get_with_retries(
         lambda c: c.get(f"{BASE}/meetings", headers=_headers(key), params=params),
+        timeout=timeout,
+    )
+
+
+def list_meetings_for_bulk_sync(
+    *,
+    cursor: Optional[str] = None,
+    api_key: str,
+    timeout: float = 60.0,
+) -> Dict[str, Any]:
+    """
+    Light /meetings pagination for bulk import.
+
+    Per Fathom rate limits, include_summary/include_transcript count as *heavy*
+    requests (~30/min). Bulk sync lists metadata + calendar_invitees only (60/min),
+    then background jobs pull summary/transcript via /recordings/*.
+    """
+    return list_meetings(
+        cursor=cursor,
+        include_summary=False,
+        include_transcript=False,
+        api_key=api_key,
         timeout=timeout,
     )
 

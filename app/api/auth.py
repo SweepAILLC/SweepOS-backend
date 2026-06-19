@@ -332,10 +332,10 @@ def update_user_settings(
         user_row.hashed_password = get_password_hash(settings_data.new_password)
     
     if settings_data.fathom_api_key is not None:
-        from app.models.user import UserRole
+        from app.services.org_user_context import user_can_manage_org_integrations
 
         org_id = getattr(current_user, "selected_org_id", user_row.org_id)
-        if current_user.role not in (UserRole.ADMIN, UserRole.OWNER) and not current_user.is_admin:
+        if not user_can_manage_org_integrations(current_user, db):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only organization admins and owners can set the Fathom API key.",
@@ -488,41 +488,45 @@ def switch_organization(
     Switch to a different organization.
     Verifies user has access to the requested organization.
     """
-    # Verify user has access to the requested org
-    user_org = db.query(UserOrganization).filter(
-        UserOrganization.user_id == current_user.id,
-        UserOrganization.org_id == switch_request.org_id
-    ).first()
-    
-    # If no user_org found, check if user.org_id matches (backward compatibility)
-    if not user_org:
+    from app.services.org_user_context import fetch_user_row_for_org, user_has_email_org_access
+    from app.models.user import parse_user_role_from_db
+
+    if not user_has_email_org_access(db, current_user.email, switch_request.org_id):
         if current_user.org_id != switch_request.org_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="User does not have access to this organization"
+                detail="User does not have access to this organization",
             )
-    elif user_org.org_id != switch_request.org_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User does not have access to this organization"
-        )
-    
-    # Verify organization exists
+
     org = db.query(Organization).filter(Organization.id == switch_request.org_id).first()
     if not org:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Organization not found"
+            detail="Organization not found",
         )
-    
-    # Create new token with selected org_id
+
+    resolved = fetch_user_row_for_org(db, current_user.email, switch_request.org_id)
+    if not resolved:
+        from app.services.org_user_context import materialize_org_user_row_if_missing
+
+        resolved = materialize_org_user_row_if_missing(db, current_user.email, switch_request.org_id)
+        if resolved:
+            db.commit()
+    if resolved:
+        token_user_id = str(resolved[0])
+        token_role = role_to_api(parse_user_role_from_db(resolved[4]))
+    else:
+        token_user_id = str(current_user.id)
+        token_role = role_to_api(current_user.role)
+
+    # Create new token with selected org_id and org-scoped user id/role
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={
             "sub": current_user.email,
             "org_id": str(switch_request.org_id),
-            "user_id": str(current_user.id),
-            "role": role_to_api(current_user.role),
+            "user_id": token_user_id,
+            "role": token_role,
         },
         expires_delta=access_token_expires
     )
@@ -640,29 +644,60 @@ def accept_invitation(
     # Check if user already exists (any org)
     existing_user = db.query(User).filter(func.lower(User.email) == email_normalized).first()
     if existing_user:
-        # Existing user: add to org via UserOrganization
-        already_in_org = db.query(UserOrganization).filter(
-            UserOrganization.user_id == existing_user.id,
-            UserOrganization.org_id == inv.org_id,
+        in_org_user = db.query(User).filter(
+            func.lower(User.email) == email_normalized,
+            User.org_id == inv.org_id,
         ).first()
-        if already_in_org:
+        if in_org_user:
             raise HTTPException(status_code=400, detail="You are already in this organization")
-        uo = UserOrganization(
-            user_id=existing_user.id,
-            org_id=inv.org_id,
-            is_primary=False,
+
+        already_linked = db.query(UserOrganization).filter(
+            UserOrganization.org_id == inv.org_id,
+            UserOrganization.user_id == existing_user.id,
+        ).first()
+        if already_linked:
+            raise HTTPException(status_code=400, detail="You are already in this organization")
+
+        if org.max_user_seats is not None:
+            current_count = db.query(func.count(User.id)).filter(User.org_id == inv.org_id).scalar() or 0
+            if current_count >= org.max_user_seats:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Organization user limit has been reached. The invitation can no longer be accepted.",
+                )
+
+        user_role = parse_user_role_from_api(role_normalized)
+        org_user_id = uuid.uuid4()
+        db.execute(
+            text("""
+                INSERT INTO users (id, org_id, email, hashed_password, role, is_admin, created_at)
+                VALUES (:id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW())
+            """),
+            {
+                "id": org_user_id,
+                "org_id": inv.org_id,
+                "email": email_normalized,
+                "hashed_password": existing_user.hashed_password,
+                "role": user_role.value,
+                "is_admin": user_role in (UserRole.ADMIN, UserRole.OWNER),
+            },
         )
-        db.add(uo)
+        db.add(
+            UserOrganization(
+                user_id=org_user_id,
+                org_id=inv.org_id,
+                is_primary=False,
+            )
+        )
         inv.used_at = datetime.utcnow()
         db.commit()
-        # Issue token so frontend can set cookie and switch to this org
         access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             data={
-                "sub": existing_user.email,
+                "sub": email_normalized,
                 "org_id": str(inv.org_id),
-                "user_id": str(existing_user.id),
-                "role": role_to_api(existing_user.role),
+                "user_id": str(org_user_id),
+                "role": role_to_api(user_role),
             },
             expires_delta=access_token_expires,
         )
@@ -670,7 +705,7 @@ def accept_invitation(
             access_token=access_token,
             token_type="bearer",
             org_id=inv.org_id,
-            user_id=existing_user.id,
+            user_id=org_user_id,
             existing_user=True,
             message="You have been added to this organization.",
         )

@@ -106,14 +106,13 @@ def _user_from_token(db: Session, token: str) -> User:
             org_id_uuid = None
 
         if org_id_uuid:
-            from app.models.user_organization import UserOrganization
+            from app.services.org_user_context import user_has_email_org_access
 
-            user_org = db.query(UserOrganization).filter(
-                UserOrganization.user_id == user.id,
-                UserOrganization.org_id == org_id_uuid,
-            ).first()
-
-            if not user_org and user.org_id != org_id_uuid:
+            has_access = (
+                str(user.org_id) == str(org_id_uuid)
+                or user_has_email_org_access(db, user.email, org_id_uuid)
+            )
+            if not has_access:
                 _logger.warning("User %s denied access to org %s", user.id, org_id_uuid)
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -124,6 +123,10 @@ def _user_from_token(db: Session, token: str) -> User:
             _logger.debug("User %s accessing org %s", user.id, selected_org_id)
 
     user.selected_org_id = selected_org_id
+
+    from app.services.org_user_context import apply_selected_org_user_context
+
+    apply_selected_org_user_context(user, db, selected_org_id)
     return user
 
 
@@ -169,13 +172,13 @@ def get_selected_org_id(
         if org_id_from_token:
             try:
                 selected_org_id = uuid.UUID(org_id_from_token)
-                # Verify user has access to this org
-                from app.models.user_organization import UserOrganization
-                user_org = db.query(UserOrganization).filter(
-                    UserOrganization.user_id == user.id,
-                    UserOrganization.org_id == selected_org_id
-                ).first()
-                if user_org or str(user.org_id) == str(selected_org_id):
+                from app.services.org_user_context import user_has_email_org_access
+
+                has_access = (
+                    str(user.org_id) == str(selected_org_id)
+                    or user_has_email_org_access(db, user.email, selected_org_id)
+                )
+                if has_access:
                     return selected_org_id
             except (ValueError, TypeError):
                 pass
@@ -241,21 +244,14 @@ def require_admin_or_owner(
     This is less restrictive than require_admin - it allows admins/owners in any org,
     not just the main org. Use this for org-scoped operations like managing integrations.
     """
-    from app.core.config import settings
-    from app.models.user import UserRole
-    
-    # Check if user is the sudo admin (always allowed)
-    if user.email == settings.SUDO_ADMIN_EMAIL:
-        return user
-    
-    # Check if user has admin or owner role (or is_admin flag)
-    if user.role in (UserRole.ADMIN, UserRole.OWNER) or user.is_admin:
-        return user
-    
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Admin or owner access required. Members cannot manage integrations."
-    )
+    from app.services.org_user_context import user_can_manage_org_integrations
+
+    if not user_can_manage_org_integrations(user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or owner access required. Members cannot manage integrations.",
+        )
+    return user
 
 
 def _tab_scope_org_id(user: User) -> uuid.UUID:

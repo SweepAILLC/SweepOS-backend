@@ -156,7 +156,7 @@ class CalComEventType(BaseModel):
 class CalComBookingsResponse(BaseModel):
     bookings: List[CalComBooking]
     total: Optional[int] = None
-    nextCursor: Optional[int] = None
+    nextCursor: Optional[str] = None
 
 
 class CalComEventTypesResponse(BaseModel):

@@ -135,6 +135,33 @@ def client_has_recorded_sale(db: Session, org_id: uuid.UUID, client_id: uuid.UUI
     return not _has_no_recorded_sale(db, org_id, client_id)
 
 
+def _has_upcoming_sales_call(
+    db: Session,
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    from app.models.client_checkin import ClientCheckIn
+    from app.services.calendar_booking_time import effective_end_sql_expression, ensure_utc
+
+    now_utc = ensure_utc(now or datetime.now(timezone.utc))
+    effective_end = effective_end_sql_expression()
+    row = (
+        db.query(ClientCheckIn.id)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.client_id == client_id,
+            ClientCheckIn.is_sales_call.is_(True),
+            ClientCheckIn.cancelled.is_(False),
+            effective_end >= now_utc,
+        )
+        .limit(1)
+        .first()
+    )
+    return row is not None
+
+
 def _has_unclosed_past_sales_call(
     db: Session,
     org_id: uuid.UUID,
@@ -185,6 +212,27 @@ def update_client_progress(db: Session, client: Client) -> bool:
     return False
 
 
+def update_to_booked_on_upcoming_sales_call(db: Session, client: Client) -> bool:
+    """
+    Pre-payment leads with an upcoming sales call on the calendar → booked.
+    """
+    state = _lifecycle_str(client.lifecycle_state)
+    if state not in {s.value for s in PRE_PAYMENT_LIFECYCLE_STATES}:
+        return False
+    if state == LifecycleState.BOOKED.value:
+        return False
+    if not _has_upcoming_sales_call(db, client.org_id, client.id):
+        return False
+    print(
+        f"[CLIENT_AUTOMATION] Client {client.id} ({client.email}): "
+        f"{state} + upcoming sales call → BOOKED"
+    )
+    client.lifecycle_state = LifecycleState.BOOKED
+    client.last_activity_at = datetime.utcnow()
+    db.flush()
+    return True
+
+
 def update_booked_to_nurturing(db: Session, client: Client) -> bool:
     """
     Booked leads who had a sales call that did not close and have not paid → nurturing.
@@ -192,6 +240,8 @@ def update_booked_to_nurturing(db: Session, client: Client) -> bool:
     if _lifecycle_str(client.lifecycle_state) != LifecycleState.BOOKED.value:
         return False
     if client_has_recorded_sale(db, client.org_id, client.id):
+        return False
+    if _has_upcoming_sales_call(db, client.org_id, client.id):
         return False
     if not _has_unclosed_past_sales_call(db, client.org_id, client.id):
         return False
@@ -204,12 +254,14 @@ def update_booked_to_nurturing(db: Session, client: Client) -> bool:
     return True
 
 
-def update_expired_follow_ups_to_cold_lead(client: Client) -> bool:
+def update_expired_follow_ups_to_cold_lead(db: Session, client: Client) -> bool:
     """
     Qualified / nurturing / booked leads whose follow-up timer has elapsed → cold_lead.
     """
     state = _lifecycle_str(client.lifecycle_state)
     if state not in {s.value for s in (LifecycleState.QUALIFIED, LifecycleState.NURTURING, LifecycleState.BOOKED)}:
+        return False
+    if _has_upcoming_sales_call(db, client.org_id, client.id):
         return False
     if not is_follow_up_expired(client):
         return False
@@ -301,13 +353,15 @@ def update_client_lifecycle_state(db: Session, client: Client, force: bool = Fal
 
 
 def process_pipeline_lifecycle_for_client(db: Session, client: Client) -> bool:
-    """Run booked→nurturing and follow-up expiry rules for one client."""
+    """Run upcoming-call→booked, booked→nurturing, and follow-up expiry rules for one client."""
     if is_manual_lifecycle_protected(client):
         return False
     changed = False
+    if update_to_booked_on_upcoming_sales_call(db, client):
+        changed = True
     if update_booked_to_nurturing(db, client):
         changed = True
-    if update_expired_follow_ups_to_cold_lead(client):
+    if update_expired_follow_ups_to_cold_lead(db, client):
         changed = True
     return changed
 

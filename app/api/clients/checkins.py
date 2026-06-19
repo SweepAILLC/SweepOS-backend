@@ -517,6 +517,9 @@ def create_manual_check_in(
         db.add(manual_check_in)
         db.commit()
         db.refresh(manual_check_in)
+
+        if is_sales_call and process_pipeline_lifecycle_for_client(db, client):
+            db.commit()
         
         return {
             "id": str(manual_check_in.id),

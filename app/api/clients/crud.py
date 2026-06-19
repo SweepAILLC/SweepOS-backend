@@ -182,6 +182,9 @@ def create_client(
             detail="Could not create client due to a conflict with existing data (e.g. duplicate email).",
         )
     db.refresh(client)
+    from app.services.fathom_client_link import relink_fathom_for_client_and_queue
+
+    relink_fathom_for_client_and_queue(db, org_id, client)
     return client
 
 
@@ -353,6 +356,10 @@ def update_client(
                 str(org_id),
                 str(client.id),
             )
+        if "email" in update_data or "emails" in update_data:
+            from app.services.fathom_client_link import relink_fathom_for_client_and_queue
+
+            relink_fathom_for_client_and_queue(db, org_id, client)
         return ClientSchema.model_validate(client, from_attributes=True)
     except HTTPException:
         raise
@@ -509,6 +516,9 @@ def merge_clients(
     db.commit()
     db.refresh(keep)
     invalidate_health_score_cache(db, keep_id, org_id, do_commit=True)
+    from app.services.fathom_client_link import relink_fathom_for_client_and_queue
+
+    relink_fathom_for_client_and_queue(db, org_id, keep)
     return ClientSchema.model_validate(keep, from_attributes=True)
 
 
