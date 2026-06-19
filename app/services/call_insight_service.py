@@ -951,6 +951,23 @@ def reconcile_call_insights_for_client_merge(
     from app.models.client_ai_recommendation_state import ClientAIRecommendationState
     from app.models.client_health_score_cache import ClientHealthScoreCache
 
+    keep_fathom_ids = {
+        row[0]
+        for row in db.query(ClientCallInsight.fathom_call_record_id)
+        .filter(
+            ClientCallInsight.org_id == org_id,
+            ClientCallInsight.client_id == keep_id,
+        )
+        .all()
+        if row[0] is not None
+    }
+    if keep_fathom_ids:
+        db.query(ClientCallInsight).filter(
+            ClientCallInsight.org_id == org_id,
+            ClientCallInsight.client_id.in_(remove_ids),
+            ClientCallInsight.fathom_call_record_id.in_(keep_fathom_ids),
+        ).delete(synchronize_session=False)
+
     db.query(ClientCallInsight).filter(
         ClientCallInsight.org_id == org_id,
         ClientCallInsight.client_id.in_(remove_ids),

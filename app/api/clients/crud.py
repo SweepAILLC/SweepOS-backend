@@ -69,6 +69,7 @@ from app.services.health_score_cache_service import invalidate_health_score_cach
 from app.services.call_insight_service import (
     on_client_became_dead,
     reconcile_call_insights_for_client_merge,
+    refresh_insight_summary_from_latest_stored_insight,
     refresh_latest_call_insight_background,
 )
 from app.services.client_delete_service import purge_client_dependencies
@@ -509,16 +510,33 @@ def merge_clients(
         except Exception:
             pass
 
-    for c in to_remove:
-        db.delete(c)
+    for rid in remove_ids:
+        purge_client_dependencies(db, org_id, rid)
+
+    db.query(Client).filter(
+        Client.id.in_(remove_ids),
+        Client.org_id == org_id,
+    ).delete(synchronize_session=False)
 
     refresh_insight_summary_from_latest_stored_insight(db, org_id, keep_id)
-    db.commit()
-    db.refresh(keep)
-    invalidate_health_score_cache(db, keep_id, org_id, do_commit=True)
-    from app.services.fathom_client_link import relink_fathom_for_client_and_queue
+    try:
+        db.commit()
+        db.refresh(keep)
+    except IntegrityError as e:
+        db.rollback()
+        LOG.exception("merge_clients integrity error org=%s keep=%s remove=%s", org_id, keep_id, remove_ids)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Could not merge clients due to conflicting related records. Try again or contact support.",
+        ) from e
 
-    relink_fathom_for_client_and_queue(db, org_id, keep)
+    invalidate_health_score_cache(db, keep_id, org_id, do_commit=True)
+    try:
+        from app.services.fathom_client_link import relink_fathom_for_client_and_queue
+
+        relink_fathom_for_client_and_queue(db, org_id, keep)
+    except Exception:
+        LOG.exception("merge_clients fathom relink failed org=%s client=%s", org_id, keep_id)
     return ClientSchema.model_validate(keep, from_attributes=True)
 
 

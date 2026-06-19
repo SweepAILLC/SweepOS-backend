@@ -169,5 +169,5 @@ def relink_fathom_for_client_and_queue(
     if not linked:
         return 0
     db.commit()
-    queue_fathom_relink_followups(background_tasks, org_id, linked)
+    queue_fathom_relink_followups(background_tasks, org_id, [rec_id for rec_id, _ in linked])
     return len(linked)
