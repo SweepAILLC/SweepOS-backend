@@ -476,6 +476,16 @@ def create_manual_payment(
     db.add(manual_payment)
     db.commit()
     db.refresh(manual_payment)
+
+    try:
+        from app.services.client_automation import apply_automatic_lifecycle_for_client
+
+        apply_automatic_lifecycle_for_client(db, client)
+        db.commit()
+        db.refresh(client)
+    except Exception as lc_err:
+        print(f"[MANUAL PAYMENT] lifecycle update skipped for {client.id}: {lc_err}")
+
     invalidate_terminal_monthly_trends_cache(org_id)
 
     return {

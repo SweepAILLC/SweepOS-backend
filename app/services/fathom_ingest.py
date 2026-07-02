@@ -15,6 +15,7 @@ from sqlalchemy import text
 from app.models.client import find_client_by_email
 from app.models.fathom_call_record import FathomCallRecord
 from app.services.fathom_attendee_clients import resolve_clients_for_meeting
+from app.services.fathom_call_labels import fathom_meeting_title_from_payload
 from app.services.fathom_client import resolve_fathom_api_key, get_recording_summary, get_recording_transcript
 from app.services.fathom_sentiment import default_neutral, derive_sentiment
 from app.services.health_score_cache_service import invalidate_health_score_cache
@@ -75,6 +76,7 @@ def _ensure_fathom_media_columns(db: Session) -> None:
     try:
         db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS share_url TEXT"))
         db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS video_url TEXT"))
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS meeting_title TEXT"))
         db.commit()
         _fathom_media_columns_ensured = True
     except Exception:
@@ -152,6 +154,7 @@ def upsert_call_record(
     transcript_text: str,
     meeting_at: Optional[datetime],
     *,
+    meeting_title: Optional[str] = None,
     recording_url: Optional[str] = None,
     share_url: Optional[str] = None,
     video_url: Optional[str] = None,
@@ -179,6 +182,8 @@ def upsert_call_record(
     row.summary_text = summary_md[:50000] if summary_md else None
     row.transcript_snippet = truncate_for_tokens(transcript_text, 24000) if transcript_text else None
     row.meeting_at = meeting_at
+    if meeting_title is not None:
+        row.meeting_title = (meeting_title or "")[:500] or None
     if recording_url:
         row.recording_url = recording_url[:2000]
     if share_url:
@@ -294,6 +299,7 @@ def ingest_meeting_payload(
             pass
 
     common_upsert_kwargs = dict(
+        meeting_title=fathom_meeting_title_from_payload(meeting),
         recording_url=recording_url or None,
         share_url=media.get("share_url"),
         video_url=media.get("video_url"),

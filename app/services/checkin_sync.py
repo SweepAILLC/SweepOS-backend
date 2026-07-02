@@ -1032,6 +1032,7 @@ def sync_all_checkins(
     user_id: uuid.UUID,
     *,
     apply_pipeline_lifecycle_rules: bool = True,
+    force_lifecycle: bool = False,
 ) -> Dict[str, Any]:
     """Sync check-ins from all connected calendar providers."""
     from datetime import datetime, timezone
@@ -1120,10 +1121,13 @@ def sync_all_checkins(
             try:
                 from app.services.client_automation import run_pipeline_lifecycle_for_org
 
-                pipeline_changes = run_pipeline_lifecycle_for_org(db, org_id)
+                pipeline_changes = run_pipeline_lifecycle_for_org(
+                    db, org_id, force=force_lifecycle
+                )
                 results["pipeline_lifecycle_changes"] = pipeline_changes
             except Exception as pipe_err:
                 print(f"[CHECKIN SYNC] pipeline lifecycle pass skipped: {pipe_err}")
+                db.rollback()
         else:
             results["pipeline_lifecycle_changes"] = 0
 

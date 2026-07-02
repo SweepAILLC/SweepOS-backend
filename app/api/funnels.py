@@ -524,9 +524,18 @@ def create_lead_from_funnel(
         if notes is not None and notes:
             client.notes = (client.notes or "").strip() + ("\n\n" + notes if (client.notes or "").strip() else notes)
         _apply_prospect_meta(client)
+        from app.services.client_automation import apply_funnel_lead_lifecycle, apply_automatic_lifecycle_for_client
+
+        apply_funnel_lead_lifecycle(client)
         client.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(client)
+        try:
+            apply_automatic_lifecycle_for_client(db, client)
+            db.commit()
+            db.refresh(client)
+        except Exception as lc_err:
+            print(f"[FUNNEL LEAD] lifecycle reconcile skipped for {client.id}: {lc_err}")
         invalidate_health_score_cache(db, client.id, org_id)
         return FunnelLeadResponse(client_id=client.id, created=False, message="Client updated")
     else:

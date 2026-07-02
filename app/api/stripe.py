@@ -412,7 +412,7 @@ def sync_stripe_data(
                 db.commit()
                 print(f"[API] Temporarily set last_sync_at to {oauth_token.last_sync_at} to sync recent payments")
         
-        sync_result = sync_stripe_incremental(db, org_id=org_id, force_full=force_full)
+        sync_result = sync_stripe_incremental(db, org_id=org_id, force_full=force_full, sync_recent=sync_recent)
         
         # Restore original last_sync_at if we modified it
         if sync_recent and 'original_last_sync' in locals() and original_last_sync is not None:
@@ -459,9 +459,10 @@ def sync_stripe_data(
         
         return response_data
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         import traceback
         error_detail = str(e)
         print(f"[API] ❌ Error syncing Stripe data: {error_detail}")
@@ -511,7 +512,7 @@ def sync_and_reconcile_stripe_data(
                 oauth_token.last_sync_at = datetime.utcnow() - timedelta(hours=24)
                 db.commit()
 
-        sync_result = sync_stripe_incremental(db, org_id=org_id, force_full=force_full)
+        sync_result = sync_stripe_incremental(db, org_id=org_id, force_full=force_full, sync_recent=sync_recent)
 
         if sync_recent and original_last_sync is not None:
             oauth_token = db.query(OAuthToken).filter(
@@ -531,6 +532,9 @@ def sync_and_reconcile_stripe_data(
         # 2. Reconcile immediately (same DB session)
         reconcile_result = reconcile_stripe_data(db, org_id=org_id)
 
+        from app.services.client_automation import reconcile_org_client_lifecycles
+        lifecycle_updated = reconcile_org_client_lifecycles(db, org_id, force=True)
+
         return {
             "success": True,
             "message": "Sync and reconciliation complete",
@@ -546,11 +550,14 @@ def sync_and_reconcile_stripe_data(
             "reconciliation": {
                 "clients_reconciled": reconcile_result.get("clients_reconciled", 0),
                 "revenue_recalculated": reconcile_result.get("revenue_recalculated", 0),
+                "lifecycle_clients_updated": lifecycle_updated,
             },
         }
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
+        db.rollback()
         import traceback
         print(f"[API] ❌ Sync-and-reconcile error: {e}")
         print(traceback.format_exc())

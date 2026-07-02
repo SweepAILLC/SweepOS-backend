@@ -130,9 +130,32 @@ def is_follow_up_expired(client: Client, *, now: Optional[datetime] = None) -> b
 
 
 def client_has_recorded_sale(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> bool:
+    """True when client has succeeded Stripe or paid-like Whop rows."""
     from app.services.automation_engine import _has_no_recorded_sale
 
     return not _has_no_recorded_sale(db, org_id, client_id)
+
+
+def client_has_recorded_payment(
+    db: Session,
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+) -> bool:
+    """True when client has any recorded sale (Stripe, Whop, or manual payment)."""
+    if client_has_recorded_sale(db, org_id, client_id):
+        return True
+    from app.models.manual_payment import ManualPayment
+
+    manual = (
+        db.query(ManualPayment.id)
+        .filter(
+            ManualPayment.org_id == org_id,
+            ManualPayment.client_id == client_id,
+        )
+        .limit(1)
+        .first()
+    )
+    return manual is not None
 
 
 def _has_upcoming_sales_call(
@@ -142,6 +165,7 @@ def _has_upcoming_sales_call(
     *,
     now: Optional[datetime] = None,
 ) -> bool:
+    """Upcoming check-in marked (or event-typed) as a sales call."""
     from app.models.client_checkin import ClientCheckIn
     from app.services.calendar_booking_time import effective_end_sql_expression, ensure_utc
 
@@ -154,6 +178,7 @@ def _has_upcoming_sales_call(
             ClientCheckIn.client_id == client_id,
             ClientCheckIn.is_sales_call.is_(True),
             ClientCheckIn.cancelled.is_(False),
+            ClientCheckIn.no_show.is_(False),
             effective_end >= now_utc,
         )
         .limit(1)
@@ -169,6 +194,7 @@ def _has_unclosed_past_sales_call(
     *,
     now: Optional[datetime] = None,
 ) -> bool:
+    """Past sales call that has not been marked sale-closed."""
     from app.models.client_checkin import ClientCheckIn
 
     now_naive = _as_naive_utc(now or datetime.utcnow())
@@ -181,6 +207,8 @@ def _has_unclosed_past_sales_call(
             ClientCheckIn.org_id == org_id,
             ClientCheckIn.client_id == client_id,
             ClientCheckIn.is_sales_call.is_(True),
+            ClientCheckIn.cancelled.is_(False),
+            ClientCheckIn.no_show.is_(False),
             or_(ClientCheckIn.sale_closed.is_(False), ClientCheckIn.sale_closed.is_(None)),
         )
         .order_by(ClientCheckIn.start_time.desc())
@@ -221,6 +249,8 @@ def update_to_booked_on_upcoming_sales_call(db: Session, client: Client) -> bool
         return False
     if state == LifecycleState.BOOKED.value:
         return False
+    if client_has_recorded_payment(db, client.org_id, client.id):
+        return False
     if not _has_upcoming_sales_call(db, client.org_id, client.id):
         return False
     print(
@@ -239,7 +269,7 @@ def update_booked_to_nurturing(db: Session, client: Client) -> bool:
     """
     if _lifecycle_str(client.lifecycle_state) != LifecycleState.BOOKED.value:
         return False
-    if client_has_recorded_sale(db, client.org_id, client.id):
+    if client_has_recorded_payment(db, client.org_id, client.id):
         return False
     if _has_upcoming_sales_call(db, client.org_id, client.id):
         return False
@@ -254,12 +284,36 @@ def update_booked_to_nurturing(db: Session, client: Client) -> bool:
     return True
 
 
+def revert_booked_without_sales_call(db: Session, client: Client) -> bool:
+    """
+    Booked column requires an upcoming or past unclosed sales call.
+    Corrects profiles that were moved on generic calendar check-ins.
+    """
+    if _lifecycle_str(client.lifecycle_state) != LifecycleState.BOOKED.value:
+        return False
+    if client_has_recorded_payment(db, client.org_id, client.id):
+        return False
+    if _has_upcoming_sales_call(db, client.org_id, client.id):
+        return False
+    if _has_unclosed_past_sales_call(db, client.org_id, client.id):
+        return False
+    print(
+        f"[CLIENT_AUTOMATION] Client {client.id} ({client.email}): "
+        "booked without sales call basis → QUALIFIED"
+    )
+    client.lifecycle_state = LifecycleState.QUALIFIED
+    db.flush()
+    return True
+
+
 def update_expired_follow_ups_to_cold_lead(db: Session, client: Client) -> bool:
     """
     Qualified / nurturing / booked leads whose follow-up timer has elapsed → cold_lead.
     """
     state = _lifecycle_str(client.lifecycle_state)
     if state not in {s.value for s in (LifecycleState.QUALIFIED, LifecycleState.NURTURING, LifecycleState.BOOKED)}:
+        return False
+    if client_has_recorded_payment(db, client.org_id, client.id):
         return False
     if _has_upcoming_sales_call(db, client.org_id, client.id):
         return False
@@ -271,6 +325,16 @@ def update_expired_follow_ups_to_cold_lead(db: Session, client: Client) -> bool:
     )
     client.lifecycle_state = LifecycleState.COLD_LEAD
     return True
+
+
+def apply_funnel_lead_lifecycle(client: Client) -> bool:
+    """Funnel capture moves early-stage leads to qualified."""
+    state = _lifecycle_str(client.lifecycle_state)
+    if state in (LifecycleState.COLD_LEAD.value, LifecycleState.NURTURING.value):
+        client.lifecycle_state = LifecycleState.QUALIFIED
+        client.last_activity_at = datetime.utcnow()
+        return True
+    return False
 
 
 def update_client_lifecycle_state(db: Session, client: Client, force: bool = False) -> bool:
@@ -352,47 +416,109 @@ def update_client_lifecycle_state(db: Session, client: Client, force: bool = Fal
     return True
 
 
-def process_pipeline_lifecycle_for_client(db: Session, client: Client) -> bool:
-    """Run upcoming-call→booked, booked→nurturing, and follow-up expiry rules for one client."""
-    if is_manual_lifecycle_protected(client):
+def apply_automatic_lifecycle_for_client(
+    db: Session,
+    client: Client,
+    *,
+    force: bool = False,
+) -> bool:
+    """
+    Apply all automatic lifecycle rules for one client (priority order):
+    1. Payment → active
+    2. Program progress → offboarding @ 75%, dead @ 100%
+    3. Upcoming sales call → booked (pre-payment)
+    4. Past unclosed sales call without payment → nurturing
+    5. Booked without sales call basis → qualified (backfill)
+    6. Follow-up expired → cold_lead
+    """
+    if not force and is_manual_lifecycle_protected(client):
         return False
+
     changed = False
+
+    if client_has_recorded_payment(db, client.org_id, client.id):
+        if move_client_to_active_on_payment(db, client):
+            db.flush()
+            return True
+
+    if client.program_start_date and client.program_duration_days:
+        if update_client_progress(db, client):
+            changed = True
+        if update_client_lifecycle_state(db, client, force=force):
+            changed = True
+
+    state = _lifecycle_str(client.lifecycle_state)
+    if state not in {s.value for s in PRE_PAYMENT_LIFECYCLE_STATES}:
+        return changed
+
     if update_to_booked_on_upcoming_sales_call(db, client):
-        changed = True
+        return True
     if update_booked_to_nurturing(db, client):
         changed = True
-    if update_expired_follow_ups_to_cold_lead(db, client):
+    elif revert_booked_without_sales_call(db, client):
+        changed = True
+    elif update_expired_follow_ups_to_cold_lead(db, client):
         changed = True
     return changed
 
 
-def run_pipeline_lifecycle_for_org(db: Session, org_id: uuid.UUID) -> int:
-    """Apply pipeline rules to all pre-payment clients in an org. Returns change count."""
-    candidates = (
-        db.query(Client)
-        .filter(
-            Client.org_id == org_id,
-            Client.lifecycle_state.in_(
-                [
-                    LifecycleState.COLD_LEAD,
-                    LifecycleState.NURTURING,
-                    LifecycleState.QUALIFIED,
-                    LifecycleState.BOOKED,
-                ]
-            ),
-        )
-        .all()
-    )
+def process_pipeline_lifecycle_for_client(db: Session, client: Client) -> bool:
+    """Run upcoming-call→booked, booked→nurturing, and follow-up expiry rules for one client."""
+    return apply_automatic_lifecycle_for_client(db, client)
+
+
+def run_pipeline_lifecycle_for_org(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    force: bool = False,
+) -> int:
+    """Apply lifecycle rules to all clients in an org. Returns change count."""
+    clients = db.query(Client).filter(Client.org_id == org_id).all()
     changed = 0
-    for client in candidates:
-        if process_pipeline_lifecycle_for_client(db, client):
-            changed += 1
+    for client in clients:
+        try:
+            if apply_automatic_lifecycle_for_client(db, client, force=force):
+                changed += 1
+        except Exception as client_err:
+            print(f"[CLIENT_AUTOMATION] pipeline rule skip for {client.id}: {client_err}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
     if changed:
-        db.commit()
+        try:
+            db.commit()
+        except Exception as commit_err:
+            print(f"[CLIENT_AUTOMATION] pipeline lifecycle commit failed: {commit_err}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return 0
     return changed
 
 
-def process_client_automation(db: Session, org_id: uuid.UUID = None):
+def reconcile_org_client_lifecycles(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    force: bool = True,
+) -> int:
+    """
+    Re-evaluate lifecycle for every client in the org (backfill / board refresh).
+    ``force=True`` bypasses the 14-day manual column-move shield so misclassified
+    existing profiles can be corrected.
+    """
+    return run_pipeline_lifecycle_for_org(db, org_id, force=force)
+
+
+def process_client_automation(
+    db: Session,
+    org_id: uuid.UUID = None,
+    *,
+    force: bool = False,
+):
     """
     Process automation for clients: program progress, program lifecycle, and pipeline rules.
     """
@@ -402,39 +528,34 @@ def process_client_automation(db: Session, org_id: uuid.UUID = None):
 
     clients = query.all()
     progress_updates = 0
-    program_state_changes = 0
     pipeline_changes = 0
 
     for client in clients:
-        if client.program_start_date and client.program_duration_days:
-            if update_client_progress(db, client):
-                progress_updates += 1
-            if update_client_lifecycle_state(db, client):
-                program_state_changes += 1
-        if process_pipeline_lifecycle_for_client(db, client):
+        if apply_automatic_lifecycle_for_client(db, client, force=force):
             pipeline_changes += 1
 
     db.commit()
 
     print(
         f"[CLIENT_AUTOMATION] Processed {len(clients)} clients: "
-        f"{progress_updates} progress updates, {program_state_changes} program state changes, "
-        f"{pipeline_changes} pipeline changes"
+        f"{pipeline_changes} lifecycle changes"
     )
 
     return {
         "clients_processed": len(clients),
         "progress_updates": progress_updates,
-        "state_changes": program_state_changes + pipeline_changes,
+        "state_changes": pipeline_changes,
         "pipeline_changes": pipeline_changes,
     }
 
 
 def move_client_to_active_on_payment(db: Session, client: Client) -> bool:
     """
-    Move client to active when they receive a payment.
+    Move client to active when they have recorded payment.
     Applies to any pre-payment pipeline stage plus offboarding/dead win-backs.
     """
+    if not client_has_recorded_payment(db, client.org_id, client.id):
+        return False
     state = client.lifecycle_state
     if state in PRE_PAYMENT_LIFECYCLE_STATES or state in (
         LifecycleState.OFFBOARDING,
@@ -445,5 +566,7 @@ def move_client_to_active_on_payment(db: Session, client: Client) -> bool:
             f"(was {_lifecycle_str(state)})"
         )
         client.lifecycle_state = LifecycleState.ACTIVE
+        client.last_activity_at = datetime.utcnow()
+        db.flush()
         return True
     return False

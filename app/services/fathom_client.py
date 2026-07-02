@@ -35,6 +35,11 @@ def normalize_fathom_api_key(raw: Optional[str]) -> Optional[str]:
     low = s[:7].lower()
     if low == "bearer ":
         s = s[7:].strip()
+    # Fathom settings UI sometimes copies as "API KEY: <token>"
+    if s.upper().startswith("API KEY:"):
+        s = s[9:].strip()
+    elif s.upper().startswith("API KEY "):
+        s = s[8:].strip()
     s = "".join(s.splitlines()).strip()
     return s or None
 
@@ -291,6 +296,7 @@ def create_webhook(
             "my_recordings",
             "my_shared_with_team_recordings",
             "shared_external_recordings",
+            "shared_team_recordings",
         ],
     }
     with httpx.Client(timeout=timeout) as client:

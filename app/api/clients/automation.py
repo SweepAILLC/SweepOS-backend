@@ -56,11 +56,44 @@ from app.utils.stripe_ids import normalize_stripe_id_for_dedup
 router = APIRouter()
 
 
-from app.services.client_automation import process_client_automation
+from app.services.client_automation import process_client_automation, reconcile_org_client_lifecycles
+
+
+@router.post("/automation/reconcile-lifecycle", status_code=status.HTTP_200_OK)
+def reconcile_client_lifecycle_endpoint(
+    force: bool = Query(
+        True,
+        description="Bypass 14-day manual column-move protection when correcting pipeline columns.",
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Re-evaluate lifecycle rules for every client in the org (backfill / board refresh).
+    """
+    try:
+        org_id = effective_org_id(current_user)
+        clients_updated = reconcile_org_client_lifecycles(db, org_id, force=force)
+        return {
+            "success": True,
+            "message": "Client lifecycle reconciliation complete",
+            "clients_updated": clients_updated,
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error reconciling client lifecycles: {str(e)}",
+        )
 
 
 @router.post("/automation/process", status_code=status.HTTP_200_OK)
 def process_client_automation_endpoint(
+    force: bool = Query(
+        False,
+        description="Bypass 14-day manual column-move protection for all clients.",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -71,7 +104,7 @@ def process_client_automation_endpoint(
     """
     try:
         org_id = effective_org_id(current_user)
-        result = process_client_automation(db, org_id=org_id)
+        result = process_client_automation(db, org_id=org_id, force=force)
         return {
             "success": True,
             "message": "Client automation processed successfully",

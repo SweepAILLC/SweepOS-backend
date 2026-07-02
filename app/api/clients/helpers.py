@@ -50,7 +50,12 @@ def org_checkin_sync_lock(org_key: str) -> ThreadingLock:
         return _checkin_sync_org_locks[org_key]
 
 
-def sync_check_ins_in_worker(token: str, *, apply_pipeline_lifecycle_rules: bool = True) -> dict:
+def sync_check_ins_in_worker(
+    token: str,
+    *,
+    apply_pipeline_lifecycle_rules: bool = True,
+    force_lifecycle: bool = False,
+) -> dict:
     """Short auth session, then one org-serialized sync with its own session (no route-level get_db)."""
     from app.api.deps import resolve_org_and_user_ids_for_checkin_sync
     from app.services.checkin_sync import sync_all_checkins
@@ -73,6 +78,7 @@ def sync_check_ins_in_worker(token: str, *, apply_pipeline_lifecycle_rules: bool
                 org_id,
                 user_id,
                 apply_pipeline_lifecycle_rules=apply_pipeline_lifecycle_rules,
+                force_lifecycle=force_lifecycle,
             )
             invalidate_terminal_monthly_trends_cache(org_id)
             return result

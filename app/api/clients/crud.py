@@ -60,6 +60,7 @@ router = APIRouter()
 from app.schemas.client import Client as ClientSchema, ClientCreate, ClientUpdate, MergeClientsRequest
 from app.services.client_automation import (
     apply_manual_lifecycle_change,
+    apply_automatic_lifecycle_for_client,
     resolve_lifecycle_state,
     update_client_progress,
     update_client_lifecycle_state,
@@ -206,20 +207,25 @@ def get_client(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
     
-    # Update progress if program is set
-    if client.program_start_date and client.program_duration_days:
-        old_state = client.lifecycle_state.value if hasattr(client.lifecycle_state, 'value') else str(client.lifecycle_state)
-        progress_updated = update_client_progress(db, client)
-        state_updated = update_client_lifecycle_state(db, client)
-        if progress_updated or state_updated:
-            db.commit()
-            # Refresh the client object to get updated state
-            db.refresh(client)
-            new_state = client.lifecycle_state.value if hasattr(client.lifecycle_state, 'value') else str(client.lifecycle_state)
-            print(f"[CLIENT_API] Client {client.id} ({client.email}) updated: progress={client.program_progress_percent}%, state={old_state} → {new_state}")
-            if old_state != new_state:
-                print(f"[CLIENT_API] ✅ State change confirmed: {old_state} → {new_state}")
-    
+    old_state = (
+        client.lifecycle_state.value
+        if hasattr(client.lifecycle_state, "value")
+        else str(client.lifecycle_state)
+    )
+    if apply_automatic_lifecycle_for_client(db, client):
+        db.commit()
+        db.refresh(client)
+        new_state = (
+            client.lifecycle_state.value
+            if hasattr(client.lifecycle_state, "value")
+            else str(client.lifecycle_state)
+        )
+        if old_state != new_state:
+            print(
+                f"[CLIENT_API] Client {client.id} ({client.email}) lifecycle: "
+                f"{old_state} → {new_state}"
+            )
+
     return client
 
 @router.patch("/{client_id}", response_model=ClientSchema)

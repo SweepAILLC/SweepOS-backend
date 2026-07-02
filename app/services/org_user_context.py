@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, Optional, Tuple
 
@@ -10,6 +11,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.user import UserRole, parse_user_role_from_api, parse_user_role_from_db
+
+_logger = logging.getLogger(__name__)
 
 
 def fetch_user_row_for_org(
@@ -53,22 +56,31 @@ def user_has_email_org_access(db: Session, email: str, org_id: uuid.UUID) -> boo
 
 
 def _latest_used_invitation_role(db: Session, email: str, org_id: uuid.UUID) -> Optional[str]:
-    from app.models.organization_invitation import OrganizationInvitation
+    try:
+        from app.models.organization_invitation import OrganizationInvitation
 
-    inv = (
-        db.query(OrganizationInvitation)
-        .filter(
-            OrganizationInvitation.org_id == org_id,
-            func.lower(OrganizationInvitation.invitee_email) == email.strip().lower(),
-            OrganizationInvitation.used_at.isnot(None),
+        inv = (
+            db.query(OrganizationInvitation)
+            .filter(
+                OrganizationInvitation.org_id == org_id,
+                func.lower(OrganizationInvitation.invitee_email) == email.strip().lower(),
+                OrganizationInvitation.used_at.isnot(None),
+            )
+            .order_by(OrganizationInvitation.used_at.desc())
+            .first()
         )
-        .order_by(OrganizationInvitation.used_at.desc())
-        .first()
-    )
-    if not inv:
+        if not inv:
+            return None
+        role = (inv.role or "member").strip().lower()
+        return role if role in ("owner", "admin", "member") else "member"
+    except Exception as exc:
+        _logger.warning(
+            "Could not load invitation role for %s in org %s: %s",
+            email,
+            org_id,
+            exc,
+        )
         return None
-    role = (inv.role or "member").strip().lower()
-    return role if role in ("owner", "admin", "member") else "member"
 
 
 def _role_from_invitation(db: Session, email: str, org_id: uuid.UUID) -> Optional[UserRole]:
@@ -118,7 +130,7 @@ def materialize_org_user_row_if_missing(
                 "is_admin": user_role in (UserRole.ADMIN, UserRole.OWNER),
             },
         )
-        db.flush()
+        db.commit()
     except IntegrityError:
         db.rollback()
     return fetch_user_row_for_org(db, email, org_id)

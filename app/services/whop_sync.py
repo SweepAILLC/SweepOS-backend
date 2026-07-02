@@ -198,6 +198,13 @@ def sync_whop_incremental(db: Session, org_id: uuid.UUID, force_full: bool = Fal
                     amount_cents=int(sig["amount_cents"] or 0),
                     paid_at=sig.get("paid_at"),
                 )
+            from app.models.client import Client
+            from app.services.client_automation import apply_automatic_lifecycle_for_client
+
+            for cid in {sig["client_id"] for sig in new_first_payment_signals}:
+                client_row = db.query(Client).filter(Client.id == cid).first()
+                if client_row:
+                    apply_automatic_lifecycle_for_client(db, client_row)
             db.commit()
         except Exception:
             db.rollback()

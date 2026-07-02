@@ -19,10 +19,11 @@ except ImportError:
 from decimal import Decimal
 import json
 from datetime import datetime, timedelta
+from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func as sa_func
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, PendingRollbackError
 from psycopg2.errors import DeadlockDetected
 import uuid
 import httpx
@@ -43,6 +44,28 @@ SYNC_BUFFER_SECONDS = 300
 # Deadlock retry configuration
 MAX_DEADLOCK_RETRIES = 3
 DEADLOCK_RETRY_DELAY = 0.1  # Start with 100ms
+
+
+def _session_needs_rollback(exc: BaseException) -> bool:
+    """True when the SQLAlchemy session must be rolled back before continuing."""
+    if isinstance(exc, (OperationalError, PendingRollbackError)):
+        return True
+    msg = str(exc).lower()
+    return (
+        "deadlock" in msg
+        or "querycanceled" in msg
+        or "statement timeout" in msg
+        or "rolled back" in msg
+        or "pendingrollback" in msg
+    )
+
+
+def _rollback_session_safe(db: Session, label: str = "") -> None:
+    try:
+        db.rollback()
+    except Exception as rb_err:
+        if label:
+            print(f"[SYNC] rollback after {label} failed: {rb_err}")
 
 
 def handle_deadlock_retry(func):
@@ -169,27 +192,33 @@ def upsert_client_with_retry(db: Session, customer_data, org_id: uuid.UUID, max_
                 if attempt < max_retries - 1:
                     wait_time = 0.1 * (2 ** attempt)
                     print(f"[UPSERT_CLIENT] Deadlock detected, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
-                    db.rollback()
+                    _rollback_session_safe(db)
                     time.sleep(wait_time)
                     continue
                 else:
                     print(f"[UPSERT_CLIENT] Max retries reached for customer {customer_data.id}")
                     raise
-            else:
-                raise
+            if _session_needs_rollback(e):
+                _rollback_session_safe(db)
+            raise
         except Exception as e:
             error_str = str(e).lower()
             if 'deadlock' in error_str:
                 if attempt < max_retries - 1:
                     wait_time = 0.1 * (2 ** attempt)
                     print(f"[UPSERT_CLIENT] Deadlock detected (from message), retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
-                    db.rollback()
+                    _rollback_session_safe(db)
                     time.sleep(wait_time)
                     continue
                 else:
                     raise
-            else:
-                raise
+            if _session_needs_rollback(e) and attempt < max_retries - 1:
+                wait_time = 0.1 * (2 ** attempt)
+                print(f"[UPSERT_CLIENT] Session error, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries}): {e}")
+                _rollback_session_safe(db)
+                time.sleep(wait_time)
+                continue
+            raise
     return upsert_client(db, customer_data, org_id)
 
 
@@ -214,12 +243,15 @@ def upsert_client(db: Session, customer_data, org_id: uuid.UUID) -> Client:
     
     # Create or update client
     if client:
-        # Update existing
+        changed = False
         if not client.email and customer_email:
             client.email = customer_email
+            changed = True
         if not client.stripe_customer_id:
             client.stripe_customer_id = customer_id
-        client.updated_at = datetime.utcnow()
+            changed = True
+        if changed:
+            client.updated_at = datetime.utcnow()
     else:
         # Create new when Stripe provides a display name and/or email (email-only payers get a card)
         customer_name = (getattr(customer_data, 'name', None) or '').strip()
@@ -976,7 +1008,12 @@ def repair_payments_without_clients(db: Session, org_id: uuid.UUID, api_key: str
     return results
 
 
-def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = False) -> dict:
+def sync_stripe_incremental(
+    db: Session,
+    org_id: uuid.UUID,
+    force_full: bool = False,
+    sync_recent: bool = False,
+) -> dict:
     """Sync Stripe data incrementally"""
     _check_stripe_available()
     """
@@ -1056,12 +1093,11 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                             print(f"[SYNC] Error committing during customer sync: {str(commit_err)}")
                             db.rollback()
                 except Exception as e:
-                    error_str = str(e).lower()
-                    if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
-                        print(f"[SYNC] Deadlock upserting customer {customer.id}, rolling back and continuing: {str(e)}")
-                        db.rollback()
+                    if _session_needs_rollback(e):
+                        print(f"[SYNC] Rolling back session after customer {customer.id} error: {e}")
+                        _rollback_session_safe(db)
                     else:
-                        print(f"[SYNC] Error upserting customer {customer.id}: {str(e)}")
+                        print(f"[SYNC] Error upserting customer {customer.id}: {e}")
                     import traceback
                     traceback.print_exc()
                     continue
@@ -1071,37 +1107,58 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
             traceback.print_exc()
             # Continue with other syncs even if customers fail
         
-        # Sync subscriptions: always list all so status (active/trialing/canceled) stays accurate.
-        # Incremental created filter would miss status updates on existing subscriptions.
-        print(f"[SYNC] Syncing subscriptions...")
-        sub_params = {"limit": 100, "status": "all"}
-        try:
-            subscriptions = stripe.Subscription.list(**sub_params)
-            for sub in subscriptions.auto_paging_iter():
-                try:
-                    # Ensure customer exists
-                    if sub.customer:
-                        try:
-                            customer = stripe.Customer.retrieve(sub.customer)
-                            upsert_client_with_retry(db, customer, org_id)
-                        except:
-                            pass
-                    
-                    subscription, was_update = upsert_subscription(db, sub, org_id)
-                    if was_update:
-                        results["subscriptions_updated"] += 1
-                    else:
-                        results["subscriptions_synced"] += 1
-                except Exception as e:
-                    print(f"[SYNC] Error upserting subscription {sub.id}: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
-        except Exception as e:
-            print(f"[SYNC] Error listing subscriptions: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            # Continue with other syncs
+        # Sync subscriptions: full scan keeps MRR/status accurate; skip on recent-only refresh.
+        if sync_recent:
+            print("[SYNC] Skipping full subscription scan (sync_recent=True — payments-only refresh)")
+        else:
+            print(f"[SYNC] Syncing subscriptions...")
+            sub_params = {"limit": 100, "status": "all"}
+            customer_cache: dict[str, Optional[Client]] = {}
+            try:
+                subscriptions = stripe.Subscription.list(**sub_params)
+                sub_count = 0
+                for sub in subscriptions.auto_paging_iter():
+                    sub_count += 1
+                    try:
+                        if sub.customer:
+                            cached = customer_cache.get(sub.customer)
+                            if cached is None and sub.customer not in customer_cache:
+                                try:
+                                    customer = stripe.Customer.retrieve(sub.customer)
+                                    customer_cache[sub.customer] = upsert_client_with_retry(db, customer, org_id)
+                                except Exception as cust_err:
+                                    customer_cache[sub.customer] = None
+                                    print(f"[SYNC] Could not upsert customer {sub.customer} for sub {sub.id}: {cust_err}")
+                            elif cached is not None:
+                                pass  # already linked this sync pass
+
+                        subscription, was_update = upsert_subscription(db, sub, org_id)
+                        if was_update:
+                            results["subscriptions_updated"] += 1
+                        else:
+                            results["subscriptions_synced"] += 1
+
+                        if sub_count % 50 == 0:
+                            try:
+                                db.commit()
+                            except Exception as commit_err:
+                                print(f"[SYNC] Error committing during subscription sync: {commit_err}")
+                                _rollback_session_safe(db)
+                    except Exception as e:
+                        if _session_needs_rollback(e):
+                            print(f"[SYNC] Rolling back session after subscription {sub.id} error: {e}")
+                            _rollback_session_safe(db)
+                        else:
+                            print(f"[SYNC] Error upserting subscription {sub.id}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+            except Exception as e:
+                if _session_needs_rollback(e):
+                    _rollback_session_safe(db)
+                print(f"[SYNC] Error listing subscriptions: {e}")
+                import traceback
+                traceback.print_exc()
         
         # Sync charges (legacy API)
         # According to Stripe best practices: Sync both Charges and PaymentIntents
@@ -1152,12 +1209,11 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                             print(f"[SYNC] Error committing during charge sync: {str(commit_err)}")
                             db.rollback()
                 except Exception as e:
-                    error_str = str(e).lower()
-                    if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
-                        print(f"[SYNC] Deadlock upserting charge {charge.id}, rolling back and continuing: {str(e)}")
-                        db.rollback()
+                    if _session_needs_rollback(e):
+                        print(f"[SYNC] Rolling back session after charge {charge.id} error: {e}")
+                        _rollback_session_safe(db)
                     else:
-                        print(f"[SYNC] Error upserting charge {charge.id}: {str(e)}")
+                        print(f"[SYNC] Error upserting charge {charge.id}: {e}")
                     import traceback
                     traceback.print_exc()
                     continue
@@ -1215,12 +1271,11 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                             print(f"[SYNC] Error committing during payment intent sync: {str(commit_err)}")
                             db.rollback()
                 except Exception as e:
-                    error_str = str(e).lower()
-                    if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
-                        print(f"[SYNC] Deadlock upserting payment intent {pi.id}, rolling back and continuing: {str(e)}")
-                        db.rollback()
+                    if _session_needs_rollback(e):
+                        print(f"[SYNC] Rolling back session after payment intent {pi.id} error: {e}")
+                        _rollback_session_safe(db)
                     else:
-                        print(f"[SYNC] Error upserting payment intent {pi.id}: {str(e)}")
+                        print(f"[SYNC] Error upserting payment intent {pi.id}: {e}")
                     import traceback
                     traceback.print_exc()
                     continue
@@ -1271,12 +1326,11 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                             print(f"[SYNC] Error committing during invoice sync: {str(commit_err)}")
                             db.rollback()
                 except Exception as e:
-                    error_str = str(e).lower()
-                    if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
-                        print(f"[SYNC] Deadlock upserting invoice {invoice.id}, rolling back and continuing: {str(e)}")
-                        db.rollback()
+                    if _session_needs_rollback(e):
+                        print(f"[SYNC] Rolling back session after invoice {invoice.id} error: {e}")
+                        _rollback_session_safe(db)
                     else:
-                        print(f"[SYNC] Error upserting invoice {invoice.id}: {str(e)}")
+                        print(f"[SYNC] Error upserting invoice {invoice.id}: {e}")
                     import traceback
                     traceback.print_exc()
                     continue
@@ -1317,12 +1371,11 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                                 print(f"[SYNC] Error committing during failed invoice sync: {str(commit_err)}")
                                 db.rollback()
                     except Exception as e:
-                        error_str = str(e).lower()
-                        if 'deadlock' in error_str or (hasattr(e, 'orig') and hasattr(e.orig, 'pgcode') and e.orig.pgcode == '40P01'):
-                            print(f"[SYNC] Deadlock upserting failed invoice {invoice.id}, rolling back: {str(e)}")
-                            db.rollback()
+                        if _session_needs_rollback(e):
+                            print(f"[SYNC] Rolling back session after failed invoice {invoice.id} error: {e}")
+                            _rollback_session_safe(db)
                         else:
-                            print(f"[SYNC] Error upserting failed invoice {invoice.id}: {str(e)}")
+                            print(f"[SYNC] Error upserting failed invoice {invoice.id}: {e}")
                         import traceback
                         traceback.print_exc()
                         continue
@@ -1331,17 +1384,21 @@ def sync_stripe_incremental(db: Session, org_id: uuid.UUID, force_full: bool = F
                 import traceback
                 traceback.print_exc()
 
-        # Repair existing payments without clients (runs every sync to fix any missing links)
-        print(f"[SYNC] Repairing payments without clients...")
-        try:
-            repair_results = repair_payments_without_clients(db, org_id, api_key)
-            results["repair"] = repair_results
-            print(f"[SYNC] Repair complete: {repair_results['payments_fixed']} payments fixed, {repair_results['clients_created']} clients created")
-        except Exception as e:
-            print(f"[SYNC] ⚠️  Repair failed (non-fatal): {str(e)}")
-            import traceback
-            traceback.print_exc()
-            # Don't fail sync if repair fails
+        # Repair existing payments without clients (skip on lightweight recent refresh).
+        if sync_recent:
+            print("[SYNC] Skipping payment repair pass (sync_recent=True)")
+        else:
+            print(f"[SYNC] Repairing payments without clients...")
+            try:
+                repair_results = repair_payments_without_clients(db, org_id, api_key)
+                results["repair"] = repair_results
+                print(f"[SYNC] Repair complete: {repair_results['payments_fixed']} payments fixed, {repair_results['clients_created']} clients created")
+            except Exception as e:
+                if _session_needs_rollback(e):
+                    _rollback_session_safe(db)
+                print(f"[SYNC] ⚠️  Repair failed (non-fatal): {e}")
+                import traceback
+                traceback.print_exc()
         
         # Update last_sync_at with deadlock retry
         max_retries = 3
@@ -1416,43 +1473,60 @@ def reconcile_stripe_data(db: Session, org_id: uuid.UUID) -> dict:
     # Prefer charge records over invoice records
     
     clients = db.query(Client).filter(Client.org_id == org_id).all()
+    batch_dirty = 0
     for client in clients:
-        # Get all succeeded payments for this client
-        all_payments = db.query(StripePayment).filter(
-            StripePayment.client_id == client.id,
-            StripePayment.status == 'succeeded',
-            StripePayment.org_id == org_id
-        ).all()
-        
-        # Deduplicate: group by (subscription_id, invoice_id) or (invoice_id)
-        seen = set()
-        deduplicated_payments = []
-        
-        # Sort: prefer charge over invoice, then by updated_at (most recent first)
-        all_payments.sort(key=lambda p: (
-            0 if p.type == 'charge' else 1,
-            -(p.updated_at.timestamp() if p.updated_at else 0)
-        ))
-        
-        for payment in all_payments:
-            if payment.subscription_id and payment.invoice_id:
-                key = (normalize_stripe_id_for_dedup(payment.subscription_id), normalize_stripe_id_for_dedup(payment.invoice_id))
-            elif payment.invoice_id:
-                key = (None, normalize_stripe_id_for_dedup(payment.invoice_id))
-            else:
-                key = normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id
-            if key not in seen:
-                seen.add(key)
-                deduplicated_payments.append(payment)
-        
-        total_revenue = sum(p.amount_cents for p in deduplicated_payments)
-        
-        if client.lifetime_revenue_cents != total_revenue:
-            client.lifetime_revenue_cents = total_revenue
-            results["revenue_recalculated"] += 1
-        
-        results["clients_reconciled"] += 1
-    
-    db.commit()
+        try:
+            all_payments = db.query(StripePayment).filter(
+                StripePayment.client_id == client.id,
+                StripePayment.status == 'succeeded',
+                StripePayment.org_id == org_id
+            ).all()
+
+            seen = set()
+            deduplicated_payments = []
+            all_payments.sort(key=lambda p: (
+                0 if p.type == 'charge' else 1,
+                -(p.updated_at.timestamp() if p.updated_at else 0)
+            ))
+
+            for payment in all_payments:
+                if payment.subscription_id and payment.invoice_id:
+                    key = (normalize_stripe_id_for_dedup(payment.subscription_id), normalize_stripe_id_for_dedup(payment.invoice_id))
+                elif payment.invoice_id:
+                    key = (None, normalize_stripe_id_for_dedup(payment.invoice_id))
+                else:
+                    key = normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id
+                if key not in seen:
+                    seen.add(key)
+                    deduplicated_payments.append(payment)
+
+            total_revenue = sum(p.amount_cents for p in deduplicated_payments)
+
+            if client.lifetime_revenue_cents != total_revenue:
+                client.lifetime_revenue_cents = total_revenue
+                results["revenue_recalculated"] += 1
+                batch_dirty += 1
+                if total_revenue > 0:
+                    try:
+                        from app.services.client_automation import apply_automatic_lifecycle_for_client
+
+                        apply_automatic_lifecycle_for_client(db, client)
+                        batch_dirty += 1
+                    except Exception as lc_err:
+                        print(f"[RECONCILE] lifecycle skip for {client.id}: {lc_err}")
+
+            results["clients_reconciled"] += 1
+
+            if batch_dirty >= 50:
+                db.commit()
+                batch_dirty = 0
+        except Exception as exc:
+            print(f"[RECONCILE] Skipping client {client.id}: {exc}")
+            _rollback_session_safe(db)
+            batch_dirty = 0
+            continue
+
+    if batch_dirty:
+        db.commit()
     return results
 

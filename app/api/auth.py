@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func, text
 from datetime import datetime, timedelta
 from typing import List, Optional
 from uuid import UUID
 import uuid
+import logging
 from app.db.session import get_db
 from app.models.user import User, parse_user_role_from_db, role_to_api, parse_user_role_from_api
 from app.models.user_organization import UserOrganization
@@ -20,6 +21,7 @@ from app.api.deps import get_current_user
 from app.services.fathom_client import normalize_fathom_api_key
 
 router = APIRouter()
+_logger = logging.getLogger(__name__)
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -284,8 +286,9 @@ def get_current_user_info(current_user: User = Depends(get_current_user), db: Se
 @router.put("/me/settings", response_model=UserSchema)
 def update_user_settings(
     settings_data: UserSettingsUpdate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Update user settings including email, password, and privacy preferences.
@@ -331,6 +334,8 @@ def update_user_settings(
             )
         user_row.hashed_password = get_password_hash(settings_data.new_password)
     
+    _fathom_key_changed = False
+    _fathom_key_requested = False
     if settings_data.fathom_api_key is not None:
         from app.services.org_user_context import user_can_manage_org_integrations
 
@@ -343,7 +348,11 @@ def update_user_settings(
         org = db.query(Organization).filter(Organization.id == org_id).first()
         if not org:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-        org.fathom_api_key = normalize_fathom_api_key(settings_data.fathom_api_key)
+        new_key = normalize_fathom_api_key(settings_data.fathom_api_key)
+        old_key = normalize_fathom_api_key(getattr(org, "fathom_api_key", None))
+        org.fathom_api_key = new_key
+        _fathom_key_changed = bool(new_key) and new_key != old_key
+        _fathom_key_requested = bool(new_key)
 
     if settings_data.ai_profile is not None:
         from app.services.org_intelligence_profile import set_org_ai_profile
@@ -352,7 +361,14 @@ def update_user_settings(
 
     db.commit()
     db.refresh(user_row)
-    
+
+    if _fathom_key_changed or _fathom_key_requested:
+        _fathom_org_id = getattr(current_user, "selected_org_id", user_row.org_id)
+        from app.services.fathom_onboard import setup_fathom_webhook_background
+
+        # Always register/refresh the webhook when the key changes.
+        background_tasks.add_task(setup_fathom_webhook_background, str(_fathom_org_id))
+
     role_value = role_to_api(user_row.role)
     org_id = getattr(current_user, "selected_org_id", user_row.org_id)
     org_name = _organization_name(db, org_id)
@@ -426,27 +442,33 @@ def get_user_organizations(
     Used for organization selection after login.
     Requires email parameter for security (user must know their email).
     """
-    # Normalize email
     normalized_email = email.lower().strip()
-    
-    # Find canonical user by email (oldest row) so org lists are stable in dev.
-    user = (
-        db.query(User)
-        .filter(func.lower(User.email) == normalized_email)
-        .order_by(User.created_at.asc())
-        .first()
-    )
-    if not user:
-        # Don't reveal if user exists for security
-        return []
-    
-    # Get all organizations for this user
-    user_orgs = db.query(UserOrganization).filter(
-        UserOrganization.user_id == user.id
-    ).all()
-    
-    # If no user_orgs, fall back to user.org_id (backward compatibility)
-    if not user_orgs:
+
+    linked_rows = db.execute(
+        text(
+            """
+            SELECT uo.org_id,
+                   BOOL_OR(uo.is_primary) AS is_primary,
+                   MIN(uo.created_at) AS created_at
+            FROM user_organizations uo
+            INNER JOIN users u ON u.id = uo.user_id
+            WHERE LOWER(u.email) = LOWER(:email)
+            GROUP BY uo.org_id
+            ORDER BY is_primary DESC, created_at ASC
+            """
+        ),
+        {"email": normalized_email},
+    ).fetchall()
+
+    if not linked_rows:
+        user = (
+            db.query(User)
+            .filter(func.lower(User.email) == normalized_email)
+            .order_by(User.created_at.asc())
+            .first()
+        )
+        if not user:
+            return []
         org = db.query(Organization).filter(Organization.id == user.org_id).first()
         if org:
             return [UserOrganizationResponse(
@@ -456,24 +478,22 @@ def get_user_organizations(
                 created_at=org.created_at
             )]
         return []
-    
-    # Get organization details
-    org_ids = [uo.org_id for uo in user_orgs]
+
+    org_ids = [row[0] for row in linked_rows]
     orgs = db.query(Organization).filter(Organization.id.in_(org_ids)).all()
-    
-    # Map to response
     org_dict = {org.id: org for org in orgs}
+
     result = []
-    for uo in user_orgs:
-        if uo.org_id in org_dict:
+    for org_id, is_primary, created_at in linked_rows:
+        org = org_dict.get(org_id)
+        if org:
             result.append(UserOrganizationResponse(
-                id=uo.org_id,
-                name=org_dict[uo.org_id].name,
-                is_primary=uo.is_primary,
-                created_at=uo.created_at
+                id=org.id,
+                name=org.name,
+                is_primary=bool(is_primary),
+                created_at=created_at,
             ))
-    
-    # Sort by is_primary (primary first), then by name
+
     result.sort(key=lambda x: (not x.is_primary, x.name))
     return result
 
@@ -488,49 +508,74 @@ def switch_organization(
     Switch to a different organization.
     Verifies user has access to the requested organization.
     """
-    from app.services.org_user_context import fetch_user_row_for_org, user_has_email_org_access
-    from app.models.user import parse_user_role_from_db
+    from app.services.org_user_context import (
+        fetch_user_row_for_org,
+        materialize_org_user_row_if_missing,
+        user_has_email_org_access,
+        _role_from_invitation,
+    )
 
-    if not user_has_email_org_access(db, current_user.email, switch_request.org_id):
-        if current_user.org_id != switch_request.org_id:
+    target_org_id = switch_request.org_id
+    email = current_user.email
+
+    try:
+        has_row = fetch_user_row_for_org(db, email, target_org_id) is not None
+        has_link = user_has_email_org_access(db, email, target_org_id)
+        selected_org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+        if not has_row and not has_link:
+            if str(selected_org_id) != str(target_org_id) and str(current_user.org_id) != str(target_org_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User does not have access to this organization",
+                )
+
+        org = db.query(Organization).filter(Organization.id == target_org_id).first()
+        if not org:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User does not have access to this organization",
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Organization not found",
             )
 
-    org = db.query(Organization).filter(Organization.id == switch_request.org_id).first()
-    if not org:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Organization not found",
-        )
+        resolved = fetch_user_row_for_org(db, email, target_org_id)
+        if not resolved:
+            resolved = materialize_org_user_row_if_missing(db, email, target_org_id)
 
-    resolved = fetch_user_row_for_org(db, current_user.email, switch_request.org_id)
-    if not resolved:
-        from app.services.org_user_context import materialize_org_user_row_if_missing
-
-        resolved = materialize_org_user_row_if_missing(db, current_user.email, switch_request.org_id)
         if resolved:
-            db.commit()
-    if resolved:
-        token_user_id = str(resolved[0])
-        token_role = role_to_api(parse_user_role_from_db(resolved[4]))
-    else:
-        token_user_id = str(current_user.id)
-        token_role = role_to_api(current_user.role)
+            token_user_id = str(resolved[0])
+            token_role = role_to_api(parse_user_role_from_db(resolved[4]))
+        else:
+            invited_role = _role_from_invitation(db, email, target_org_id)
+            if invited_role is None and not has_link and not has_row:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User does not have access to this organization",
+                )
+            token_user_id = str(current_user.id)
+            token_role = role_to_api(invited_role or current_user.role)
 
-    # Create new token with selected org_id and org-scoped user id/role
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={
-            "sub": current_user.email,
-            "org_id": str(switch_request.org_id),
-            "user_id": token_user_id,
-            "role": token_role,
-        },
-        expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
+        access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={
+                "sub": email,
+                "org_id": str(target_org_id),
+                "user_id": token_user_id,
+                "role": token_role,
+            },
+            expires_delta=access_token_expires
+        )
+        return {"access_token": access_token, "token_type": "bearer"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _logger.exception(
+            "switch_organization failed for email=%s org_id=%s",
+            email,
+            target_org_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to switch organization",
+        ) from exc
 
 
 @router.delete("/organizations/{org_id}", status_code=status.HTTP_204_NO_CONTENT)

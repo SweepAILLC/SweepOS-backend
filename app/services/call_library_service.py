@@ -1,11 +1,11 @@
 """Orchestrate Call Library report generation and persistence."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
-from uuid import UUID
 
 from sqlalchemy import desc, func, text
 from sqlalchemy.orm import Session, joinedload
@@ -14,10 +14,12 @@ if TYPE_CHECKING:
     from fastapi import BackgroundTasks
 
 from app.models.call_library_report import CallLibraryReport
-from app.models.client import Client
 from app.models.fathom_call_record import FathomCallRecord
 from app.services.call_library_ai import generate_call_library_report
-from app.services.fathom_attendee_clients import client_display_name
+from app.services.fathom_call_labels import (
+    derive_call_library_title,
+    primary_external_attendee_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 _call_title_override_column_ensured = False
 _call_media_columns_ensured = False
 _call_deal_columns_ensured = False
+_fathom_meeting_title_column_ensured = False
 
 
 def _ensure_call_title_override_column(db: Session) -> None:
@@ -96,6 +99,21 @@ def _ensure_call_deal_columns(db: Session) -> None:
         _call_deal_columns_ensured = True
 
 
+def _ensure_fathom_meeting_title_column(db: Session) -> None:
+    """Idempotent ADD COLUMN for meeting_title on fathom_call_records."""
+    global _fathom_meeting_title_column_ensured
+    if _fathom_meeting_title_column_ensured:
+        return
+    try:
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS meeting_title TEXT"))
+        db.commit()
+        _fathom_meeting_title_column_ensured = True
+    except Exception as e:
+        db.rollback()
+        logger.warning("call_library: ensure meeting_title column failed: %s", e)
+        _fathom_meeting_title_column_ensured = True
+
+
 def _coerce_deal_outcome(report_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Pull the persisted columns out of an LLM report's deal_outcome block."""
     fallback = {
@@ -138,18 +156,22 @@ def _coerce_deal_outcome(report_json: Optional[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
-def _derive_call_title(rec: FathomCallRecord, db: Session, org_id: uuid.UUID) -> str:
-    """Build a human-readable title from the call record."""
-    if rec.client_id:
-        client = db.query(Client).filter(Client.id == rec.client_id).first()
-        if client:
-            dn = client_display_name(client)
-            date_str = rec.meeting_at.strftime("%b %d, %Y") if rec.meeting_at else ""
-            return f"Call with {dn}" + (f" — {date_str}" if date_str else "")
+def _hash_call_inputs(summary: str, transcript: str) -> str:
+    """Stable hash for skipping identical LLM work."""
+    payload = f"{summary}\n---\n{transcript}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(payload).hexdigest()
 
-    if rec.meeting_at:
-        return f"Call on {rec.meeting_at.strftime('%B %d, %Y at %I:%M %p UTC')}"
-    return f"Call #{rec.fathom_recording_id}"
+
+def _derive_call_title(rec: FathomCallRecord, db: Session, org_id: uuid.UUID) -> str:
+    """Build display title from Fathom meeting metadata (not linked CRM client)."""
+    attendees = rec.attendees_json if isinstance(rec.attendees_json, list) else None
+    meeting_title = getattr(rec, "meeting_title", None)
+    return derive_call_library_title(
+        meeting_title=meeting_title,
+        attendees_json=attendees,
+        meeting_at=rec.meeting_at,
+        recording_id=int(rec.fathom_recording_id) if rec.fathom_recording_id is not None else None,
+    )
 
 
 def ensure_pending_call_library_report(
@@ -161,6 +183,7 @@ def ensure_pending_call_library_report(
     _ensure_call_title_override_column(db)
     _ensure_call_media_columns(db)
     _ensure_call_deal_columns(db)
+    _ensure_fathom_meeting_title_column(db)
     rec = (
         db.query(FathomCallRecord)
         .filter(
@@ -220,6 +243,7 @@ def generate_and_persist_report(
     _ensure_call_title_override_column(db)
     _ensure_call_media_columns(db)
     _ensure_call_deal_columns(db)
+    _ensure_fathom_meeting_title_column(db)
     rec = (
         db.query(FathomCallRecord)
         .filter(
@@ -235,6 +259,23 @@ def generate_and_persist_report(
     transcript = rec.transcript_snippet or ""
     summary = rec.summary_text or ""
     call_title = _derive_call_title(rec, db, org_id)
+    input_hash = _hash_call_inputs(summary, transcript)
+
+    existing = (
+        db.query(CallLibraryReport)
+        .filter(CallLibraryReport.fathom_call_record_id == fathom_record_id)
+        .first()
+    )
+    if existing and existing.status == "complete":
+        prev_hash = None
+        if isinstance(existing.report_json, dict):
+            prev_hash = existing.report_json.get("_input_hash")
+        if prev_hash == input_hash:
+            if call_title and existing.call_title != call_title:
+                existing.call_title = call_title
+                existing.updated_at = datetime.now(timezone.utc)
+                db.commit()
+            return "skipped"
 
     if not transcript and not summary:
         _upsert_report(
@@ -256,6 +297,9 @@ def generate_and_persist_report(
         summary=summary,
         org_id=org_id,
     )
+
+    if isinstance(report_json, dict):
+        report_json["_input_hash"] = input_hash
 
     if not report_json:
         _upsert_report(
@@ -398,6 +442,7 @@ def get_call_library_for_org(
     _ensure_call_title_override_column(db)
     _ensure_call_media_columns(db)
     _ensure_call_deal_columns(db)
+    _ensure_fathom_meeting_title_column(db)
     total = (
         db.query(func.count(CallLibraryReport.id))
         .filter(CallLibraryReport.org_id == org_id)
@@ -414,33 +459,28 @@ def get_call_library_for_org(
         .all()
     )
 
-    client_ids = {
-        r.fathom_call_record.client_id
-        for r in rows
-        if r.fathom_call_record is not None and r.fathom_call_record.client_id is not None
-    }
-    clients_by_id: Dict[UUID, Client] = {}
-    if client_ids:
-        for c in db.query(Client).filter(Client.id.in_(client_ids)).all():
-            clients_by_id[c.id] = c
-
     items: List[Dict[str, Any]] = []
     for row in rows:
         fathom_rec = row.fathom_call_record
-        client_name: Optional[str] = None
-        if fathom_rec and fathom_rec.client_id:
-            client = clients_by_id.get(fathom_rec.client_id)
-            if client:
-                client_name = client_display_name(client)
 
         attendees = row.attendees_json if row.attendees_json is not None else (
             fathom_rec.attendees_json if fathom_rec else None
         )
+        client_name = primary_external_attendee_label(
+            attendees if isinstance(attendees, list) else None
+        )
+
         recording_url = row.recording_url or (fathom_rec.recording_url if fathom_rec else None)
         share_url = getattr(row, "share_url", None) or (getattr(fathom_rec, "share_url", None) if fathom_rec else None)
         video_url = getattr(row, "video_url", None) or (getattr(fathom_rec, "video_url", None) if fathom_rec else None)
 
-        derived_title = row.call_title or f"Call #{fathom_rec.fathom_recording_id if fathom_rec else '?'}"
+        fathom_meeting_title = getattr(fathom_rec, "meeting_title", None) if fathom_rec else None
+        derived_title = derive_call_library_title(
+            meeting_title=fathom_meeting_title,
+            attendees_json=attendees if isinstance(attendees, list) else None,
+            meeting_at=fathom_rec.meeting_at if fathom_rec else None,
+            recording_id=int(fathom_rec.fathom_recording_id) if fathom_rec and fathom_rec.fathom_recording_id is not None else None,
+        )
         display_title = (getattr(row, "call_title_override", None) or "").strip() or derived_title
 
         items.append(

@@ -31,35 +31,61 @@ from app.db.session import SessionLocal
 LOG = logging.getLogger("app.worker")
 
 _SHUTDOWN = False
+_rq_worker: Optional[object] = None
 
 
 def _handle_signal(_signum, _frame) -> None:
     global _SHUTDOWN
     _SHUTDOWN = True
     LOG.info("received shutdown signal; draining...")
+    w = _rq_worker
+    if w is not None:
+        try:
+            w.request_stop()
+        except Exception:
+            pass
+
+
+class _SideThreadRQWorker:
+    """Factory: RQ Worker subclass that skips signal handlers (illegal outside main thread)."""
+
+    @staticmethod
+    def create(queues, connection):
+        from rq import Worker
+
+        class _Worker(Worker):
+            def _install_signal_handlers(self) -> None:
+                return
+
+        return _Worker(queues, connection=connection)
 
 
 def _start_rq_worker_thread() -> Optional[threading.Thread]:
     """Run RQ in a daemon thread when configured. Returns the Thread or None."""
+    global _rq_worker
     if not (settings.REDIS_URL and settings.USE_RQ_LONG_JOBS):
         LOG.info("RQ worker disabled (REDIS_URL/USE_RQ_LONG_JOBS unset)")
         return None
     try:
         from redis import Redis
-        from rq import Queue, Worker
+        from rq import Queue
     except Exception as e:  # noqa: BLE001 - rq optional
         LOG.warning("RQ deps missing (%s); automation dispatcher will still run", e)
         return None
 
     def _run_rq() -> None:
+        global _rq_worker
         try:
             conn = Redis.from_url(settings.REDIS_URL)
             queues = [Queue("sweep_long", connection=conn)]
-            w = Worker(queues, connection=conn)
+            w = _SideThreadRQWorker.create(queues, conn)
+            _rq_worker = w
             LOG.info("RQ worker listening on queue sweep_long")
             w.work(with_scheduler=False, burst=False)
         except Exception:
             LOG.exception("RQ worker thread crashed; dispatcher continues")
+        finally:
+            _rq_worker = None
 
     t = threading.Thread(target=_run_rq, name="rq-worker", daemon=True)
     t.start()

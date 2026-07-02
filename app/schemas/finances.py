@@ -7,6 +7,8 @@ class FinancesSourceSlice(BaseModel):
 
     last_30_days_revenue: float = 0.0
     last_mtd_revenue: float = 0.0
+    last_30_days_order_count: int = 0
+    last_mtd_order_count: int = 0
 
 
 class FinancesCombinedSummary(BaseModel):
@@ -16,6 +18,9 @@ class FinancesCombinedSummary(BaseModel):
     stripe: FinancesSourceSlice
     whop: FinancesSourceSlice
     manual: FinancesSourceSlice = Field(default_factory=FinancesSourceSlice)
+    # Prior window of equal length (for KPI trend badges); omitted when scope=all.
+    prior_period_revenue: Optional[float] = None
+    prior_period_order_count: Optional[int] = None
 
 
 class FinancesTimelinePoint(BaseModel):

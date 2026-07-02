@@ -53,6 +53,15 @@ def _stripe_succeeded_cents_since(
     db: Session, org_id: uuid.UUID, since: datetime, until: datetime
 ) -> int:
     """Dedupe by stripe_id (latest row wins), then sum amounts with created_at in [since, until]."""
+    total = 0
+    for p in _stripe_succeeded_in_window(db, org_id, since, until):
+        total += p.amount_cents or 0
+    return total
+
+
+def _stripe_succeeded_in_window(
+    db: Session, org_id: uuid.UUID, since: datetime, until: datetime
+) -> List[StripePayment]:
     rows = (
         db.query(StripePayment)
         .filter(StripePayment.org_id == org_id, StripePayment.status == "succeeded")
@@ -66,29 +75,45 @@ def _stripe_succeeded_cents_since(
             continue
         if sid not in best:
             best[sid] = p
-    total = 0
+    out: List[StripePayment] = []
     for p in best.values():
         ts = p.created_at
         if not ts or ts < since or ts > until:
             continue
-        total += p.amount_cents or 0
-    return total
+        out.append(p)
+    return out
 
 
-def _whop_paid_cents_since(db: Session, org_id: uuid.UUID, since: datetime, until: datetime) -> int:
-    total = 0
+def _stripe_order_count_since(db: Session, org_id: uuid.UUID, since: datetime, until: datetime) -> int:
+    return len(_stripe_succeeded_in_window(db, org_id, since, until))
+
+
+def _whop_paid_in_window(
+    db: Session, org_id: uuid.UUID, since: datetime, until: datetime
+) -> List[WhopPayment]:
+    out: List[WhopPayment] = []
     for p in db.query(WhopPayment).filter(WhopPayment.org_id == org_id).all():
         if (p.status or "").lower() != "paid":
             continue
         ts = p.created_at
         if not ts or ts < since or ts > until:
             continue
-        total += p.amount_cents or 0
-    return total
+        out.append(p)
+    return out
 
 
-def _manual_cents_since(db: Session, org_id: uuid.UUID, since: datetime, until: datetime) -> int:
-    total = 0
+def _whop_paid_cents_since(db: Session, org_id: uuid.UUID, since: datetime, until: datetime) -> int:
+    return sum(p.amount_cents or 0 for p in _whop_paid_in_window(db, org_id, since, until))
+
+
+def _whop_order_count_since(db: Session, org_id: uuid.UUID, since: datetime, until: datetime) -> int:
+    return len(_whop_paid_in_window(db, org_id, since, until))
+
+
+def _manual_in_window(
+    db: Session, org_id: uuid.UUID, since: datetime, until: datetime
+) -> List[ManualPayment]:
+    out: List[ManualPayment] = []
     for p in db.query(ManualPayment).filter(ManualPayment.org_id == org_id).all():
         ts = p.payment_date or p.created_at
         if not ts:
@@ -96,8 +121,16 @@ def _manual_cents_since(db: Session, org_id: uuid.UUID, since: datetime, until: 
         ts = _naive_utc(ts)
         if ts < since or ts > until:
             continue
-        total += p.amount_cents or 0
-    return total
+        out.append(p)
+    return out
+
+
+def _manual_cents_since(db: Session, org_id: uuid.UUID, since: datetime, until: datetime) -> int:
+    return sum(p.amount_cents or 0 for p in _manual_in_window(db, org_id, since, until))
+
+
+def _manual_order_count_since(db: Session, org_id: uuid.UUID, since: datetime, until: datetime) -> int:
+    return len(_manual_in_window(db, org_id, since, until))
 
 
 @router.get("/summary", response_model=FinancesCombinedSummary)
@@ -128,25 +161,59 @@ def finances_summary(
     w_pri = _whop_paid_cents_since(db, org_id, period_start, period_end) if wh_ok else 0
     m_pri = _manual_cents_since(db, org_id, period_start, period_end)
 
+    s_pri_n = _stripe_order_count_since(db, org_id, period_start, period_end) if st_ok else 0
+    w_pri_n = _whop_order_count_since(db, org_id, period_start, period_end) if wh_ok else 0
+    m_pri_n = _manual_order_count_since(db, org_id, period_start, period_end)
+
+    smtd_n = _stripe_order_count_since(db, org_id, mtd_start, now) if st_ok else 0
+    wmtd_n = _whop_order_count_since(db, org_id, mtd_start, now) if wh_ok else 0
+    mmtd_n = _manual_order_count_since(db, org_id, mtd_start, now)
+
+    prior_revenue: float | None = None
+    prior_orders: int | None = None
+    if scope != "all":
+        span = period_end - period_start
+        prior_end = period_start
+        prior_start = prior_end - span
+        sp = _stripe_succeeded_cents_since(db, org_id, prior_start, prior_end) if st_ok else 0
+        wp = _whop_paid_cents_since(db, org_id, prior_start, prior_end) if wh_ok else 0
+        mp = _manual_cents_since(db, org_id, prior_start, prior_end)
+        prior_revenue = (sp + wp + mp) / 100.0
+        prior_orders = (
+            (_stripe_order_count_since(db, org_id, prior_start, prior_end) if st_ok else 0)
+            + (_whop_order_count_since(db, org_id, prior_start, prior_end) if wh_ok else 0)
+            + _manual_order_count_since(db, org_id, prior_start, prior_end)
+        )
+
     return FinancesCombinedSummary(
         stripe_connected=st_ok,
         whop_connected=wh_ok,
         combined=FinancesSourceSlice(
             last_30_days_revenue=(s_pri + w_pri + m_pri) / 100.0,
             last_mtd_revenue=(smtd_only + wmtd_only + mmtd_only) / 100.0,
+            last_30_days_order_count=s_pri_n + w_pri_n + m_pri_n,
+            last_mtd_order_count=smtd_n + wmtd_n + mmtd_n,
         ),
         stripe=FinancesSourceSlice(
             last_30_days_revenue=s_pri / 100.0,
             last_mtd_revenue=smtd_only / 100.0,
+            last_30_days_order_count=s_pri_n,
+            last_mtd_order_count=smtd_n,
         ),
         whop=FinancesSourceSlice(
             last_30_days_revenue=w_pri / 100.0,
             last_mtd_revenue=wmtd_only / 100.0,
+            last_30_days_order_count=w_pri_n,
+            last_mtd_order_count=wmtd_n,
         ),
         manual=FinancesSourceSlice(
             last_30_days_revenue=m_pri / 100.0,
             last_mtd_revenue=mmtd_only / 100.0,
+            last_30_days_order_count=m_pri_n,
+            last_mtd_order_count=mmtd_n,
         ),
+        prior_period_revenue=prior_revenue,
+        prior_period_order_count=prior_orders,
     )
 
 

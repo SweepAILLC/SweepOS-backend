@@ -28,6 +28,7 @@ class FathomCallRecord(Base):
     sentiment_snippet = Column(String(512), nullable=True)
 
     meeting_at = Column(DateTime(timezone=True), nullable=True)
+    meeting_title = Column(Text, nullable=True)  # Fathom meeting_title / title snapshot
 
     recording_url = Column(Text, nullable=True)
     # Optional extra URLs from the meeting payload (webhook/list API) for embedding.

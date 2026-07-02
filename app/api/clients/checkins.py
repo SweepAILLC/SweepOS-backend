@@ -67,6 +67,10 @@ async def sync_check_ins(
         True,
         description="When false, sync calendar rows only — skip automated pipeline stage moves.",
     ),
+    force_lifecycle: bool = Query(
+        False,
+        description="When true with pipeline rules, bypass 14-day manual column-move protection.",
+    ),
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """
@@ -84,6 +88,7 @@ async def sync_check_ins(
             sync_check_ins_in_worker,
             token,
             apply_pipeline_lifecycle_rules=apply_pipeline_rules,
+            force_lifecycle=force_lifecycle,
         )
     except ImportError as e:
         import traceback

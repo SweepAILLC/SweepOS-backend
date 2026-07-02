@@ -65,7 +65,10 @@ def extract_attendee_payloads(meeting: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         seen.add(ne)
         name = str(inv.get("name") or inv.get("display_name") or "").strip() or None
-        out.append({"email": ne, "name": name, "source": "calendar_invitee"})
+        payload: Dict[str, Any] = {"email": ne, "name": name, "source": "calendar_invitee"}
+        if "is_external" in inv:
+            payload["is_external"] = bool(inv.get("is_external"))
+        out.append(payload)
 
     for block in meeting.get("transcript") or []:
         if not isinstance(block, dict):
@@ -155,7 +158,10 @@ def resolve_clients_for_meeting(
 
     for p in payloads:
         email = p["email"]
-        is_internal = email in internal
+        if "is_external" in p:
+            is_internal = not bool(p["is_external"])
+        else:
+            is_internal = email in internal
         stored_attendees.append(
             {
                 "email": email,

@@ -37,6 +37,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _proxy_upstream_status(upstream_status: int) -> int:
+    """Map third-party 401/403 to 502 so the frontend does not treat them as session expiry."""
+    if upstream_status in (401, 403):
+        return status.HTTP_502_BAD_GATEWAY
+    return upstream_status
+
+
 def get_calendar_booking_sales_metadata(
     db: Session,
     org_id: uuid.UUID,
@@ -436,7 +443,7 @@ def get_calcom_auth_headers(
     user_id: uuid.UUID,
     api_version: str = "2026-05-01"  # Bookings list cursor pagination (Cal.com docs)
 ) -> dict:
-    """Bearer headers for Cal.com v2 (prefers CALCOM_API_KEY env when set)."""
+    """Bearer headers for Cal.com v2 (org Integrations token, else dev CALCOM_API_KEY fallback)."""
     from app.services.calcom_auth import get_calcom_access_token
 
     access_token = get_calcom_access_token(db, org_id, user_id)
@@ -1009,7 +1016,7 @@ def get_calcom_event_types(
                 error_msg = error_text
             
             raise HTTPException(
-                status_code=response.status_code,
+                status_code=_proxy_upstream_status(response.status_code),
                 detail=f"Failed to fetch Cal.com event types (HTTP {response.status_code}): {error_msg}"
             )
             
@@ -4302,6 +4309,57 @@ def sync_fathom_meetings(
     }
 
 
+@router.get("/fathom/status")
+def get_fathom_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return Fathom integration health: API key set, webhook registered, recent call count."""
+    from sqlalchemy import text
+
+    from app.services.fathom_client import resolve_fathom_api_key
+    from app.models.fathom_call_record import FathomCallRecord
+    from app.models.organization import Organization
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    _ensure_org_fathom_webhook_columns(db)
+
+    has_key = bool(resolve_fathom_api_key(db, org_id, user=current_user))
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+
+    webhook_id = getattr(org, "fathom_webhook_id", None) if org else None
+    webhook_url = getattr(org, "fathom_webhook_url", None) if org else None
+    webhook_active = bool(webhook_id and webhook_url)
+
+    total_calls = (
+        db.query(func.count(FathomCallRecord.id))
+        .filter(FathomCallRecord.org_id == org_id)
+        .scalar()
+        or 0
+    )
+
+    latest_call_at = None
+    from sqlalchemy import desc
+
+    latest = (
+        db.query(FathomCallRecord.meeting_at)
+        .filter(FathomCallRecord.org_id == org_id)
+        .order_by(desc(FathomCallRecord.meeting_at))
+        .limit(1)
+        .first()
+    )
+    if latest and latest[0]:
+        latest_call_at = latest[0].isoformat()
+
+    return {
+        "configured": has_key,
+        "webhook_active": webhook_active,
+        "webhook_url": webhook_url,
+        "total_calls": total_calls,
+        "latest_call_at": latest_call_at,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fathom webhooks (API key + webhook ingestion)
 # ---------------------------------------------------------------------------
@@ -4320,6 +4378,7 @@ def _ensure_org_fathom_webhook_columns(db: Session) -> None:
 
 @router.post("/fathom/webhook/setup")
 def setup_fathom_webhook(
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin_or_owner),
 ):
@@ -4331,7 +4390,9 @@ def setup_fathom_webhook(
 
     Webhook includes transcript + summary + action_items for LLM context.
     """
-    from app.services.fathom_client import create_webhook, resolve_fathom_api_key
+    from app.services.fathom_client import resolve_fathom_api_key
+    from app.services.fathom_onboard import setup_fathom_webhook_background
+    from app.long_jobs import schedule_background_work
     from app.models.organization import Organization
 
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
@@ -4350,48 +4411,12 @@ def setup_fathom_webhook(
 
     destination = f"{public}/integrations/fathom/webhook/{org_id}"
 
-    try:
-        wh = create_webhook(
-            destination_url=destination,
-            include_transcript=True,
-            include_summary=True,
-            include_action_items=True,
-            db=db,
-            org_id=org_id,
-            api_key=key,
-        )
-    except httpx.HTTPStatusError as e:
-        if e.response is not None and e.response.status_code == 401:
-            raise HTTPException(
-                status_code=400,
-                detail="Fathom rejected the API key (401). Regenerate it in Fathom → Settings → API Access and try again.",
-            ) from e
-        raise HTTPException(
-            status_code=502,
-            detail=f"Fathom webhook create failed (HTTP {e.response.status_code if e.response else 'unknown'}).",
-        ) from e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Webhook setup failed: {e!s}") from e
-
-    org = db.query(Organization).filter(Organization.id == org_id).first()
-    if org:
-        try:
-            org.fathom_webhook_id = str(wh.get("id") or "")[:200] or None
-            org.fathom_webhook_secret = str(wh.get("secret") or "")[:500] or None
-            org.fathom_webhook_url = str(wh.get("url") or destination)[:2000] or destination
-        except Exception:
-            pass
-        db.commit()
-
+    schedule_background_work(setup_fathom_webhook_background, background_tasks, str(org_id))
     return {
-        "success": True,
+        "started": True,
+        "background": True,
         "destination_url": destination,
-        "webhook_id": wh.get("id"),
-        "webhook_url": wh.get("url"),
-        "include_transcript": wh.get("include_transcript"),
-        "include_summary": wh.get("include_summary"),
-        "include_action_items": wh.get("include_action_items"),
-        "triggered_for": wh.get("triggered_for"),
+        "message": "Fathom webhook registration started. It will appear as active shortly.",
     }
 
 
