@@ -1111,7 +1111,18 @@ def reconcile_call_insights_for_dead_lifecycle(
         db.flush()
         return
 
-    fj = db.query(FathomCallRecord).filter(FathomCallRecord.id == row.fathom_call_record_id).first()
+    fj = None
+    if row.fathom_call_record_id:
+        try:
+            fj = db.query(FathomCallRecord).filter(FathomCallRecord.id == row.fathom_call_record_id).first()
+        except Exception as fathom_err:
+            from sqlalchemy.exc import ProgrammingError
+
+            if isinstance(fathom_err, ProgrammingError) or "does not exist" in str(fathom_err).lower():
+                refresh_insight_summary_from_latest_stored_insight(db, org_id, client.id)
+                db.flush()
+                return
+            raise
     if not fj:
         refresh_insight_summary_from_latest_stored_insight(db, org_id, client.id)
         db.flush()
@@ -1155,15 +1166,22 @@ def reconcile_call_insights_for_dead_lifecycle(
 def on_client_became_dead(db: Session, org_id: uuid.UUID, client: Client) -> bool:
     """Sync reconcile + optional background LLM refresh when Fathom data exists."""
     reconcile_call_insights_for_dead_lifecycle(db, org_id, client)
-    has_fathom = (
-        db.query(FathomCallRecord.id)
-        .filter(
-            FathomCallRecord.org_id == org_id,
-            FathomCallRecord.client_id == client.id,
-            FathomCallRecord.sentiment_status == "complete",
+    try:
+        has_fathom = (
+            db.query(FathomCallRecord.id)
+            .filter(
+                FathomCallRecord.org_id == org_id,
+                FathomCallRecord.client_id == client.id,
+                FathomCallRecord.sentiment_status == "complete",
+            )
+            .limit(1)
+            .first()
+            is not None
         )
-        .limit(1)
-        .first()
-        is not None
-    )
+    except Exception as exc:
+        from sqlalchemy.exc import ProgrammingError
+
+        if isinstance(exc, ProgrammingError) or "does not exist" in str(exc).lower():
+            return False
+        raise
     return has_fathom

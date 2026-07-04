@@ -7,7 +7,13 @@ from uuid import UUID
 import uuid
 import logging
 from app.db.session import get_db
-from app.models.user import User, parse_user_role_from_db, role_to_api, parse_user_role_from_api
+from app.models.user import (
+    User,
+    parse_user_role_from_db,
+    role_to_api,
+    parse_user_role_from_api,
+    userrole_bind_value,
+)
 from app.models.user_organization import UserOrganization
 from app.models.organization import Organization
 from app.schemas.user import UserLogin, Token, User as UserSchema, UserSettingsUpdate, LoginResponse
@@ -723,7 +729,7 @@ def accept_invitation(
                 "org_id": inv.org_id,
                 "email": email_normalized,
                 "hashed_password": existing_user.hashed_password,
-                "role": user_role.value,
+                "role": userrole_bind_value(user_role),
                 "is_admin": user_role in (UserRole.ADMIN, UserRole.OWNER),
             },
         )
@@ -794,7 +800,7 @@ def accept_invitation(
             "org_id": inv.org_id,
             "email": email_normalized,
             "hashed_password": get_password_hash(password),
-            "role": user_role.value,
+            "role": userrole_bind_value(user_role),
             "is_admin": (user_role in (UserRole.ADMIN, UserRole.OWNER)),
         },
     )

@@ -32,6 +32,13 @@ def parse_user_role_from_db(raw: object) -> UserRole:
     return UserRole.ADMIN
 
 
+def userrole_bind_value(role: UserRole) -> str:
+    """PostgreSQL `userrole` label for raw SQL CAST (legacy rows use lowercase `member`)."""
+    if role == UserRole.MEMBER:
+        return "member"
+    return role.value
+
+
 def role_to_api(role: UserRole) -> str:
     """API / frontend expect lowercase owner | admin | member."""
     return role.value.lower()

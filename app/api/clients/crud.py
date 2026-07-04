@@ -348,9 +348,12 @@ def update_client(
         
         schedule_dead_llm_refresh = False
         if entered_dead:
+            nested = db.begin_nested()
             try:
                 schedule_dead_llm_refresh = on_client_became_dead(db, org_id, client)
+                nested.commit()
             except Exception as dead_hook_err:
+                nested.rollback()
                 print(f"[UPDATE_CLIENT] Dead lifecycle hook failed for {client.id}: {dead_hook_err}")
 
         db.commit()
@@ -620,7 +623,13 @@ def delete_client(
 
         try:
             purge_client_dependencies(db, org_id, client_uuid)
-            db.delete(client_to_delete)
+            removed = (
+                db.query(Client)
+                .filter(Client.id == client_uuid, Client.org_id == org_id)
+                .delete(synchronize_session=False)
+            )
+            if not removed:
+                continue
             deleted_count += 1
             print(f"[DELETE_CLIENT] Deleted client {cid} and dependencies")
         except IntegrityError as e:

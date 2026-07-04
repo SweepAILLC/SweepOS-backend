@@ -10,7 +10,12 @@ from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.user import UserRole, parse_user_role_from_api, parse_user_role_from_db
+from app.models.user import (
+    UserRole,
+    parse_user_role_from_api,
+    parse_user_role_from_db,
+    userrole_bind_value,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -126,7 +131,7 @@ def materialize_org_user_row_if_missing(
                 "org_id": str(org_id),
                 "email": email.strip().lower(),
                 "hashed_password": pwd_row[0],
-                "role": user_role.value,
+                "role": userrole_bind_value(user_role),
                 "is_admin": user_role in (UserRole.ADMIN, UserRole.OWNER),
             },
         )

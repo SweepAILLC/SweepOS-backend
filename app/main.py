@@ -91,6 +91,25 @@ def _ensure_schema_columns_on_startup() -> None:
         # user_organizations: per-org Intelligence bank
         db.execute(text("ALTER TABLE user_organizations ADD COLUMN IF NOT EXISTS ai_profile JSONB"))
 
+        # lifecyclestate: ensure lowercase labels exist (migration 047) for ORM + API writes
+        for label in (
+            "cold_lead",
+            "nurturing",
+            "qualified",
+            "booked",
+            "active",
+            "offboarding",
+            "dead",
+        ):
+            db.execute(
+                text(
+                    "DO $$ BEGIN "
+                    f"ALTER TYPE lifecyclestate ADD VALUE IF NOT EXISTS '{label}'; "
+                    "EXCEPTION WHEN duplicate_object THEN NULL; "
+                    "END $$;"
+                )
+            )
+
         # organizations: fathom webhook fields
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))

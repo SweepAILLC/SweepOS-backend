@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Numeric, JSON, Integer, Enum as SQLEnum, Text, ForeignKey, Index, or_
+from sqlalchemy import Column, String, DateTime, Numeric, JSON, Integer, Text, ForeignKey, Index, or_, TypeDecorator
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
@@ -28,6 +28,56 @@ class LifecycleState(str, enum.Enum):
     DEAD = "dead"
 
 
+def parse_lifecycle_state_from_db(raw: object) -> LifecycleState:
+    """Map DB lifecyclestate (any legacy casing) to LifecycleState."""
+    if raw is None:
+        return LifecycleState.QUALIFIED
+    if isinstance(raw, LifecycleState):
+        return raw
+    key = str(raw).strip().lower()
+    if key == "warm_lead":
+        return LifecycleState.BOOKED
+    try:
+        return LifecycleState(key)
+    except ValueError:
+        return LifecycleState.QUALIFIED
+
+
+def lifecyclestate_bind_value(state: LifecycleState | str) -> str:
+    """
+    PostgreSQL lifecyclestate label for raw SQL / legacy DBs.
+
+    Older production DBs store UPPERCASE labels (DEAD, COLD_LEAD); migration 047 adds
+    lowercase. Prefer uppercase on bind so column moves work before migrations run.
+    """
+    if isinstance(state, LifecycleState):
+        key = state.value
+    else:
+        key = str(state).strip().lower()
+    if key == "warm_lead":
+        key = "booked"
+    return key.upper()
+
+
+class PgLifecycleState(TypeDecorator):
+    """Bind lifecycle values using labels that exist on legacy PostgreSQL enums."""
+
+    impl = String(32)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if isinstance(value, LifecycleState):
+            return lifecyclestate_bind_value(value)
+        return lifecyclestate_bind_value(str(value))
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return parse_lifecycle_state_from_db(value)
+
+
 # Pre-payment pipeline stages (funnel → qualified → booked → active).
 PRE_PAYMENT_LIFECYCLE_STATES = frozenset(
     {
@@ -55,7 +105,7 @@ class Client(Base):
     phone = Column(String, nullable=True)
     instagram = Column(String, nullable=True)
     lifecycle_state = Column(
-        SQLEnum(LifecycleState, values_callable=lambda obj: [e.value for e in obj]),
+        PgLifecycleState(),
         default=LifecycleState.QUALIFIED,
         nullable=False,
     )

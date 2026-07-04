@@ -1,8 +1,9 @@
 """Delete a client and all org-scoped rows that reference clients.id."""
 from __future__ import annotations
 
+import logging
 import uuid
-from typing import Union
+from typing import Callable, Union
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -16,6 +17,8 @@ from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction
 from app.models.whop_payment import WhopPayment
+
+_logger = logging.getLogger(__name__)
 
 try:
     from app.models.client_call_insight import ClientCallInsight, ClientInsightSummary
@@ -41,6 +44,26 @@ def _as_uuid(client_id: Union[str, UUID]) -> UUID:
     return client_id if isinstance(client_id, uuid.UUID) else UUID(str(client_id))
 
 
+def _purge_step(db: Session, label: str, fn: Callable[[], None]) -> None:
+    """
+    Run one purge step; skip when the table is missing (common on prod before migrations).
+
+    Uses a savepoint so a failed optional step does not roll back earlier deletes.
+    """
+    nested = db.begin_nested()
+    try:
+        fn()
+    except Exception as exc:
+        nested.rollback()
+        msg = str(getattr(exc, "orig", exc)).lower()
+        if "does not exist" in msg or "undefinedtable" in msg.replace(" ", ""):
+            _logger.warning("Skipping client purge step %s: %s", label, exc)
+            return
+        raise
+    else:
+        nested.commit()
+
+
 def purge_client_dependencies(db: Session, org_id: UUID, client_id: Union[str, UUID]) -> None:
     """
     Remove or detach all foreign-key dependents before deleting the Client row.
@@ -52,34 +75,49 @@ def purge_client_dependencies(db: Session, org_id: UUID, client_id: Union[str, U
 
     # 1:1 / insight rows use client_id as PK — must DELETE (ORM cannot SET NULL on delete).
     if ClientCallInsight is not None:
-        db.query(ClientCallInsight).filter(
-            ClientCallInsight.client_id == cid,
-            ClientCallInsight.org_id == org_id,
-        ).delete(synchronize_session=False)
+        def _purge_call_insights() -> None:
+            db.query(ClientCallInsight).filter(
+                ClientCallInsight.client_id == cid,
+                ClientCallInsight.org_id == org_id,
+            ).delete(synchronize_session=False)
+
+        _purge_step(db, "client_call_insights", _purge_call_insights)
 
     if ClientInsightSummary is not None:
-        db.query(ClientInsightSummary).filter(
-            ClientInsightSummary.client_id == cid,
-            ClientInsightSummary.org_id == org_id,
-        ).delete(synchronize_session=False)
+        def _purge_insight_summaries() -> None:
+            db.query(ClientInsightSummary).filter(
+                ClientInsightSummary.client_id == cid,
+                ClientInsightSummary.org_id == org_id,
+            ).delete(synchronize_session=False)
+
+        _purge_step(db, "client_insight_summaries", _purge_insight_summaries)
 
     if ClientHealthScoreCache is not None:
-        db.query(ClientHealthScoreCache).filter(
-            ClientHealthScoreCache.client_id == cid,
-            ClientHealthScoreCache.org_id == org_id,
-        ).delete(synchronize_session=False)
+        def _purge_health_cache() -> None:
+            db.query(ClientHealthScoreCache).filter(
+                ClientHealthScoreCache.client_id == cid,
+                ClientHealthScoreCache.org_id == org_id,
+            ).delete(synchronize_session=False)
+
+        _purge_step(db, "client_health_score_cache", _purge_health_cache)
 
     if ClientAIRecommendationState is not None:
-        db.query(ClientAIRecommendationState).filter(
-            ClientAIRecommendationState.client_id == cid,
-            ClientAIRecommendationState.org_id == org_id,
-        ).delete(synchronize_session=False)
+        def _purge_ai_state() -> None:
+            db.query(ClientAIRecommendationState).filter(
+                ClientAIRecommendationState.client_id == cid,
+                ClientAIRecommendationState.org_id == org_id,
+            ).delete(synchronize_session=False)
+
+        _purge_step(db, "client_ai_recommendation_state", _purge_ai_state)
 
     if HealthOutcomeSnapshot is not None:
-        db.query(HealthOutcomeSnapshot).filter(
-            HealthOutcomeSnapshot.client_id == cid,
-            HealthOutcomeSnapshot.org_id == org_id,
-        ).delete(synchronize_session=False)
+        def _purge_health_outcomes() -> None:
+            db.query(HealthOutcomeSnapshot).filter(
+                HealthOutcomeSnapshot.client_id == cid,
+                HealthOutcomeSnapshot.org_id == org_id,
+            ).delete(synchronize_session=False)
+
+        _purge_step(db, "health_outcome_snapshots", _purge_health_outcomes)
 
     db.query(ManualPayment).filter(
         ManualPayment.client_id == cid,
@@ -127,13 +165,19 @@ def purge_client_dependencies(db: Session, org_id: UUID, client_id: Union[str, U
     ).update({Recommendation.client_id: None}, synchronize_session=False)
 
     if FathomCallRecord is not None:
-        db.query(FathomCallRecord).filter(
-            FathomCallRecord.client_id == cid,
-            FathomCallRecord.org_id == org_id,
-        ).update({FathomCallRecord.client_id: None}, synchronize_session=False)
+        def _detach_fathom() -> None:
+            db.query(FathomCallRecord).filter(
+                FathomCallRecord.client_id == cid,
+                FathomCallRecord.org_id == org_id,
+            ).update({FathomCallRecord.client_id: None}, synchronize_session=False)
+
+        _purge_step(db, "fathom_call_records", _detach_fathom)
 
     if AutomationEmailJob is not None:
-        db.query(AutomationEmailJob).filter(
-            AutomationEmailJob.client_id == cid,
-            AutomationEmailJob.org_id == org_id,
-        ).delete(synchronize_session=False)
+        def _purge_automation_jobs() -> None:
+            db.query(AutomationEmailJob).filter(
+                AutomationEmailJob.client_id == cid,
+                AutomationEmailJob.org_id == org_id,
+            ).delete(synchronize_session=False)
+
+        _purge_step(db, "automation_email_jobs", _purge_automation_jobs)
