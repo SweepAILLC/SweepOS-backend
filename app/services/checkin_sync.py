@@ -329,12 +329,13 @@ def ensure_client_for_booking_attendee(
         email=email.strip(),
         first_name=first_name,
         last_name=last_name,
-            lifecycle_state=LifecycleState.BOOKED,
+        lifecycle_state=LifecycleState.BOOKED,
         notes="Created from calendar booking (attendee)",
     )
     db.add(client)
     db.flush()
     print(f"[CHECKIN SYNC] Created new booked client for booking attendee: {email}")
+    nested = db.begin_nested()
     try:
         from app.services.fathom_client_link import (
             queue_fathom_relink_followups,
@@ -344,7 +345,9 @@ def ensure_client_for_booking_attendee(
         linked = relink_fathom_records_for_client(db, org_id, client)
         if linked:
             queue_fathom_relink_followups(None, org_id, linked)
+        nested.commit()
     except Exception as relink_err:
+        nested.rollback()
         print(f"[CHECKIN SYNC] Fathom relink after booking client create skipped: {relink_err}")
     return client
 
@@ -461,11 +464,13 @@ def sync_calcom_bookings(
         )
         
         for idx, booking in enumerate(bookings):
+            nested = db.begin_nested()
             try:
                 # Handle case where booking might not be a dict
                 if not isinstance(booking, dict):
                     print(f"[CHECKIN SYNC] [CALCOM] ⚠️ Booking {idx} is not a dict: {type(booking)}")
                     print(f"[CHECKIN SYNC] [CALCOM] Booking {idx} value: {str(booking)[:200]}")
+                    nested.rollback()
                     continue
                 
                 # Cal.com v2 canonical id is uid (string); numeric id is legacy.
@@ -473,6 +478,7 @@ def sync_calcom_bookings(
                 legacy_event_id = str(booking.get("id") or "").strip() if booking.get("id") else None
                 if not event_id:
                     print(f"[CHECKIN SYNC] [CALCOM] ⚠️ Booking {idx} has no ID, skipping")
+                    nested.rollback()
                     continue
                 
                 title = booking.get("title") or (booking.get("eventType", {}) or {}).get("title") if isinstance(booking.get("eventType"), dict) else "Untitled"
@@ -484,6 +490,7 @@ def sync_calcom_bookings(
                 
                 if not start_time_str:
                     print(f"[CHECKIN SYNC] Skipping booking {event_id}: no start_time")
+                    nested.rollback()
                     continue
                 
                 start_time = ensure_utc(datetime.fromisoformat(start_time_str.replace('Z', '+00:00')))
@@ -513,6 +520,7 @@ def sync_calcom_bookings(
                 use_placeholder = bool(attendee.get("_placeholder"))
                 attendee_email = attendee.get("email")
                 if not attendee_email:
+                    nested.rollback()
                     continue
 
                 attendee_name = attendee.get("name") or (title if use_placeholder else None)
@@ -529,6 +537,7 @@ def sync_calcom_bookings(
                             _add_client_to_email_index(email_index, matching_client)
                     if not matching_client:
                         bookings_without_matching_clients += 1
+                        nested.rollback()
                         continue
 
                 existing_checkin = _find_calcom_checkin(db, org_id, event_id, legacy_event_id)
@@ -620,8 +629,10 @@ def sync_calcom_bookings(
                         })
 
                 db.flush()
+                nested.commit()
                 
             except Exception as e:
+                nested.rollback()
                 print(f"[CHECKIN SYNC] [CALCOM] ❌ Error processing booking {idx}: {str(e)}")
                 print(f"[CHECKIN SYNC] [CALCOM] Booking type: {type(booking)}")
                 if isinstance(booking, dict):
@@ -769,6 +780,7 @@ def sync_calendly_events(
         )
 
         for event in events:
+            nested = db.begin_nested()
             try:
                 event_uri = event.get("uri", "")
                 event_uuid = event_uri.split("/")[-1] if "/" in event_uri else event_uri
@@ -779,6 +791,7 @@ def sync_calendly_events(
                 location = event.get("location", {})
 
                 if not start_time_str:
+                    nested.rollback()
                     continue
 
                 start_time = ensure_utc(datetime.fromisoformat(start_time_str.replace("Z", "+00:00")))
@@ -812,6 +825,7 @@ def sync_calendly_events(
                 use_placeholder = bool(invitee.get("_placeholder"))
                 invitee_email = invitee.get("email")
                 if not invitee_email:
+                    nested.rollback()
                     continue
 
                 invitee_name = invitee.get("name") or (name if use_placeholder else None)
@@ -832,6 +846,7 @@ def sync_calendly_events(
                             _add_client_to_email_index(email_index, matching_client)
                     if not matching_client:
                         events_without_matching_clients += 1
+                        nested.rollback()
                         continue
 
                 existing_checkin = db.query(ClientCheckIn).filter(
@@ -931,8 +946,10 @@ def sync_calendly_events(
                         })
 
                 db.flush()
+                nested.commit()
                 
             except Exception as e:
+                nested.rollback()
                 print(f"[CHECKIN SYNC] Error processing Calendly event: {e}")
                 continue
         
