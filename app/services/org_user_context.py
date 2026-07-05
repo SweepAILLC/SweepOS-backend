@@ -20,6 +20,116 @@ from app.models.user import (
 _logger = logging.getLogger(__name__)
 
 
+def list_organizations_for_email(
+    db: Session,
+    email: str,
+) -> list[dict]:
+    """
+    All orgs this email can access — from users rows and user_organizations links.
+    Returns dicts: org_id (UUID), is_primary (bool), created_at (datetime).
+    """
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return []
+
+    rows = db.execute(
+        text(
+            """
+            WITH combined AS (
+                SELECT u.org_id,
+                       COALESCE(uo.is_primary, FALSE) AS is_primary,
+                       COALESCE(uo.created_at, u.created_at) AS created_at
+                FROM users u
+                LEFT JOIN user_organizations uo
+                  ON uo.user_id = u.id AND uo.org_id = u.org_id
+                WHERE LOWER(u.email) = :email
+
+                UNION ALL
+
+                SELECT uo.org_id, uo.is_primary, uo.created_at
+                FROM user_organizations uo
+                INNER JOIN users u ON u.id = uo.user_id
+                WHERE LOWER(u.email) = :email
+            )
+            SELECT org_id,
+                   BOOL_OR(is_primary) AS is_primary,
+                   MIN(created_at) AS created_at
+            FROM combined
+            GROUP BY org_id
+            ORDER BY is_primary DESC, created_at ASC
+            """
+        ),
+        {"email": normalized},
+    ).fetchall()
+
+    if not rows:
+        return []
+
+    primary_row = db.execute(
+        text(
+            """
+            SELECT u.org_id
+            FROM users u
+            LEFT JOIN user_organizations uo ON uo.user_id = u.id AND uo.org_id = u.org_id
+            WHERE LOWER(u.email) = :email
+            ORDER BY COALESCE(uo.is_primary, FALSE) DESC, u.created_at ASC
+            LIMIT 1
+            """
+        ),
+        {"email": normalized},
+    ).fetchone()
+    primary_org_id = str(primary_row[0]) if primary_row else None
+
+    result: list[dict] = []
+    for org_id, is_primary, created_at in rows:
+        result.append(
+            {
+                "org_id": org_id,
+                "is_primary": bool(is_primary) or (primary_org_id is not None and str(org_id) == primary_org_id),
+                "created_at": created_at,
+            }
+        )
+    return result
+
+
+def ensure_user_organization_link(
+    db: Session,
+    email: str,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+    *,
+    is_primary: bool = False,
+) -> None:
+    """Ensure user_organizations row exists so org switcher and access checks stay in sync."""
+    if not email or not org_id or not user_id:
+        return
+    existing = db.execute(
+        text(
+            """
+            SELECT 1 FROM user_organizations
+            WHERE user_id = :user_id AND org_id = :org_id
+            LIMIT 1
+            """
+        ),
+        {"user_id": str(user_id), "org_id": str(org_id)},
+    ).fetchone()
+    if existing:
+        return
+    try:
+        from app.models.user_organization import UserOrganization
+
+        db.add(
+            UserOrganization(
+                user_id=user_id,
+                org_id=org_id,
+                is_primary=is_primary,
+            )
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+
+
 def fetch_user_row_for_org(
     db: Session,
     email: str,
@@ -42,9 +152,11 @@ def fetch_user_row_for_org(
 
 
 def user_has_email_org_access(db: Session, email: str, org_id: uuid.UUID) -> bool:
-    """True when any users row for this email is linked to the org."""
+    """True when this email has a users row in the org or a user_organizations link to it."""
     if not email or not org_id:
         return False
+    if fetch_user_row_for_org(db, email, org_id) is not None:
+        return True
     row = db.execute(
         text(
             """
@@ -136,6 +248,7 @@ def materialize_org_user_row_if_missing(
             },
         )
         db.commit()
+        ensure_user_organization_link(db, email.strip(), org_id, new_user_id, is_primary=False)
     except IntegrityError:
         db.rollback()
     return fetch_user_row_for_org(db, email, org_id)

@@ -125,13 +125,14 @@ def login(
         # Create UserOrganization records for the canonical user to access all orgs
         # and ensure exactly one "is_primary" org (the canonical org).
         for org_id in unique_org_ids:
+            org_user = next((u for u in matching_users if u.org_id == org_id), user)
             existing_uo = db.query(UserOrganization).filter(
-                UserOrganization.user_id == user.id,
+                UserOrganization.user_id == org_user.id,
                 UserOrganization.org_id == org_id
             ).first()
             if not existing_uo:
                 user_org = UserOrganization(
-                    user_id=user.id,
+                    user_id=org_user.id,
                     org_id=org_id,
                     is_primary=(org_id == primary_org_id),
                 )
@@ -450,54 +451,25 @@ def get_user_organizations(
     """
     normalized_email = email.lower().strip()
 
-    linked_rows = db.execute(
-        text(
-            """
-            SELECT uo.org_id,
-                   BOOL_OR(uo.is_primary) AS is_primary,
-                   MIN(uo.created_at) AS created_at
-            FROM user_organizations uo
-            INNER JOIN users u ON u.id = uo.user_id
-            WHERE LOWER(u.email) = LOWER(:email)
-            GROUP BY uo.org_id
-            ORDER BY is_primary DESC, created_at ASC
-            """
-        ),
-        {"email": normalized_email},
-    ).fetchall()
+    from app.services.org_user_context import list_organizations_for_email
 
-    if not linked_rows:
-        user = (
-            db.query(User)
-            .filter(func.lower(User.email) == normalized_email)
-            .order_by(User.created_at.asc())
-            .first()
-        )
-        if not user:
-            return []
-        org = db.query(Organization).filter(Organization.id == user.org_id).first()
-        if org:
-            return [UserOrganizationResponse(
-                id=org.id,
-                name=org.name,
-                is_primary=True,
-                created_at=org.created_at
-            )]
+    org_entries = list_organizations_for_email(db, normalized_email)
+    if not org_entries:
         return []
 
-    org_ids = [row[0] for row in linked_rows]
+    org_ids = [entry["org_id"] for entry in org_entries]
     orgs = db.query(Organization).filter(Organization.id.in_(org_ids)).all()
     org_dict = {org.id: org for org in orgs}
 
     result = []
-    for org_id, is_primary, created_at in linked_rows:
-        org = org_dict.get(org_id)
+    for entry in org_entries:
+        org = org_dict.get(entry["org_id"])
         if org:
             result.append(UserOrganizationResponse(
                 id=org.id,
                 name=org.name,
-                is_primary=bool(is_primary),
-                created_at=created_at,
+                is_primary=bool(entry["is_primary"]),
+                created_at=entry["created_at"],
             ))
 
     result.sort(key=lambda x: (not x.is_primary, x.name))
@@ -518,6 +490,7 @@ def switch_organization(
         fetch_user_row_for_org,
         materialize_org_user_row_if_missing,
         user_has_email_org_access,
+        ensure_user_organization_link,
         _role_from_invitation,
     )
 
@@ -549,6 +522,13 @@ def switch_organization(
         if resolved:
             token_user_id = str(resolved[0])
             token_role = role_to_api(parse_user_role_from_db(resolved[4]))
+            ensure_user_organization_link(
+                db,
+                email,
+                target_org_id,
+                resolved[0],
+                is_primary=str(resolved[1]) == str(target_org_id) and str(current_user.org_id) == str(target_org_id),
+            )
         else:
             invited_role = _role_from_invitation(db, email, target_org_id)
             if invited_role is None and not has_link and not has_row:

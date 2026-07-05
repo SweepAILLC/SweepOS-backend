@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, TypeDecorator
-from sqlalchemy.dialects.postgresql import UUID, JSON, ENUM as PG_ENUM
+from sqlalchemy.dialects.postgresql import UUID, JSON
 import uuid
 from datetime import datetime
 import enum
@@ -58,42 +58,23 @@ def parse_user_role_from_api(raw: str) -> UserRole:
     return UserRole.MEMBER
 
 
-_PG_USERROLE = PG_ENUM(
-    "OWNER",
-    "ADMIN",
-    "MEMBER",
-    name="userrole",
-    create_type=False,
-)
-
-
 class PgUserRole(TypeDecorator):
     """
-    Always bind PostgreSQL `userrole` labels as OWNER/ADMIN/MEMBER.
+    Read/write PostgreSQL `userrole` tolerating legacy lowercase `member` labels.
 
-    Plain SQLEnum can still emit lowercase legacy strings if a User row was loaded with a bad
-    Python value; that breaks sync when unrelated rows (e.g. Client) are flushed in the same session.
+    Avoid binding through PG_ENUM directly — production DBs may only accept lowercase
+    `member` while SQLAlchemy's enum processor expects uppercase MEMBER.
     """
 
     impl = String(32)
     cache_ok = True
 
-    def load_dialect_impl(self, dialect):
-        if dialect.name == "postgresql":
-            return dialect.type_descriptor(_PG_USERROLE)
-        return dialect.type_descriptor(String(32))
-
     def process_bind_param(self, value, dialect):
         if value is None:
             return None
         if isinstance(value, UserRole):
-            return value.value
-        s = str(value).strip()
-        up = s.upper()
-        if up in ("OWNER", "ADMIN", "MEMBER"):
-            return up
-        low = s.lower()
-        return {"owner": "OWNER", "admin": "ADMIN", "member": "MEMBER"}.get(low, "ADMIN")
+            return userrole_bind_value(value)
+        return userrole_bind_value(parse_user_role_from_db(value))
 
     def process_result_value(self, value, dialect):
         if value is None:
