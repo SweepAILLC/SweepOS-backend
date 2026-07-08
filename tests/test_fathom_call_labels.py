@@ -52,3 +52,27 @@ def test_primary_external_attendee_label_skips_team():
         ]
     )
     assert label == "Shai"
+
+
+def test_derive_call_library_title_truncates_long_meeting_title():
+    long_title = "A" * 600
+    title = derive_call_library_title(
+        meeting_title=long_title,
+        attendees_json=None,
+        meeting_at=None,
+        recording_id=1,
+    )
+    assert len(title) == 500
+
+
+def test_external_attendees_skips_rows_without_email():
+    from app.services.fathom_call_labels import external_attendees_from_json
+
+    rows = external_attendees_from_json(
+        [
+            {"name": "No Email", "is_team_member": False},
+            {"email": "ok@client.com", "name": "Ok", "is_team_member": False},
+        ]
+    )
+    assert len(rows) == 1
+    assert rows[0]["email"] == "ok@client.com"

@@ -3,7 +3,7 @@ from typing import List
 
 from fastapi import APIRouter, status
 
-from app.api.clients import automation, checkins, crud, insights, payments, terminal
+from app.api.clients import automation, checkins, crud, import_clients, insights, payments, terminal
 from app.schemas.client import Client as ClientSchema
 
 router = APIRouter(tags=["clients"])
@@ -14,6 +14,7 @@ router.include_router(insights.router)
 router.include_router(automation.router)
 router.include_router(checkins.router)
 router.include_router(payments.router)
+router.include_router(import_clients.router)
 
 # Collection list/create must live on this router (FastAPI disallows "" on included sub-routers)
 router.add_api_route(

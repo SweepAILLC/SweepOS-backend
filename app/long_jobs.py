@@ -70,3 +70,35 @@ def schedule_background_work(
         background_tasks.add_task(fn, *args)
         return
     threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def schedule_delayed_background_work(
+    fn: Callable[..., Any],
+    background_tasks: Any | None,
+    delay_sec: float,
+    *args: Any,
+) -> None:
+    """Schedule background work after delay_sec (RQ enqueue_in when available)."""
+    if delay_sec <= 0:
+        schedule_background_work(fn, background_tasks, *args)
+        return
+
+    q = _get_queue()
+    if q is not None:
+        try:
+            from datetime import timedelta
+
+            q.enqueue_in(timedelta(seconds=delay_sec), fn, *args, job_timeout=900, result_ttl=300)
+            return
+        except Exception:
+            logger.exception(
+                "RQ delayed enqueue failed for %s; falling back to Timer",
+                getattr(fn, "__name__", fn),
+            )
+
+    def _kick() -> None:
+        schedule_background_work(fn, None, *args)
+
+    t = threading.Timer(delay_sec, _kick)
+    t.daemon = True
+    t.start()

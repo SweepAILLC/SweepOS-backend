@@ -24,6 +24,7 @@ from app.api.deps import get_current_user, require_admin_or_owner
 from app.models.user import User
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.core.encryption import decrypt_token
+from app.core.config import settings
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple, Dict, Any
 import json
@@ -4330,6 +4331,12 @@ def get_fathom_status(
     webhook_id = getattr(org, "fathom_webhook_id", None) if org else None
     webhook_url = getattr(org, "fathom_webhook_url", None) if org else None
     webhook_active = bool(webhook_id and webhook_url)
+    if webhook_active:
+        webhook_status = "active"
+    elif has_key:
+        webhook_status = "not_registered"
+    else:
+        webhook_status = "not_configured"
 
     total_calls = (
         db.query(func.count(FathomCallRecord.id))
@@ -4354,6 +4361,7 @@ def get_fathom_status(
     return {
         "configured": has_key,
         "webhook_active": webhook_active,
+        "webhook_status": webhook_status,
         "webhook_url": webhook_url,
         "total_calls": total_calls,
         "latest_call_at": latest_call_at,
@@ -4379,21 +4387,21 @@ def _ensure_org_fathom_webhook_columns(db: Session) -> None:
 @router.post("/fathom/webhook/setup")
 def setup_fathom_webhook(
     background_tasks: BackgroundTasks,
+    background: bool = False,
+    force: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin_or_owner),
 ):
     """
-    Create (or recreate) a Fathom webhook using the org's API key.
+    Create or reconcile a Fathom webhook using the org's API key.
 
-    Uses BACKEND_PUBLIC_URL as the destination base. The webhook endpoint is:
-      POST /integrations/fathom/webhook/{org_id}
-
-    Webhook includes transcript + summary + action_items for LLM context.
+    Default is idempotent so Save on an existing integration does not force
+    a new webhook against localhost. Pass ?force=true to recreate explicitly.
+    Pass ?background=true to enqueue (legacy async path).
     """
     from app.services.fathom_client import resolve_fathom_api_key
-    from app.services.fathom_onboard import setup_fathom_webhook_background
+    from app.services.fathom_onboard import register_fathom_webhook_for_org, setup_fathom_webhook_background
     from app.long_jobs import schedule_background_work
-    from app.models.organization import Organization
 
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
     _ensure_org_fathom_webhook_columns(db)
@@ -4409,14 +4417,35 @@ def setup_fathom_webhook(
             detail="BACKEND_PUBLIC_URL is not set on the server; cannot create webhook destination URL.",
         )
 
-    destination = f"{public}/integrations/fathom/webhook/{org_id}"
+    destination = f"{public}/webhooks/fathom/{org_id}"
 
-    schedule_background_work(setup_fathom_webhook_background, background_tasks, str(org_id))
+    if background:
+        schedule_background_work(setup_fathom_webhook_background, background_tasks, str(org_id))
+        return {
+            "success": False,
+            "started": True,
+            "background": True,
+            "webhook_active": False,
+            "destination_url": destination,
+            "message": "Fathom webhook registration started. It will appear as active shortly.",
+        }
+
+    result = register_fathom_webhook_for_org(str(org_id), force=force)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("error") or "Fathom webhook registration failed",
+        )
     return {
-        "started": True,
-        "background": True,
-        "destination_url": destination,
-        "message": "Fathom webhook registration started. It will appear as active shortly.",
+        "success": True,
+        "background": False,
+        "webhook_active": bool(result.get("webhook_active")),
+        "webhook_id": result.get("webhook_id"),
+        "destination_url": result.get("destination_url") or destination,
+        "requested_destination_url": result.get("requested_destination_url"),
+        "registration_skipped": bool(result.get("registration_skipped")),
+        "reason": result.get("reason"),
+        "message": result.get("message") or "Fathom webhook registered. New calls will sync automatically.",
     }
 
 

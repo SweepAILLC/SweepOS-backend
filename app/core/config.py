@@ -144,6 +144,8 @@ class Settings(BaseSettings):
     # Re-pull API with backoff, then enqueue insight + library jobs (bounded; avoids noisy bulk rescans).
     FATHOM_WEBHOOK_ENRICH_MAX_ATTEMPTS: int = 8
     FATHOM_WEBHOOK_ENRICH_DELAY_SEC: int = 90
+    # On deploy, ensure orgs with saved Fathom API keys have a webhook pointed at this backend.
+    FATHOM_RECONCILE_WEBHOOKS_ON_STARTUP: bool = True
 
     # Call insights (LLM per matched Fathom recording; safeguards for cost)
     CALL_INSIGHT_MIN_INPUT_CHARS: int = 400
@@ -152,6 +154,16 @@ class Settings(BaseSettings):
     CALL_INSIGHT_COOLDOWN_HOURS: int = 24
     CALL_INSIGHT_ORG_MAX_PER_HOUR: int = 40
     CALL_INSIGHT_HEALTH_SCORE_DELTA_OVERRIDE: float = 15.0
+
+    # Call Library LLM (sales coaching reports — separate tuning for speed/cost)
+    CALL_LIBRARY_LLM_MODEL: Optional[str] = None  # defaults to HEALTH_SCORE_LLM_MODEL
+    CALL_LIBRARY_MAX_TRANSCRIPT_CHARS: int = 12000
+    CALL_LIBRARY_MAX_SUMMARY_CHARS: int = 6000
+    CALL_LIBRARY_LLM_TIMEOUT_SEC: float = 90.0
+    CALL_LIBRARY_STAGGER_SEC: float = 1.5  # gap between queued library jobs (≈40/min)
+    CALL_LIBRARY_STUCK_PENDING_MINUTES: int = 8
+    CALL_LIBRARY_STUCK_REQUEUE_BATCH: int = 25
+    CALL_LIBRARY_BUDGET_RETRY_SEC: float = 65.0
 
     # Org sales content themes (objections / patterns must recur across clients before content use)
     ORG_SALES_THEME_MIN_DISTINCT_CLIENTS: int = 3

@@ -328,3 +328,48 @@ class AIRecommendationEmailDraftResponse(BaseModel):
     body_html: str
     source: str = "template"  # "llm" | "template"
 
+
+# ---------------------------------------------------------------------------
+# CSV / bulk import
+# ---------------------------------------------------------------------------
+
+class ClientImportRow(BaseModel):
+    email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    phone: Optional[str] = None
+    instagram: Optional[str] = None
+    notes: Optional[str] = None
+    pipeline_column: Optional[LifecycleState] = None
+    program_start_date: Optional[datetime] = None
+    program_duration_days: Optional[int] = None
+
+    @field_validator("program_start_date", mode="before")
+    @classmethod
+    def parse_import_program_date(cls, v):
+        return parse_optional_program_datetime(v)
+
+
+class ClientImportRequest(BaseModel):
+    rows: List[ClientImportRow]
+    default_pipeline_column: LifecycleState = LifecycleState.QUALIFIED
+    run_lifecycle_reconcile: bool = True
+    source_filename: Optional[str] = None
+
+
+class ClientImportFailedRow(BaseModel):
+    row_index: int
+    email: Optional[str] = None
+    error: str
+
+
+class ClientImportResponse(BaseModel):
+    success: bool = True
+    created_count: int = 0
+    updated_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    failed_rows: List[ClientImportFailedRow] = []
+    imported_client_ids: List[str] = []
+    lifecycle_adjusted_count: int = 0
+

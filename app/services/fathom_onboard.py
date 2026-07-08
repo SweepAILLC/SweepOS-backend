@@ -1,15 +1,11 @@
-"""Fathom webhook registration on first connect.
+"""Fathom webhook registration when the API key is saved or re-saved."""
 
-Called as a background task when the Fathom API key is first saved on an org
-with no existing call data. Registers a webhook so *future* meetings auto-sync.
-
-Past meetings are never pulled here — use POST /integrations/fathom/sync (or the
-UI "Sync Fathom now" button) so key save stays fast.
-"""
 from __future__ import annotations
 
 import logging
 import uuid
+from urllib.parse import urlparse
+from typing import Any, Optional
 
 from app.core.config import settings
 from app.db.session import SessionLocal
@@ -17,8 +13,26 @@ from app.db.session import SessionLocal
 logger = logging.getLogger(__name__)
 
 
-def bootstrap_fathom_for_org(org_id_str: str) -> None:
-    """Background-safe entry point (no DB session in caller). Webhook only — no bulk sync."""
+def fathom_webhook_destination_for_org(org_id: uuid.UUID) -> str | None:
+    public_url = (getattr(settings, "BACKEND_PUBLIC_URL", None) or "").strip().rstrip("/")
+    if not public_url:
+        return None
+    return f"{public_url}/webhooks/fathom/{org_id}"
+
+
+def _is_public_webhook_destination(url: str) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        return False
+    return host not in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} and not host.endswith(".local")
+
+
+def register_fathom_webhook_for_org(org_id_str: str, *, force: bool = True) -> dict[str, Any]:
+    """
+    Register (or re-register) the Fathom webhook for an org. Runs synchronously so
+    production saves return a definitive success/failure instead of fire-and-forget tasks.
+    """
     from app.services.fathom_client import resolve_fathom_api_key
 
     db = SessionLocal()
@@ -26,58 +40,119 @@ def bootstrap_fathom_for_org(org_id_str: str) -> None:
         org_id = uuid.UUID(org_id_str)
         api_key = resolve_fathom_api_key(db, org_id)
         if not api_key:
-            logger.info("fathom_onboard: no API key for org=%s, skipping", org_id)
-            return
+            return {
+                "success": False,
+                "webhook_active": False,
+                "error": "Fathom API key not configured for this organization.",
+            }
 
-        _register_webhook(db, org_id, api_key, force=False)
+        public_url = (getattr(settings, "BACKEND_PUBLIC_URL", None) or "").strip().rstrip("/")
+        if not public_url:
+            return {
+                "success": False,
+                "webhook_active": False,
+                "error": "BACKEND_PUBLIC_URL is not set on the server; cannot create webhook destination URL.",
+            }
+
+        result = _register_webhook(db, org_id, api_key, force=force)
         db.commit()
-        logger.info("fathom_onboard: webhook bootstrap done org=%s", org_id)
-    except Exception:
-        logger.exception("fathom_onboard: bootstrap failed org=%s", org_id_str)
+        return result
+    except Exception as exc:
+        logger.exception("fathom_onboard: register failed org=%s", org_id_str)
         db.rollback()
+        return {
+            "success": False,
+            "webhook_active": False,
+            "error": str(exc) or "Webhook registration failed",
+        }
     finally:
         db.close()
+
+
+def bootstrap_fathom_for_org(org_id_str: str) -> None:
+    """Background-safe entry point (no DB session in caller). Webhook only — no bulk sync."""
+    register_fathom_webhook_for_org(org_id_str, force=False)
 
 
 def setup_fathom_webhook_background(org_id_str: str) -> None:
-    """Force webhook registration in the background (used by manual setup endpoint)."""
-    from app.services.fathom_client import resolve_fathom_api_key
+    """Force webhook registration in the background (legacy async path)."""
+    register_fathom_webhook_for_org(org_id_str, force=True)
+
+
+def reconcile_fathom_webhooks_for_existing_orgs() -> dict[str, int]:
+    """
+    Ensure existing org-level Fathom API keys have a live webhook after deploys.
+
+    This intentionally does not sync historical calls. It only creates/replaces
+    the Fathom webhook destination so future Fathom-ready recordings flow in.
+    """
+    from app.models.organization import Organization
+    from app.services.fathom_client import normalize_fathom_api_key
+
+    destination_missing = fathom_webhook_destination_for_org(
+        uuid.UUID("00000000-0000-0000-0000-000000000000")
+    ) is None
+    if destination_missing:
+        logger.info("fathom_onboard: startup reconcile skipped; BACKEND_PUBLIC_URL unset")
+        return {"checked": 0, "registered": 0, "failed": 0, "skipped": 0}
 
     db = SessionLocal()
     try:
-        org_id = uuid.UUID(org_id_str)
-        api_key = resolve_fathom_api_key(db, org_id)
-        if not api_key:
-            logger.info("fathom_onboard: no API key for org=%s, skipping", org_id)
-            return
-        _register_webhook(db, org_id, api_key, force=True)
-        db.commit()
-        logger.info("fathom_onboard: webhook setup done org=%s", org_id)
-    except Exception:
-        logger.exception("fathom_onboard: setup failed org=%s", org_id_str)
-        db.rollback()
+        org_rows = (
+            db.query(Organization.id, Organization.fathom_api_key)
+            .filter(Organization.fathom_api_key.isnot(None))
+            .all()
+        )
     finally:
         db.close()
 
+    checked = registered = failed = skipped = 0
+    for org_id, fathom_api_key in org_rows:
+        api_key = normalize_fathom_api_key(fathom_api_key)
+        if not api_key:
+            skipped += 1
+            continue
 
-def _register_webhook(db, org_id: uuid.UUID, api_key: str, *, force: bool) -> None:
+        checked += 1
+        result = register_fathom_webhook_for_org(str(org_id), force=False)
+        if result.get("success") and result.get("skipped"):
+            skipped += 1
+        elif result.get("success") and result.get("webhook_active"):
+            registered += 1
+        else:
+            failed += 1
+            logger.warning(
+                "fathom_onboard: startup reconcile failed org=%s error=%s",
+                org_id,
+                result.get("error"),
+            )
+
+    logger.info(
+        "fathom_onboard: startup reconcile complete checked=%s registered=%s skipped=%s failed=%s",
+        checked,
+        registered,
+        skipped,
+        failed,
+    )
+    return {"checked": checked, "registered": registered, "failed": failed, "skipped": skipped}
+
+
+def _register_webhook(db, org_id: uuid.UUID, api_key: str, *, force: bool) -> dict[str, Any]:
     from app.services.fathom_client import create_webhook
     from app.models.organization import Organization
     from sqlalchemy import text
 
-    public_url = (getattr(settings, "BACKEND_PUBLIC_URL", None) or "").strip().rstrip("/")
-    if not public_url:
-        logger.warning(
-            "fathom_onboard: BACKEND_PUBLIC_URL not set; skipping webhook registration for org=%s",
-            org_id,
-        )
-        return
+    destination = fathom_webhook_destination_for_org(org_id) or ""
 
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
-        return
+        return {
+            "success": False,
+            "webhook_active": False,
+            "error": "Organization not found",
+            "destination_url": destination or None,
+        }
 
-    # Idempotent column adds for fresh DBs
     try:
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))
@@ -87,15 +162,55 @@ def _register_webhook(db, org_id: uuid.UUID, api_key: str, *, force: bool) -> No
         db.rollback()
 
     existing_wh_url = getattr(org, "fathom_webhook_url", None) or ""
-    destination = f"{public_url}/integrations/fathom/webhook/{org_id}"
+    existing_wh_id = getattr(org, "fathom_webhook_id", None)
 
-    if not force and existing_wh_url == destination and getattr(org, "fathom_webhook_id", None):
+    if not force and existing_wh_url == destination and existing_wh_id:
         logger.info(
             "fathom_onboard: webhook already registered for org=%s (%s), skipping",
             org_id,
             existing_wh_url,
         )
-        return
+        return {
+            "success": True,
+            "webhook_active": True,
+            "skipped": True,
+            "webhook_id": existing_wh_id,
+            "destination_url": existing_wh_url,
+        }
+
+    if not _is_public_webhook_destination(destination):
+        if existing_wh_id and existing_wh_url:
+            logger.info(
+                "fathom_onboard: preserving existing webhook for local/non-public destination org=%s existing=%s requested=%s",
+                org_id,
+                existing_wh_url,
+                destination,
+            )
+            return {
+                "success": True,
+                "webhook_active": True,
+                "skipped": True,
+                "registration_skipped": True,
+                "reason": "non_public_destination",
+                "webhook_id": existing_wh_id,
+                "destination_url": existing_wh_url,
+                "requested_destination_url": destination,
+                "message": "Existing Fathom webhook preserved; local BACKEND_PUBLIC_URL is not publicly reachable.",
+            }
+        logger.info(
+            "fathom_onboard: skipping webhook registration for local/non-public destination org=%s requested=%s",
+            org_id,
+            destination,
+        )
+        return {
+            "success": True,
+            "webhook_active": False,
+            "skipped": True,
+            "registration_skipped": True,
+            "reason": "non_public_destination",
+            "destination_url": destination,
+            "message": "Fathom API key saved. Webhook registration is skipped in local dev unless BACKEND_PUBLIC_URL is a public HTTPS URL.",
+        }
 
     try:
         wh = create_webhook(
@@ -111,14 +226,34 @@ def _register_webhook(db, org_id: uuid.UUID, api_key: str, *, force: bool) -> No
             ],
             api_key=api_key,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("fathom_onboard: webhook create API call failed org=%s", org_id)
-        return
+        detail = str(exc)
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            try:
+                body = resp.json()
+                if isinstance(body, dict) and body.get("detail"):
+                    detail = str(body["detail"])
+            except Exception:
+                pass
+        return {
+            "success": False,
+            "webhook_active": bool(existing_wh_id and existing_wh_url),
+            "error": detail or "Fathom webhook API call failed",
+            "destination_url": destination,
+        }
 
+    webhook_id: Optional[str] = None
+    webhook_secret: Optional[str] = None
+    webhook_url: Optional[str] = None
     try:
-        org.fathom_webhook_id = str(wh.get("id") or "")[:200] or None
-        org.fathom_webhook_secret = str(wh.get("secret") or "")[:500] or None
-        org.fathom_webhook_url = str(wh.get("url") or destination)[:2000] or destination
+        webhook_id = str(wh.get("id") or "")[:200] or None
+        webhook_secret = str(wh.get("secret") or "")[:500] or None
+        webhook_url = str(wh.get("url") or destination)[:2000] or destination
+        org.fathom_webhook_id = webhook_id
+        org.fathom_webhook_secret = webhook_secret
+        org.fathom_webhook_url = webhook_url
     except Exception:
         pass
 
@@ -126,5 +261,11 @@ def _register_webhook(db, org_id: uuid.UUID, api_key: str, *, force: bool) -> No
         "fathom_onboard: webhook registered org=%s dest=%s id=%s",
         org_id,
         destination,
-        wh.get("id"),
+        webhook_id,
     )
+    return {
+        "success": True,
+        "webhook_active": bool(webhook_id and webhook_url),
+        "webhook_id": webhook_id,
+        "destination_url": webhook_url or destination,
+    }

@@ -33,8 +33,7 @@ router = APIRouter()
 
 # Available tabs
 # Note: 'owner' tab is restricted to OWNER role only
-# 'users' tab is restricted from MEMBER role
-AVAILABLE_TABS = ['brevo', 'clients', 'stripe', 'funnels', 'performance', 'content_studio', 'call_library', 'integrations', 'users', 'owner']
+AVAILABLE_TABS = ['brevo', 'clients', 'stripe', 'funnels', 'performance', 'content_studio', 'call_library', 'integrations', 'owner']
 
 
 @router.get("", response_model=List[UserSchema])

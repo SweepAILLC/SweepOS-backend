@@ -1,9 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio, call_library, automations, outreach, calendar_webhooks
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio, call_library, automations, outreach, calendar_webhooks, resources
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
 import logging
+import threading
 
 app = FastAPI(title="Sweep Coach OS API", version="1.0.0")
 
@@ -72,6 +73,7 @@ app.include_router(calendar_webhooks.router, prefix="/webhooks", tags=["calendar
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])
+app.include_router(resources.router, prefix="/resources", tags=["resources"])
 
 @app.on_event("startup")
 def _ensure_schema_columns_on_startup() -> None:
@@ -115,9 +117,18 @@ def _ensure_schema_columns_on_startup() -> None:
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_url TEXT"))
 
+        # fathom_call_records: ensure table exists (some DBs stamped past 031 without the table)
+        from app.models.fathom_call_record import FathomCallRecord
+
+        FathomCallRecord.__table__.create(db.bind, checkfirst=True)
+
         # fathom_call_records: media URLs from payload
         db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS share_url TEXT"))
         db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS video_url TEXT"))
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS meeting_title TEXT"))
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS recording_url TEXT"))
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS attendees_json JSONB"))
+        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS related_client_ids JSONB"))
 
         # call_library_reports: media URLs for embedding
         db.execute(text("ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS share_url TEXT"))
@@ -131,7 +142,24 @@ def _ensure_schema_columns_on_startup() -> None:
             )
         )
 
+        # resource_documents: owner-editable SOPs for the Resources tab
+        from app.services.resource_documents import ensure_resource_documents_table
+        ensure_resource_documents_table(db)
+
+        # org_resource_library: org-specific uploads/links library
+        from app.services.resource_library import ensure_resource_library_table
+        ensure_resource_library_table(db)
+
         db.commit()
+
+        if getattr(app_settings, "FATHOM_RECONCILE_WEBHOOKS_ON_STARTUP", True):
+            from app.services.fathom_onboard import reconcile_fathom_webhooks_for_existing_orgs
+
+            threading.Thread(
+                target=reconcile_fathom_webhooks_for_existing_orgs,
+                daemon=True,
+                name="fathom-webhook-reconcile",
+            ).start()
     except Exception as e:
         db.rollback()
         log.warning("startup schema ensure failed: %s", e)

@@ -532,9 +532,6 @@ def sync_and_reconcile_stripe_data(
         # 2. Reconcile immediately (same DB session)
         reconcile_result = reconcile_stripe_data(db, org_id=org_id)
 
-        from app.services.client_automation import reconcile_org_client_lifecycles
-        lifecycle_updated = reconcile_org_client_lifecycles(db, org_id, force=True)
-
         return {
             "success": True,
             "message": "Sync and reconciliation complete",
@@ -550,7 +547,6 @@ def sync_and_reconcile_stripe_data(
             "reconciliation": {
                 "clients_reconciled": reconcile_result.get("clients_reconciled", 0),
                 "revenue_recalculated": reconcile_result.get("revenue_recalculated", 0),
-                "lifecycle_clients_updated": lifecycle_updated,
             },
         }
     except HTTPException:

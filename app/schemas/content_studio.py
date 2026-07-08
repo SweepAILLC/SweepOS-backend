@@ -30,13 +30,14 @@ class KnowledgeOut(BaseModel):
 
 
 class StageConceptOut(BaseModel):
-    """Single video concept (long-form or short-form). Bulleted concept only — never a script."""
+    """Single video concept (long/short). Directional beats + one scripted hook — never a full script."""
 
     model_config = ConfigDict(extra="ignore")
 
     id: str
     format: Literal["long", "short"] = "short"
     title: str
+    hook: str = ""
     bullets: List[str] = Field(default_factory=list)
     why_for_icp: str = ""
     funnel_path_to_sale: str = ""

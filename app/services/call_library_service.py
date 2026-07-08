@@ -244,6 +244,11 @@ def generate_and_persist_report(
     _ensure_call_media_columns(db)
     _ensure_call_deal_columns(db)
     _ensure_fathom_meeting_title_column(db)
+    existing = (
+        db.query(CallLibraryReport)
+        .filter(CallLibraryReport.fathom_call_record_id == fathom_record_id)
+        .first()
+    )
     rec = (
         db.query(FathomCallRecord)
         .filter(
@@ -254,6 +259,11 @@ def generate_and_persist_report(
     )
     if not rec:
         logger.info("call_library skipped: no record org=%s record=%s", org_id, fathom_record_id)
+        if existing and existing.status == "pending":
+            existing.status = "failed"
+            existing.failure_reason = "orphan_fathom_record"
+            existing.updated_at = datetime.now(timezone.utc)
+            db.commit()
         return "skipped"
 
     transcript = rec.transcript_snippet or ""
@@ -261,11 +271,6 @@ def generate_and_persist_report(
     call_title = _derive_call_title(rec, db, org_id)
     input_hash = _hash_call_inputs(summary, transcript)
 
-    existing = (
-        db.query(CallLibraryReport)
-        .filter(CallLibraryReport.fathom_call_record_id == fathom_record_id)
-        .first()
-    )
     if existing and existing.status == "complete":
         prev_hash = None
         if isinstance(existing.report_json, dict):
@@ -278,6 +283,15 @@ def generate_and_persist_report(
             return "skipped"
 
     if not transcript and not summary:
+        # Content can be briefly absent during a Fathom re-ingest/enrichment window.
+        # Never clobber an already-complete report with no_content — keep the good
+        # report and let a later run refresh it once content is back.
+        if existing and existing.status == "complete":
+            logger.info(
+                "call_library skip no_content: preserving complete report record=%s",
+                fathom_record_id,
+            )
+            return "skipped"
         _upsert_report(
             db,
             org_id,
@@ -292,11 +306,50 @@ def generate_and_persist_report(
         logger.info("call_library failed: no_content record=%s", fathom_record_id)
         return "failed"
 
-    report_json = generate_call_library_report(
-        transcript=transcript,
-        summary=summary,
-        org_id=org_id,
-    )
+    try:
+        from app.services.resource_documents import get_document_content
+        from app.services.call_library_ai import (
+            DISCOVERY_AUDIT_SOP,
+            PITCHING_SOP,
+            OBJECTION_HANDLING_SOP,
+        )
+
+        discovery_sop = get_document_content(
+            db, org_id, "discovery-audit-sop", fallback=DISCOVERY_AUDIT_SOP
+        )
+        pitching_sop = get_document_content(
+            db, org_id, "pitching-sop", fallback=PITCHING_SOP
+        )
+        objection_sop = get_document_content(
+            db, org_id, "objection-handling-sop", fallback=OBJECTION_HANDLING_SOP
+        )
+        report_json = generate_call_library_report(
+            transcript=transcript,
+            summary=summary,
+            org_id=org_id,
+            discovery_audit_sop=discovery_sop,
+            pitching_sop=pitching_sop,
+            objection_handling_sop=objection_sop,
+        )
+    except RuntimeError as e:
+        if "llm_budget" in str(e).lower():
+            _upsert_report(
+                db,
+                org_id,
+                fathom_record_id,
+                rec,
+                "pending",
+                None,
+                "budget_deferred",
+                call_title=call_title,
+                call_score=None,
+            )
+            from app.services.call_library_queue import schedule_budget_retry
+
+            schedule_budget_retry(str(org_id), str(fathom_record_id))
+            logger.info("call_library budget deferred record=%s", fathom_record_id)
+            return "deferred"
+        report_json = None
 
     if isinstance(report_json, dict):
         report_json["_input_hash"] = input_hash
@@ -538,28 +591,39 @@ def requeue_llm_failed_reports(
     background_tasks: "BackgroundTasks",
 ) -> int:
     """
-    Re-run report generation for rows where the LLM failed. Matches the Call Library UI:
-    failure_reason == 'llm_failed', status == 'failed' (shows the “Analyzing…” chip while not complete).
+    Re-run report generation for rows where the LLM failed or was budget-deferred.
     """
     _ensure_call_title_override_column(db)
     rows = (
         db.query(CallLibraryReport)
         .filter(
             CallLibraryReport.org_id == org_id,
-            CallLibraryReport.failure_reason == "llm_failed",
-            CallLibraryReport.status == "failed",
+            CallLibraryReport.status.in_(("failed", "pending")),
+            CallLibraryReport.failure_reason.in_(("llm_failed", "budget_deferred")),
         )
         .all()
     )
     if not rows:
         return 0
+    ids: List[uuid.UUID] = []
     for row in rows:
         row.status = "pending"
         row.failure_reason = None
         row.updated_at = datetime.now(timezone.utc)
+        if row.fathom_call_record_id:
+            ids.append(row.fathom_call_record_id)
     db.commit()
-    oid_str = str(org_id)
-    for row in rows:
-        fid = row.fathom_call_record_id
-        background_tasks.add_task(run_call_library_report_background, oid_str, str(fid))
-    return len(rows)
+    from app.services.call_library_queue import schedule_call_library_reports
+
+    schedule_call_library_reports(org_id, ids, background_tasks)
+    return len(ids)
+
+
+def requeue_stuck_pending_reports(
+    db: Session,
+    org_id: uuid.UUID,
+    background_tasks: "BackgroundTasks",
+) -> int:
+    from app.services.call_library_queue import requeue_stuck_pending_reports as _requeue
+
+    return _requeue(db, org_id, background_tasks)

@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 
 from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
 from app.models.user import User
+from app.services.content_sop import SOP_VERSION, marketing_intel_knowledge_block
+from app.services.resource_documents import sop_content_fingerprint
 from app.services.content_studio_fathom_context import collect_fathom_sales_signals
 from app.services.llm_client import chat_json, llm_available
 from app.services.user_ai_profile_context import extract_ai_profile_for_llm
@@ -127,6 +129,10 @@ def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
     )
     payload = {
         "v": BUNDLE_VERSION,
+        "sop_v": SOP_VERSION,
+        "sop_hash": sop_content_fingerprint(
+            db, org_id, ["content-ideation-sop", "building-an-offer-sop"]
+        ),
         "tk": tk[:50],
         "ic": ic,
         "ac": ac,
@@ -149,6 +155,7 @@ def _normalize_concept(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     title = str(raw.get("title") or raw.get("hook") or "").strip()
     if not title:
         return None
+    hook = str(raw.get("hook") or "").strip()[:300]
     bullets_in = raw.get("bullets") if isinstance(raw.get("bullets"), list) else []
     bullets: List[str] = []
     for b in bullets_in[:8]:
@@ -161,6 +168,7 @@ def _normalize_concept(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "id": str(raw.get("id") or uuid.uuid4()),
         "format": fmt,
         "title": title[:240],
+        "hook": hook,
         "bullets": bullets,
         "why_for_icp": why,
         "funnel_path_to_sale": funnel,
@@ -211,9 +219,10 @@ Return ONLY valid JSON (no markdown) with this exact top-level shape:
       "concepts": [
         {
           "format": "long" | "short",
-          "title": "string — concept headline (NOT a script line, NOT a hook to be read on camera)",
-          "bullets": ["string — concrete shot/structure beat"],
-          "why_for_icp": "string — 2-3 sentences tying this concept to the ICP from INTELLIGENCE_PROFILE (who they are, what they want, why this lands)",
+          "title": "string — concept headline / working name (NOT the hook, NOT a script line)",
+          "hook": "string — ONE scripted 1-line hook, the only verbatim line. Obeys the SOP: widest relevant audience, ZERO niche-specific terms, one universal driver, passes the swap test",
+          "bullets": ["string — concrete structure beat in the order: proof/credibility, re-hook, body/value, CTA (directional, NOT scripted)"],
+          "why_for_icp": "string — 2-3 sentences tying this concept to the ICP from INTELLIGENCE_PROFILE AND the specific objection/goal from the Fathom SIGNALS it pre-handles",
           "funnel_path_to_sale": "string — 1 sentence: how this piece intentionally moves the viewer one step closer to a sale of the operator's offer"
         }
       ]
@@ -226,18 +235,26 @@ Return ONLY valid JSON (no markdown) with this exact top-level shape:
 HARD RULES:
 - Output ONLY the three stages: TOF, MOF, BOF — in that order.
 - Each stage gives 4-6 concepts. Mix `format`: at least one "long" and at least one "short" per stage when data supports it.
-- NEVER write scripts, captions, hooks-as-VO, voiceover lines, or social copy. `bullets` describe structure / shots / beats only.
+- `hook` is the ONLY verbatim/scripted line allowed — exactly ONE line per concept. NEVER write full scripts, captions, voiceover lines, or social copy. `bullets` stay directional (structure/beats), never scripted.
 - Concepts must be PURELY grounded in Fathom signals + INTELLIGENCE_PROFILE. Do not invent facts, names, numbers, or claims.
+- CONVERSION MANDATE (CONVERSION IDEATION METHOD): every concept must be reverse-engineered from the sales process. Build each around a real objection, bottleneck, pain, or converting goal found in the Fathom SIGNALS so the content pre-handles objections BEFORE the prospect reaches a call. No generic content that does not pre-sell the offer.
 - Stage purpose:
   - TOF: trending, scroll-stopping concepts that mine the most attention-grabbing pains/shocks/beliefs from Fathom data and tie back to the ICP's surface-level pain.
   - MOF: education concepts the operator already teaches on sales calls (frameworks, reframes, decision rules, myth-busts). Pre-handles objections.
   - BOF: client wins & case study breakdowns from `insights[].wins`, `insights[].testimonial_stories`, `active_client_insights[].wins`. If those are empty, return fewer or 0 BOF concepts and say so in the stage intro — never fabricate.
-- Every concept MUST include `funnel_path_to_sale`. The piece is intentionally curated to bring the viewer one step closer to buying the operator's offer.
-- Every concept MUST include `why_for_icp` referencing the ICP fields in INTELLIGENCE_PROFILE (target_audience, business_description, unique_selling_proposition, pipeline_priorities, offer_ladder).
+- Every concept MUST include `hook` (1 scripted line), `bullets` (proof → re-hook → body → CTA beats), `why_for_icp`, and `funnel_path_to_sale`.
+- `why_for_icp` MUST reference the ICP fields in INTELLIGENCE_PROFILE (target_audience, business_description, unique_selling_proposition, pipeline_priorities, offer_ladder) AND name the specific objection/goal from the Fathom SIGNALS the concept dissolves.
+- KNOWLEDGE_BASE (CONTENT_IDEATION_SOP + OFFER_BUILDING_SOP + CONVERSION IDEATION METHOD) is a MANDATORY creative constraint:
+  - 3-layer funnel: the `hook` behaves as the HOOK (widest relevant audience, ZERO niche terms, one universal driver, passes the swap test); niche/ICP specificity only enters in the amplifier beats (context → symptom → system); the final beat is the CTA (one ask tied to the amplifier's specific promise). Pick hook types from the SOP's 13 that fit each stage's goal.
+  - Reinforce the OFFER: where relevant, echo the operator's positioning levers (owned category, named enemy/wrong-cause, named mechanism, proof) and move the value equation (raise believable outcome/likelihood, lower perceived time/effort).
+  - The frameworks are the STRUCTURE; INTELLIGENCE_PROFILE + Fathom SIGNALS are the SUBSTANCE.
 - No PII (no full names). Paraphrase any quotes."""
 
     user = f"""INTELLIGENCE_PROFILE (ICP, offer ladder, USP, voice — anchor every concept to this):
 {profile_block}
+
+KNOWLEDGE_BASE (mandatory frameworks — obey the structure, personalize with INTELLIGENCE_PROFILE + SIGNALS):
+{marketing_intel_knowledge_block(db, org_id)}
 
 GROUNDING (mandatory stage → Fathom field mapping):
 {grounding}
@@ -310,6 +327,7 @@ def default_bundle_placeholder(fingerprint: str) -> Dict[str, Any]:
                         "id": str(uuid.uuid4()),
                         "format": fmt,
                         "title": ttl,
+                        "hook": "",
                         "bullets": list(b),
                         "why_for_icp": (
                             "Once Fathom calls + Intelligence ICP are populated, this section will tie each "

@@ -274,7 +274,6 @@ def check_tab_access(
     Logic:
     1. Role-based restrictions:
        - 'owner' tab: Only OWNER role (and main org users)
-       - 'users' tab: Not accessible to MEMBER role
     2. Users in main org always have access to all tabs (including owner)
     3. Check user-specific permissions first (overrides org permissions)
     4. Check organization-level permissions
@@ -288,12 +287,7 @@ def check_tab_access(
         if str(scope_org_id) == str(MAIN_ORG_ID):
             return True  # Main org users always have access
         return user.role == UserRole.OWNER
-    
-    # 'users' tab: MEMBER role cannot access
-    if tab_name == 'users':
-        if user.role == UserRole.MEMBER:
-            return False
-    
+
     # Main org users always have access to all other tabs
     if str(scope_org_id) == str(MAIN_ORG_ID):
         return True

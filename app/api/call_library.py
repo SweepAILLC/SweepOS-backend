@@ -34,13 +34,18 @@ def _org_id(user: User) -> uuid.UUID:
 
 @router.get("")
 def list_call_library(
+    background_tasks: BackgroundTasks,
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     _require_call_library_tab(db, current_user)
-    return cls.get_call_library_for_org(db, _org_id(current_user), limit=limit, offset=offset)
+    oid = _org_id(current_user)
+    from app.services.call_library_queue import maybe_drain_stuck_pending_on_read
+
+    maybe_drain_stuck_pending_on_read(db, oid, background_tasks)
+    return cls.get_call_library_for_org(db, oid, limit=limit, offset=offset)
 
 
 @router.patch("/{report_id}")
@@ -70,4 +75,16 @@ def retry_llm_failed_call_reports(
     """Re-queue report generation for calls where the LLM previously failed (still showing as non-complete / analyzing)."""
     _require_call_library_tab(db, current_user)
     n = cls.requeue_llm_failed_reports(db, _org_id(current_user), background_tasks)
+    return {"requeued": n}
+
+
+@router.post("/retry-stuck-pending")
+def retry_stuck_pending_call_reports(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Re-queue library rows stuck in pending (job never ran or was starved during bulk upload)."""
+    _require_call_library_tab(db, current_user)
+    n = cls.requeue_stuck_pending_reports(db, _org_id(current_user), background_tasks)
     return {"requeued": n}

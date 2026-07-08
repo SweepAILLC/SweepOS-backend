@@ -396,6 +396,7 @@ def update_client_lifecycle_state(db: Session, client: Client, force: bool = Fal
         except Exception as automation_error:
             print(f"[AUTOMATION_ENGINE] ⚠️  Error enqueueing offboarding job: {automation_error}")
     if target_str == LifecycleState.DEAD.value:
+        hook_sp = db.begin_nested()
         try:
             from app.long_jobs import schedule_background_work
             from app.services.call_insight_service import (
@@ -411,7 +412,9 @@ def update_client_lifecycle_state(db: Session, client: Client, force: bool = Fal
                     str(client.org_id),
                     str(client.id),
                 )
+            hook_sp.commit()
         except Exception as dead_hook_err:
+            hook_sp.rollback()
             print(f"[CLIENT_AUTOMATION] ⚠️  Dead lifecycle insight hook failed: {dead_hook_err}")
     return True
 
@@ -477,15 +480,14 @@ def run_pipeline_lifecycle_for_org(
     clients = db.query(Client).filter(Client.org_id == org_id).all()
     changed = 0
     for client in clients:
+        sp = db.begin_nested()
         try:
             if apply_automatic_lifecycle_for_client(db, client, force=force):
                 changed += 1
+            sp.commit()
         except Exception as client_err:
+            sp.rollback()
             print(f"[CLIENT_AUTOMATION] pipeline rule skip for {client.id}: {client_err}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
     if changed:
         try:
             db.commit()

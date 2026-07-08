@@ -150,12 +150,12 @@ def queue_fathom_relink_followups(
         return
     from app.long_jobs import schedule_background_work
     from app.services.call_insight_service import run_call_insight_background
-    from app.services.call_library_service import run_call_library_report_background
+    from app.services.call_library_queue import schedule_call_library_reports
 
     oid = str(org_id)
     for rid in fathom_record_ids:
         schedule_background_work(run_call_insight_background, background_tasks, oid, str(rid))
-        schedule_background_work(run_call_library_report_background, background_tasks, oid, str(rid))
+    schedule_call_library_reports(org_id, fathom_record_ids, background_tasks)
 
 
 def relink_fathom_for_client_and_queue(

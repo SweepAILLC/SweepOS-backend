@@ -167,13 +167,21 @@ def _active_client_insights(db: Session, org_id: uuid.UUID, limit: int = 14) -> 
 
 
 def _fathom_summaries(db: Session, org_id: uuid.UUID, limit: int = 10) -> List[str]:
-    rows = (
-        db.query(FathomCallRecord)
-        .filter(FathomCallRecord.org_id == org_id)
-        .order_by(desc(FathomCallRecord.updated_at))
-        .limit(limit)
-        .all()
-    )
+    try:
+        rows = (
+            db.query(FathomCallRecord)
+            .filter(FathomCallRecord.org_id == org_id)
+            .order_by(desc(FathomCallRecord.updated_at))
+            .limit(limit)
+            .all()
+        )
+    except Exception as exc:
+        from sqlalchemy.exc import ProgrammingError
+
+        if isinstance(exc, ProgrammingError) or "does not exist" in str(exc).lower():
+            db.rollback()
+            return []
+        raise
     out: List[str] = []
     for r in rows:
         t = (r.summary_text or "").strip()

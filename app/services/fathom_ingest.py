@@ -179,8 +179,20 @@ def upsert_call_record(
         db.add(row)
 
     row.client_id = client_id
-    row.summary_text = summary_md[:50000] if summary_md else None
-    row.transcript_snippet = truncate_for_tokens(transcript_text, 24000) if transcript_text else None
+
+    # Preserve existing content on re-ingest. The bulk-sync list endpoint returns
+    # no summary/transcript, so blindly assigning would wipe previously enriched
+    # calls to NULL and flip their Call Library reports to "no_content".
+    new_summary = summary_md[:50000] if summary_md else None
+    new_transcript = truncate_for_tokens(transcript_text, 24000) if transcript_text else None
+    content_changed = False
+    if new_summary and new_summary != row.summary_text:
+        row.summary_text = new_summary
+        content_changed = True
+    if new_transcript and new_transcript != row.transcript_snippet:
+        row.transcript_snippet = new_transcript
+        content_changed = True
+
     row.meeting_at = meeting_at
     if meeting_title is not None:
         row.meeting_title = (meeting_title or "")[:500] or None
@@ -200,7 +212,10 @@ def upsert_call_record(
         row.attendees_json = attendees_json
     if related_client_ids is not None:
         row.related_client_ids = related_client_ids
-    row.sentiment_status = "pending"
+    # Only (re)queue sentiment when we actually have new content or none yet, so a
+    # metadata-only re-ingest doesn't churn LLM re-analysis of unchanged calls.
+    if content_changed or not row.sentiment_status:
+        row.sentiment_status = "pending"
     row.updated_at = datetime.now(timezone.utc)
     if not row.created_at:
         row.created_at = datetime.now(timezone.utc)
@@ -472,48 +487,41 @@ def run_fathom_sync_background(org_id_str: str) -> None:
 
 def queue_fathom_sync_followups(background_tasks: Any, org_id: uuid.UUID, sync_result: Dict[str, Any]) -> None:
     """Queue call-insight and call-library background jobs after sync (shared with integrations + Content Studio)."""
-    from app.long_jobs import schedule_background_work
+    from app.long_jobs import schedule_background_work, schedule_delayed_background_work
     from app.services.call_insight_service import run_call_insight_background
-    from app.services.call_library_service import run_call_library_report_background
+    from app.services.call_library_queue import schedule_call_library_reports
 
     oid_str = str(org_id)
     enrichment_ids = {str(x) for x in (sync_result.get("pending_enrichment_record_ids") or [])}
+
+    # Insights only for client-linked rows not handled solely by enrichment.
     for rid in sync_result.get("pending_insight_record_ids") or []:
         if str(rid) in enrichment_ids:
             continue
         schedule_background_work(run_call_insight_background, background_tasks, oid_str, str(rid))
+
+    # Always queue library LLM with stagger — bulk sync previously skipped these when
+    # enrichment_ids overlapped, leaving rows stuck in pending forever.
+    library_ids: List[uuid.UUID] = []
     for rid in sync_result.get("pending_library_record_ids") or []:
-        if str(rid) in enrichment_ids:
+        try:
+            library_ids.append(uuid.UUID(str(rid)))
+        except ValueError:
             continue
-        schedule_background_work(run_call_library_report_background, background_tasks, oid_str, str(rid))
+    if library_ids:
+        schedule_call_library_reports(org_id, library_ids, background_tasks)
+
+    stagger = float(getattr(app_settings, "FATHOM_ENRICHMENT_STAGGER_SEC", 3) or 3)
     for i, rid in enumerate(sorted(enrichment_ids)):
-        delay_sec = i * float(getattr(app_settings, "FATHOM_ENRICHMENT_STAGGER_SEC", 3) or 3)
-        if delay_sec > 0:
-
-            def _kick(
-                off: str = oid_str,
-                record_id: str = str(rid),
-                attempt: str = "1",
-            ) -> None:
-                schedule_background_work(
-                    run_fathom_webhook_enrichment_and_followups,
-                    None,
-                    off,
-                    record_id,
-                    attempt,
-                )
-
-            t = threading.Timer(delay_sec, _kick)
-            t.daemon = True
-            t.start()
-        else:
-            schedule_background_work(
-                run_fathom_webhook_enrichment_and_followups,
-                background_tasks,
-                oid_str,
-                str(rid),
-                "1",
-            )
+        delay_sec = i * stagger
+        schedule_delayed_background_work(
+            run_fathom_webhook_enrichment_and_followups,
+            background_tasks,
+            delay_sec,
+            oid_str,
+            str(rid),
+            "1",
+        )
 
 
 def _refresh_fathom_row_from_api(db: Session, rec: FathomCallRecord, api_key: Optional[str]) -> bool:
@@ -638,13 +646,11 @@ def run_fathom_webhook_enrichment_and_followups(
             .first()
         )
         if not lib_row or lib_row.status != "complete":
-            # queue_fathom_webhook_record_followups fast-paths library when content is already
-            # complete on attempt 1 — avoid double LLM runs.
             skip_library = attempt == 1 and not still_thin
             if not skip_library:
-                schedule_background_work(
-                    run_call_library_report_background, None, org_id_str, fathom_record_uuid_str
-                )
+                from app.services.call_library_queue import schedule_call_library_reports
+
+                schedule_call_library_reports(org_id, [rec_id], None)
         if rec.client_id:
             schedule_background_work(run_call_insight_background, None, org_id_str, fathom_record_uuid_str)
         logger.info(
@@ -669,7 +675,7 @@ def queue_fathom_webhook_record_followups(
     from app.db.session import SessionLocal
     from app.long_jobs import schedule_background_work
     from app.services.call_insight_context import is_meeting_snapshot_thin
-    from app.services.call_library_service import run_call_library_report_background
+    from app.services.call_library_queue import schedule_call_library_reports
 
     oid_str = str(org_id)
     rid_str = str(fathom_call_record_id)
@@ -690,9 +696,7 @@ def queue_fathom_webhook_record_followups(
 
     if fast_path:
         # Webhook payload already has enough content — start library LLM immediately.
-        schedule_background_work(
-            run_call_library_report_background, background_tasks, oid_str, rid_str
-        )
+        schedule_call_library_reports(org_id, [fathom_call_record_id], background_tasks)
 
     schedule_background_work(
         run_fathom_webhook_enrichment_and_followups,

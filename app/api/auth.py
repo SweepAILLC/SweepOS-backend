@@ -341,8 +341,6 @@ def update_user_settings(
             )
         user_row.hashed_password = get_password_hash(settings_data.new_password)
     
-    _fathom_key_changed = False
-    _fathom_key_requested = False
     if settings_data.fathom_api_key is not None:
         from app.services.org_user_context import user_can_manage_org_integrations
 
@@ -356,10 +354,7 @@ def update_user_settings(
         if not org:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
         new_key = normalize_fathom_api_key(settings_data.fathom_api_key)
-        old_key = normalize_fathom_api_key(getattr(org, "fathom_api_key", None))
         org.fathom_api_key = new_key
-        _fathom_key_changed = bool(new_key) and new_key != old_key
-        _fathom_key_requested = bool(new_key)
 
     if settings_data.ai_profile is not None:
         from app.services.org_intelligence_profile import set_org_ai_profile
@@ -368,13 +363,6 @@ def update_user_settings(
 
     db.commit()
     db.refresh(user_row)
-
-    if _fathom_key_changed or _fathom_key_requested:
-        _fathom_org_id = getattr(current_user, "selected_org_id", user_row.org_id)
-        from app.services.fathom_onboard import setup_fathom_webhook_background
-
-        # Always register/refresh the webhook when the key changes.
-        background_tasks.add_task(setup_fathom_webhook_background, str(_fathom_org_id))
 
     role_value = role_to_api(user_row.role)
     org_id = getattr(current_user, "selected_org_id", user_row.org_id)

@@ -50,6 +50,7 @@ def chat_json(
     temperature: float = 0.0,
     timeout: float = 60.0,
     org_id: Optional[uuid.UUID] = None,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Single-turn chat; request JSON object in response. Parses first JSON object from text.
@@ -67,8 +68,8 @@ def chat_json(
     system_prompt, user_prompt = sanitize_llm_user_payload(system_prompt, user_prompt, max_total)
 
     if provider == "gemini":
-        return _gemini_generate_json(api_key, system_prompt, user_prompt, temperature, timeout)
-    return _openai_chat_json(api_key, system_prompt, user_prompt, temperature, timeout)
+        return _gemini_generate_json(api_key, system_prompt, user_prompt, temperature, timeout, model=model)
+    return _openai_chat_json(api_key, system_prompt, user_prompt, temperature, timeout, model=model)
 
 
 def _gemini_generate_json(
@@ -77,12 +78,14 @@ def _gemini_generate_json(
     user: str,
     temperature: float,
     timeout: float,
+    *,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
-    model = settings.HEALTH_SCORE_LLM_MODEL.strip()
-    if not model.startswith("models/"):
-        model_id = f"models/{model}"
+    model_name = (model or settings.HEALTH_SCORE_LLM_MODEL or "").strip()
+    if not model_name.startswith("models/"):
+        model_id = f"models/{model_name}"
     else:
-        model_id = model
+        model_id = model_name
     url = f"https://generativelanguage.googleapis.com/v1beta/{model_id}:generateContent"
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
@@ -111,12 +114,14 @@ def _openai_chat_json(
     user: str,
     temperature: float,
     timeout: float,
+    *,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
-    model = settings.HEALTH_SCORE_LLM_MODEL.strip()
+    model_name = (model or settings.HEALTH_SCORE_LLM_MODEL or "").strip()
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     body = {
-        "model": model,
+        "model": model_name,
         "temperature": temperature,
         "response_format": {"type": "json_object"},
         "messages": [
