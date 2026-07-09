@@ -25,11 +25,23 @@ def _library_stagger_sec() -> float:
 
 
 def _stuck_pending_minutes() -> int:
-    return int(getattr(settings, "CALL_LIBRARY_STUCK_PENDING_MINUTES", 2) or 2)
+    return int(getattr(settings, "CALL_LIBRARY_STUCK_PENDING_MINUTES", 15) or 15)
 
 
 def _ready_pending_seconds() -> int:
     return int(getattr(settings, "CALL_LIBRARY_READY_PENDING_SEC", 45) or 45)
+
+
+def _max_batch_size() -> int:
+    return int(getattr(settings, "CALL_LIBRARY_MAX_BATCH_SIZE", 8) or 8)
+
+
+def _batch_job_timeout_sec(batch_len: int) -> int:
+    llm_timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
+    stagger = _library_stagger_sec()
+    per_item = llm_timeout + stagger + 15.0
+    job_timeout = int(batch_len * per_item) + 180
+    return max(min(job_timeout, 7200), 600)
 
 
 def run_call_library_reports_batch_background(
@@ -51,10 +63,6 @@ def run_call_library_reports_batch_background(
             )
 
 
-def _max_batch_size() -> int:
-    return int(getattr(settings, "CALL_LIBRARY_MAX_BATCH_SIZE", 12) or 12)
-
-
 def schedule_call_library_reports(
     org_id: uuid.UUID,
     record_ids: List[uuid.UUID],
@@ -63,15 +71,15 @@ def schedule_call_library_reports(
     start_index: int = 0,
 ) -> int:
     """
-    Queue LLM report jobs with stagger so we stay under per-org LLM budget (~45/min).
+    Queue LLM report jobs in chained batches so bulk sync never floods the worker.
 
-    In production (REDIS_URL + USE_RQ_LONG_JOBS), jobs are enqueued to the RQ worker
-    instead of the web dyno — BackgroundTasks cannot run hour-long LLM batches reliably.
+    Each batch runs up to CALL_LIBRARY_MAX_BATCH_SIZE reports with in-job stagger.
+    Additional batches are delayed so only one batch runs at a time per org wave.
     """
     if not record_ids:
         return 0
     from app.db.session import SessionLocal
-    from app.long_jobs import long_jobs_enabled, schedule_background_work
+    from app.long_jobs import long_jobs_enabled, schedule_background_work, schedule_delayed_background_work
     from app.services.call_library_service import (
         filter_fathom_records_needing_library_analysis,
     )
@@ -85,48 +93,53 @@ def schedule_call_library_reports(
         return 0
 
     max_batch = _max_batch_size()
-    if len(record_ids) > max_batch:
-        logger.info(
-            "call_library capping batch org=%s requested=%s max=%s",
-            org_id,
-            len(record_ids),
-            max_batch,
-        )
-        record_ids = record_ids[:max_batch]
-
     oid = str(org_id)
     stagger = _library_stagger_sec()
-    id_strs = [str(r) for r in record_ids]
-
-    if start_index > 0:
-        time.sleep(start_index * stagger)
-
-    # Web dynos must not run long LLM batches; the worker process handles these in prod.
     tasks = None if long_jobs_enabled() else background_tasks
 
+    chunks: List[List[uuid.UUID]] = [
+        record_ids[i : i + max_batch] for i in range(0, len(record_ids), max_batch)
+    ]
+    # Delay between batch jobs ≈ time for prior batch to finish (stagger + LLM per item).
     llm_timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
-    per_item = llm_timeout + stagger + 15.0
-    job_timeout = int(len(record_ids) * per_item) + 180
-    job_timeout = max(job_timeout, 600)
-    job_timeout = min(job_timeout, 7200)
+    inter_batch_delay = max_batch * (stagger + llm_timeout * 0.35) + 30.0
 
-    schedule_background_work(
-        run_call_library_reports_batch_background,
-        tasks,
-        oid,
-        id_strs,
-        prefer_rq=True,
-        job_timeout=job_timeout,
-    )
+    queued = 0
+    for chunk_idx, chunk in enumerate(chunks):
+        id_strs = [str(r) for r in chunk]
+        job_timeout = _batch_job_timeout_sec(len(chunk))
+        delay_sec = (start_index + chunk_idx) * inter_batch_delay
+
+        if delay_sec <= 0:
+            schedule_background_work(
+                run_call_library_reports_batch_background,
+                tasks,
+                oid,
+                id_strs,
+                prefer_rq=True,
+                job_timeout=job_timeout,
+            )
+        else:
+            schedule_delayed_background_work(
+                run_call_library_reports_batch_background,
+                tasks,
+                delay_sec,
+                oid,
+                id_strs,
+                prefer_rq=True,
+                job_timeout=job_timeout,
+            )
+        queued += len(chunk)
 
     logger.info(
-        "call_library queued org=%s count=%s stagger_s=%s rq=%s batch=true",
+        "call_library queued org=%s total=%s batches=%s stagger_s=%s rq=%s",
         org_id,
-        len(record_ids),
+        queued,
+        len(chunks),
         stagger,
         long_jobs_enabled(),
     )
-    return len(record_ids)
+    return queued
 
 
 def find_pending_report_ids_with_content(
@@ -169,13 +182,39 @@ def find_pending_report_ids_with_content(
     return [r[0] for r in rows if r[0] is not None]
 
 
-def find_stuck_pending_report_ids(db: Session, org_id: uuid.UUID) -> List[uuid.UUID]:
-    """Pending rows older than threshold — job likely never ran or was starved."""
-    return find_pending_report_ids_with_content(
-        db,
-        org_id,
-        min_age_seconds=_stuck_pending_minutes() * 60,
+def find_recoverable_failed_report_ids(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    limit: Optional[int] = None,
+) -> List[uuid.UUID]:
+    """Failed rows that can be retried once content exists or LLM had a transient miss."""
+    from app.models.fathom_call_record import FathomCallRecord
+    from sqlalchemy import or_
+
+    batch = limit or int(getattr(settings, "CALL_LIBRARY_STUCK_REQUEUE_BATCH", 25) or 25)
+    rows = (
+        db.query(CallLibraryReport.fathom_call_record_id)
+        .join(
+            FathomCallRecord,
+            FathomCallRecord.id == CallLibraryReport.fathom_call_record_id,
+        )
+        .filter(
+            CallLibraryReport.org_id == org_id,
+            CallLibraryReport.status == "failed",
+            CallLibraryReport.failure_reason.in_(
+                ("llm_failed", "llm_empty", "budget_deferred", "no_content")
+            ),
+            or_(
+                FathomCallRecord.summary_text != "",
+                FathomCallRecord.transcript_snippet != "",
+            ),
+        )
+        .order_by(CallLibraryReport.updated_at.asc())
+        .limit(batch)
+        .all()
     )
+    return [r[0] for r in rows if r[0] is not None]
 
 
 def mark_orphan_pending_reports_failed(db: Session, org_id: uuid.UUID) -> int:
@@ -222,15 +261,30 @@ def requeue_pending_reports(
     background_tasks: Any | None,
     *,
     min_age_seconds: int = 0,
+    include_failed: bool = True,
 ) -> int:
+    """Re-queue stuck pending (very old) and recoverable failed rows — not in-flight pending."""
     mark_orphan_pending_reports_failed(db, org_id)
-    ids = find_pending_report_ids_with_content(
-        db,
-        org_id,
-        min_age_seconds=min_age_seconds,
-    )
+    ids: List[uuid.UUID] = []
+    if min_age_seconds > 0:
+        ids.extend(
+            find_pending_report_ids_with_content(
+                db,
+                org_id,
+                min_age_seconds=min_age_seconds,
+            )
+        )
+    if include_failed:
+        for rid in find_recoverable_failed_report_ids(db, org_id):
+            if rid not in ids:
+                ids.append(rid)
     if not ids:
         return 0
+
+    max_requeue = int(getattr(settings, "CALL_LIBRARY_MAX_REQUEUE_PER_REFRESH", 10) or 10)
+    if len(ids) > max_requeue:
+        ids = ids[:max_requeue]
+
     for row in (
         db.query(CallLibraryReport)
         .filter(
@@ -239,11 +293,13 @@ def requeue_pending_reports(
         )
         .all()
     ):
+        row.status = "pending"
         row.failure_reason = None
+        row.updated_at = datetime.now(timezone.utc)
     db.commit()
     schedule_call_library_reports(org_id, ids, background_tasks)
     logger.info(
-        "call_library requeued pending org=%s count=%s min_age_s=%s",
+        "call_library requeued org=%s count=%s min_age_s=%s",
         org_id,
         len(ids),
         min_age_seconds,
@@ -283,7 +339,7 @@ def maybe_drain_stuck_pending_on_read(
             db,
             org_id,
             background_tasks,
-            min_age_seconds=max(_stuck_pending_minutes() * 60, _ready_pending_seconds()),
+            min_age_seconds=_stuck_pending_minutes() * 60,
         )
         if n:
             logger.info("call_library auto-drain on read org=%s requeued=%s", org_id, n)
@@ -308,19 +364,17 @@ def schedule_budget_retry(org_id_str: str, record_id_str: str) -> None:
 
 
 def drain_stuck_pending_all_orgs() -> int:
-    """Worker-safe: re-queue pending library rows stuck past threshold (all orgs)."""
+    """Worker-safe: re-queue only genuinely stuck/failed rows (not in-flight pending)."""
     from app.db.session import SessionLocal
     from app.models.call_library_report import CallLibraryReport
 
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=_stuck_pending_minutes())
     db = SessionLocal()
     try:
         org_ids = {
             r[0]
             for r in db.query(CallLibraryReport.org_id)
             .filter(
-                CallLibraryReport.status == "pending",
-                CallLibraryReport.updated_at < cutoff,
+                CallLibraryReport.status.in_(("pending", "failed")),
             )
             .distinct()
             .all()
@@ -333,6 +387,7 @@ def drain_stuck_pending_all_orgs() -> int:
                 org_id,
                 None,
                 min_age_seconds=_stuck_pending_minutes() * 60,
+                include_failed=True,
             )
         return total
     finally:

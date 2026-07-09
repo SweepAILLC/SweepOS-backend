@@ -500,7 +500,6 @@ def queue_fathom_sync_followups(background_tasks: Any, org_id: uuid.UUID, sync_r
     """Queue call-insight and call-library background jobs after sync (shared with integrations + Content Studio)."""
     from app.long_jobs import schedule_background_work, schedule_delayed_background_work
     from app.services.call_insight_service import run_call_insight_background
-    from app.services.call_library_queue import schedule_call_library_reports
 
     oid_str = str(org_id)
     enrichment_ids = {str(x) for x in (sync_result.get("pending_enrichment_record_ids") or [])}
@@ -511,16 +510,9 @@ def queue_fathom_sync_followups(background_tasks: Any, org_id: uuid.UUID, sync_r
             continue
         schedule_background_work(run_call_insight_background, background_tasks, oid_str, str(rid))
 
-    # Always queue library LLM with stagger — bulk sync previously skipped these when
-    # enrichment_ids overlapped, leaving rows stuck in pending forever.
-    library_ids: List[uuid.UUID] = []
-    for rid in sync_result.get("pending_library_record_ids") or []:
-        try:
-            library_ids.append(uuid.UUID(str(rid)))
-        except ValueError:
-            continue
-    if library_ids:
-        schedule_call_library_reports(org_id, library_ids, background_tasks)
+    # Bulk list sync has no summary/transcript — enrichment jobs below fetch content
+    # from Fathom, then each job queues Call Library analysis when ready.
+    # Do NOT schedule library LLM here (causes no_content / wasted tokens).
 
     stagger = float(getattr(app_settings, "FATHOM_ENRICHMENT_STAGGER_SEC", 3) or 3)
     for i, rid in enumerate(sorted(enrichment_ids)):
@@ -661,6 +653,17 @@ def run_fathom_webhook_enrichment_and_followups(
             if not skip_library:
                 from app.services.call_library_queue import schedule_call_library_reports
 
+                # Reset no_content failures once enrichment has transcript/summary.
+                if (
+                    lib_row
+                    and lib_row.status == "failed"
+                    and lib_row.failure_reason == "no_content"
+                    and not still_thin
+                ):
+                    lib_row.status = "pending"
+                    lib_row.failure_reason = None
+                    lib_row.updated_at = datetime.now(timezone.utc)
+                    db.commit()
                 schedule_call_library_reports(org_id, [rec_id], None)
         if rec.client_id:
             schedule_background_work(run_call_insight_background, None, org_id_str, fathom_record_uuid_str)

@@ -161,17 +161,19 @@ class Settings(BaseSettings):
     CALL_LIBRARY_MAX_SUMMARY_CHARS: int = 6000
     CALL_LIBRARY_LLM_TIMEOUT_SEC: float = 90.0
     CALL_LIBRARY_STAGGER_SEC: float = 1.5  # gap between queued library jobs (≈40/min)
-    CALL_LIBRARY_STUCK_PENDING_MINUTES: int = 2
+    CALL_LIBRARY_STUCK_PENDING_MINUTES: int = 15  # only requeue pending older than this
     CALL_LIBRARY_READY_PENDING_SEC: int = 45
     CALL_LIBRARY_STUCK_REQUEUE_BATCH: int = 25
     CALL_LIBRARY_BUDGET_RETRY_SEC: float = 65.0
-    # Max reports queued per schedule/requeue call (prevents mass re-analysis storms).
-    CALL_LIBRARY_MAX_BATCH_SIZE: int = 12
+    # Reports per RQ batch job; additional batches are chained with delays.
+    CALL_LIBRARY_MAX_BATCH_SIZE: int = 8
     CALL_LIBRARY_MAX_REQUEUE_PER_REFRESH: int = 10
     # Worker-only: how often to scan for stuck pending library rows (seconds).
     CALL_LIBRARY_WORKER_DRAIN_INTERVAL_SEC: int = 180
     # GET /call-library auto-drain disabled by default (polling + drain caused requeue loops).
     CALL_LIBRARY_AUTO_DRAIN_ON_READ: bool = False
+    # Skip runtime ALTER TABLE in prod when migrations are managed separately.
+    DISABLE_RUNTIME_SCHEMA_ENSURE: bool = False
 
     # Org sales content themes (objections / patterns must recur across clients before content use)
     ORG_SALES_THEME_MIN_DISTINCT_CLIENTS: int = 3

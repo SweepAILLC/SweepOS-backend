@@ -13,11 +13,14 @@ Produces a structured report with sections:
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
 from app.services.llm_client import chat_json, llm_available, truncate_for_tokens
+
+logger = logging.getLogger(__name__)
 
 DISCOVERY_AUDIT_SOP = """\
 DISCOVERY AUDIT SOP — scoring framework (use this to score the discovery_audit section):
@@ -278,6 +281,18 @@ def _build_library_user_payload(summary: str, transcript: str) -> str:
     return "\n\n".join(parts)
 
 
+def _resolve_call_library_model() -> Optional[str]:
+    """Pick a JSON-capable model for Call Library (avoid Gemini model on OpenAI endpoint)."""
+    override = (getattr(settings, "CALL_LIBRARY_LLM_MODEL", None) or "").strip()
+    if override:
+        return override
+    health = (getattr(settings, "HEALTH_SCORE_LLM_MODEL", None) or "").strip()
+    prov = (getattr(settings, "LLM_PROVIDER", "auto") or "auto").lower()
+    if prov == "openai" or (prov == "auto" and "gpt" in health.lower()):
+        return health if "gpt" in health.lower() else "gpt-4o-mini"
+    return health or None
+
+
 def generate_call_library_report(
     *,
     transcript: str,
@@ -302,7 +317,7 @@ def generate_call_library_report(
 
     user_msg = "DATA:\n" + combined
     timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
-    model_override = getattr(settings, "CALL_LIBRARY_LLM_MODEL", None) or None
+    model_override = _resolve_call_library_model()
 
     try:
         raw = chat_json(
@@ -316,14 +331,46 @@ def generate_call_library_report(
     except RuntimeError as e:
         if "llm_budget" in str(e).lower():
             raise
+        logger.warning("call_library LLM runtime error: %s", e)
         return None
-    except Exception:
+    except Exception as e:
+        logger.warning("call_library LLM request failed: %s", e)
         return None
 
     normalized = _normalize_report(raw)
+    normalized = _infer_missing_call_score(normalized)
     if not is_substantive_call_library_report(normalized):
+        keys = list(raw.keys()) if isinstance(raw, dict) else []
+        logger.warning(
+            "call_library LLM non-substantive response model=%s keys=%s low_signal=%s",
+            model_override,
+            keys[:12],
+            normalized.get("low_signal"),
+        )
         return None
     return normalized
+
+
+def _infer_missing_call_score(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive call_score from audit dimension scores when the model omits top-level score."""
+    if report.get("call_score") is not None:
+        return report
+    scores: List[float] = []
+    for block_key in ("discovery_audit", "pitching_audit", "objection_handling_audit"):
+        block = report.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        for field, val in block.items():
+            if not field.endswith("_score"):
+                continue
+            try:
+                if val is not None:
+                    scores.append(float(val))
+            except (TypeError, ValueError):
+                continue
+    if scores:
+        report["call_score"] = max(0.0, min(100.0, sum(scores) / len(scores) * 10.0))
+    return report
 
 
 def is_substantive_call_library_report(report_json: Any) -> bool:

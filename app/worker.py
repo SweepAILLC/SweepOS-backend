@@ -109,8 +109,18 @@ def _dispatcher_loop() -> None:
                 attempted = tick(db)
                 now = time.time()
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                    write_heartbeat(db)
-                    last_heartbeat = now
+                    try:
+                        write_heartbeat(db)
+                    except Exception:
+                        LOG.exception("dispatcher heartbeat failed")
+                        db.rollback()
+                        try:
+                            from app.db.session import engine
+                            engine.dispose()
+                        except Exception:
+                            pass
+                    else:
+                        last_heartbeat = now
                 if now - last_call_library_drain >= call_library_drain_interval:
                     try:
                         from app.services.call_library_queue import drain_stuck_pending_all_orgs

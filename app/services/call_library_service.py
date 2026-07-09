@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
 
 from app.models.call_library_report import CallLibraryReport
 from app.models.fathom_call_record import FathomCallRecord
+from app.core.config import settings
 from app.services.call_library_ai import generate_call_library_report
 from app.services.fathom_call_labels import (
     derive_call_library_title,
@@ -65,6 +67,9 @@ def _ensure_call_title_override_column(db: Session) -> None:
     global _call_title_override_column_ensured
     if _call_title_override_column_ensured:
         return
+    if getattr(settings, "DISABLE_RUNTIME_SCHEMA_ENSURE", False):
+        _call_title_override_column_ensured = True
+        return
     try:
         db.execute(
             text(
@@ -75,6 +80,7 @@ def _ensure_call_title_override_column(db: Session) -> None:
         _call_title_override_column_ensured = True
     except Exception as e:
         db.rollback()
+        _call_title_override_column_ensured = True
         logger.warning("call_library: ensure call_title_override column failed: %s", e)
 
 
@@ -291,8 +297,8 @@ def filter_fathom_records_needing_library_analysis(
         .all()
         if r[0] is not None
     }
-    # Pending rows touched in the last 2 minutes already have a job in flight.
-    recent_pending_cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
+    # Pending rows touched in the last 5 minutes already have a job in flight.
+    recent_pending_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
     pending_recent_ids = {
         r[0]
         for r in db.query(CallLibraryReport.fathom_call_record_id)
@@ -386,14 +392,14 @@ def generate_and_persist_report(
             org_id,
             fathom_record_id,
             rec,
-            "failed",
+            "pending",
             None,
             "no_content",
             call_title=call_title,
             call_score=None,
         )
-        logger.info("call_library failed: no_content record=%s", fathom_record_id)
-        return "failed"
+        logger.info("call_library deferred: no_content record=%s", fathom_record_id)
+        return "deferred"
 
     try:
         from app.services.resource_documents import get_document_content
@@ -438,6 +444,9 @@ def generate_and_persist_report(
             schedule_budget_retry(str(org_id), str(fathom_record_id))
             logger.info("call_library budget deferred record=%s", fathom_record_id)
             return "deferred"
+        report_json = None
+    except Exception as e:
+        logger.warning("call_library LLM error record=%s: %s", fathom_record_id, e)
         report_json = None
 
     if isinstance(report_json, dict):
@@ -594,21 +603,44 @@ def _upsert_report(
 
 
 def run_call_library_report_background(org_id_str: str, fathom_record_id_str: str) -> None:
-    """Thread-safe background entry point for FastAPI BackgroundTasks."""
-    from app.db.session import SessionLocal
+    """Thread-safe background entry point for FastAPI BackgroundTasks / RQ."""
+    from app.db.session import SessionLocal, engine
 
-    db = SessionLocal()
-    try:
-        oid = uuid.UUID(org_id_str)
-        rid = uuid.UUID(fathom_record_id_str)
-        status = generate_and_persist_report(db, oid, rid)
-        logger.info(
-            "call_library background done record=%s status=%s", fathom_record_id_str, status
-        )
-    except Exception as e:
-        logger.exception("call_library background failed record=%s: %s", fathom_record_id_str, e)
-    finally:
-        db.close()
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        db = SessionLocal()
+        try:
+            oid = uuid.UUID(org_id_str)
+            rid = uuid.UUID(fathom_record_id_str)
+            status = generate_and_persist_report(db, oid, rid)
+            logger.info(
+                "call_library background done record=%s status=%s", fathom_record_id_str, status
+            )
+            return
+        except Exception as e:
+            db.rollback()
+            err = str(e).lower()
+            retryable = "ssl" in err or "eof" in err or "decryption" in err or "connection" in err
+            if retryable and attempt < max_attempts:
+                logger.warning(
+                    "call_library DB retry record=%s attempt=%s/%s: %s",
+                    fathom_record_id_str,
+                    attempt,
+                    max_attempts,
+                    e,
+                )
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
+                time.sleep(min(2.0 * attempt, 6.0))
+                continue
+            logger.exception(
+                "call_library background failed record=%s: %s", fathom_record_id_str, e
+            )
+            return
+        finally:
+            db.close()
 
 
 def get_call_library_for_org(
