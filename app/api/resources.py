@@ -1,8 +1,8 @@
 """
-Resources tab — org-scoped resource documents (owner create/edit).
+Resources tab — org-scoped resource documents and library.
 
-Built-in docs (SOPs + AI skills) ship with default markdown; owners can override or create new docs.
-All authenticated users may read; only owners may write.
+Built-in docs (SOPs + AI skills) ship with default markdown; any org member can
+read, create, edit, and manage org docs and library items.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -10,8 +10,6 @@ import logging
 
 from app.db.session import get_db
 from app.api.deps import get_current_user
-from app.core.config import settings
-from app.models.user import UserRole, parse_user_role_from_db
 from app.services.resource_documents import (
     ensure_resource_documents_table,
     list_docs,
@@ -37,23 +35,6 @@ _log = logging.getLogger(__name__)
 
 def _org_id(current_user) -> str:
     return str(getattr(current_user, "selected_org_id", None) or current_user.org_id)
-
-
-def _resolved_role(current_user) -> UserRole:
-    role = getattr(current_user, "role", None)
-    if isinstance(role, UserRole):
-        return role
-    return parse_user_role_from_db(getattr(current_user, "role_str", None) or role)
-
-
-def _require_owner(current_user) -> None:
-    if getattr(current_user, "email", None) == settings.SUDO_ADMIN_EMAIL:
-        return
-    if _resolved_role(current_user) != UserRole.OWNER:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only owners can edit resource documents.",
-        )
 
 
 @router.get("/docs")
@@ -101,8 +82,7 @@ def update_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Create or update a document. Owner role required."""
-    _require_owner(current_user)
+    """Create or update a document. Any org member may edit."""
     from uuid import UUID
 
     org = UUID(_org_id(current_user))
@@ -148,8 +128,7 @@ def create_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Create a new custom doc. Owner role required."""
-    _require_owner(current_user)
+    """Create a new custom doc. Any org member may create."""
     from uuid import UUID
 
     category = str(body.get("category") or "SOP").strip() or "SOP"
@@ -187,8 +166,7 @@ def remove_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Delete a custom doc, or reset a built-in doc to its default. Owner only."""
-    _require_owner(current_user)
+    """Delete a custom doc, or reset a built-in doc to its default."""
     from uuid import UUID
 
     ok = delete_doc(db, UUID(_org_id(current_user)), resource_id)
@@ -235,7 +213,6 @@ def create_org_library_item(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _require_owner(current_user)
     from uuid import UUID
     ensure_resource_library_table(db)
     try:
@@ -273,7 +250,6 @@ def update_org_library_item(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _require_owner(current_user)
     from uuid import UUID
     ensure_resource_library_table(db)
     try:
@@ -304,7 +280,6 @@ def delete_org_library_item(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    _require_owner(current_user)
     from uuid import UUID
     ensure_resource_library_table(db)
     ok = delete_library_item(db, org_id=UUID(_org_id(current_user)), item_id=UUID(item_id))

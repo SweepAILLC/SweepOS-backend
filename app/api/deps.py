@@ -281,6 +281,10 @@ def check_tab_access(
     """
     scope_org_id = _tab_scope_org_id(user)
 
+    # Resources (docs + org library) are available to every org member.
+    if tab_name == "resources":
+        return True
+
     # Role-based restrictions
     # 'owner' tab: Only OWNER role can access (unless in main org)
     if tab_name == 'owner':
