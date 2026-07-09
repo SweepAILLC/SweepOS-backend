@@ -23,6 +23,36 @@ from app.services.fathom_call_labels import (
 
 logger = logging.getLogger(__name__)
 
+
+def row_has_substantive_report(row: CallLibraryReport) -> bool:
+    """True when the persisted row has real analysis (column or JSON)."""
+    from app.services.call_library_ai import is_substantive_call_library_report
+
+    if row.call_score is not None:
+        return True
+    return is_substantive_call_library_report(row.report_json)
+
+
+def _restore_substantive_report_after_failure(
+    db: Session,
+    existing: Optional[CallLibraryReport],
+    failure_reason: str,
+    fathom_record_id: uuid.UUID,
+) -> bool:
+    """Keep a good report visible if a retry fails — do not wipe to empty failed state."""
+    if not existing or not row_has_substantive_report(existing):
+        return False
+    existing.status = "complete"
+    existing.failure_reason = None
+    existing.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    logger.warning(
+        "call_library preserved substantive report after %s record=%s",
+        failure_reason,
+        fathom_record_id,
+    )
+    return True
+
 # ORM includes call_title_override; DB may lag migrations — add column once per process if missing.
 _call_title_override_column_ensured = False
 _call_media_columns_ensured = False
@@ -245,9 +275,11 @@ def filter_fathom_records_needing_library_analysis(
     org_id: uuid.UUID,
     record_ids: List[uuid.UUID],
 ) -> List[uuid.UUID]:
-    """Drop rows that already have a complete library report (bulk sync must not re-run LLM)."""
+    """Drop rows that already have a complete report or are already queued (pending)."""
     if not record_ids:
         return []
+    from datetime import timedelta
+
     complete_ids = {
         r[0]
         for r in db.query(CallLibraryReport.fathom_call_record_id)
@@ -259,7 +291,22 @@ def filter_fathom_records_needing_library_analysis(
         .all()
         if r[0] is not None
     }
-    return [rid for rid in record_ids if rid not in complete_ids]
+    # Pending rows touched in the last 2 minutes already have a job in flight.
+    recent_pending_cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
+    pending_recent_ids = {
+        r[0]
+        for r in db.query(CallLibraryReport.fathom_call_record_id)
+        .filter(
+            CallLibraryReport.org_id == org_id,
+            CallLibraryReport.fathom_call_record_id.in_(record_ids),
+            CallLibraryReport.status == "pending",
+            CallLibraryReport.updated_at >= recent_pending_cutoff,
+        )
+        .all()
+        if r[0] is not None
+    }
+    skip = complete_ids | pending_recent_ids
+    return [rid for rid in record_ids if rid not in skip]
 
 
 def generate_and_persist_report(
@@ -305,22 +352,21 @@ def generate_and_persist_report(
     input_hash = _hash_call_inputs(summary, transcript)
 
     if existing and existing.status == "complete" and not force_regenerate:
-        from app.services.call_library_ai import is_substantive_call_library_report
-
-        if isinstance(existing.report_json, dict):
-            rep = dict(existing.report_json)
-            if not rep.get("_input_hash"):
-                rep["_input_hash"] = input_hash
-                existing.report_json = rep
-        if call_title and existing.call_title != call_title:
-            existing.call_title = call_title
-        if isinstance(existing.report_json, dict) and not is_substantive_call_library_report(
-            existing.report_json
-        ):
-            logger.info(
-                "call_library skip degraded complete (use Refresh to retry) record=%s",
-                fathom_record_id,
-            )
+        if row_has_substantive_report(existing):
+            if isinstance(existing.report_json, dict):
+                rep = dict(existing.report_json)
+                if not rep.get("_input_hash"):
+                    rep["_input_hash"] = input_hash
+                    existing.report_json = rep
+            if call_title and existing.call_title != call_title:
+                existing.call_title = call_title
+            existing.updated_at = datetime.now(timezone.utc)
+            db.commit()
+            return "skipped"
+        logger.info(
+            "call_library skip degraded complete (use Refresh to retry) record=%s",
+            fathom_record_id,
+        )
         existing.updated_at = datetime.now(timezone.utc)
         db.commit()
         return "skipped"
@@ -398,6 +444,10 @@ def generate_and_persist_report(
         report_json["_input_hash"] = input_hash
 
     if not report_json:
+        if _restore_substantive_report_after_failure(
+            db, existing, "llm_failed", fathom_record_id
+        ):
+            return "skipped"
         if existing and existing.status == "complete":
             logger.info(
                 "call_library preserve complete after LLM miss record=%s",
@@ -421,6 +471,10 @@ def generate_and_persist_report(
     from app.services.call_library_ai import is_substantive_call_library_report
 
     if not is_substantive_call_library_report(report_json):
+        if _restore_substantive_report_after_failure(
+            db, existing, "llm_empty", fathom_record_id
+        ):
+            return "skipped"
         if existing and existing.status == "complete":
             logger.warning(
                 "call_library rejected empty template; kept complete record=%s",
@@ -663,28 +717,33 @@ def requeue_llm_failed_reports(
     background_tasks: "BackgroundTasks",
 ) -> int:
     """
-    Re-run report generation for failed/deferred rows and degraded empty templates.
+    Re-run report generation for explicitly failed rows and degraded empty templates.
+
+    Does not touch healthy complete reports or in-flight pending rows (those are
+    handled by the worker drain). Capped per call so Refresh cannot storm the LLM.
     """
-    from app.services.call_library_ai import is_substantive_call_library_report
+    from app.core.config import settings
 
     _ensure_call_title_override_column(db)
+    max_requeue = int(getattr(settings, "CALL_LIBRARY_MAX_REQUEUE_PER_REFRESH", 10) or 10)
     rows = (
         db.query(CallLibraryReport)
         .filter(
             CallLibraryReport.org_id == org_id,
-            CallLibraryReport.status.in_(("failed", "pending", "complete")),
+            CallLibraryReport.status.in_(("failed", "complete")),
         )
+        .order_by(CallLibraryReport.updated_at.asc())
         .all()
     )
     ids: List[uuid.UUID] = []
     for row in rows:
+        if len(ids) >= max_requeue:
+            break
         if row.status == "complete":
-            if is_substantive_call_library_report(row.report_json):
+            if row_has_substantive_report(row):
                 continue
-        elif row.status in ("failed", "pending"):
-            if row.failure_reason not in ("llm_failed", "budget_deferred", "llm_empty", None):
-                continue
-            if row.status == "pending" and row.failure_reason is None:
+        elif row.status == "failed":
+            if row.failure_reason not in ("llm_failed", "budget_deferred", "llm_empty"):
                 continue
         else:
             continue

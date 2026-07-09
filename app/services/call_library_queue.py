@@ -51,6 +51,10 @@ def run_call_library_reports_batch_background(
             )
 
 
+def _max_batch_size() -> int:
+    return int(getattr(settings, "CALL_LIBRARY_MAX_BATCH_SIZE", 12) or 12)
+
+
 def schedule_call_library_reports(
     org_id: uuid.UUID,
     record_ids: List[uuid.UUID],
@@ -59,16 +63,15 @@ def schedule_call_library_reports(
     start_index: int = 0,
 ) -> int:
     """
-    Queue LLM report jobs with stagger so we stay under per-org LLM budget (~45/min)
-    without flooding BackgroundTasks/RQ.
+    Queue LLM report jobs with stagger so we stay under per-org LLM budget (~45/min).
 
-    Uses one batch worker job (in-process stagger) so prod RQ does not depend on
-    rq-scheduler for delayed enqueue_in jobs.
+    In production (REDIS_URL + USE_RQ_LONG_JOBS), jobs are enqueued to the RQ worker
+    instead of the web dyno — BackgroundTasks cannot run hour-long LLM batches reliably.
     """
     if not record_ids:
         return 0
     from app.db.session import SessionLocal
-    from app.long_jobs import schedule_background_work
+    from app.long_jobs import long_jobs_enabled, schedule_background_work
     from app.services.call_library_service import (
         filter_fathom_records_needing_library_analysis,
     )
@@ -81,6 +84,16 @@ def schedule_call_library_reports(
     if not record_ids:
         return 0
 
+    max_batch = _max_batch_size()
+    if len(record_ids) > max_batch:
+        logger.info(
+            "call_library capping batch org=%s requested=%s max=%s",
+            org_id,
+            len(record_ids),
+            max_batch,
+        )
+        record_ids = record_ids[:max_batch]
+
     oid = str(org_id)
     stagger = _library_stagger_sec()
     id_strs = [str(r) for r in record_ids]
@@ -88,19 +101,23 @@ def schedule_call_library_reports(
     if start_index > 0:
         time.sleep(start_index * stagger)
 
+    # Web dynos must not run long LLM batches; the worker process handles these in prod.
+    tasks = None if long_jobs_enabled() else background_tasks
+
     schedule_background_work(
         run_call_library_reports_batch_background,
-        background_tasks,
+        tasks,
         oid,
         id_strs,
-        prefer_rq=False,
+        prefer_rq=True,
     )
 
     logger.info(
-        "call_library queued org=%s count=%s stagger_s=%s batch=true",
+        "call_library queued org=%s count=%s stagger_s=%s rq=%s batch=true",
         org_id,
         len(record_ids),
         stagger,
+        long_jobs_enabled(),
     )
     return len(record_ids)
 
@@ -245,7 +262,9 @@ def maybe_drain_stuck_pending_on_read(
     org_id: uuid.UUID,
     background_tasks: Any | None,
 ) -> None:
-    """Light self-heal when the Call Library tab is open (rate-limited per org)."""
+    """Optional self-heal when the Call Library tab is open (disabled by default)."""
+    if not getattr(settings, "CALL_LIBRARY_AUTO_DRAIN_ON_READ", False):
+        return
     key = str(org_id)
     now = time.time()
     with _org_drain_lock:
@@ -277,7 +296,7 @@ def schedule_budget_retry(org_id_str: str, record_id_str: str) -> None:
         delay,
         org_id_str,
         record_id_str,
-        prefer_rq=False,
+        prefer_rq=True,
     )
 
 
