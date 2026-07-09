@@ -83,7 +83,6 @@ def schedule_background_work(
     *args: Any,
     prefer_rq: bool = True,
     job_timeout: int = 900,
-    *,
     queue_name: str = DEFAULT_RQ_QUEUE,
     at_front: bool = False,
 ) -> None:
@@ -153,7 +152,6 @@ def schedule_delayed_background_work(
     *args: Any,
     prefer_rq: bool = True,
     job_timeout: int = 900,
-    *,
     queue_name: str = DEFAULT_RQ_QUEUE,
     at_front: bool = False,
 ) -> None:
