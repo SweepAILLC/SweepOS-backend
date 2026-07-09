@@ -654,6 +654,8 @@ def get_call_library_for_org(
     _ensure_call_media_columns(db)
     _ensure_call_deal_columns(db)
     _ensure_fathom_meeting_title_column(db)
+    from app.models.fathom_call_record import FathomCallRecord
+
     total = (
         db.query(func.count(CallLibraryReport.id))
         .filter(CallLibraryReport.org_id == org_id)
@@ -663,8 +665,15 @@ def get_call_library_for_org(
     rows = (
         db.query(CallLibraryReport)
         .options(joinedload(CallLibraryReport.fathom_call_record))
+        .outerjoin(
+            FathomCallRecord,
+            CallLibraryReport.fathom_call_record_id == FathomCallRecord.id,
+        )
         .filter(CallLibraryReport.org_id == org_id)
-        .order_by(desc(CallLibraryReport.created_at))
+        .order_by(
+            desc(FathomCallRecord.meeting_at),
+            desc(CallLibraryReport.created_at),
+        )
         .offset(offset)
         .limit(limit)
         .all()
@@ -694,13 +703,17 @@ def get_call_library_for_org(
         )
         display_title = (getattr(row, "call_title_override", None) or "").strip() or derived_title
 
+        status = row.status
+        if status != "complete" and row_has_substantive_report(row):
+            status = "complete"
+
         items.append(
             {
                 "id": str(row.id),
                 "fathom_recording_id": int(fathom_rec.fathom_recording_id) if fathom_rec else None,
                 "call_title": display_title,
                 "meeting_at": fathom_rec.meeting_at.isoformat() if fathom_rec and fathom_rec.meeting_at else None,
-                "status": row.status,
+                "status": status,
                 "failure_reason": row.failure_reason,
                 "client_name": client_name,
                 "call_score": row.call_score,

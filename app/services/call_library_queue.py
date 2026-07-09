@@ -79,7 +79,7 @@ def schedule_call_library_reports(
     if not record_ids:
         return 0
     from app.db.session import SessionLocal
-    from app.long_jobs import long_jobs_enabled, schedule_background_work, schedule_delayed_background_work
+    from app.long_jobs import long_jobs_enabled, schedule_call_library_work
     from app.services.call_library_service import (
         filter_fathom_records_needing_library_analysis,
     )
@@ -112,23 +112,21 @@ def schedule_call_library_reports(
         delay_sec = (start_index + chunk_idx) * inter_batch_delay
 
         if delay_sec <= 0:
-            schedule_background_work(
+            schedule_call_library_work(
                 run_call_library_reports_batch_background,
                 tasks,
                 oid,
                 id_strs,
-                prefer_rq=True,
                 job_timeout=job_timeout,
             )
         else:
-            schedule_delayed_background_work(
+            schedule_call_library_work(
                 run_call_library_reports_batch_background,
                 tasks,
-                delay_sec,
                 oid,
                 id_strs,
-                prefer_rq=True,
                 job_timeout=job_timeout,
+                delay_sec=delay_sec,
             )
         queued += len(chunk)
 
@@ -353,22 +351,54 @@ def maybe_drain_stuck_pending_on_read(
 
 def schedule_budget_retry(org_id_str: str, record_id_str: str) -> None:
     """Re-run a single report after LLM budget window rolls (≈65s)."""
-    from app.long_jobs import schedule_delayed_background_work
+    from app.long_jobs import schedule_call_library_work
     from app.services.call_library_service import run_call_library_report_background
 
     delay = float(getattr(settings, "CALL_LIBRARY_BUDGET_RETRY_SEC", 65) or 65)
-    schedule_delayed_background_work(
+    schedule_call_library_work(
         run_call_library_report_background,
         None,
-        delay,
         org_id_str,
         record_id_str,
-        prefer_rq=True,
+        delay_sec=delay,
     )
+
+
+def _inline_batch_size() -> int:
+    return int(getattr(settings, "CALL_LIBRARY_INLINE_BATCH_SIZE", 4) or 4)
+
+
+def process_inline_call_library_batch(db: Session, org_id: uuid.UUID) -> int:
+    """Run a small batch in-process so analysis progresses even when sweep_long is backed up."""
+    ids = find_pending_report_ids_with_content(
+        db,
+        org_id,
+        min_age_seconds=_ready_pending_seconds(),
+        limit=_inline_batch_size(),
+    )
+    if not ids:
+        return 0
+    now = datetime.now(timezone.utc)
+    for row in (
+        db.query(CallLibraryReport)
+        .filter(
+            CallLibraryReport.org_id == org_id,
+            CallLibraryReport.fathom_call_record_id.in_(ids),
+        )
+        .all()
+    ):
+        row.updated_at = now
+    db.commit()
+    id_strs = [str(i) for i in ids]
+    logger.info("call_library inline batch org=%s count=%s", org_id, len(id_strs))
+    run_call_library_reports_batch_background(str(org_id), id_strs)
+    return len(id_strs)
 
 
 def drain_stuck_pending_all_orgs() -> int:
     """Worker-safe: re-queue only genuinely stuck/failed rows (not in-flight pending)."""
+    import threading
+
     from app.db.session import SessionLocal
     from app.models.call_library_report import CallLibraryReport
 
@@ -393,6 +423,23 @@ def drain_stuck_pending_all_orgs() -> int:
                 min_age_seconds=_stuck_pending_minutes() * 60,
                 include_failed=True,
             )
+        if org_ids:
+
+            def _inline_batches() -> None:
+                idb = SessionLocal()
+                processed = 0
+                try:
+                    for org_id in org_ids:
+                        try:
+                            processed += process_inline_call_library_batch(idb, org_id)
+                        except Exception:
+                            logger.exception("call_library inline batch failed org=%s", org_id)
+                    if processed:
+                        logger.info("call_library inline batch processed=%s", processed)
+                finally:
+                    idb.close()
+
+            threading.Thread(target=_inline_batches, name="call-library-inline", daemon=True).start()
         return total
     finally:
         db.close()

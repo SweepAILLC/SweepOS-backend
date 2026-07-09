@@ -171,6 +171,8 @@ class Settings(BaseSettings):
     CALL_LIBRARY_MAX_REQUEUE_PER_REFRESH: int = 10
     # Worker-only: how often to scan for stuck pending library rows (seconds).
     CALL_LIBRARY_WORKER_DRAIN_INTERVAL_SEC: int = 180
+    # When sweep_long is flooded by Fathom sync, process this many reports inline per drain.
+    CALL_LIBRARY_INLINE_BATCH_SIZE: int = 4
     # GET /call-library auto-drain disabled by default (polling + drain caused requeue loops).
     CALL_LIBRARY_AUTO_DRAIN_ON_READ: bool = False
     # Skip runtime ALTER TABLE in prod when migrations are managed separately.

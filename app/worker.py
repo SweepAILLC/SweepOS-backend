@@ -58,10 +58,19 @@ def _run_rq_worker_main() -> None:
 
     try:
         conn = Redis.from_url(settings.REDIS_URL)
-        queues = [Queue("sweep_long", connection=conn)]
+        from app.long_jobs import CALL_LIBRARY_RQ_QUEUE, DEFAULT_RQ_QUEUE
+
+        queues = [
+            Queue(CALL_LIBRARY_RQ_QUEUE, connection=conn),
+            Queue(DEFAULT_RQ_QUEUE, connection=conn),
+        ]
         w = Worker(queues, connection=conn)
         _rq_worker = w
-        LOG.info("RQ worker listening on queue sweep_long (main thread)")
+        LOG.info(
+            "RQ worker listening on %s (priority) then %s (main thread)",
+            CALL_LIBRARY_RQ_QUEUE,
+            DEFAULT_RQ_QUEUE,
+        )
         w.work(with_scheduler=True, burst=False)
     except Exception:
         LOG.exception("RQ worker crashed")
