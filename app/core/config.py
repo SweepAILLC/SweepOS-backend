@@ -164,6 +164,8 @@ class Settings(BaseSettings):
     CALL_LIBRARY_STUCK_PENDING_MINUTES: int = 8
     CALL_LIBRARY_STUCK_REQUEUE_BATCH: int = 25
     CALL_LIBRARY_BUDGET_RETRY_SEC: float = 65.0
+    # Worker-only: how often to scan for stuck pending library rows (seconds).
+    CALL_LIBRARY_WORKER_DRAIN_INTERVAL_SEC: int = 180
 
     # Org sales content themes (objections / patterns must recur across clients before content use)
     ORG_SALES_THEME_MIN_DISTINCT_CLIENTS: int = 3

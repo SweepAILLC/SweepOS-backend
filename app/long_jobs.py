@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Callable
 
 from app.core.config import settings
@@ -50,6 +51,13 @@ def _get_queue():
         return None
 
 
+def _run_after_delay(delay_sec: float, fn: Callable[..., Any], *args: Any) -> None:
+    """RQ-safe delayed execution: sleep inside the worker job (no scheduler required)."""
+    if delay_sec > 0:
+        time.sleep(delay_sec)
+    fn(*args)
+
+
 def schedule_background_work(
     fn: Callable[..., Any],
     background_tasks: Any | None,
@@ -78,7 +86,10 @@ def schedule_delayed_background_work(
     delay_sec: float,
     *args: Any,
 ) -> None:
-    """Schedule background work after delay_sec (RQ enqueue_in when available)."""
+    """Schedule background work after delay_sec.
+
+    Uses an in-job sleep when RQ is enabled so delayed jobs run without rq-scheduler.
+    """
     if delay_sec <= 0:
         schedule_background_work(fn, background_tasks, *args)
         return
@@ -86,9 +97,14 @@ def schedule_delayed_background_work(
     q = _get_queue()
     if q is not None:
         try:
-            from datetime import timedelta
-
-            q.enqueue_in(timedelta(seconds=delay_sec), fn, *args, job_timeout=900, result_ttl=300)
+            q.enqueue(
+                _run_after_delay,
+                delay_sec,
+                fn,
+                *args,
+                job_timeout=int(900 + delay_sec + 120),
+                result_ttl=300,
+            )
             return
         except Exception:
             logger.exception(

@@ -81,7 +81,7 @@ def _start_rq_worker_thread() -> Optional[threading.Thread]:
             w = _SideThreadRQWorker.create(queues, conn)
             _rq_worker = w
             LOG.info("RQ worker listening on queue sweep_long")
-            w.work(with_scheduler=False, burst=False)
+            w.work(with_scheduler=True, burst=False)
         except Exception:
             LOG.exception("RQ worker thread crashed; dispatcher continues")
         finally:
@@ -112,6 +112,10 @@ def _dispatcher_loop() -> None:
             LOG.exception("recovery sweep failed on boot")
 
     last_heartbeat = 0.0
+    last_call_library_drain = 0.0
+    call_library_drain_interval = float(
+        getattr(settings, "CALL_LIBRARY_WORKER_DRAIN_INTERVAL_SEC", 180) or 180
+    )
     while not _SHUTDOWN:
         loop_started = time.time()
         try:
@@ -121,6 +125,16 @@ def _dispatcher_loop() -> None:
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     write_heartbeat(db)
                     last_heartbeat = now
+                if now - last_call_library_drain >= call_library_drain_interval:
+                    try:
+                        from app.services.call_library_queue import drain_stuck_pending_all_orgs
+
+                        n = drain_stuck_pending_all_orgs()
+                        if n:
+                            LOG.info("call_library worker drain requeued=%s", n)
+                    except Exception:
+                        LOG.exception("call_library worker drain failed")
+                    last_call_library_drain = now
                 if attempted:
                     LOG.info("dispatcher: processed %d job(s)", attempted)
         except Exception:

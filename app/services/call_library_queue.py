@@ -28,6 +28,25 @@ def _stuck_pending_minutes() -> int:
     return int(getattr(settings, "CALL_LIBRARY_STUCK_PENDING_MINUTES", 8) or 8)
 
 
+def run_call_library_reports_batch_background(
+    org_id_str: str,
+    record_id_strs: List[str],
+) -> None:
+    """Process a batch of library reports in one RQ job (staggered sleep inside worker)."""
+    from app.services.call_library_service import run_call_library_report_background
+
+    stagger = _library_stagger_sec()
+    for i, rid in enumerate(record_id_strs):
+        if i > 0:
+            time.sleep(stagger)
+        try:
+            run_call_library_report_background(org_id_str, rid)
+        except Exception:
+            logger.exception(
+                "call_library batch item failed org=%s record=%s", org_id_str, rid
+            )
+
+
 def schedule_call_library_reports(
     org_id: uuid.UUID,
     record_ids: List[uuid.UUID],
@@ -38,25 +57,30 @@ def schedule_call_library_reports(
     """
     Queue LLM report jobs with stagger so we stay under per-org LLM budget (~45/min)
     without flooding BackgroundTasks/RQ.
+
+    Uses one batch worker job (in-process stagger) so prod RQ does not depend on
+    rq-scheduler for delayed enqueue_in jobs.
     """
     if not record_ids:
         return 0
-    from app.long_jobs import schedule_delayed_background_work
-    from app.services.call_library_service import run_call_library_report_background
+    from app.long_jobs import schedule_background_work
 
     oid = str(org_id)
     stagger = _library_stagger_sec()
-    for i, rid in enumerate(record_ids):
-        delay = max(0.0, (start_index + i) * stagger)
-        schedule_delayed_background_work(
-            run_call_library_report_background,
-            background_tasks,
-            delay,
-            oid,
-            str(rid),
-        )
+    id_strs = [str(r) for r in record_ids]
+
+    if start_index > 0:
+        time.sleep(start_index * stagger)
+
+    schedule_background_work(
+        run_call_library_reports_batch_background,
+        background_tasks,
+        oid,
+        id_strs,
+    )
+
     logger.info(
-        "call_library queued org=%s count=%s stagger_s=%s",
+        "call_library queued org=%s count=%s stagger_s=%s batch=true",
         org_id,
         len(record_ids),
         stagger,
@@ -166,16 +190,41 @@ def maybe_drain_stuck_pending_on_read(
 
 def schedule_budget_retry(org_id_str: str, record_id_str: str) -> None:
     """Re-run a single report after LLM budget window rolls (≈65s)."""
+    from app.long_jobs import schedule_delayed_background_work
+    from app.services.call_library_service import run_call_library_report_background
+
     delay = float(getattr(settings, "CALL_LIBRARY_BUDGET_RETRY_SEC", 65) or 65)
+    schedule_delayed_background_work(
+        run_call_library_report_background,
+        None,
+        delay,
+        org_id_str,
+        record_id_str,
+    )
 
-    def _kick() -> None:
-        from app.long_jobs import schedule_background_work
-        from app.services.call_library_service import run_call_library_report_background
 
-        schedule_background_work(
-            run_call_library_report_background, None, org_id_str, record_id_str
-        )
+def drain_stuck_pending_all_orgs() -> int:
+    """Worker-safe: re-queue pending library rows stuck past threshold (all orgs)."""
+    from app.db.session import SessionLocal
+    from app.models.call_library_report import CallLibraryReport
 
-    t = threading.Timer(delay, _kick)
-    t.daemon = True
-    t.start()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=_stuck_pending_minutes())
+    db = SessionLocal()
+    try:
+        org_ids = {
+            r[0]
+            for r in db.query(CallLibraryReport.org_id)
+            .filter(
+                CallLibraryReport.status == "pending",
+                CallLibraryReport.updated_at < cutoff,
+            )
+            .distinct()
+            .all()
+            if r[0] is not None
+        }
+        total = 0
+        for org_id in org_ids:
+            total += requeue_stuck_pending_reports(db, org_id, None)
+        return total
+    finally:
+        db.close()
