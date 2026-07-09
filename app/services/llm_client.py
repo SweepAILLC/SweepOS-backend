@@ -55,6 +55,8 @@ def chat_json(
     org_id: Optional[uuid.UUID] = None,
     model: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    max_input_chars: Optional[int] = None,
+    min_user_chars: int = 0,
 ) -> Dict[str, Any]:
     """
     Single-turn chat; request JSON object in response. Parses first JSON object from text.
@@ -68,8 +70,17 @@ def chat_json(
     if org_id is not None and not consume_llm_budget(org_id):
         raise RuntimeError("llm_budget_exceeded")
 
-    max_total = getattr(settings, "LLM_MAX_INPUT_CHARS_TOTAL", 48000)
-    system_prompt, user_prompt = sanitize_llm_user_payload(system_prompt, user_prompt, max_total)
+    max_total = int(
+        max_input_chars
+        if max_input_chars is not None
+        else getattr(settings, "LLM_MAX_INPUT_CHARS_TOTAL", 48000)
+    )
+    system_prompt, user_prompt = sanitize_llm_user_payload(
+        system_prompt,
+        user_prompt,
+        max_total,
+        min_user_chars=min_user_chars,
+    )
 
     if provider == "gemini":
         return _gemini_generate_json(api_key, system_prompt, user_prompt, temperature, timeout, model=model)

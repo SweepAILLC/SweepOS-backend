@@ -335,7 +335,11 @@ def generate_call_library_report(
     timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
     model_override = _resolve_call_library_model()
 
-    max_tokens = int(getattr(settings, "CALL_LIBRARY_MAX_OUTPUT_TOKENS", 3000) or 3000)
+    max_tokens = int(getattr(settings, "CALL_LIBRARY_MAX_OUTPUT_TOKENS", 4096) or 4096)
+    max_input = int(
+        getattr(settings, "CALL_LIBRARY_MAX_INPUT_CHARS_TOTAL", 56000) or 56000
+    )
+    min_user = int(getattr(settings, "CALL_LIBRARY_MIN_USER_INPUT_CHARS", 12000) or 12000)
     try:
         raw = chat_json(
             system_prompt,
@@ -345,6 +349,8 @@ def generate_call_library_report(
             org_id=org_id,
             model=model_override,
             max_tokens=max_tokens,
+            max_input_chars=max_input,
+            min_user_chars=min_user,
         )
     except RuntimeError as e:
         if "llm_budget" in str(e).lower():
@@ -359,11 +365,14 @@ def generate_call_library_report(
     normalized = _infer_missing_call_score(normalized)
     if not is_substantive_call_library_report(normalized):
         keys = list(raw.keys()) if isinstance(raw, dict) else []
+        pi = (normalized.get("discovery_audit") or {}).get("pain_identification") or {}
         logger.warning(
-            "call_library LLM non-substantive response model=%s keys=%s low_signal=%s",
+            "call_library LLM non-substantive response model=%s keys=%s low_signal=%s pain_score=%s user_len=%s",
             model_override,
             keys[:12],
             normalized.get("low_signal"),
+            pi.get("score"),
+            len(user_msg),
         )
         return None
     return normalized

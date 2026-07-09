@@ -20,9 +20,22 @@ def sanitize_llm_text(text: Optional[str], max_length: int) -> str:
     return s
 
 
-def sanitize_llm_user_payload(system_prompt: str, user_prompt: str, max_total: int) -> tuple[str, str]:
-    """Cap combined size; trim user portion first (system prompt is trusted/smaller)."""
-    sys_s = sanitize_llm_text(system_prompt, max_total // 4)
-    remaining = max(0, max_total - len(sys_s))
+def sanitize_llm_user_payload(
+    system_prompt: str,
+    user_prompt: str,
+    max_total: int,
+    *,
+    min_user_chars: int = 0,
+) -> tuple[str, str]:
+    """Cap combined size while preserving enough user transcript for analysis."""
+    if len(system_prompt) + len(user_prompt) <= max_total:
+        return (
+            sanitize_llm_text(system_prompt, max_total),
+            sanitize_llm_text(user_prompt, max_total - len(system_prompt)),
+        )
+    floor_user = min(max(min_user_chars, 0), max(max_total // 2, 0))
+    max_sys = max(0, max_total - floor_user)
+    sys_s = sanitize_llm_text(system_prompt, max_sys)
+    remaining = max(floor_user, max_total - len(sys_s))
     usr_s = sanitize_llm_text(user_prompt, remaining)
     return sys_s, usr_s
