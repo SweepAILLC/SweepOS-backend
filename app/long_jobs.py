@@ -63,11 +63,12 @@ def schedule_background_work(
     background_tasks: Any | None,
     *args: Any,
     prefer_rq: bool = True,
+    job_timeout: int = 900,
 ) -> None:
     """Schedule background work.
 
-    When ``prefer_rq`` is False (Call Library), always run in-process so prod does
-    not depend on a separate RQ worker for user-visible analysis jobs.
+    Call Library batches pass a higher ``job_timeout`` — each report can take up to
+    CALL_LIBRARY_LLM_TIMEOUT_SEC and batches run sequentially with stagger.
     """
     if background_tasks is not None:
         background_tasks.add_task(fn, *args)
@@ -76,7 +77,7 @@ def schedule_background_work(
         q = _get_queue()
         if q is not None:
             try:
-                q.enqueue(fn, *args, job_timeout=900, result_ttl=300)
+                q.enqueue(fn, *args, job_timeout=job_timeout, result_ttl=300)
                 return
             except Exception:
                 logger.exception(
@@ -92,13 +93,16 @@ def schedule_delayed_background_work(
     delay_sec: float,
     *args: Any,
     prefer_rq: bool = True,
+    job_timeout: int = 900,
 ) -> None:
     """Schedule background work after delay_sec.
 
     Uses an in-job sleep when RQ is enabled so delayed jobs run without rq-scheduler.
     """
     if delay_sec <= 0:
-        schedule_background_work(fn, background_tasks, *args, prefer_rq=prefer_rq)
+        schedule_background_work(
+            fn, background_tasks, *args, prefer_rq=prefer_rq, job_timeout=job_timeout
+        )
         return
 
     if prefer_rq:
@@ -110,7 +114,7 @@ def schedule_delayed_background_work(
                     delay_sec,
                     fn,
                     *args,
-                    job_timeout=int(900 + delay_sec + 120),
+                    job_timeout=int(job_timeout + delay_sec + 120),
                     result_ttl=300,
                 )
                 return
@@ -121,7 +125,9 @@ def schedule_delayed_background_work(
                 )
 
     def _kick() -> None:
-        schedule_background_work(fn, None, *args, prefer_rq=prefer_rq)
+        schedule_background_work(
+            fn, None, *args, prefer_rq=prefer_rq, job_timeout=job_timeout
+        )
 
     t = threading.Timer(delay_sec, _kick)
     t.daemon = True

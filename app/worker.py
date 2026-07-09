@@ -2,18 +2,15 @@
 
 Runs two jobs in one container so ops only has to deploy a single worker:
 
-1. **Automation dispatcher loop** (always on) — polls the ``automation_email_jobs``
-   table, claims due rows with ``FOR UPDATE SKIP LOCKED``, materializes the email
-   draft, sends via Brevo, persists the outcome. Independent of REDIS_URL so the
-   automation engine works in any deployment shape.
-2. **RQ worker** (when REDIS_URL + USE_RQ_LONG_JOBS are set) — runs the existing
-   ``sweep_long`` queue used by Fathom follow-ups, content studio bundle regen,
-   etc. Lives in a daemon thread so a Redis hiccup can't take down the dispatcher.
+1. **RQ worker** (main thread, when REDIS_URL + USE_RQ_LONG_JOBS) — processes the
+   ``sweep_long`` queue (Fathom follow-ups, Call Library LLM batches, etc.).
+   Must run on the main thread: RQ uses SIGALRM for job timeouts and crashes in
+   a side thread with ``ValueError: signal only works in main thread``.
+2. **Automation dispatcher loop** (daemon thread) — polls ``automation_email_jobs``,
+   claims due rows, sends via Brevo. Independent of REDIS_URL.
 
-Crash recovery: on boot we sweep all ``sending`` rows back to ``scheduled``,
-so a SIGKILL never strands an email. During normal ticks, only rows stuck in
-``sending`` longer than STALE_SENDING_AFTER_SECONDS are reset (safe for multiple
-worker replicas). SIGTERM/SIGINT trigger a graceful drain.
+Crash recovery: on boot we sweep all ``sending`` rows back to ``scheduled``.
+SIGTERM/SIGINT trigger a graceful drain.
 """
 from __future__ import annotations
 
@@ -46,50 +43,30 @@ def _handle_signal(_signum, _frame) -> None:
             pass
 
 
-class _SideThreadRQWorker:
-    """Factory: RQ Worker subclass that skips signal handlers (illegal outside main thread)."""
-
-    @staticmethod
-    def create(queues, connection):
-        from rq import Worker
-
-        class _Worker(Worker):
-            def _install_signal_handlers(self) -> None:
-                return
-
-        return _Worker(queues, connection=connection)
-
-
-def _start_rq_worker_thread() -> Optional[threading.Thread]:
-    """Run RQ in a daemon thread when configured. Returns the Thread or None."""
+def _run_rq_worker_main() -> None:
+    """Run RQ on the main thread (required for SIGALRM-based job monitoring)."""
     global _rq_worker
     if not (settings.REDIS_URL and settings.USE_RQ_LONG_JOBS):
         LOG.info("RQ worker disabled (REDIS_URL/USE_RQ_LONG_JOBS unset)")
-        return None
+        return
     try:
         from redis import Redis
-        from rq import Queue
+        from rq import Queue, Worker
     except Exception as e:  # noqa: BLE001 - rq optional
         LOG.warning("RQ deps missing (%s); automation dispatcher will still run", e)
-        return None
+        return
 
-    def _run_rq() -> None:
-        global _rq_worker
-        try:
-            conn = Redis.from_url(settings.REDIS_URL)
-            queues = [Queue("sweep_long", connection=conn)]
-            w = _SideThreadRQWorker.create(queues, conn)
-            _rq_worker = w
-            LOG.info("RQ worker listening on queue sweep_long")
-            w.work(with_scheduler=True, burst=False)
-        except Exception:
-            LOG.exception("RQ worker thread crashed; dispatcher continues")
-        finally:
-            _rq_worker = None
-
-    t = threading.Thread(target=_run_rq, name="rq-worker", daemon=True)
-    t.start()
-    return t
+    try:
+        conn = Redis.from_url(settings.REDIS_URL)
+        queues = [Queue("sweep_long", connection=conn)]
+        w = Worker(queues, connection=conn)
+        _rq_worker = w
+        LOG.info("RQ worker listening on queue sweep_long (main thread)")
+        w.work(with_scheduler=True, burst=False)
+    except Exception:
+        LOG.exception("RQ worker crashed")
+    finally:
+        _rq_worker = None
 
 
 def _dispatcher_loop() -> None:
@@ -110,6 +87,15 @@ def _dispatcher_loop() -> None:
                 LOG.info("recovered %d in-flight 'sending' jobs on boot", n)
         except Exception:
             LOG.exception("recovery sweep failed on boot")
+
+    try:
+        from app.services.call_library_queue import drain_stuck_pending_all_orgs
+
+        n = drain_stuck_pending_all_orgs()
+        if n:
+            LOG.info("call_library boot drain requeued=%s", n)
+    except Exception:
+        LOG.exception("call_library boot drain failed on startup")
 
     last_heartbeat = 0.0
     last_call_library_drain = 0.0
@@ -142,7 +128,6 @@ def _dispatcher_loop() -> None:
             time.sleep(2.0)
             continue
 
-        # Hold the loop interval even if tick() ran fast
         elapsed = time.time() - loop_started
         if elapsed < TICK_INTERVAL and not _SHUTDOWN:
             time.sleep(TICK_INTERVAL - elapsed)
@@ -153,22 +138,29 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    rq_enabled = bool(settings.REDIS_URL and settings.USE_RQ_LONG_JOBS)
     LOG.info(
         "starting worker pid=%s redis=%s rq=%s",
         os.getpid(),
         bool(settings.REDIS_URL),
-        bool(settings.REDIS_URL and settings.USE_RQ_LONG_JOBS),
+        rq_enabled,
     )
 
-    rq_thread = _start_rq_worker_thread()
+    dispatcher_thread = threading.Thread(
+        target=_dispatcher_loop,
+        name="automation-dispatcher",
+        daemon=True,
+    )
+    dispatcher_thread.start()
 
     try:
-        _dispatcher_loop()
+        if rq_enabled:
+            _run_rq_worker_main()
+        else:
+            while not _SHUTDOWN:
+                time.sleep(1.0)
     finally:
         LOG.info("worker shutting down")
-        if rq_thread is not None and rq_thread.is_alive():
-            # rq worker is daemon, will exit with the process
-            pass
 
 
 if __name__ == "__main__":

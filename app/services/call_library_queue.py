@@ -104,12 +104,19 @@ def schedule_call_library_reports(
     # Web dynos must not run long LLM batches; the worker process handles these in prod.
     tasks = None if long_jobs_enabled() else background_tasks
 
+    llm_timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
+    per_item = llm_timeout + stagger + 15.0
+    job_timeout = int(len(record_ids) * per_item) + 180
+    job_timeout = max(job_timeout, 600)
+    job_timeout = min(job_timeout, 7200)
+
     schedule_background_work(
         run_call_library_reports_batch_background,
         tasks,
         oid,
         id_strs,
         prefer_rq=True,
+        job_timeout=job_timeout,
     )
 
     logger.info(
