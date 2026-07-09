@@ -68,3 +68,12 @@ class TestSubstantiveReportGuard:
         assert is_substantive_call_library_report(
             {"call_score": 7, "overall_impression": "Good call"}
         )
+
+    def test_accepts_nested_dimension_scores(self):
+        assert is_substantive_call_library_report(
+            {
+                "discovery_audit": {
+                    "pain_identification": {"score": 7, "summary": "Asked about pain"},
+                }
+            }
+        )

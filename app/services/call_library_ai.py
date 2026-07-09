@@ -369,6 +369,47 @@ def generate_call_library_report(
     return normalized
 
 
+def _collect_audit_scores(block: Dict[str, Any]) -> List[float]:
+    """Gather numeric scores from an audit block (top-level *_score and nested dim.score)."""
+    scores: List[float] = []
+    for field, val in block.items():
+        if field.endswith("_score") and val is not None:
+            try:
+                scores.append(float(val))
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(val, dict) and val.get("score") is not None:
+            try:
+                scores.append(float(val["score"]))
+            except (TypeError, ValueError):
+                continue
+    return scores
+
+
+def _audit_block_has_substance(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    if _collect_audit_scores(block):
+        return True
+    for summary_key in ("discovery_summary", "pitch_summary", "objection_summary"):
+        if str(block.get(summary_key) or "").strip():
+            return True
+    objections = block.get("objections")
+    if isinstance(objections, list) and objections:
+        return True
+    for val in block.values():
+        if not isinstance(val, dict):
+            continue
+        if val.get("score") is not None:
+            return True
+        if str(val.get("summary") or "").strip():
+            return True
+        goals = val.get("goals_uncovered")
+        if isinstance(goals, list) and goals:
+            return True
+    return False
+
+
 def _infer_missing_call_score(report: Dict[str, Any]) -> Dict[str, Any]:
     """Derive call_score from audit dimension scores when the model omits top-level score."""
     if report.get("call_score") is not None:
@@ -376,18 +417,15 @@ def _infer_missing_call_score(report: Dict[str, Any]) -> Dict[str, Any]:
     scores: List[float] = []
     for block_key in ("discovery_audit", "pitching_audit", "objection_handling_audit"):
         block = report.get(block_key)
-        if not isinstance(block, dict):
-            continue
-        for field, val in block.items():
-            if not field.endswith("_score"):
-                continue
-            try:
-                if val is not None:
-                    scores.append(float(val))
-            except (TypeError, ValueError):
-                continue
+        if isinstance(block, dict):
+            scores.extend(_collect_audit_scores(block))
     if scores:
-        report["call_score"] = max(0.0, min(100.0, sum(scores) / len(scores) * 10.0))
+        # Dimension scores are 1-10; block scores (discovery_score etc.) are 0-100.
+        avg = sum(scores) / len(scores)
+        if avg <= 10.0:
+            report["call_score"] = max(0.0, min(100.0, avg * 10.0))
+        else:
+            report["call_score"] = max(0.0, min(100.0, avg))
     return report
 
 
@@ -408,15 +446,8 @@ def is_substantive_call_library_report(report_json: Any) -> bool:
     if isinstance(weaknesses, list) and weaknesses:
         return True
     for key in ("discovery_audit", "pitching_audit", "objection_handling_audit"):
-        block = report_json.get(key)
-        if not isinstance(block, dict):
-            continue
-        for field, val in block.items():
-            if field.endswith("_score") and val is not None:
-                return True
-        for summary_key in ("discovery_summary", "pitch_summary", "objection_summary"):
-            if str(block.get(summary_key) or "").strip():
-                return True
+        if _audit_block_has_substance(report_json.get(key)):
+            return True
     ctx = report_json.get("call_context")
     if isinstance(ctx, dict) and str(ctx.get("background") or "").strip():
         return True
