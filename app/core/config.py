@@ -161,7 +161,8 @@ class Settings(BaseSettings):
     CALL_LIBRARY_MAX_SUMMARY_CHARS: int = 6000
     CALL_LIBRARY_LLM_TIMEOUT_SEC: float = 90.0
     CALL_LIBRARY_STAGGER_SEC: float = 1.5  # gap between queued library jobs (≈40/min)
-    CALL_LIBRARY_STUCK_PENDING_MINUTES: int = 8
+    CALL_LIBRARY_STUCK_PENDING_MINUTES: int = 2
+    CALL_LIBRARY_READY_PENDING_SEC: int = 45
     CALL_LIBRARY_STUCK_REQUEUE_BATCH: int = 25
     CALL_LIBRARY_BUDGET_RETRY_SEC: float = 65.0
     # Worker-only: how often to scan for stuck pending library rows (seconds).

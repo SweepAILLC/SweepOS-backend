@@ -86,5 +86,7 @@ def retry_stuck_pending_call_reports(
 ):
     """Re-queue library rows stuck in pending (job never ran or was starved during bulk upload)."""
     _require_call_library_tab(db, current_user)
-    n = cls.requeue_stuck_pending_reports(db, _org_id(current_user), background_tasks)
+    from app.services.call_library_queue import requeue_pending_reports
+
+    n = requeue_pending_reports(db, _org_id(current_user), background_tasks, min_age_seconds=0)
     return {"requeued": n}

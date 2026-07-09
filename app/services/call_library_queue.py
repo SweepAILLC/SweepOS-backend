@@ -25,7 +25,11 @@ def _library_stagger_sec() -> float:
 
 
 def _stuck_pending_minutes() -> int:
-    return int(getattr(settings, "CALL_LIBRARY_STUCK_PENDING_MINUTES", 8) or 8)
+    return int(getattr(settings, "CALL_LIBRARY_STUCK_PENDING_MINUTES", 2) or 2)
+
+
+def _ready_pending_seconds() -> int:
+    return int(getattr(settings, "CALL_LIBRARY_READY_PENDING_SEC", 45) or 45)
 
 
 def run_call_library_reports_batch_background(
@@ -77,6 +81,7 @@ def schedule_call_library_reports(
         background_tasks,
         oid,
         id_strs,
+        prefer_rq=False,
     )
 
     logger.info(
@@ -88,21 +93,53 @@ def schedule_call_library_reports(
     return len(record_ids)
 
 
-def find_stuck_pending_report_ids(db: Session, org_id: uuid.UUID) -> List[uuid.UUID]:
-    """Pending rows older than threshold — job likely never ran or was starved."""
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=_stuck_pending_minutes())
-    rows = (
+def find_pending_report_ids_with_content(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    min_age_seconds: int = 0,
+    limit: Optional[int] = None,
+) -> List[uuid.UUID]:
+    """Pending rows whose Fathom source call has summary/transcript to analyze."""
+    from app.models.fathom_call_record import FathomCallRecord
+    from sqlalchemy import or_
+
+    q = (
         db.query(CallLibraryReport.fathom_call_record_id)
+        .join(
+            FathomCallRecord,
+            FathomCallRecord.id == CallLibraryReport.fathom_call_record_id,
+        )
         .filter(
             CallLibraryReport.org_id == org_id,
             CallLibraryReport.status == "pending",
-            CallLibraryReport.updated_at < cutoff,
+            FathomCallRecord.org_id == org_id,
+            or_(
+                FathomCallRecord.summary_text.isnot(None),
+                FathomCallRecord.transcript_snippet.isnot(None),
+            ),
+            or_(
+                FathomCallRecord.summary_text != "",
+                FathomCallRecord.transcript_snippet != "",
+            ),
         )
-        .order_by(CallLibraryReport.updated_at.asc())
-        .limit(int(getattr(settings, "CALL_LIBRARY_STUCK_REQUEUE_BATCH", 25) or 25))
-        .all()
     )
+    if min_age_seconds > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=min_age_seconds)
+        q = q.filter(CallLibraryReport.updated_at < cutoff)
+    q = q.order_by(CallLibraryReport.updated_at.asc())
+    batch = limit or int(getattr(settings, "CALL_LIBRARY_STUCK_REQUEUE_BATCH", 25) or 25)
+    rows = q.limit(batch).all()
     return [r[0] for r in rows if r[0] is not None]
+
+
+def find_stuck_pending_report_ids(db: Session, org_id: uuid.UUID) -> List[uuid.UUID]:
+    """Pending rows older than threshold — job likely never ran or was starved."""
+    return find_pending_report_ids_with_content(
+        db,
+        org_id,
+        min_age_seconds=_stuck_pending_minutes() * 60,
+    )
 
 
 def mark_orphan_pending_reports_failed(db: Session, org_id: uuid.UUID) -> int:
@@ -143,13 +180,19 @@ def mark_orphan_pending_reports_failed(db: Session, org_id: uuid.UUID) -> int:
     return n
 
 
-def requeue_stuck_pending_reports(
+def requeue_pending_reports(
     db: Session,
     org_id: uuid.UUID,
     background_tasks: Any | None,
+    *,
+    min_age_seconds: int = 0,
 ) -> int:
     mark_orphan_pending_reports_failed(db, org_id)
-    ids = find_stuck_pending_report_ids(db, org_id)
+    ids = find_pending_report_ids_with_content(
+        db,
+        org_id,
+        min_age_seconds=min_age_seconds,
+    )
     if not ids:
         return 0
     for row in (
@@ -161,11 +204,28 @@ def requeue_stuck_pending_reports(
         .all()
     ):
         row.failure_reason = None
-        row.updated_at = datetime.now(timezone.utc)
     db.commit()
     schedule_call_library_reports(org_id, ids, background_tasks)
-    logger.info("call_library requeued stuck pending org=%s count=%s", org_id, len(ids))
+    logger.info(
+        "call_library requeued pending org=%s count=%s min_age_s=%s",
+        org_id,
+        len(ids),
+        min_age_seconds,
+    )
     return len(ids)
+
+
+def requeue_stuck_pending_reports(
+    db: Session,
+    org_id: uuid.UUID,
+    background_tasks: Any | None,
+) -> int:
+    return requeue_pending_reports(
+        db,
+        org_id,
+        background_tasks,
+        min_age_seconds=_stuck_pending_minutes() * 60,
+    )
 
 
 def maybe_drain_stuck_pending_on_read(
@@ -181,7 +241,12 @@ def maybe_drain_stuck_pending_on_read(
             return
         _org_drain_last[key] = now
     try:
-        n = requeue_stuck_pending_reports(db, org_id, background_tasks)
+        n = requeue_pending_reports(
+            db,
+            org_id,
+            background_tasks,
+            min_age_seconds=_ready_pending_seconds(),
+        )
         if n:
             logger.info("call_library auto-drain on read org=%s requeued=%s", org_id, n)
     except Exception:
@@ -200,6 +265,7 @@ def schedule_budget_retry(org_id_str: str, record_id_str: str) -> None:
         delay,
         org_id_str,
         record_id_str,
+        prefer_rq=False,
     )
 
 
@@ -224,7 +290,12 @@ def drain_stuck_pending_all_orgs() -> int:
         }
         total = 0
         for org_id in org_ids:
-            total += requeue_stuck_pending_reports(db, org_id, None)
+            total += requeue_pending_reports(
+                db,
+                org_id,
+                None,
+                min_age_seconds=_stuck_pending_minutes() * 60,
+            )
         return total
     finally:
         db.close()

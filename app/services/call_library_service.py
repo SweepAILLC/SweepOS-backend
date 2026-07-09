@@ -214,9 +214,17 @@ def ensure_pending_call_library_report(
         # Already analyzed — leave the finished report untouched.
         return row
     else:
+        was_pending = row.status == "pending"
         row.status = "pending"
         row.failure_reason = None
         row.call_title = call_title or row.call_title
+        # Do not bump updated_at when already pending — otherwise bulk re-ingest
+        # resets the stuck-pending drain timer forever.
+        if not was_pending:
+            row.updated_at = datetime.now(timezone.utc)
+
+    if row.status == "pending" and row.updated_at is None:
+        row.updated_at = datetime.now(timezone.utc)
 
     row.recording_url = (rec.recording_url or "")[:2000] or None
     try:
@@ -225,7 +233,8 @@ def ensure_pending_call_library_report(
     except Exception:
         pass
     row.attendees_json = rec.attendees_json
-    row.updated_at = datetime.now(timezone.utc)
+    if not row.updated_at:
+        row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)
     return row

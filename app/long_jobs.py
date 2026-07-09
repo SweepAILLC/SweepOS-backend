@@ -62,21 +62,27 @@ def schedule_background_work(
     fn: Callable[..., Any],
     background_tasks: Any | None,
     *args: Any,
+    prefer_rq: bool = True,
 ) -> None:
-    """Prefer RQ when enabled; else FastAPI BackgroundTasks; else a daemon thread."""
-    q = _get_queue()
-    if q is not None:
-        try:
-            q.enqueue(fn, *args, job_timeout=900, result_ttl=300)
-            return
-        except Exception:
-            logger.exception(
-                "RQ enqueue failed for %s; falling back",
-                getattr(fn, "__name__", fn),
-            )
+    """Schedule background work.
+
+    When ``prefer_rq`` is False (Call Library), always run in-process so prod does
+    not depend on a separate RQ worker for user-visible analysis jobs.
+    """
     if background_tasks is not None:
         background_tasks.add_task(fn, *args)
         return
+    if prefer_rq:
+        q = _get_queue()
+        if q is not None:
+            try:
+                q.enqueue(fn, *args, job_timeout=900, result_ttl=300)
+                return
+            except Exception:
+                logger.exception(
+                    "RQ enqueue failed for %s; falling back",
+                    getattr(fn, "__name__", fn),
+                )
     threading.Thread(target=fn, args=args, daemon=True).start()
 
 
@@ -85,35 +91,37 @@ def schedule_delayed_background_work(
     background_tasks: Any | None,
     delay_sec: float,
     *args: Any,
+    prefer_rq: bool = True,
 ) -> None:
     """Schedule background work after delay_sec.
 
     Uses an in-job sleep when RQ is enabled so delayed jobs run without rq-scheduler.
     """
     if delay_sec <= 0:
-        schedule_background_work(fn, background_tasks, *args)
+        schedule_background_work(fn, background_tasks, *args, prefer_rq=prefer_rq)
         return
 
-    q = _get_queue()
-    if q is not None:
-        try:
-            q.enqueue(
-                _run_after_delay,
-                delay_sec,
-                fn,
-                *args,
-                job_timeout=int(900 + delay_sec + 120),
-                result_ttl=300,
-            )
-            return
-        except Exception:
-            logger.exception(
-                "RQ delayed enqueue failed for %s; falling back to Timer",
-                getattr(fn, "__name__", fn),
-            )
+    if prefer_rq:
+        q = _get_queue()
+        if q is not None:
+            try:
+                q.enqueue(
+                    _run_after_delay,
+                    delay_sec,
+                    fn,
+                    *args,
+                    job_timeout=int(900 + delay_sec + 120),
+                    result_ttl=300,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "RQ delayed enqueue failed for %s; falling back to Timer",
+                    getattr(fn, "__name__", fn),
+                )
 
     def _kick() -> None:
-        schedule_background_work(fn, None, *args)
+        schedule_background_work(fn, None, *args, prefer_rq=prefer_rq)
 
     t = threading.Timer(delay_sec, _kick)
     t.daemon = True
