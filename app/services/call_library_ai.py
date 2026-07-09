@@ -320,7 +320,42 @@ def generate_call_library_report(
     except Exception:
         return None
 
-    return _normalize_report(raw)
+    normalized = _normalize_report(raw)
+    if not is_substantive_call_library_report(normalized):
+        return None
+    return normalized
+
+
+def is_substantive_call_library_report(report_json: Any) -> bool:
+    """True when the report has real analysis content (not an empty template shell)."""
+    if not isinstance(report_json, dict):
+        return False
+    if report_json.get("low_signal"):
+        return False
+    if report_json.get("call_score") is not None:
+        return True
+    if str(report_json.get("overall_impression") or "").strip():
+        return True
+    strengths = report_json.get("strengths")
+    weaknesses = report_json.get("weaknesses")
+    if isinstance(strengths, list) and strengths:
+        return True
+    if isinstance(weaknesses, list) and weaknesses:
+        return True
+    for key in ("discovery_audit", "pitching_audit", "objection_handling_audit"):
+        block = report_json.get(key)
+        if not isinstance(block, dict):
+            continue
+        for field, val in block.items():
+            if field.endswith("_score") and val is not None:
+                return True
+        for summary_key in ("discovery_summary", "pitch_summary", "objection_summary"):
+            if str(block.get(summary_key) or "").strip():
+                return True
+    ctx = report_json.get("call_context")
+    if isinstance(ctx, dict) and str(ctx.get("background") or "").strip():
+        return True
+    return False
 
 
 _ALLOWED_BILLING = {"one_time", "recurring_monthly", "recurring_annual", "unknown"}

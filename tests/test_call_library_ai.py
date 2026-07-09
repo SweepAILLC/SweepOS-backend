@@ -7,6 +7,7 @@ from app.services.call_library_ai import (
     PITCHING_SOP,
     _build_library_user_payload,
     generate_call_library_report,
+    is_substantive_call_library_report,
 )
 
 
@@ -55,3 +56,15 @@ class TestSopBlocksPresent:
         # Keep SOP injection sizes reasonable for token budget (enforced again at runtime)
         assert len(PITCHING_SOP) < 6000
         assert len(OBJECTION_HANDLING_SOP) < 8000
+
+
+class TestSubstantiveReportGuard:
+    def test_rejects_empty_template(self):
+        assert not is_substantive_call_library_report(
+            {"discovery_score": None, "objections": [], "summary": ""}
+        )
+
+    def test_accepts_scored_report(self):
+        assert is_substantive_call_library_report(
+            {"call_score": 7, "overall_impression": "Good call"}
+        )

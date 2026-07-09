@@ -335,9 +335,20 @@ def ingest_meeting_payload(
     db.refresh(rec)
 
     try:
+        from app.models.call_library_report import CallLibraryReport
         from app.services.call_library_service import ensure_pending_call_library_report
 
-        ensure_pending_call_library_report(db, org_id, rec.id)
+        existing_lib = (
+            db.query(CallLibraryReport)
+            .filter(
+                CallLibraryReport.org_id == org_id,
+                CallLibraryReport.fathom_call_record_id == rec.id,
+                CallLibraryReport.status == "complete",
+            )
+            .first()
+        )
+        if not existing_lib:
+            ensure_pending_call_library_report(db, org_id, rec.id)
     except Exception:
         logger.exception(
             "call_library pending row failed org=%s recording_id=%s",

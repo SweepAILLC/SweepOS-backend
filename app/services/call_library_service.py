@@ -240,10 +240,34 @@ def ensure_pending_call_library_report(
     return row
 
 
+def filter_fathom_records_needing_library_analysis(
+    db: Session,
+    org_id: uuid.UUID,
+    record_ids: List[uuid.UUID],
+) -> List[uuid.UUID]:
+    """Drop rows that already have a complete library report (bulk sync must not re-run LLM)."""
+    if not record_ids:
+        return []
+    complete_ids = {
+        r[0]
+        for r in db.query(CallLibraryReport.fathom_call_record_id)
+        .filter(
+            CallLibraryReport.org_id == org_id,
+            CallLibraryReport.fathom_call_record_id.in_(record_ids),
+            CallLibraryReport.status == "complete",
+        )
+        .all()
+        if r[0] is not None
+    }
+    return [rid for rid in record_ids if rid not in complete_ids]
+
+
 def generate_and_persist_report(
     db: Session,
     org_id: uuid.UUID,
     fathom_record_id: uuid.UUID,
+    *,
+    force_regenerate: bool = False,
 ) -> str:
     """
     Generate the AI call library report for a fathom record and persist it.
@@ -280,16 +304,26 @@ def generate_and_persist_report(
     call_title = _derive_call_title(rec, db, org_id)
     input_hash = _hash_call_inputs(summary, transcript)
 
-    if existing and existing.status == "complete":
-        prev_hash = None
+    if existing and existing.status == "complete" and not force_regenerate:
+        from app.services.call_library_ai import is_substantive_call_library_report
+
         if isinstance(existing.report_json, dict):
-            prev_hash = existing.report_json.get("_input_hash")
-        if prev_hash == input_hash:
-            if call_title and existing.call_title != call_title:
-                existing.call_title = call_title
-                existing.updated_at = datetime.now(timezone.utc)
-                db.commit()
-            return "skipped"
+            rep = dict(existing.report_json)
+            if not rep.get("_input_hash"):
+                rep["_input_hash"] = input_hash
+                existing.report_json = rep
+        if call_title and existing.call_title != call_title:
+            existing.call_title = call_title
+        if isinstance(existing.report_json, dict) and not is_substantive_call_library_report(
+            existing.report_json
+        ):
+            logger.info(
+                "call_library skip degraded complete (use Refresh to retry) record=%s",
+                fathom_record_id,
+            )
+        existing.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        return "skipped"
 
     if not transcript and not summary:
         # Content can be briefly absent during a Fathom re-ingest/enrichment window.
@@ -364,6 +398,12 @@ def generate_and_persist_report(
         report_json["_input_hash"] = input_hash
 
     if not report_json:
+        if existing and existing.status == "complete":
+            logger.info(
+                "call_library preserve complete after LLM miss record=%s",
+                fathom_record_id,
+            )
+            return "skipped"
         _upsert_report(
             db,
             org_id,
@@ -376,6 +416,29 @@ def generate_and_persist_report(
             call_score=None,
         )
         logger.warning("call_library AI failed record=%s", fathom_record_id)
+        return "failed"
+
+    from app.services.call_library_ai import is_substantive_call_library_report
+
+    if not is_substantive_call_library_report(report_json):
+        if existing and existing.status == "complete":
+            logger.warning(
+                "call_library rejected empty template; kept complete record=%s",
+                fathom_record_id,
+            )
+            return "skipped"
+        _upsert_report(
+            db,
+            org_id,
+            fathom_record_id,
+            rec,
+            "failed",
+            None,
+            "llm_empty",
+            call_title=call_title,
+            call_score=None,
+        )
+        logger.warning("call_library empty template rejected record=%s", fathom_record_id)
         return "failed"
 
     cs = report_json.get("call_score")
@@ -600,27 +663,38 @@ def requeue_llm_failed_reports(
     background_tasks: "BackgroundTasks",
 ) -> int:
     """
-    Re-run report generation for rows where the LLM failed or was budget-deferred.
+    Re-run report generation for failed/deferred rows and degraded empty templates.
     """
+    from app.services.call_library_ai import is_substantive_call_library_report
+
     _ensure_call_title_override_column(db)
     rows = (
         db.query(CallLibraryReport)
         .filter(
             CallLibraryReport.org_id == org_id,
-            CallLibraryReport.status.in_(("failed", "pending")),
-            CallLibraryReport.failure_reason.in_(("llm_failed", "budget_deferred")),
+            CallLibraryReport.status.in_(("failed", "pending", "complete")),
         )
         .all()
     )
-    if not rows:
-        return 0
     ids: List[uuid.UUID] = []
     for row in rows:
+        if row.status == "complete":
+            if is_substantive_call_library_report(row.report_json):
+                continue
+        elif row.status in ("failed", "pending"):
+            if row.failure_reason not in ("llm_failed", "budget_deferred", "llm_empty", None):
+                continue
+            if row.status == "pending" and row.failure_reason is None:
+                continue
+        else:
+            continue
         row.status = "pending"
         row.failure_reason = None
         row.updated_at = datetime.now(timezone.utc)
         if row.fathom_call_record_id:
             ids.append(row.fathom_call_record_id)
+    if not ids:
+        return 0
     db.commit()
     from app.services.call_library_queue import schedule_call_library_reports
 

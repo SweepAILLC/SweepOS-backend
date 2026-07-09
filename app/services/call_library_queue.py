@@ -67,7 +67,19 @@ def schedule_call_library_reports(
     """
     if not record_ids:
         return 0
+    from app.db.session import SessionLocal
     from app.long_jobs import schedule_background_work
+    from app.services.call_library_service import (
+        filter_fathom_records_needing_library_analysis,
+    )
+
+    db = SessionLocal()
+    try:
+        record_ids = filter_fathom_records_needing_library_analysis(db, org_id, record_ids)
+    finally:
+        db.close()
+    if not record_ids:
+        return 0
 
     oid = str(org_id)
     stagger = _library_stagger_sec()
@@ -245,7 +257,7 @@ def maybe_drain_stuck_pending_on_read(
             db,
             org_id,
             background_tasks,
-            min_age_seconds=_ready_pending_seconds(),
+            min_age_seconds=max(_stuck_pending_minutes() * 60, _ready_pending_seconds()),
         )
         if n:
             logger.info("call_library auto-drain on read org=%s requeued=%s", org_id, n)
