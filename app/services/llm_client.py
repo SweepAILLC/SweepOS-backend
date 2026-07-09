@@ -5,6 +5,7 @@ Used for Fathom sentiment and AI health score. No extra deps beyond httpx.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -15,6 +16,8 @@ import httpx
 from app.core.config import settings
 from app.core.llm_budget import consume_llm_budget
 from app.core.prompt_security import sanitize_llm_user_payload
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_provider_and_key() -> Tuple[str, Optional[str]]:
@@ -51,6 +54,7 @@ def chat_json(
     timeout: float = 60.0,
     org_id: Optional[uuid.UUID] = None,
     model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Single-turn chat; request JSON object in response. Parses first JSON object from text.
@@ -69,7 +73,9 @@ def chat_json(
 
     if provider == "gemini":
         return _gemini_generate_json(api_key, system_prompt, user_prompt, temperature, timeout, model=model)
-    return _openai_chat_json(api_key, system_prompt, user_prompt, temperature, timeout, model=model)
+    return _openai_chat_json(
+        api_key, system_prompt, user_prompt, temperature, timeout, model=model, max_tokens=max_tokens
+    )
 
 
 def _gemini_generate_json(
@@ -116,6 +122,7 @@ def _openai_chat_json(
     timeout: float,
     *,
     model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     model_name = (model or settings.HEALTH_SCORE_LLM_MODEL or "").strip()
     url = "https://api.openai.com/v1/chat/completions"
@@ -129,12 +136,35 @@ def _openai_chat_json(
             {"role": "user", "content": user},
         ],
     }
+    if max_tokens and max_tokens > 0:
+        body["max_tokens"] = int(max_tokens)
     data = _post_with_retries(
         lambda c: c.post(url, headers=headers, json=body),
         timeout=timeout,
     )
-    text = data["choices"][0]["message"]["content"] or "{}"
-    return _parse_json_object(text)
+    try:
+        choice = data["choices"][0]
+        finish_reason = choice.get("finish_reason")
+        text = choice["message"]["content"] or "{}"
+    except (KeyError, IndexError, TypeError) as e:
+        logger.warning("openai response shape unexpected model=%s err=%s", model_name, e)
+        raise ValueError(f"LLM response missing choices: {e}")
+    if finish_reason == "length":
+        logger.warning(
+            "openai response truncated (finish_reason=length) model=%s len=%s — increase max_tokens",
+            model_name,
+            len(text),
+        )
+    try:
+        return _parse_json_object(text)
+    except ValueError:
+        logger.warning(
+            "openai JSON parse failed model=%s finish=%s content_head=%r",
+            model_name,
+            finish_reason,
+            text[:300],
+        )
+        raise
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:
@@ -181,9 +211,16 @@ def _post_with_retries(post_fn, *, timeout: float, max_attempts: int = 3) -> Any
             raise RuntimeError("LLM provider connection failed") from e
         except httpx.HTTPStatusError as e:
             last_exc = e
+            status = e.response.status_code if e.response is not None else "?"
             if e.response is not None and e.response.status_code in _RETRYABLE_STATUS and attempt < max_attempts - 1:
                 time.sleep(min(0.5 * (2 ** attempt), 8))
                 continue
+            body_head = ""
+            try:
+                body_head = e.response.text[:300] if e.response is not None else ""
+            except Exception:
+                pass
+            logger.warning("LLM HTTP %s error (non-retryable): %s", status, body_head)
             raise
     raise RuntimeError("LLM request exhausted retries") from last_exc
 

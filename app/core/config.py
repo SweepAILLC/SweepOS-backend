@@ -159,7 +159,8 @@ class Settings(BaseSettings):
     CALL_LIBRARY_LLM_MODEL: Optional[str] = None  # defaults to HEALTH_SCORE_LLM_MODEL
     CALL_LIBRARY_MAX_TRANSCRIPT_CHARS: int = 12000
     CALL_LIBRARY_MAX_SUMMARY_CHARS: int = 6000
-    CALL_LIBRARY_LLM_TIMEOUT_SEC: float = 90.0
+    CALL_LIBRARY_LLM_TIMEOUT_SEC: float = 120.0
+    CALL_LIBRARY_MAX_OUTPUT_TOKENS: int = 3000  # cap report size; avoids finish_reason=length truncation
     CALL_LIBRARY_STAGGER_SEC: float = 1.5  # gap between queued library jobs (≈40/min)
     CALL_LIBRARY_STUCK_PENDING_MINUTES: int = 15  # only requeue pending older than this
     CALL_LIBRARY_READY_PENDING_SEC: int = 45

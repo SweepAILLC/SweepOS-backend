@@ -720,6 +720,25 @@ def get_call_library_for_org(
     return {"items": items, "total": total}
 
 
+def delete_call_library_report(
+    db: Session,
+    org_id: uuid.UUID,
+    report_id: uuid.UUID,
+) -> bool:
+    """Delete a single call library report. Returns True if a row was removed."""
+    row = (
+        db.query(CallLibraryReport)
+        .filter(CallLibraryReport.id == report_id, CallLibraryReport.org_id == org_id)
+        .first()
+    )
+    if not row:
+        return False
+    db.delete(row)
+    db.commit()
+    logger.info("call_library report deleted org=%s report=%s", org_id, report_id)
+    return True
+
+
 def update_call_library_title(
     db: Session,
     org_id: uuid.UUID,

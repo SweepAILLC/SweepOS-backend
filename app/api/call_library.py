@@ -66,6 +66,24 @@ def patch_call_library_report(
     return {"ok": True, "id": str(row.id)}
 
 
+@router.delete("/{report_id}")
+def delete_call_library_report(
+    report_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a single call report (removes the row; source Fathom record is kept)."""
+    _require_call_library_tab(db, current_user)
+    try:
+        rid = uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid report id")
+    ok = cls.delete_call_library_report(db, _org_id(current_user), rid)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+    return {"ok": True, "id": report_id}
+
+
 @router.post("/retry-llm-failed")
 def retry_llm_failed_call_reports(
     background_tasks: BackgroundTasks,

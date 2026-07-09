@@ -282,14 +282,30 @@ def _build_library_user_payload(summary: str, transcript: str) -> str:
 
 
 def _resolve_call_library_model() -> Optional[str]:
-    """Pick a JSON-capable model for Call Library (avoid Gemini model on OpenAI endpoint)."""
+    """Pick a JSON-capable model that matches the provider that will actually be used.
+
+    Guards against sending a Gemini model name to the OpenAI endpoint (404) when
+    HEALTH_SCORE_LLM_MODEL is Gemini but only an OpenAI key is configured.
+    """
+    from app.services.llm_client import _resolve_provider_and_key
+
     override = (getattr(settings, "CALL_LIBRARY_LLM_MODEL", None) or "").strip()
-    if override:
-        return override
+    provider, _ = _resolve_provider_and_key()
     health = (getattr(settings, "HEALTH_SCORE_LLM_MODEL", None) or "").strip()
-    prov = (getattr(settings, "LLM_PROVIDER", "auto") or "auto").lower()
-    if prov == "openai" or (prov == "auto" and "gpt" in health.lower()):
+
+    if override:
+        # Only trust an override that matches the active provider.
+        low = override.lower()
+        if provider == "openai" and "gemini" in low:
+            return "gpt-4o-mini"
+        if provider == "gemini" and "gpt" in low:
+            return health or "gemini-2.0-flash"
+        return override
+
+    if provider == "openai":
         return health if "gpt" in health.lower() else "gpt-4o-mini"
+    if provider == "gemini":
+        return health if "gemini" in health.lower() else "gemini-2.0-flash"
     return health or None
 
 
@@ -319,6 +335,7 @@ def generate_call_library_report(
     timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
     model_override = _resolve_call_library_model()
 
+    max_tokens = int(getattr(settings, "CALL_LIBRARY_MAX_OUTPUT_TOKENS", 3000) or 3000)
     try:
         raw = chat_json(
             system_prompt,
@@ -327,14 +344,15 @@ def generate_call_library_report(
             timeout=timeout,
             org_id=org_id,
             model=model_override,
+            max_tokens=max_tokens,
         )
     except RuntimeError as e:
         if "llm_budget" in str(e).lower():
             raise
-        logger.warning("call_library LLM runtime error: %s", e)
+        logger.warning("call_library LLM runtime error model=%s: %s", model_override, e)
         return None
     except Exception as e:
-        logger.warning("call_library LLM request failed: %s", e)
+        logger.warning("call_library LLM request failed model=%s: %s", model_override, e)
         return None
 
     normalized = _normalize_report(raw)
