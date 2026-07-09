@@ -90,6 +90,7 @@ def schedule_call_library_reports(
     finally:
         db.close()
     if not record_ids:
+        logger.debug("call_library schedule skipped org=%s (all filtered)", org_id)
         return 0
 
     max_batch = _max_batch_size()
@@ -285,6 +286,9 @@ def requeue_pending_reports(
     if len(ids) > max_requeue:
         ids = ids[:max_requeue]
 
+    # Enqueue before touching updated_at — filter skips pending rows updated in the
+    # last few minutes as "in flight", so resetting updated_at first drops all jobs.
+    scheduled = schedule_call_library_reports(org_id, ids, background_tasks)
     for row in (
         db.query(CallLibraryReport)
         .filter(
@@ -297,11 +301,11 @@ def requeue_pending_reports(
         row.failure_reason = None
         row.updated_at = datetime.now(timezone.utc)
     db.commit()
-    schedule_call_library_reports(org_id, ids, background_tasks)
     logger.info(
-        "call_library requeued org=%s count=%s min_age_s=%s",
+        "call_library requeued org=%s count=%s scheduled=%s min_age_s=%s",
         org_id,
         len(ids),
+        scheduled,
         min_age_seconds,
     )
     return len(ids)
