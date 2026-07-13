@@ -36,6 +36,7 @@ from app.models.automation import (
 )
 from app.models.client import Client, LifecycleState
 from app.models.client_call_insight import ClientCallInsight
+from app.models.manual_payment import ManualPayment
 from app.models.stripe_payment import StripePayment
 from app.models.whop_payment import WhopPayment
 from app.services.offer_ladder import (
@@ -426,7 +427,19 @@ def _is_first_succeeded_payment(
     if excluding_whop_id:
         whop_q = whop_q.filter(WhopPayment.whop_id != excluding_whop_id)
     whop_count = int(whop_q.scalar() or 0)
-    return whop_count == 0
+    if whop_count > 0:
+        return False
+
+    manual_count = int(
+        db.query(func.count(ManualPayment.id))
+        .filter(
+            ManualPayment.org_id == org_id,
+            ManualPayment.client_id == client_id,
+        )
+        .scalar()
+        or 0
+    )
+    return manual_count == 0
 
 
 def _client_has_any_onboarding_automation_job(
@@ -473,10 +486,9 @@ def on_payment_received(
     1. ``_is_first_succeeded_payment``: the client has no other succeeded
        Stripe/Whop payment row aside from this one. Defends against re-fired
        webhooks and against Whop sync bringing in N rows for one client.
-    2. ``client.lifetime_revenue_cents`` is at most ``amount_cents``. If the
-       client already has accumulated revenue (manual entry, prior import, or
-       another integration), they aren't actually new and we shouldn't email
-       them onboarding copy.
+    2. Prior ``lifetime_revenue_cents`` (before this charge) must be zero. The
+       webhook path increments lifetime before enqueue; we subtract this payment
+       amount so sync+webhook double-counting does not block first-time payers.
     3. Recency: ``paid_at`` must be within ``FIRST_PAYMENT_RECENCY_HOURS`` of
        now. Historical payments imported in a backfill produce idempotency
        rows but never trigger onboarding/referral.
@@ -489,12 +501,19 @@ def on_payment_received(
 
     Returns the list of newly created job ids.
     """
+    seed_default_rules(db, org_id)
+
     client = (
         db.query(Client)
         .filter(Client.id == client_id, Client.org_id == org_id)
         .first()
     )
     if not client:
+        LOG.info(
+            "automation: skipping first-payment for missing client %s (org %s).",
+            client_id,
+            org_id,
+        )
         return []
 
     is_first = _is_first_succeeded_payment(
@@ -505,23 +524,28 @@ def on_payment_received(
         excluding_whop_id=payment_external_id if payment_source == "whop" else None,
     )
     if not is_first:
+        LOG.info(
+            "automation: skipping first-payment for client %s -- not the first succeeded payment.",
+            client_id,
+        )
         return []
 
-    # Cross-source revenue gate: lifetime_revenue_cents tracks ALL revenue
-    # this client has ever attributed to them, not just the rows we just
-    # counted. If it exceeds this charge, they're not actually a brand-new
-    # payer -- skip onboarding rather than misfire.
+    # Cross-source revenue gate: lifetime_revenue_cents may already include this
+    # charge (webhook increments before enqueue; sync may have set totals too).
+    # Compare revenue *before* this payment rather than the post-increment total.
     try:
         existing_lifetime = int(client.lifetime_revenue_cents or 0)
     except (TypeError, ValueError):
         existing_lifetime = 0
-    if existing_lifetime > int(amount_cents or 0):
+    payment_amount = int(amount_cents or 0)
+    prior_lifetime = max(0, existing_lifetime - payment_amount)
+    if prior_lifetime > 0:
         LOG.info(
             "automation: skipping first-payment onboarding for client %s -- "
-            "lifetime_revenue_cents=%s already exceeds this payment (%s).",
+            "prior lifetime_revenue_cents=%s before this payment (%s).",
             client_id,
-            existing_lifetime,
-            amount_cents,
+            prior_lifetime,
+            payment_amount,
         )
         return []
 
@@ -546,6 +570,21 @@ def on_payment_received(
             )
             return []
 
+    # Paying clients should be active before audience filters (Whop sync used to
+    # enqueue before lifecycle automation, blocking lifecycle_in: ["active"]).
+    try:
+        from app.services.client_automation import move_client_to_active_on_payment
+
+        if move_client_to_active_on_payment(db, client):
+            db.flush()
+            db.refresh(client)
+    except Exception as exc:
+        LOG.warning(
+            "automation: could not move client %s to active before first-payment enqueue: %s",
+            client_id,
+            exc,
+        )
+
     created: List[uuid.UUID] = []
     discriminator = f"{payment_source}:{payment_external_id}"
     payload = {
@@ -564,9 +603,32 @@ def on_payment_received(
             "an onboarding automation job already exists for this client.",
             client_id,
         )
+    elif not onboarding_rule:
+        LOG.info(
+            "automation: skipping first-payment onboarding for client %s -- "
+            "no first_payment_onboarding rule for org %s.",
+            client_id,
+            org_id,
+        )
+    elif not onboarding_rule.enabled:
+        LOG.info(
+            "automation: skipping first-payment onboarding for client %s -- "
+            "rule exists but is disabled for org %s.",
+            client_id,
+            org_id,
+        )
+    elif not audience_filter_passes(client, onboarding_rule.audience_filter):
+        LOG.info(
+            "automation: skipping first-payment onboarding for client %s -- "
+            "audience filter rejected lifecycle=%s filter=%s.",
+            client_id,
+            getattr(client.lifecycle_state, "value", client.lifecycle_state),
+            onboarding_rule.audience_filter,
+        )
     onboarding_discriminator = f"lifetime_once:{client_id}"
     if (
         onboarding_rule
+        and onboarding_rule.enabled
         and audience_filter_passes(client, onboarding_rule.audience_filter)
         and not onboarding_blocked
     ):
@@ -581,9 +643,14 @@ def on_payment_received(
         )
         if nid:
             created.append(nid)
+            LOG.info(
+                "automation: enqueued first_payment_onboarding job %s for client %s.",
+                nid,
+                client_id,
+            )
 
     referral_rule = _get_rule(db, org_id, Playbook.FIRST_PAYMENT_REFERRAL.value)
-    if referral_rule and audience_filter_passes(client, referral_rule.audience_filter):
+    if referral_rule and referral_rule.enabled and audience_filter_passes(client, referral_rule.audience_filter):
         nid = _enqueue_job(
             db,
             org_id=org_id,

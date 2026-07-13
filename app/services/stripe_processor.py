@@ -188,6 +188,14 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
     payment_type = 'charge' if not event_type.startswith("invoice.") else 'invoice'
     created_ts = data.get('created', int(datetime.utcnow().timestamp()))
     created_at = datetime.fromtimestamp(created_ts) if created_ts else datetime.utcnow()
+
+    preexisting_payment = db.query(StripePayment).filter(
+        StripePayment.org_id == org_id,
+        StripePayment.stripe_id == payment_id,
+    ).first()
+    payment_already_succeeded = (
+        preexisting_payment is not None and preexisting_payment.status == "succeeded"
+    )
     
     stmt = insert(StripePayment).values(
         org_id=org_id,
@@ -232,20 +240,27 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
             StripePayment.stripe_id != payment_id,
         ).count()
         from app.models.whop_payment import WhopPayment as _WhopPayment
+        from app.models.manual_payment import ManualPayment as _ManualPayment
         whop_succeeded = db.query(_WhopPayment).filter(
             _WhopPayment.org_id == org_id,
             _WhopPayment.client_id == client.id,
             _WhopPayment.status.in_(("paid", "succeeded", "completed", "successful")),
         ).count()
-        first_payment_signal = (existing_succeeded == 0 and whop_succeeded == 0)
+        manual_count = db.query(_ManualPayment).filter(
+            _ManualPayment.org_id == org_id,
+            _ManualPayment.client_id == client.id,
+        ).count()
+        first_payment_signal = (
+            existing_succeeded == 0 and whop_succeeded == 0 and manual_count == 0
+        )
 
-        # Keep client.lifetime_revenue_cents in sync on webhook ingest. The previous
-        # comment about "recalculated during reconciliation" left this field stale
-        # whenever sync wasn't run, breaking audience filters and Performance views.
-        try:
-            client.lifetime_revenue_cents = int(client.lifetime_revenue_cents or 0) + int(amount_cents)
-        except (TypeError, ValueError):
-            pass
+        # Only increment lifetime on first ingest of a succeeded charge. Re-delivered
+        # webhooks and sync-then-webhook paths already have the row and lifetime set.
+        if not payment_already_succeeded:
+            try:
+                client.lifetime_revenue_cents = int(client.lifetime_revenue_cents or 0) + int(amount_cents)
+            except (TypeError, ValueError):
+                pass
     
     # If invoice has subscription, ensure subscription exists with MRR
     # Test events might not trigger subscription.created, so create/update from invoice
@@ -308,7 +323,7 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
             if first_payment_signal:
                 try:
                     from app.services.automation_engine import on_payment_received
-                    on_payment_received(
+                    job_ids = on_payment_received(
                         db,
                         org_id=org_id,
                         client_id=client.id,
@@ -318,6 +333,16 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
                         paid_at=created_at,
                     )
                     db.commit()
+                    if job_ids:
+                        print(
+                            f"[AUTOMATION_ENGINE] ✅ Enqueued {len(job_ids)} first-payment job(s) "
+                            f"for client {client.id}: {job_ids}"
+                        )
+                    else:
+                        print(
+                            f"[AUTOMATION_ENGINE] No first-payment jobs enqueued for client {client.id} "
+                            f"(rule disabled, audience filter, or not first payment — see server logs)."
+                        )
                 except Exception as automation_error:
                     print(f"[AUTOMATION_ENGINE] ⚠️ Error enqueueing first-payment jobs: {automation_error}")
                     db.rollback()
