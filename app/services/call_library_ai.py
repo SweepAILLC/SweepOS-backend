@@ -108,159 +108,73 @@ For each objection in objections[], label type, classification (fear|logistics|m
 sop_path_followed (bool), steps_hit[], steps_missed[], handled_well, summary, quote.
 """
 
-_PITCHING_SCORE_SCHEMA = """\
-  "pitching_audit": {
-    "pitch_score": integer 0-100 = sum(dimension_score * 20),
-    "pain_weaving": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "natural_solution_framing": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "goal_bridge": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "positioning_clarity": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "credibility_in_context": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "pitch_summary": "One paragraph verdict on the pitch"
-  },\
+# Compact rubrics for LLM scoring (full SOPs above remain for Resources/docs fallbacks).
+DISCOVERY_AUDIT_RUBRIC = """\
+DISCOVERY (each dim 1-10; discovery_score = sum(dim×20), 0-100):
+pain_identification | pain_impact | tangible_goals | intangible_goals | rapport_trust_authority
+9-10 root/explicit+confirmed; 7-8 solid; 5-6 surface; 3-4 weak; 1-2 missing.
 """
 
-_OBJECTION_SCORE_SCHEMA = """\
-  "objection_handling_audit": {
-    "objection_score": integer 0-100 = sum(aggregate_dimension * 25),
-    "fear_handled_first": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "classification_accuracy": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "sop_path_adherence": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "resolution_quality": { "score": 1-10, "summary": "2-3 sentences", "quote": "verbatim or null" },
-    "objections": [
-      {
-        "objection_label": "think_about_it | too_expensive | bad_timing | wont_work | need_partner | other",
-        "surface_quote": "what prospect said, verbatim or close",
-        "classification": "fear | logistics | mixed",
-        "fear_addressed_first": boolean,
-        "sop_path_followed": boolean,
-        "steps_hit": ["key steps from SOP tree that were used"],
-        "steps_missed": ["important SOP steps skipped"],
-        "handled_well": boolean,
-        "summary": "2-3 sentences coaching assessment",
-        "quote": "best supporting quote or null"
-      }
-    ],
-    "objection_summary": "One paragraph overall verdict on objection handling"
-  },\
+PITCHING_RUBRIC = """\
+PITCH (each dim 1-10; pitch_score = sum(dim×20)):
+pain_weaving | natural_solution_framing | goal_bridge | positioning_clarity | credibility_in_context
+Score only if a pitch/offer occurred; otherwise omit pitching_audit and note none found.
 """
 
-_DISCOVERY_SCORE_SCHEMA = """\
-  "discovery_audit": {
-    "discovery_score": integer 0-100 calculated as sum of (each dimension_score * 20),
-    "pain_identification": {
-      "score": integer 1-10 per DISCOVERY AUDIT SOP dimension 1,
-      "summary": "2-3 sentences: what the salesperson did or failed to do, with specific evidence",
-      "quote": "Verbatim short quote from transcript illustrating this dimension, or null"
-    },
-    "pain_impact": {
-      "score": integer 1-10 per DISCOVERY AUDIT SOP dimension 2,
-      "summary": "2-3 sentences: was the daily-life grounding achieved? specific evidence",
-      "quote": "Verbatim short quote, or null"
-    },
-    "tangible_goals": {
-      "score": integer 1-10 per DISCOVERY AUDIT SOP dimension 3,
-      "goals_uncovered": ["list of specific tangible goals found — number + timeframe if present"],
-      "summary": "2-3 sentences: were goals quantified? were they prospect-supplied?",
-      "quote": "Verbatim short quote, or null"
-    },
-    "intangible_goals": {
-      "score": integer 1-10 per DISCOVERY AUDIT SOP dimension 4,
-      "goals_uncovered": ["list of specific intangible goals found — category + what was named"],
-      "summary": "2-3 sentences: were emotional/identity stakes surfaced? were they named explicitly?",
-      "quote": "Verbatim short quote, or null"
-    },
-    "rapport_trust_authority": {
-      "score": integer 1-10 per DISCOVERY AUDIT SOP dimension 5,
-      "summary": "2-3 sentences: was safety created? was authority demonstrated through questions?",
-      "quote": "Verbatim short quote, or null"
-    },
-    "discovery_summary": "One paragraph (3-5 sentences) with the overall verdict on the discovery: what was built well, what was left on the table, and what it means for the pitch that followed. Be direct and coaching in tone."
-  },\
+OBJECTION_HANDLING_RUBRIC = """\
+OBJECTIONS — fear before logistics. Aggregate dims 1-10 (×25 → objection_score):
+fear_handled_first | classification_accuracy | sop_path_adherence | resolution_quality
+Labels: think_about_it|too_expensive|bad_timing|wont_work|need_partner|other
+Class: fear|logistics|mixed. If none, omit objection_handling_audit and note none found.
 """
+
 
 def _build_system_prompt(
-    discovery_audit_sop: str,
-    pitching_sop: str,
-    objection_handling_sop: str,
+    discovery_audit_sop: str = "",
+    pitching_sop: str = "",
+    objection_handling_sop: str = "",
 ) -> str:
-    return """\
-You are an expert sales coach reviewing a recorded sales call. Analyze the transcript and summary \
-provided in the DATA block and output a single JSON object ONLY — no markdown, no extra text.
+    """Build a compact coach prompt: rubrics + short schema (no duplicated long SOP/schema)."""
+    custom_bits: list[str] = []
+    for label, text in (
+        ("Discovery notes", discovery_audit_sop),
+        ("Pitch notes", pitching_sop),
+        ("Objection notes", objection_handling_sop),
+    ):
+        t = (text or "").strip()
+        # Only append org-custom notes when they differ from built-in full SOPs.
+        if not t or t in (DISCOVERY_AUDIT_SOP, PITCHING_SOP, OBJECTION_HANDLING_SOP):
+            continue
+        custom_bits.append(f"{label}:\n{truncate_for_tokens(t, 800)}")
+    custom_block = ("\n\nOrg custom guidance:\n" + "\n\n".join(custom_bits)) if custom_bits else ""
 
-Use the DISCOVERY AUDIT SOP below to score discovery_audit:
-""" + discovery_audit_sop + """
+    return f"""\
+You are an expert sales coach. Analyze DATA and return ONE JSON object only (no markdown).
 
-Use the PITCHING SOP below to score pitching_audit:
-""" + pitching_sop + """
+Score with these rubrics:
+{DISCOVERY_AUDIT_RUBRIC}
+{PITCHING_RUBRIC}
+{OBJECTION_HANDLING_RUBRIC}
+{custom_block}
 
-Use the OBJECTION HANDLING SOP below to score objection_handling_audit:
-""" + objection_handling_sop + """
-
-Schema:
-{
-  "call_context": {
-    "salesperson": "Name or role of the salesperson if identifiable, else 'Salesperson'",
-    "prospect": "Name or role of the prospect if identifiable, else 'Prospect'",
-    "topic": "One sentence: what the call was about",
-    "background": "1-2 sentences: relationship context, how they connected, any referral"
-  },
-""" + _DISCOVERY_SCORE_SCHEMA + """
-""" + _PITCHING_SCORE_SCHEMA + """
-""" + _OBJECTION_SCORE_SCHEMA + """
-  "strengths": [
-    {
-      "title": "Short label for the strength the salesperson demonstrated on the call in moving the deal forward toward closing (e.g. 'Building trust through shared frustration')",
-      "detail": "2-3 sentences explaining exactly how and why this was effective",
-      "timestamp": "Timestamp if visible in transcript (e.g. '09:12'), else null",
-      "quote": "Verbatim short quote from the transcript that best illustrates this, or null"
-    }
-  ],
-  "weaknesses": [
-    {
-      "title": "Short label for the weakness the salesperson demonstrated on the call in failing to move the deal forward toward closing (e.g. 'Not asking for the sale')",
-      "detail": "2-3 sentences explaining what went wrong and what the impact was in terms of affecting the salesperson's ability to close the sale",
-      "timestamp": "Timestamp if visible, else null",
-      "quote": "Verbatim short quote if relevant, or null"
-    }
-  ],
-  "customer_response": {
-    "emotional_tone": "One sentence describing how the customer/prospect behaved emotionally to the salesperson's efforts",
-    "questions_asked": ["List of key questions the customer asked, verbatim or close paraphrase"],
-    "buying_signals": ["Any positive signals that suggest intent to purchase or deepen relationship"],
-    "objections_or_barriers": ["Objections, hesitations, or blockers the customer raised that blocked or stalled the follow through or closing of the sale"]
-  },
-  "overall_impression": "One paragraph (4-6 sentences) summarizing whether the call succeeded at \
-moving the deal forward toward closing or completing the sale or failed. Be direct, analytical, and honest.",
-  "call_score": integer 0-100 estimating overall sales call quality (discovery, next steps, objection handling, clarity). Not a lead score.,
-  "deal_outcome": {
-    "closed": boolean — true ONLY when it is unambiguously clear from the DATA that the sale was closed on this call (verbal commitment to buy, payment confirmed, contract acceptance, "let's get you signed up" / "send the invoice" / "I'm in"). Default to false on any doubt — interest, hesitation, "I'll think about it", "let me check with my partner", or scheduling another call all mean closed=false,
-    "amount": number | null — total deal value in the deal_outcome.currency (use whole units, e.g. 4500 for $4,500; do not store cents). Pull only from explicit price/figure stated or agreed in the transcript or summary. Use null when the figure is not stated even if closed=true,
-    "currency": "USD" | "EUR" | "GBP" | "CAD" | "AUD" | other ISO 4217 — default "USD" when unclear,
-    "billing": "one_time" | "recurring_monthly" | "recurring_annual" | "unknown" — derive from how the sale was framed (e.g. monthly retainer vs lump sum); use "unknown" if not stated,
-    "confidence": "high" | "medium" | "low" — your confidence that the close happened on this call,
-    "evidence": "Short verbatim quote (or close paraphrase if the transcript only summarizes) from DATA that proves the close happened. Empty string when closed=false."
-  },
-  "low_signal": boolean indicating if the call was so thin or lacked enough substance that it was not possible to generate a meaningful analysis,
-  "low_signal_reason": string explaining why the call was so thin or lacked enough substance that it was not possible to generate a meaningful analysis"
-}
+JSON keys (omit sections with no evidence — do NOT invent empty audits):
+- call_context: {{salesperson, prospect, topic, background}}
+- discovery_audit: {{discovery_score, pain_identification|pain_impact|tangible_goals|intangible_goals|rapport_trust_authority each {{score,summary,quote}}, discovery_summary}} — omit if no discovery
+- pitching_audit: {{pitch_score, pain_weaving|natural_solution_framing|goal_bridge|positioning_clarity|credibility_in_context each {{score,summary,quote}}, pitch_summary}} — omit if no pitch
+- objection_handling_audit: {{objection_score, fear_handled_first|classification_accuracy|sop_path_adherence|resolution_quality each {{score,summary,quote}}, objections[], objection_summary}} — omit if no objections
+- strengths[] / weaknesses[]: {{title, detail, timestamp, quote}} — 0-4 each; [] if none
+- customer_response: {{emotional_tone, questions_asked[], buying_signals[], objections_or_barriers[]}}
+- overall_impression: short coaching paragraph
+- call_score: 0-100 overall quality
+- deal_outcome: {{closed(bool default false), amount|null, currency, billing(one_time|recurring_monthly|recurring_annual|unknown), confidence(high|medium|low), evidence}}
+- low_signal / low_signal_reason when DATA is too thin
 
 RULES:
-- Use ONLY information from the DATA block. Do not invent names, quotes, or events.
-- discovery_audit: score every call with discovery content. If discovery absent, score dims 1 and explain.
-- pitching_audit: score if a pitch/offer presentation occurred. If no pitch, score dims 1 and explain in pitch_summary.
-- objection_handling_audit: if no objections raised, set objection_score null, objections=[], explain in objection_summary. If objections exist, populate objections[] for EACH distinct objection using SOP trees.
-- FEAR FIRST: penalize handling logistics (price break, schedule follow-up) before fear layer in weaknesses.
-- call_score: integer 0-100 estimating overall sales call quality (discovery, pitch, objection handling, next steps). Not a lead score.
-- deal_outcome.closed defaults to FALSE. Only flip it to true when the DATA contains an unambiguous close signal — explicit verbal yes ("let's do it", "I'm in", "sign me up"), a stated payment ("I'll send the invoice", "card on file", "payment processed"), a contract/agreement acceptance, or the salesperson confirming next-step onboarding for a now-paying client. Interest, soft yeses, scheduling another call, "I'll think about it", or pricing discussions without commitment are NOT closes.
-- deal_outcome.amount must come from a number actually stated in the DATA (transcript or summary). Never guess or interpolate. If closed=true but no figure is stated, leave amount=null.
-- deal_outcome.evidence must quote (or tightly paraphrase) the line in DATA that proves the close. If closed=false, return an empty string.
-- If the transcript is too short or empty to analyze, set low_signal=true and explain in low_signal_reason.
-- strengths and weaknesses: include 2-4 bullets each when evidence exists. Align with discovery, pitching, and objection audits. Empty arrays if no evidence.
-- Write "detail" and "summary" fields as 2-4 sentences in a coaching tone, like a written report (not terse bullets only).
-- Timestamps: copy exactly as they appear in the transcript (e.g. "09:12"); leave null if absent.
-- Quotes must be verbatim substrings from the transcript. Never fabricate quotes.
-- Output valid JSON only — no markdown fences.
+- Use ONLY DATA. Never invent quotes, names, or events.
+- Skip sections with no evidence (report nothing found via omission or a one-line summary field).
+- closed=true only on unambiguous close; amount only if stated; evidence quotes the close line.
+- Quotes verbatim from transcript; timestamps as shown or null.
+- Valid JSON only.
 """
 
 
@@ -326,20 +240,20 @@ def generate_call_library_report(
     if not combined.strip():
         return None
 
-    disc = truncate_for_tokens((discovery_audit_sop or DISCOVERY_AUDIT_SOP).strip(), 5000)
-    pitch = truncate_for_tokens((pitching_sop or PITCHING_SOP).strip(), 4000)
-    obj = truncate_for_tokens((objection_handling_sop or OBJECTION_HANDLING_SOP).strip(), 5000)
+    disc = (discovery_audit_sop or "").strip()
+    pitch = (pitching_sop or "").strip()
+    obj = (objection_handling_sop or "").strip()
     system_prompt = _build_system_prompt(disc, pitch, obj)
 
     user_msg = "DATA:\n" + combined
     timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
     model_override = _resolve_call_library_model()
 
-    max_tokens = int(getattr(settings, "CALL_LIBRARY_MAX_OUTPUT_TOKENS", 4096) or 4096)
+    max_tokens = int(getattr(settings, "CALL_LIBRARY_MAX_OUTPUT_TOKENS", 2500) or 2500)
     max_input = int(
-        getattr(settings, "CALL_LIBRARY_MAX_INPUT_CHARS_TOTAL", 56000) or 56000
+        getattr(settings, "CALL_LIBRARY_MAX_INPUT_CHARS_TOTAL", 40000) or 40000
     )
-    min_user = int(getattr(settings, "CALL_LIBRARY_MIN_USER_INPUT_CHARS", 12000) or 12000)
+    min_user = int(getattr(settings, "CALL_LIBRARY_MIN_USER_INPUT_CHARS", 10000) or 10000)
     try:
         raw = chat_json(
             system_prompt,
@@ -351,6 +265,7 @@ def generate_call_library_report(
             max_tokens=max_tokens,
             max_input_chars=max_input,
             min_user_chars=min_user,
+            feature="call_library",
         )
     except RuntimeError as e:
         if "llm_budget" in str(e).lower():
@@ -719,12 +634,29 @@ def _normalize_report(raw: Dict[str, Any]) -> Dict[str, Any]:
         "low_signal_reason": str(raw.get("low_signal_reason") or "")[:500],
     }
 
-    # discovery_audit
-    out["discovery_audit"] = _normalize_discovery_audit(raw.get("discovery_audit"))
-    out["pitching_audit"] = _normalize_pitching_audit(raw.get("pitching_audit"))
-    out["objection_handling_audit"] = _normalize_objection_handling_audit(
-        raw.get("objection_handling_audit")
-    )
+    # discovery / pitch / objections — omit empty shells; note when LLM skipped section
+    if raw.get("discovery_audit") is None:
+        da = _empty_discovery_audit()
+        da["discovery_summary"] = "Nothing found on this call."
+        out["discovery_audit"] = da
+    else:
+        out["discovery_audit"] = _normalize_discovery_audit(raw.get("discovery_audit"))
+
+    if raw.get("pitching_audit") is None:
+        pa = _empty_pitching_audit()
+        pa["pitch_summary"] = "Nothing found on this call."
+        out["pitching_audit"] = pa
+    else:
+        out["pitching_audit"] = _normalize_pitching_audit(raw.get("pitching_audit"))
+
+    if raw.get("objection_handling_audit") is None:
+        oa = _empty_objection_handling_audit()
+        oa["objection_summary"] = "Nothing found on this call."
+        out["objection_handling_audit"] = oa
+    else:
+        out["objection_handling_audit"] = _normalize_objection_handling_audit(
+            raw.get("objection_handling_audit")
+        )
 
     # call_context
     ctx = raw.get("call_context")

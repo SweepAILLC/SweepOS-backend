@@ -36,6 +36,56 @@ class FunnelConversionMetric(BaseModel):
     step_counts: List[FunnelStepConversion] = []
 
 
+class LlmUsageFeatureBreakdown(BaseModel):
+    feature: str
+    calls: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+
+class LlmUsageOrgBreakdown(BaseModel):
+    org_id: str
+    organization_name: str
+    calls: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+
+class LlmUsageSummary(BaseModel):
+    """Org or platform LLM API usage for a rolling window."""
+
+    days: int = 30
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    by_feature: List[LlmUsageFeatureBreakdown] = Field(default_factory=list)
+    by_org: List[LlmUsageOrgBreakdown] = Field(default_factory=list)
+
+
+class LlmUsageTimeseriesPoint(BaseModel):
+    date: str
+    calls: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+
+
+class LlmUsageTimeseriesResponse(BaseModel):
+    """Daily LLM API cost series for platform or a single org."""
+
+    org_id: Optional[str] = None
+    organization_name: Optional[str] = None
+    scope: Optional[str] = None
+    days: Optional[int] = None
+    period_start: str
+    period_end: str
+    calls: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    points: List[LlmUsageTimeseriesPoint] = Field(default_factory=list)
+
+
 class GlobalHealthResponse(BaseModel):
     """Platform-wide metrics for owner/admin Health tab (impact & growth)."""
 
@@ -98,6 +148,9 @@ class GlobalHealthResponse(BaseModel):
     close_rate_last_30d_pct: Optional[float] = None
 
     health_trend_periods: List[HealthTrendPeriod] = Field(default_factory=list)
+
+    llm_usage_last_30d: Optional[LlmUsageSummary] = None
+    """Platform LLM API usage (tokens + estimated cost) for the last 30 days."""
 
 
 class OrganizationFunnelCreate(BaseModel):
@@ -165,4 +218,7 @@ class OrganizationDashboardSummary(BaseModel):
     """Treasury-or-Stripe all-time plus manual payments for this org."""
     monthly_health_since_onboarding: List[HealthTrendPeriod] = Field(default_factory=list)
     """Calendar months from onboarding through now: show-up %, close %, cash collected."""
+
+    llm_usage_last_30d: Optional[LlmUsageSummary] = None
+    """This organization's LLM API usage for the last 30 days."""
 

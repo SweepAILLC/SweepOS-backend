@@ -57,6 +57,7 @@ def chat_json(
     max_tokens: Optional[int] = None,
     max_input_chars: Optional[int] = None,
     min_user_chars: int = 0,
+    feature: str = "unknown",
 ) -> Dict[str, Any]:
     """
     Single-turn chat; request JSON object in response. Parses first JSON object from text.
@@ -83,10 +84,36 @@ def chat_json(
     )
 
     if provider == "gemini":
-        return _gemini_generate_json(api_key, system_prompt, user_prompt, temperature, timeout, model=model)
-    return _openai_chat_json(
-        api_key, system_prompt, user_prompt, temperature, timeout, model=model, max_tokens=max_tokens
-    )
+        parsed, usage = _gemini_generate_json(
+            api_key, system_prompt, user_prompt, temperature, timeout, model=model
+        )
+    else:
+        parsed, usage = _openai_chat_json(
+            api_key,
+            system_prompt,
+            user_prompt,
+            temperature,
+            timeout,
+            model=model,
+            max_tokens=max_tokens,
+        )
+
+    if org_id is not None and usage:
+        try:
+            from app.services.llm_usage import record_llm_usage
+
+            record_llm_usage(
+                org_id=org_id,
+                provider=provider,
+                model=usage.get("model") or model,
+                feature=feature,
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
+                total_tokens=int(usage.get("total_tokens") or 0),
+            )
+        except Exception:
+            logger.exception("llm usage hook failed")
+    return parsed
 
 
 def _gemini_generate_json(
@@ -97,7 +124,7 @@ def _gemini_generate_json(
     timeout: float,
     *,
     model: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     model_name = (model or settings.HEALTH_SCORE_LLM_MODEL or "").strip()
     if not model_name.startswith("models/"):
         model_id = f"models/{model_name}"
@@ -122,7 +149,14 @@ def _gemini_generate_json(
         text = "".join(p.get("text", "") for p in parts)
     except (KeyError, IndexError, TypeError):
         text = json.dumps(data)
-    return _parse_json_object(text)
+    usage_meta = data.get("usageMetadata") or {}
+    usage = {
+        "model": model_name,
+        "prompt_tokens": int(usage_meta.get("promptTokenCount") or 0),
+        "completion_tokens": int(usage_meta.get("candidatesTokenCount") or 0),
+        "total_tokens": int(usage_meta.get("totalTokenCount") or 0),
+    }
+    return _parse_json_object(text), usage
 
 
 def _openai_chat_json(
@@ -134,7 +168,7 @@ def _openai_chat_json(
     *,
     model: Optional[str] = None,
     max_tokens: Optional[int] = None,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     model_name = (model or settings.HEALTH_SCORE_LLM_MODEL or "").strip()
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -166,8 +200,15 @@ def _openai_chat_json(
             model_name,
             len(text),
         )
+    usage_raw = data.get("usage") or {}
+    usage = {
+        "model": model_name,
+        "prompt_tokens": int(usage_raw.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage_raw.get("completion_tokens") or 0),
+        "total_tokens": int(usage_raw.get("total_tokens") or 0),
+    }
     try:
-        return _parse_json_object(text)
+        return _parse_json_object(text), usage
     except ValueError:
         logger.warning(
             "openai JSON parse failed model=%s finish=%s content_head=%r",

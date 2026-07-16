@@ -1,15 +1,15 @@
 """
 Resources tab — org-scoped resource documents and library.
 
-Built-in docs (SOPs + AI skills) ship with default markdown; any org member can
-read, create, edit, and manage org docs and library items.
+Built-in docs (SOPs + AI skills) ship with default markdown. All org members may
+read docs and manage org library items; only system owners may create or edit docs.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 import logging
 
 from app.db.session import get_db
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, user_is_system_owner
 from app.services.resource_documents import (
     ensure_resource_documents_table,
     list_docs,
@@ -35,6 +35,14 @@ _log = logging.getLogger(__name__)
 
 def _org_id(current_user) -> str:
     return str(getattr(current_user, "selected_org_id", None) or current_user.org_id)
+
+
+def _require_system_owner(current_user, db: Session) -> None:
+    if not user_is_system_owner(current_user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only system owners can edit platform resource documents.",
+        )
 
 
 @router.get("/docs")
@@ -82,9 +90,10 @@ def update_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Create or update a document. Any org member may edit."""
+    """Create or update a document. System owners only."""
     from uuid import UUID
 
+    _require_system_owner(current_user, db)
     org = UUID(_org_id(current_user))
     category = str(body.get("category") or "SOP").strip() or "SOP"
     title = str(body.get("title") or "").strip()
@@ -128,9 +137,10 @@ def create_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Create a new custom doc. Any org member may create."""
+    """Create a new custom doc. System owners only."""
     from uuid import UUID
 
+    _require_system_owner(current_user, db)
     category = str(body.get("category") or "SOP").strip() or "SOP"
     title = str(body.get("title") or "").strip()
     if not title:
@@ -166,9 +176,10 @@ def remove_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Delete a custom doc, or reset a built-in doc to its default."""
+    """Delete a custom doc, or reset a built-in doc to its default. System owners only."""
     from uuid import UUID
 
+    _require_system_owner(current_user, db)
     ok = delete_doc(db, UUID(_org_id(current_user)), resource_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Document not found or cannot be deleted.")

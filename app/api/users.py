@@ -11,8 +11,8 @@ import secrets
 import string
 
 from app.db.session import get_db
-from app.api.deps import get_current_user, check_tab_access, get_user_tab_permissions
-from app.models.user import User, UserRole, parse_user_role_from_api, role_to_api
+from app.api.deps import get_current_user, check_tab_access, get_user_tab_permissions, is_sudo_admin
+from app.models.user import User, UserRole, parse_user_role_from_api, parse_user_role_from_db, role_to_api
 from app.models.organization import Organization
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.user_tab_permission import UserTabPermission
@@ -34,6 +34,30 @@ router = APIRouter()
 # Available tabs
 # Note: 'owner' tab is restricted to OWNER role only
 AVAILABLE_TABS = ['brevo', 'clients', 'stripe', 'funnels', 'performance', 'content_studio', 'call_library', 'resources', 'integrations', 'owner']
+
+
+def _role_python_from_db(role_db: object) -> str:
+    role_db_value = role_db
+    role_python_value = str(role_db_value).lower() if role_db_value else "admin"
+    if role_db_value in ("member", "MEMBER"):
+        role_python_value = "member"
+    elif role_db_value == "OWNER":
+        role_python_value = "owner"
+    elif role_db_value == "ADMIN":
+        role_python_value = "admin"
+    return role_python_value
+
+
+def _target_user_is_owner(role_db: object) -> bool:
+    return parse_user_role_from_db(role_db) == UserRole.OWNER
+
+
+def _require_sudo_to_modify_owner(actor: User, target_role_db: object, *, action: str) -> None:
+    if _target_user_is_owner(target_role_db) and not is_sudo_admin(actor):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Only the system administrator can {action} organization owners.",
+        )
 
 
 @router.get("", response_model=List[UserSchema])
@@ -329,14 +353,12 @@ def update_user(
     
     # Get current role from database (handle both uppercase and lowercase)
     current_role_db = user_row[3]  # role column
-    current_role_python = current_role_db.lower() if current_role_db else "admin"
-    if current_role_db == "member" or current_role_db == "MEMBER":
-        current_role_python = "member"
-    elif current_role_db == "OWNER":
-        current_role_python = "owner"
-    elif current_role_db == "ADMIN":
-        current_role_python = "admin"
+    current_role_python = _role_python_from_db(current_role_db)
     
+    # Only sudo admin may modify or remove existing owners (except self via /auth/me/settings).
+    if _target_user_is_owner(current_role_db) and user_id != current_user.id:
+        _require_sudo_to_modify_owner(current_user, current_role_db, action="modify")
+
     # Role change restrictions
     if user_update.role is not None:
         new_role = parse_user_role_from_api(user_update.role)
@@ -347,6 +369,14 @@ def update_user(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only owners can assign the owner role"
             )
+
+        # Demoting an owner (including self) requires sudo admin
+        if _target_user_is_owner(current_role_db) and new_role != UserRole.OWNER:
+            if not is_sudo_admin(current_user):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Only the system administrator can remove the owner role.",
+                )
         
         # Prevent demoting the last owner in an org
         if current_role_python == "owner" and new_role != UserRole.OWNER:
@@ -467,6 +497,21 @@ def delete_user(
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
     
+    from sqlalchemy import text
+    target_row = db.execute(
+        text("""
+            SELECT role FROM users
+            WHERE id = :user_id AND org_id = :org_id
+        """),
+        {"user_id": user_id, "org_id": org_id},
+    ).fetchone()
+    if not target_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    _require_sudo_to_modify_owner(current_user, target_row[0], action="remove")
+
     # Prevent users from deleting themselves
     if user_id == current_user.id:
         raise HTTPException(
@@ -599,6 +644,8 @@ def get_user_tab_permissions_list(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
+
+    _require_sudo_to_modify_owner(current_user, user.role, action="change permissions for")
     
     permissions = db.query(UserTabPermission).filter(
         UserTabPermission.user_id == user_id
@@ -636,6 +683,8 @@ def create_user_tab_permission(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
+
+    _require_sudo_to_modify_owner(current_user, user.role, action="change permissions for")
     
     # Check if permission already exists
     existing = db.query(UserTabPermission).filter(
@@ -691,6 +740,8 @@ def update_user_tab_permission(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
+
+    _require_sudo_to_modify_owner(current_user, user.role, action="change permissions for")
     
     permission = db.query(UserTabPermission).filter(
         UserTabPermission.user_id == user_id,
@@ -740,6 +791,8 @@ def delete_user_tab_permission(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
+
+    _require_sudo_to_modify_owner(current_user, user.role, action="change permissions for")
     
     permission = db.query(UserTabPermission).filter(
         UserTabPermission.user_id == user_id,

@@ -8,6 +8,7 @@ Use check_sliding_window() inside handlers for precise control; @rate_limit for 
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -143,9 +144,89 @@ def sliding_window_try_acquire(identifier: str, max_requests: int, window_second
     return _memory_try_acquire(identifier, max_requests, window_seconds)
 
 
+def _resolve_rate_limit_identifier(
+    args,
+    kwargs,
+    *,
+    identifier_func: Optional[Callable],
+) -> tuple[str, Optional[Request], Optional[object]]:
+    request = None
+    user = None
+
+    for arg in args:
+        if isinstance(arg, Request):
+            request = arg
+            break
+
+    for value in kwargs.values():
+        if isinstance(value, Request):
+            request = value
+        elif hasattr(value, "id") and hasattr(value, "org_id"):
+            user = value
+
+    if identifier_func:
+        identifier = identifier_func(request, user)
+    elif user:
+        identifier = f"user_{user.id}_{user.org_id}"
+    elif request:
+        from app.core.request_ip import get_client_ip
+
+        identifier = f"ip_{get_client_ip(request)}"
+    else:
+        identifier = "unknown"
+
+    return identifier, request, user
+
+
+def _enforce_rate_limit(
+    *,
+    identifier: str,
+    max_requests: int,
+    window_seconds: int,
+    func_name: str,
+    request: Optional[Request],
+    user: Optional[object],
+    db: Optional[object],
+) -> None:
+    if sliding_window_try_acquire(identifier, max_requests, window_seconds):
+        return
+
+    try:
+        from app.core.audit import log_security_event
+        from app.models.audit_log import AuditEventType
+        from app.core.request_ip import get_client_ip
+
+        if db and user and request:
+            log_security_event(
+                db=db,
+                event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
+                org_id=user.org_id,
+                user_id=user.id,
+                resource_type="api_endpoint",
+                resource_id=func_name,
+                ip_address=get_client_ip(request),
+                user_agent=request.headers.get("user-agent") if request else None,
+                details={
+                    "endpoint": func_name,
+                    "max_requests": max_requests,
+                    "window_seconds": window_seconds,
+                },
+            )
+    except Exception:
+        pass
+
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=(
+            f"Rate limit exceeded: {max_requests} requests per {window_seconds} seconds. "
+            "Please try again later."
+        ),
+    )
+
+
 def rate_limit(max_requests: int = 5, window_seconds: int = 300, identifier_func: Callable = None):
     """
-    Rate limiting decorator for FastAPI endpoints.
+    Rate limiting decorator for FastAPI endpoints (sync and async).
 
     Identifiers:
     - If identifier_func is set: identifier_func(request, user)
@@ -154,67 +235,40 @@ def rate_limit(max_requests: int = 5, window_seconds: int = 300, identifier_func
     """
 
     def decorator(func: Callable):
+        if inspect.iscoroutinefunction(func):
+
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                identifier, request, user = _resolve_rate_limit_identifier(
+                    args, kwargs, identifier_func=identifier_func
+                )
+                _enforce_rate_limit(
+                    identifier=identifier,
+                    max_requests=max_requests,
+                    window_seconds=window_seconds,
+                    func_name=func.__name__,
+                    request=request,
+                    user=user,
+                    db=kwargs.get("db"),
+                )
+                return await func(*args, **kwargs)
+
+            return async_wrapper
+
         @wraps(func)
         def wrapper(*args, **kwargs):
-            request = None
-            user = None
-
-            for arg in args:
-                if isinstance(arg, Request):
-                    request = arg
-                    break
-
-            for value in kwargs.values():
-                if isinstance(value, Request):
-                    request = value
-                elif hasattr(value, "id") and hasattr(value, "org_id"):
-                    user = value
-
-            if identifier_func:
-                identifier = identifier_func(request, user)
-            elif user:
-                identifier = f"user_{user.id}_{user.org_id}"
-            elif request:
-                from app.core.request_ip import get_client_ip
-
-                identifier = f"ip_{get_client_ip(request)}"
-            else:
-                identifier = "unknown"
-
-            if not sliding_window_try_acquire(identifier, max_requests, window_seconds):
-                try:
-                    from app.core.audit import log_security_event
-                    from app.models.audit_log import AuditEventType
-                    from app.core.request_ip import get_client_ip
-
-                    db = kwargs.get("db")
-                    if db and user and request:
-                        log_security_event(
-                            db=db,
-                            event_type=AuditEventType.RATE_LIMIT_EXCEEDED,
-                            org_id=user.org_id,
-                            user_id=user.id,
-                            resource_type="api_endpoint",
-                            resource_id=func.__name__,
-                            ip_address=get_client_ip(request),
-                            user_agent=request.headers.get("user-agent") if request else None,
-                            details={
-                                "endpoint": func.__name__,
-                                "max_requests": max_requests,
-                                "window_seconds": window_seconds,
-                            },
-                        )
-                except Exception:
-                    pass
-
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail=(
-                        f"Rate limit exceeded: {max_requests} requests per {window_seconds} seconds. "
-                        "Please try again later."
-                    ),
-                )
-
+            identifier, request, user = _resolve_rate_limit_identifier(
+                args, kwargs, identifier_func=identifier_func
+            )
+            _enforce_rate_limit(
+                identifier=identifier,
+                max_requests=max_requests,
+                window_seconds=window_seconds,
+                func_name=func.__name__,
+                request=request,
+                user=user,
+                db=kwargs.get("db"),
+            )
             return func(*args, **kwargs)
 
         return wrapper

@@ -88,12 +88,15 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False, index=True)
     email = Column(String, nullable=False, index=True)
-    hashed_password = Column(String, nullable=False)
+    # Nullable for Google-only accounts (no password set)
+    hashed_password = Column(String, nullable=True)
     role = Column(PgUserRole(), default=UserRole.ADMIN, nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     fathom_api_key = Column(String, nullable=True)
     ai_profile = Column(JSON, nullable=True)
+    google_id = Column(String, nullable=True, index=True)
+    google_email = Column(String, nullable=True)
 
     __table_args__ = (
         {"schema": None},

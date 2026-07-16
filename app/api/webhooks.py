@@ -86,28 +86,36 @@ async def stripe_webhook_per_org(
 
 
 def _process_stripe_event_internal(db: Session, event: dict, org_id: uuid.UUID):
-    """Shared logic for processing Stripe webhook events (sync for now)."""
-    import asyncio
-    # Run sync DB code in executor to avoid blocking
+    """Shared logic for processing Stripe webhook events.
+
+    Idempotency: skip only when the event was already processed successfully.
+    Failed prior attempts are retried. Processing failures return 500 so Stripe retries.
+    """
+    stripe_event = None
     try:
-        # Check idempotency
         existing_event = db.query(StripeEvent).filter(
             StripeEvent.stripe_event_id == event["id"],
             StripeEvent.org_id == org_id
         ).first()
 
-        if existing_event:
+        if existing_event and existing_event.processed:
             return Response(status_code=200, content="Event already processed")
 
-        stripe_event = StripeEvent(
-            org_id=org_id,
-            stripe_event_id=event["id"],
-            type=event["type"],
-            payload=event,
-            processed=False,
-            received_at=datetime.utcnow()
-        )
-        db.add(stripe_event)
+        if existing_event:
+            stripe_event = existing_event
+            stripe_event.payload = event
+            stripe_event.type = event["type"]
+            print(f"[WEBHOOK] Retrying previously failed event {event.get('id')}")
+        else:
+            stripe_event = StripeEvent(
+                org_id=org_id,
+                stripe_event_id=event["id"],
+                type=event["type"],
+                payload=event,
+                processed=False,
+                received_at=datetime.utcnow()
+            )
+            db.add(stripe_event)
         db.commit()
 
         from app.services.stripe_processor import process_stripe_event
@@ -124,17 +132,19 @@ def _process_stripe_event_internal(db: Session, event: dict, org_id: uuid.UUID):
             token.last_webhook_processed_at = datetime.utcnow()
         db.commit()
         print(f"[WEBHOOK] ✅ Processed event {event.get('id')} ({event.get('type')})")
+        return Response(status_code=200, content="Webhook received")
     except Exception as e:
         import traceback
         print(f"[WEBHOOK] ❌ ERROR processing event: {e}")
         print(traceback.format_exc())
         try:
-            stripe_event.processed = False
-            db.commit()
+            if stripe_event is not None:
+                stripe_event.processed = False
+                db.commit()
         except Exception:
             db.rollback()
-
-    return Response(status_code=200, content="Webhook received")
+        # Non-2xx so Stripe retries delivery instead of permanently dropping the event.
+        return Response(status_code=500, content="Webhook processing failed")
 
 
 @router.post("/stripe")
@@ -207,29 +217,22 @@ async def stripe_webhook(
                 org_id = stripe_oauth.org_id
                 print(f"[WEBHOOK] Matched event account {event_account_id} to org {org_id}")
             else:
-                # Fallback: use first Stripe connection (for backward compatibility)
-                stripe_oauth = db.query(OAuthToken).filter(
-                    OAuthToken.provider == OAuthProvider.STRIPE
-                ).first()
-                if stripe_oauth:
-                    org_id = stripe_oauth.org_id
-                    print(f"[WEBHOOK] WARNING: Event account {event_account_id} not found, using first Stripe connection (org {org_id})")
-                else:
-                    # No Stripe connection - use default org for v1
-                    org_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
-                    print(f"[WEBHOOK] WARNING: No Stripe connection found, using default org {org_id}")
+                # Do not attribute to a random org — that corrupts multi-tenant data.
+                print(f"[WEBHOOK] No org matched for Stripe account {event_account_id}; ignoring event")
+                return Response(status_code=200, content="No matching Stripe account")
         else:
-            # Event doesn't have account field (shouldn't happen for Connect events, but handle gracefully)
-            stripe_oauth = db.query(OAuthToken).filter(
+            # Direct (non-Connect) platform webhook: only safe when exactly one Stripe token exists.
+            stripe_tokens = db.query(OAuthToken).filter(
                 OAuthToken.provider == OAuthProvider.STRIPE
-            ).first()
-            if stripe_oauth:
-                org_id = stripe_oauth.org_id
-                print(f"[WEBHOOK] WARNING: Event missing account field, using first Stripe connection (org {org_id})")
+            ).all()
+            if len(stripe_tokens) == 1:
+                org_id = stripe_tokens[0].org_id
+                print(f"[WEBHOOK] Event missing account field; using sole Stripe connection (org {org_id})")
             else:
-                # No Stripe connection - use default org for v1
-                org_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
-                print(f"[WEBHOOK] WARNING: No Stripe connection found, using default org {org_id}")
+                print(
+                    f"[WEBHOOK] Event missing account field and {len(stripe_tokens)} Stripe connections; ignoring"
+                )
+                return Response(status_code=200, content="Ambiguous org for event")
         
         return _process_stripe_event_internal(db, event, org_id)
     except Exception as e:

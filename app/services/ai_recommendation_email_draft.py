@@ -586,7 +586,7 @@ def _llm_draft(
     user = "DATA:\n" + truncate_for_tokens(json.dumps(user_payload, default=str), 36000)
 
     try:
-        raw = chat_json(system, user, temperature=0.42, timeout=90.0, org_id=org_id)
+        raw = chat_json(system, user, temperature=0.42, timeout=90.0, org_id=org_id, feature="ai_recommendation")
     except Exception:
         return None
 
@@ -806,7 +806,7 @@ def build_performance_task_email_draft(
     user = "DATA:\n" + truncate_for_tokens(json.dumps(user_payload, default=str), 36000)
 
     try:
-        raw = chat_json(system, user, temperature=0.42, timeout=90.0, org_id=org_id)
+        raw = chat_json(system, user, temperature=0.42, timeout=90.0, org_id=org_id, feature="ai_recommendation")
     except Exception:
         return _perf_task_template_draft(
             db,

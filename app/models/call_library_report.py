@@ -26,6 +26,8 @@ class CallLibraryReport(Base):
     status = Column(String(32), nullable=False, default="pending")  # pending | complete | failed
     report_json = Column(JSON, nullable=True)  # 5-section structured AI analysis
     failure_reason = Column(Text, nullable=True)
+    # Increments on each failed LLM analysis; capped by CALL_LIBRARY_MAX_ANALYSIS_ATTEMPTS.
+    attempt_count = Column(BigInteger, nullable=False, default=0, server_default="0")
     call_title = Column(Text, nullable=True)   # derived from meeting title / invitee names
     call_title_override = Column(Text, nullable=True)  # user-defined display name (wins in UI)
 

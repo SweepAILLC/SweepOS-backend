@@ -266,7 +266,7 @@ Fingerprint (opaque): {fingerprint}
 """
 
     try:
-        raw = chat_json(system, user, temperature=0.4, org_id=org_id)
+        raw = chat_json(system, user, temperature=0.4, org_id=org_id, feature="content_studio")
     except Exception as e:
         logger.exception("content studio bundle LLM: %s", e)
         return None

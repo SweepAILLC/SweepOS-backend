@@ -340,13 +340,16 @@ def _get_rule(db: Session, org_id: uuid.UUID, playbook: str) -> Optional[Automat
 
 def _resolve_initial_state_and_schedule(
     rule: AutomationRule,
+    *,
+    scheduled_at: Optional[datetime] = None,
 ) -> Tuple[str, datetime]:
     """Return (state, scheduled_at) given rule.delay_seconds and require_approval."""
-    delay = max(0, int(rule.delay_seconds or 0))
-    scheduled = _now() + timedelta(seconds=delay)
+    if scheduled_at is None:
+        delay = max(0, int(rule.delay_seconds or 0))
+        scheduled_at = _now() + timedelta(seconds=delay)
     if rule.require_approval:
-        return JobState.AWAITING_APPROVAL.value, scheduled
-    return JobState.SCHEDULED.value, scheduled
+        return JobState.AWAITING_APPROVAL.value, scheduled_at
+    return JobState.SCHEDULED.value, scheduled_at
 
 
 def _enqueue_job(
@@ -358,12 +361,13 @@ def _enqueue_job(
     trigger_event: str,
     discriminator: str,
     payload: Optional[Dict[str, Any]] = None,
+    scheduled_at: Optional[datetime] = None,
 ) -> Optional[uuid.UUID]:
     """Insert one job row idempotently. Returns the row id, or None when the conflict was hit."""
     if not rule.enabled:
         return None
 
-    state, scheduled = _resolve_initial_state_and_schedule(rule)
+    state, scheduled = _resolve_initial_state_and_schedule(rule, scheduled_at=scheduled_at)
     idemp = idempotency_key_for(
         playbook=rule.playbook,
         client_id=client_id,
@@ -799,26 +803,29 @@ def on_booking_created_pre_sale(
     start_time: Optional[datetime] = None,
 ) -> List[uuid.UUID]:
     """
-    Enqueue the ``pre_sale_post_booking`` playbook for a freshly created booking.
+    Enqueue post-booking emails for a freshly created booking:
 
-    Three gates -- ALL must pass -- so post-booking emails never blast historical
-    bookings or paying customers:
+    1. ``pre_sale_post_booking`` — delayed by ``delay_seconds`` after booking lands.
+    2. ``pre_sale_pre_meeting`` — scheduled ``delay_seconds`` before meeting start
+       (requires a known ``start_time``).
 
-    1. The rule's ``trigger_config`` matches this booking (provider + event type id, or
-       ``match_all_events`` opt-in). Defaults to no-match so an empty config = silent.
-    2. ``_has_no_recorded_sale``: zero succeeded Stripe + zero paid-like Whop rows
-       attributed to the client. Once they pay, win/onboarding playbooks take over.
-    3. Recency: ``start_time`` (when known) must be roughly in the future. Backfilled
-       sync of years-old past bookings does not trigger live emails.
-
-    Idempotency keys off ``provider:<external_booking_id>`` so re-syncing or webhook
-    redelivery is a no-op.
+    Both share the post-booking rule's ``trigger_config`` (event picker). The
+    pre-meeting rule only needs to be enabled and have its own content + wait.
     """
-    rule = _get_rule(db, org_id, Playbook.PRE_SALE_POST_BOOKING.value)
-    if not rule or not rule.enabled:
+    post_rule = _get_rule(db, org_id, Playbook.PRE_SALE_POST_BOOKING.value)
+    pre_meeting_rule = _get_rule(db, org_id, Playbook.PRE_SALE_PRE_MEETING.value)
+
+    # Event matching uses the post-booking rule's trigger_config as the shared source.
+    # If only pre-meeting is configured somehow, fall back to its config.
+    match_rule = post_rule or pre_meeting_rule
+    if not match_rule:
         return []
 
-    trigger_config = rule.trigger_config if isinstance(rule.trigger_config, dict) else None
+    trigger_config = match_rule.trigger_config if isinstance(match_rule.trigger_config, dict) else None
+    # Prefer post_booking trigger_config when both exist.
+    if post_rule and isinstance(post_rule.trigger_config, dict):
+        trigger_config = post_rule.trigger_config
+
     if not _booking_matches_trigger_config(
         provider=str(provider).lower(),
         event_type_id=event_type_id,
@@ -833,18 +840,16 @@ def on_booking_created_pre_sale(
     )
     if not client:
         return []
-    if not audience_filter_passes(client, rule.audience_filter):
-        return []
 
     if not _has_no_recorded_sale(db, org_id, client_id):
         LOG.info(
-            "automation: skipping pre_sale_post_booking for client %s -- "
+            "automation: skipping pre-sale booking emails for client %s -- "
             "client already has a recorded sale.",
             client_id,
         )
         return []
 
-    # Recency: drop bookings whose start_time is well in the past (backfill imports).
+    start_naive: Optional[datetime] = None
     if start_time is not None:
         try:
             start_naive = (
@@ -852,17 +857,19 @@ def on_booking_created_pre_sale(
             )
             age_seconds = (_now() - start_naive).total_seconds()
         except (TypeError, ValueError, AttributeError):
+            start_naive = None
             age_seconds = 0
-        max_past_seconds = POST_BOOKING_FUTURE_TOLERANCE_HOURS * 3600
-        if age_seconds > max_past_seconds:
-            LOG.info(
-                "automation: skipping pre_sale_post_booking for client %s -- "
-                "booking start is %.0fh in the past (cap %sh).",
-                client_id,
-                age_seconds / 3600,
-                POST_BOOKING_FUTURE_TOLERANCE_HOURS,
-            )
-            return []
+        else:
+            max_past_seconds = POST_BOOKING_FUTURE_TOLERANCE_HOURS * 3600
+            if age_seconds > max_past_seconds:
+                LOG.info(
+                    "automation: skipping pre-sale booking emails for client %s -- "
+                    "booking start is %.0fh in the past (cap %sh).",
+                    client_id,
+                    age_seconds / 3600,
+                    POST_BOOKING_FUTURE_TOLERANCE_HOURS,
+                )
+                return []
 
     payload = {
         "trigger": "booking.created.pre_sale",
@@ -873,16 +880,64 @@ def on_booking_created_pre_sale(
         "attendee_email": attendee_email,
         "start_time": start_time.isoformat() if start_time else None,
     }
-    nid = _enqueue_job(
-        db,
-        org_id=org_id,
-        client_id=client_id,
-        rule=rule,
-        trigger_event="booking.created.pre_sale",
-        discriminator=f"{str(provider).lower()}:{external_booking_id}",
-        payload=payload,
-    )
-    return [nid] if nid else []
+    created: List[uuid.UUID] = []
+    disc_base = f"{str(provider).lower()}:{external_booking_id}"
+
+    if (
+        post_rule
+        and post_rule.enabled
+        and audience_filter_passes(client, post_rule.audience_filter)
+    ):
+        nid = _enqueue_job(
+            db,
+            org_id=org_id,
+            client_id=client_id,
+            rule=post_rule,
+            trigger_event="booking.created.pre_sale",
+            discriminator=disc_base,
+            payload=payload,
+        )
+        if nid:
+            created.append(nid)
+
+    if (
+        pre_meeting_rule
+        and pre_meeting_rule.enabled
+        and audience_filter_passes(client, pre_meeting_rule.audience_filter)
+    ):
+        if start_naive is None:
+            LOG.info(
+                "automation: skipping pre_sale_pre_meeting for client %s -- "
+                "booking has no start_time.",
+                client_id,
+            )
+        else:
+            offset = max(0, int(pre_meeting_rule.delay_seconds or 0))
+            scheduled = start_naive - timedelta(seconds=offset)
+            now = _now()
+            if start_naive <= now:
+                LOG.info(
+                    "automation: skipping pre_sale_pre_meeting for client %s -- "
+                    "meeting already started.",
+                    client_id,
+                )
+            else:
+                if scheduled < now:
+                    scheduled = now
+                nid = _enqueue_job(
+                    db,
+                    org_id=org_id,
+                    client_id=client_id,
+                    rule=pre_meeting_rule,
+                    trigger_event="booking.created.pre_meeting",
+                    discriminator=f"{disc_base}:pre_meeting",
+                    payload={**payload, "schedule_mode": "before_meeting", "offset_seconds": offset},
+                    scheduled_at=scheduled,
+                )
+                if nid:
+                    created.append(nid)
+
+    return created
 
 
 def on_lifecycle_entered_offboarding(
@@ -953,6 +1008,21 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
                     "event_type_ids": [],
                     "match_all_events": False,
                 },
+                "combine_top_n": 1,
+                "require_approval": False,
+            },
+        ),
+        (
+            Playbook.PRE_SALE_PRE_MEETING.value,
+            {
+                # delay_seconds = how long BEFORE the meeting to send (not after trigger).
+                "delay_seconds": 2 * 60 * 60,  # 2 hours before meeting
+                "content_mode": ContentMode.AI_GENERATED.value,
+                "subject_template": "Looking forward to talking soon, {{first_name}}",
+                "audience_filter": None,
+                # Shares the post-booking rule's trigger_config at enqueue time;
+                # no separate event picker needed on this card.
+                "trigger_config": None,
                 "combine_top_n": 1,
                 "require_approval": False,
             },

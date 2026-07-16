@@ -2,7 +2,7 @@
 Admin API endpoints for managing organizations, permissions, and global settings.
 Only accessible to admin/owner users.
 """
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, asc, and_, text, exists
 from typing import List, Optional
@@ -37,6 +37,11 @@ from app.schemas.admin import (
     FunnelStepConversion,
     GlobalHealthResponse,
     HealthTrendPeriod,
+    LlmUsageSummary,
+    LlmUsageFeatureBreakdown,
+    LlmUsageOrgBreakdown,
+    LlmUsageTimeseriesResponse,
+    LlmUsageTimeseriesPoint,
 )
 from app.schemas.funnel import Funnel as FunnelSchema
 from app.schemas.permission import (
@@ -915,6 +920,25 @@ def get_global_health(
             break
         month_cursor = _add_one_calendar_month_first(month_cursor)
 
+    llm_usage_last_30d = None
+    try:
+        from app.services.llm_usage import summarize_platform_llm_usage
+
+        raw = summarize_platform_llm_usage(db, days=30)
+        llm_usage_last_30d = LlmUsageSummary(
+            days=raw["days"],
+            calls=raw["calls"],
+            prompt_tokens=raw["prompt_tokens"],
+            completion_tokens=raw["completion_tokens"],
+            total_tokens=raw["total_tokens"],
+            estimated_cost_usd=raw["estimated_cost_usd"],
+            by_feature=[LlmUsageFeatureBreakdown(**f) for f in raw.get("by_feature", [])],
+            by_org=[LlmUsageOrgBreakdown(**o) for o in raw.get("by_org", [])],
+        )
+    except Exception:
+        # Table may not exist until migration 049 is applied.
+        pass
+
     return GlobalHealthResponse(
         total_organizations=total_orgs,
         organizations_created_last_30_days=orgs_created_30d,
@@ -953,6 +977,42 @@ def get_global_health(
         show_up_rate_last_30d_pct=show_up_rate_last_30d_pct,
         close_rate_last_30d_pct=close_rate_last_30d_pct,
         health_trend_periods=health_trend_periods,
+        llm_usage_last_30d=llm_usage_last_30d,
+    )
+
+
+@router.get("/llm-usage/timeseries", response_model=LlmUsageTimeseriesResponse)
+def get_llm_usage_timeseries(
+    days: int = Query(30, ge=1, le=1095, description="Rolling window in days when scope is unset."),
+    scope: Optional[str] = Query(None, description="'mtd' = month-to-date; 'all' = entire history."),
+    org_id: Optional[UUID] = Query(None, description="Filter to a single organization; omit for platform total."),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Daily estimated LLM API cost over time (platform or per org)."""
+    if scope is not None and scope not in ("mtd", "all"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="scope must be mtd or all")
+    if org_id is not None:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        if not org:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+    try:
+        from app.services.llm_usage import llm_usage_timeseries
+
+        raw = llm_usage_timeseries(db, org_id=org_id, days=days, scope=scope)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    return LlmUsageTimeseriesResponse(
+        org_id=raw.get("org_id"),
+        organization_name=raw.get("organization_name"),
+        scope=raw.get("scope"),
+        days=raw.get("days"),
+        period_start=raw["period_start"],
+        period_end=raw["period_end"],
+        calls=int(raw.get("calls") or 0),
+        total_tokens=int(raw.get("total_tokens") or 0),
+        estimated_cost_usd=float(raw.get("estimated_cost_usd") or 0),
+        points=[LlmUsageTimeseriesPoint(**p) for p in (raw.get("points") or [])],
     )
 
 
@@ -1268,6 +1328,24 @@ def get_organization_dashboard(
             break
         month_cursor = _add_one_calendar_month_first(month_cursor)
 
+    llm_usage_last_30d = None
+    try:
+        from app.services.llm_usage import summarize_org_llm_usage
+
+        raw = summarize_org_llm_usage(db, org_id, days=30)
+        llm_usage_last_30d = LlmUsageSummary(
+            days=raw["days"],
+            calls=raw["calls"],
+            prompt_tokens=raw["prompt_tokens"],
+            completion_tokens=raw["completion_tokens"],
+            total_tokens=raw["total_tokens"],
+            estimated_cost_usd=raw["estimated_cost_usd"],
+            by_feature=[LlmUsageFeatureBreakdown(**f) for f in raw.get("by_feature", [])],
+            by_org=[],
+        )
+    except Exception:
+        pass
+
     return OrganizationDashboardSummary(
         organization_id=org_id,
         organization_name=org.name,
@@ -1293,6 +1371,7 @@ def get_organization_dashboard(
         manual_cash_all_time_usd=manual_cash_all_time_usd,
         total_processor_revenue_all_time_usd=total_processor_revenue_all_time_usd,
         monthly_health_since_onboarding=monthly_health_since_onboarding,
+        llm_usage_last_30d=llm_usage_last_30d,
     )
 
 

@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, performance, content_studio, call_library, automations, outreach, calendar_webhooks, resources
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth
+from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
 import logging
@@ -52,8 +53,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 # less specific ones (e.g., /integrations) to avoid conflicts.
 # See backend/app/api/ROUTING_GUIDELINES.md for details.
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(auth_google.router, prefix="/auth", tags=["auth-google"])
+app.include_router(mcp_oauth.router, tags=["mcp-oauth"])
+app.include_router(mcp_server.router, tags=["mcp"])
 app.include_router(clients.router, prefix="/clients", tags=["clients"])
-app.include_router(performance.router, prefix="/performance", tags=["performance"])
 app.include_router(automations.router, prefix="/automations", tags=["automations"])
 app.include_router(outreach.router, prefix="/outreach", tags=["outreach"])
 app.include_router(content_studio.router, prefix="/content-studio", tags=["content-studio"])
@@ -90,6 +93,19 @@ def _ensure_schema_columns_on_startup() -> None:
     log = logging.getLogger("app")
     db = SessionLocal()
     try:
+        # users: Google OAuth identity columns (non-unique index — multi-org rows share google_id)
+        db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT"))
+        db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_email TEXT"))
+        db.execute(text("ALTER TABLE users ALTER COLUMN hashed_password DROP NOT NULL"))
+        db.execute(text("DROP INDEX IF EXISTS ix_users_google_id"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_users_google_id ON users (google_id)"))
+
+        # MCP OAuth tables (Claude custom connector)
+        from app.models.mcp_oauth import McpOAuthClient, McpOAuthGrant
+
+        McpOAuthClient.__table__.create(db.bind, checkfirst=True)
+        McpOAuthGrant.__table__.create(db.bind, checkfirst=True)
+
         # user_organizations: per-org Intelligence bank
         db.execute(text("ALTER TABLE user_organizations ADD COLUMN IF NOT EXISTS ai_profile JSONB"))
 

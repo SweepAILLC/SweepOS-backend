@@ -238,7 +238,7 @@ def compute_call_insight_json(
     user = "DATA:\n" + truncate_for_tokens(json.dumps(user_obj, default=str), 42000)
 
     try:
-        raw = chat_json(sys_full, user, temperature=0.2, timeout=120.0, org_id=org_id)
+        raw = chat_json(sys_full, user, temperature=0.2, timeout=120.0, org_id=org_id, feature="call_insight")
     except Exception:
         return None
 

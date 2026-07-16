@@ -399,13 +399,26 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
         except:
             pass
     
-    # Get amount
-    if hasattr(payment_data, 'amount'):
+    # Get amount. Paid invoices often have amount_due=0 — prefer amount_paid for invoices.
+    amount_cents = 0
+    if payment_type == "invoice":
+        amount_paid = getattr(payment_data, "amount_paid", None)
+        amount_due = getattr(payment_data, "amount_due", None)
+        total = getattr(payment_data, "total", None)
+        if amount_paid not in (None, 0):
+            amount_cents = amount_paid
+        elif total not in (None, 0):
+            amount_cents = total
+        elif amount_due is not None:
+            amount_cents = amount_due
+    elif hasattr(payment_data, "amount"):
         amount_cents = payment_data.amount
-    elif hasattr(payment_data, 'amount_due'):
-        amount_cents = payment_data.amount_due
-    elif hasattr(payment_data, 'amount_paid'):
+    elif hasattr(payment_data, "amount_received"):
+        amount_cents = payment_data.amount_received or 0
+    elif hasattr(payment_data, "amount_paid"):
         amount_cents = payment_data.amount_paid
+    elif hasattr(payment_data, "amount_due"):
+        amount_cents = payment_data.amount_due
     else:
         amount_cents = 0
     
@@ -475,8 +488,14 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
                     print(f"[SYNC] Skipping {payment_type} payment {payment_id} - {existing_sub_invoice_payment.type} {existing_sub_invoice_payment.stripe_id} already exists for subscription {subscription_id}, invoice {invoice_id}")
                     return existing_sub_invoice_payment
                 elif new_type_priority < existing_type_priority:
-                    # New payment is better type, will replace via ON CONFLICT
-                    print(f"[SYNC] Replacing {existing_sub_invoice_payment.type} payment {existing_sub_invoice_payment.stripe_id} with {payment_type} {payment_id} for subscription {subscription_id}, invoice {invoice_id}")
+                    # New payment is better type — delete the inferior row (different stripe_id).
+                    print(
+                        f"[SYNC] Replacing {existing_sub_invoice_payment.type} payment "
+                        f"{existing_sub_invoice_payment.stripe_id} with {payment_type} {payment_id} "
+                        f"for subscription {subscription_id}, invoice {invoice_id}"
+                    )
+                    db.delete(existing_sub_invoice_payment)
+                    db.flush()
         
         if invoice_id:
             existing_invoice_payment = db.query(StripePayment).filter(

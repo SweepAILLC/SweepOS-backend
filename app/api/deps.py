@@ -254,6 +254,38 @@ def require_admin_or_owner(
     return user
 
 
+def is_sudo_admin(user: User) -> bool:
+    """True when the user is the configured platform sudo administrator."""
+    from app.core.config import settings
+
+    email = (getattr(user, "email", None) or "").strip().lower()
+    sudo = (getattr(settings, "SUDO_ADMIN_EMAIL", None) or "").strip().lower()
+    return bool(email and sudo and email == sudo)
+
+
+def user_is_system_owner(user: User, db: Session) -> bool:
+    """
+    True for Sweep platform operators: sudo admin, or OWNER/ADMIN in Sweep Internal.
+    Main-org membership alone (e.g. member) does not grant system-owner access.
+    Independent of which org is currently selected in the JWT.
+    """
+    from app.core.config import settings
+    from app.services.org_user_context import fetch_user_row_for_org
+
+    email = (getattr(user, "email", None) or "").strip().lower()
+    if not email:
+        return False
+    sudo = (getattr(settings, "SUDO_ADMIN_EMAIL", None) or "").strip().lower()
+    if sudo and email == sudo:
+        return True
+
+    row = fetch_user_row_for_org(db, email, MAIN_ORG_ID)
+    if not row:
+        return False
+    role = parse_user_role_from_db(row[4])
+    return role in (UserRole.OWNER, UserRole.ADMIN)
+
+
 def _tab_scope_org_id(user: User) -> uuid.UUID:
     """Org whose tab permissions apply — selected org from JWT, not the user's primary row."""
     raw = getattr(user, "selected_org_id", None) or user.org_id

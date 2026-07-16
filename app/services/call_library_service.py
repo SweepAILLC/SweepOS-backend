@@ -352,6 +352,24 @@ def generate_and_persist_report(
             db.commit()
         return "skipped"
 
+    if existing and not force_regenerate:
+        attempts = int(getattr(existing, "attempt_count", 0) or 0)
+        if (
+            existing.failure_reason == "analysis_failed"
+            or attempts >= _max_analysis_attempts()
+        ):
+            if existing.status != "failed" or existing.failure_reason != "analysis_failed":
+                existing.status = "failed"
+                existing.failure_reason = "analysis_failed"
+                existing.updated_at = datetime.now(timezone.utc)
+                db.commit()
+            logger.info(
+                "call_library skipped: analysis_failed attempts=%s record=%s",
+                attempts,
+                fathom_record_id,
+            )
+            return "failed"
+
     transcript = rec.transcript_snippet or ""
     summary = rec.summary_text or ""
     call_title = _derive_call_title(rec, db, org_id)
@@ -539,6 +557,10 @@ def generate_and_persist_report(
     return "ok"
 
 
+def _max_analysis_attempts() -> int:
+    return int(getattr(settings, "CALL_LIBRARY_MAX_ANALYSIS_ATTEMPTS", 3) or 3)
+
+
 def _upsert_report(
     db: Session,
     org_id: uuid.UUID,
@@ -561,8 +583,20 @@ def _upsert_report(
             id=uuid.uuid4(),
             org_id=org_id,
             fathom_call_record_id=fathom_record_id,
+            attempt_count=0,
         )
         db.add(row)
+
+    if status == "failed":
+        try:
+            current = int(getattr(row, "attempt_count", 0) or 0)
+        except (TypeError, ValueError):
+            current = 0
+        row.attempt_count = current + 1
+        if row.attempt_count >= _max_analysis_attempts():
+            failure_reason = "analysis_failed"
+    elif status == "complete":
+        row.attempt_count = 0
 
     row.status = status
     row.report_json = report_json

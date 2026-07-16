@@ -48,6 +48,8 @@ class User(UserBase):
     org_name: Optional[str] = None
     role: str
     is_admin: bool
+    is_system_owner: bool = False
+    is_sudo_admin: bool = False
     created_at: datetime
 
     class Config:

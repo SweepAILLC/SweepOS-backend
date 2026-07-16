@@ -30,6 +30,7 @@ from app.models.content_studio_knowledge_item import ContentStudioKnowledgeItem
 from app.models.content_studio_generation import ContentStudioGeneration
 from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
 from app.models.call_library_report import CallLibraryReport
+from app.models.llm_usage_event import LlmUsageEvent
 from app.models.automation import (
     AutomationRule,
     AutomationEmailJob,
@@ -38,6 +39,7 @@ from app.models.automation import (
     JobState,
     ContentMode,
 )
+from app.models.mcp_oauth import McpOAuthClient, McpOAuthGrant
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -55,11 +57,14 @@ __all__ = [
     "ContentStudioGeneration",
     "ContentStudioTranscriptAnalysis",
     "CallLibraryReport",
+    "LlmUsageEvent",
     "AutomationRule",
     "AutomationEmailJob",
     "AutomationWorkerHeartbeat",
     "Playbook",
     "JobState",
     "ContentMode",
+    "McpOAuthClient",
+    "McpOAuthGrant",
 ]
 

@@ -23,7 +23,7 @@ from app.core.security import verify_password, create_access_token, get_password
 from app.core.config import settings
 from app.core.rate_limit import rate_limit, check_sliding_window
 from app.core.request_ip import get_client_ip
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, user_is_system_owner, is_sudo_admin
 from app.services.fathom_client import normalize_fathom_api_key
 
 router = APIRouter()
@@ -79,8 +79,13 @@ def login(
     
     # Find all users with matching password (same user across multiple orgs)
     matching_users = []
+    google_only_hit = False
     for row in users_result:
         user_id, org_id, email, hashed_password, role_db_value, is_admin, created_at = row
+        if not hashed_password:
+            # Google-only account — password login not available
+            google_only_hit = True
+            continue
         if verify_password(normalized_password, hashed_password):
             # Create a minimal user-like object for matching
             user_role_enum = parse_user_role_from_db(role_db_value)
@@ -97,6 +102,12 @@ def login(
             matching_users.append(UserProxy(user_id, org_id, email, hashed_password, user_role_enum, is_admin, created_at))
     
     if not matching_users:
+        if google_only_hit:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="This account uses Google sign-in. Click Sign in with Google.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -263,23 +274,28 @@ def _organization_name(db: Session, org_id: UUID) -> Optional[str]:
     return row.name if row else None
 
 
+def _user_schema_response(current_user: User, db: Session) -> UserSchema:
+    role_value = role_to_api(current_user.role)
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    org_name = _organization_name(db, org_id)
+    return UserSchema(
+        id=current_user.id,
+        org_id=org_id,
+        org_name=org_name,
+        email=current_user.email,
+        role=role_value,
+        is_admin=current_user.is_admin,
+        is_system_owner=user_is_system_owner(current_user, db),
+        is_sudo_admin=is_sudo_admin(current_user),
+        created_at=current_user.created_at,
+    )
+
+
 @router.get("/me", response_model=UserSchema)
 def get_current_user_info(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get current user info with proper enum serialization"""
     try:
-        role_value = role_to_api(current_user.role)
-        # Return the currently selected org (from token), not the user row's primary org_id
-        org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-        org_name = _organization_name(db, org_id)
-        return UserSchema(
-            id=current_user.id,
-            org_id=org_id,
-            org_name=org_name,
-            email=current_user.email,
-            role=role_value,
-            is_admin=current_user.is_admin,
-            created_at=current_user.created_at
-        )
+        return _user_schema_response(current_user, db)
     except Exception as e:
         import traceback
         print(f"ERROR in get_current_user_info: {str(e)}")
@@ -329,17 +345,24 @@ def update_user_settings(
     
     # Update password if provided
     if settings_data.new_password is not None:
-        if not settings_data.current_password:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Current password is required to change password"
-            )
-        if not verify_password(settings_data.current_password, user_row.hashed_password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Current password is incorrect"
-            )
+        if user_row.hashed_password:
+            # Existing password account: require current password
+            if not settings_data.current_password:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Current password is required to change password",
+                )
+            if not verify_password(settings_data.current_password, user_row.hashed_password):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Current password is incorrect",
+                )
+        # Google-only accounts (null hash): allow setting a first password without current
         user_row.hashed_password = get_password_hash(settings_data.new_password)
+        # Keep multi-org password rows in sync for the same email
+        for peer in db.query(User).filter(func.lower(User.email) == user_row.email.lower()).all():
+            if peer.id != user_row.id:
+                peer.hashed_password = user_row.hashed_password
     
     if settings_data.fathom_api_key is not None:
         from app.services.org_user_context import user_can_manage_org_integrations
@@ -374,6 +397,8 @@ def update_user_settings(
         email=user_row.email,
         role=role_value,
         is_admin=user_row.is_admin,
+        is_system_owner=user_is_system_owner(current_user, db),
+        is_sudo_admin=is_sudo_admin(current_user),
         created_at=user_row.created_at,
     )
 
@@ -399,6 +424,32 @@ def get_user_settings(
         fathom_key = getattr(org_row, "fathom_api_key", None)
     if not fathom_key and user_row:
         fathom_key = getattr(user_row, "fathom_api_key", None)
+
+    google_connected = bool(user_row and user_row.google_id)
+    google_email = (user_row.google_email if user_row else None) or None
+    has_password = bool(user_row and user_row.hashed_password)
+    # If this email has any linked row (multi-org), treat as connected
+    if user_row and not google_connected:
+        peer = (
+            db.query(User)
+            .filter(func.lower(User.email) == user_row.email.lower(), User.google_id.isnot(None))
+            .first()
+        )
+        if peer:
+            google_connected = True
+            google_email = peer.google_email or peer.email
+    if user_row and not has_password:
+        peer_pw = (
+            db.query(User)
+            .filter(func.lower(User.email) == user_row.email.lower(), User.hashed_password.isnot(None))
+            .first()
+        )
+        has_password = peer_pw is not None
+
+    from app.core.config import settings as app_settings
+
+    google_oauth_available = app_settings.google_oauth_is_configured()
+
     return {
         "email": current_user.email,
         "role": role_to_api(current_user.role),
@@ -408,6 +459,10 @@ def get_user_settings(
         "analytics_enabled": True,
         "fathom_api_key": fathom_key or None,
         "ai_profile": ai_profile,
+        "google_connected": google_connected,
+        "google_email": google_email,
+        "google_oauth_available": google_oauth_available,
+        "has_password": has_password,
     }
 
 

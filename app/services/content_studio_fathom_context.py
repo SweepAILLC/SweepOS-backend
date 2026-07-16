@@ -327,7 +327,7 @@ No markdown. No bullet lists inside strings."""
 
     user = f"SIGNALS (from Fathom meetings, transcripts, and aggregated themes):\n{bundle}"
     try:
-        raw = chat_json(system, user, temperature=0.35, org_id=org_id)
+        raw = chat_json(system, user, temperature=0.35, org_id=org_id, feature="content_studio")
         paras = raw.get("paragraphs")
         if not isinstance(paras, list):
             return None

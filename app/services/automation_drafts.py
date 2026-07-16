@@ -6,10 +6,10 @@ Brevo.
 
 Both modes share:
 - merge-tag rendering ({{first_name}}, {{coach_name}}, {{referral_link}}, ...).
-- Intelligence ``email_html_template`` outer wrapper (the same one EmailComposer
-  uses) so all outbound mail looks like the operator's brand.
 - Combined-ask copy assembly: when ``combine_top_n`` > 1 we stack the chosen
   opportunities into one email body instead of generating multiple sends.
+  Writing-sample HTML templates (per sample) are used as-is when content_mode
+  is html_template — there is no global outer wrapper.
 """
 from __future__ import annotations
 
@@ -150,10 +150,8 @@ def render_merge_tags(template: str, values: Dict[str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTML wrap helper (mirrors the frontend EmailComposer behavior)
+# Plain HTML helpers
 # ---------------------------------------------------------------------------
-
-_OUTER_TEMPLATE_KEYS = ("email_html_template", "email_html_template_default")
 
 
 def _plain_to_html(body: str) -> str:
@@ -168,31 +166,6 @@ def _plain_to_html(body: str) -> str:
     return "".join(pieces)
 
 
-def _wrap_in_outer_template(
-    body_html: str,
-    subject: str,
-    sender_name: str,
-    sender_email: str,
-    ai_profile: Optional[Dict[str, Any]],
-) -> str:
-    template = ""
-    if isinstance(ai_profile, dict):
-        for k in _OUTER_TEMPLATE_KEYS:
-            v = ai_profile.get(k)
-            if isinstance(v, str) and v.strip():
-                template = v
-                break
-    if not template:
-        # Conservative default: leave just the inner HTML — Brevo will render it on its own.
-        return body_html
-    out = template
-    out = out.replace("{{BODY_HTML}}", body_html)
-    out = out.replace("{{SUBJECT}}", html.escape(subject))
-    out = out.replace("{{SENDER_NAME}}", html.escape(sender_name))
-    out = out.replace("{{SENDER_EMAIL}}", html.escape(sender_email))
-    return out
-
-
 # ---------------------------------------------------------------------------
 # HTML-template mode
 # ---------------------------------------------------------------------------
@@ -202,6 +175,8 @@ _PLAYBOOK_DEFAULT_SAMPLE_KIND = {
     Playbook.FIRST_PAYMENT_REFERRAL.value: "referral_campaign",
     Playbook.WIN_COMBINED_ASK.value: "referral_campaign",
     Playbook.OFFBOARDING_RECAP_ASK.value: "re_sign_campaign",
+    Playbook.PRE_SALE_POST_BOOKING.value: "onboarding_email",
+    Playbook.PRE_SALE_PRE_MEETING.value: "onboarding_email",
 }
 
 
@@ -248,6 +223,8 @@ def _resolve_writing_sample(
 
 def _html_template_subject_default(playbook: str) -> str:
     return {
+        Playbook.PRE_SALE_POST_BOOKING.value: "Quick note before our call",
+        Playbook.PRE_SALE_PRE_MEETING.value: "Looking forward to talking soon",
         Playbook.FIRST_PAYMENT_ONBOARDING.value: "Welcome — your first steps",
         Playbook.FIRST_PAYMENT_REFERRAL.value: "Thanks — a quick favor",
         Playbook.WIN_COMBINED_ASK.value: "A quick ask after your win",
@@ -312,13 +289,10 @@ def _build_html_template_draft(
         body_plain = _fallback_plain(rule.playbook, merge_values, chosen_names)
         rendered_html = _plain_to_html(body_plain)
 
-    wrapped = _wrap_in_outer_template(
-        rendered_html, subject, sender_name, sender_email, ai_profile
-    )
     return AutomationDraft(
         subject=subject,
         body_plain=body_plain,
-        html=wrapped,
+        html=rendered_html,
         chosen_opportunities=chosen_names,
         merge_tags_resolved=merge_values,
         notes=notes,
@@ -349,6 +323,22 @@ def _fallback_plain(
             "2. Add me on your usual messaging channel so we can keep momentum.\n"
             "3. Book your first check-in.\n\n"
             f"Talk soon,\n{coach}"
+        )
+    if playbook in (
+        Playbook.PRE_SALE_POST_BOOKING.value,
+        Playbook.PRE_SALE_PRE_MEETING.value,
+    ):
+        timing = (
+            "We're looking forward to talking soon."
+            if playbook == Playbook.PRE_SALE_PRE_MEETING.value
+            else "Thanks for booking — looking forward to our call."
+        )
+        return (
+            f"Hi {fn},\n\n"
+            f"{timing}\n\n"
+            "To make the most of our time together, reply with your top goal and any "
+            "context that would help me prepare.\n\n"
+            f"See you soon,\n{coach}"
         )
     if playbook == Playbook.FIRST_PAYMENT_REFERRAL.value:
         link_suffix = ref_link.strip()
@@ -416,8 +406,7 @@ _AI_SYSTEM = (
     "(business_description, target_audience, unique_selling_proposition), sales and marketing "
     "(sales_framework, sales_tactics, marketing_strategy, marketing_channels), pipeline_priorities, "
     "offer_ladder (core, downsells, upsells, referral_offer, positioning_notes, objection_handlers), "
-    "writing_samples (voice/campaign examples), asset_links (Resource Library — label + url), and "
-    "optional email_html_template_enabled / email_html_template_snippet for branding context. "
+    "writing_samples (voice/campaign examples), and asset_links (Resource Library — label + url). "
     "Match the operator's voice using intelligence_profile. When asset_links or the operator's "
     "extra instructions mention sharing a resource, workbook, calendar, or link, include the exact "
     "URL from asset_links in body_plain (plain URLs are fine). Never invent links, domains, or paths — "
@@ -573,7 +562,7 @@ def _build_ai_draft(
             ref_append = _referral_natural_voice_append(rule, chosen_names)
             if ref_append:
                 system += ref_append
-            j = chat_json(system, user_prompt, temperature=0.5, org_id=org_id)
+            j = chat_json(system, user_prompt, temperature=0.5, org_id=org_id, feature="automation")
             subject = str(j.get("subject", "")).strip()
             body_plain = str(j.get("body_plain", "")).strip()
         except Exception as e:
@@ -591,14 +580,11 @@ def _build_ai_draft(
         body_plain = _fallback_plain(rule.playbook, merge_values, chosen_names)
 
     body_html = _plain_to_html(body_plain)
-    wrapped = _wrap_in_outer_template(
-        body_html, subject, sender_name, sender_email, ai_profile
-    )
 
     return AutomationDraft(
         subject=subject,
         body_plain=body_plain,
-        html=wrapped,
+        html=body_html,
         chosen_opportunities=chosen_names,
         merge_tags_resolved=merge_values,
         notes=notes,

@@ -173,35 +173,12 @@ def resolve_org_sales_lens(db: Session, org_id: uuid.UUID) -> Optional[Dict[str,
     return None
 
 
-_EMAIL_TEMPLATE_SNIPPET_MAX = 2500
-
-
 def extract_intelligence_profile_for_automation_llm(user: Any) -> Optional[Dict[str, Any]]:
     """Per-org Intelligence export for automation email AI drafts (worker + preview).
 
-    Includes the same sanitized fields as :func:`extract_ai_profile_for_llm`, plus
-    email-branding metadata and a truncated HTML-template snippet so the model knows
-    what exists in Intelligence without dumping an entire multi-kB wrapper into every
-    prompt. Outer branding is still applied server-side when sending.
+    Includes the same sanitized fields as :func:`extract_ai_profile_for_llm`.
     """
-    base = extract_ai_profile_for_llm(user)
-    raw = getattr(user, "ai_profile", None) if user else None
-    if not isinstance(raw, dict):
-        raw = {}
-    tpl = str(raw.get("email_html_template") or "").strip()
-    if base is None and not tpl:
-        return None
-    out: Dict[str, Any] = dict(base) if base else {}
-    out["email_html_template_enabled"] = bool(raw.get("email_html_template_enabled"))
-    if tpl:
-        if len(tpl) > _EMAIL_TEMPLATE_SNIPPET_MAX:
-            out["email_html_template_snippet"] = (
-                tpl[:_EMAIL_TEMPLATE_SNIPPET_MAX]
-                + "\n… [truncated; full wrapper is applied automatically when the email is sent]"
-            )
-        else:
-            out["email_html_template_snippet"] = tpl
-    return out
+    return extract_ai_profile_for_llm(user)
 
 
 def extract_ai_profile_for_llm(user: Any) -> Optional[Dict[str, Any]]:

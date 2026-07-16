@@ -284,7 +284,7 @@ def _call_llm_picker(
     )
     user_prompt = "DATA = " + json.dumps(payload, ensure_ascii=False, default=str)
     user_prompt = truncate_for_tokens(user_prompt, 12000)
-    raw = chat_json(_PICKER_SYSTEM, user_prompt, temperature=0.2, org_id=org_id)
+    raw = chat_json(_PICKER_SYSTEM, user_prompt, temperature=0.2, org_id=org_id, feature="automation")
     chosen = _validate_names(raw.get("chosen") or [])[:cap]
     if not chosen:
         return None

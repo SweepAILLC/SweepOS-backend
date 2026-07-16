@@ -34,6 +34,9 @@ class Playbook(str, enum.Enum):
     # Lets the operator nurture booked-but-not-yet-sold leads (e.g. discovery call ->
     # send a primer / agenda / pre-call value email before the actual sales call).
     PRE_SALE_POST_BOOKING = "pre_sale_post_booking"
+    # Second post-booking email: scheduled relative to meeting start
+    # (delay_seconds = how long before the meeting to send).
+    PRE_SALE_PRE_MEETING = "pre_sale_pre_meeting"
     FIRST_PAYMENT_ONBOARDING = "first_payment_onboarding"
     FIRST_PAYMENT_REFERRAL = "first_payment_referral"
     WIN_COMBINED_ASK = "win_combined_ask"

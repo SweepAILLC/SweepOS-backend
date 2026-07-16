@@ -51,7 +51,7 @@ def compute_ai_health_score(
     user = "DATA:\n" + truncate_for_tokens(json.dumps(block, default=str), 14000)
 
     try:
-        raw = chat_json(sys_prompt, user, temperature=0.0, timeout=90.0, org_id=org_id)
+        raw = chat_json(sys_prompt, user, temperature=0.0, timeout=90.0, org_id=org_id, feature="health_score")
     except Exception:
         return None
 

@@ -63,6 +63,36 @@ class Settings(BaseSettings):
     # Auth
     SECRET_KEY: str = "supersecret_jwt_key_change_in_production"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours; reduce logout frequency
+
+    # Google OAuth (user sign-in / invite signup / account linking)
+    GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
+    GOOGLE_OAUTH_CLIENT_SECRET: Optional[str] = None
+    # Must match Google Cloud Console authorized redirect URI exactly
+    GOOGLE_OAUTH_REDIRECT_URI: Optional[str] = None  # e.g. http://localhost:8000/auth/google/callback
+    # Aliases accepted from older .env naming (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET)
+    GOOGLE_CLIENT_ID: Optional[str] = None
+    GOOGLE_CLIENT_SECRET: Optional[str] = None
+
+    def resolved_google_oauth_client_id(self) -> Optional[str]:
+        return (self.GOOGLE_OAUTH_CLIENT_ID or self.GOOGLE_CLIENT_ID or "").strip() or None
+
+    def resolved_google_oauth_client_secret(self) -> Optional[str]:
+        return (self.GOOGLE_OAUTH_CLIENT_SECRET or self.GOOGLE_CLIENT_SECRET or "").strip() or None
+
+    def google_oauth_is_configured(self) -> bool:
+        return bool(
+            self.resolved_google_oauth_client_id()
+            and self.resolved_google_oauth_client_secret()
+            and (self.GOOGLE_OAUTH_REDIRECT_URI or "").strip()
+        )
+
+    # Claude MCP connector (SweepOS acts as OAuth AS + resource server)
+    # Issuer is the public API origin (no trailing slash). Resource is the MCP URL Claude enters.
+    MCP_ISSUER_URL: Optional[str] = None  # e.g. https://api.sweepai.site
+    MCP_RESOURCE_URL: Optional[str] = None  # e.g. https://api.sweepai.site/mcp
+    MCP_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    MCP_REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    MCP_SCOPES: str = "clients:read marketing:read terminal:read email:send"
     
     # Stripe
     STRIPE_CLIENT_ID: Optional[str] = None
@@ -160,9 +190,10 @@ class Settings(BaseSettings):
     CALL_LIBRARY_MAX_TRANSCRIPT_CHARS: int = 12000
     CALL_LIBRARY_MAX_SUMMARY_CHARS: int = 6000
     CALL_LIBRARY_LLM_TIMEOUT_SEC: float = 120.0
-    CALL_LIBRARY_MAX_OUTPUT_TOKENS: int = 4096  # full audit JSON needs headroom
-    CALL_LIBRARY_MAX_INPUT_CHARS_TOTAL: int = 56000
-    CALL_LIBRARY_MIN_USER_INPUT_CHARS: int = 12000
+    CALL_LIBRARY_MAX_OUTPUT_TOKENS: int = 2500  # compact rubric prompt; enough for full report
+    CALL_LIBRARY_MAX_INPUT_CHARS_TOTAL: int = 40000
+    CALL_LIBRARY_MIN_USER_INPUT_CHARS: int = 10000
+    CALL_LIBRARY_MAX_ANALYSIS_ATTEMPTS: int = 3  # permanent failure after this many LLM misses
     CALL_LIBRARY_STAGGER_SEC: float = 1.5  # gap between queued library jobs (≈40/min)
     CALL_LIBRARY_STUCK_PENDING_MINUTES: int = 15  # only requeue pending older than this
     CALL_LIBRARY_READY_PENDING_SEC: int = 45
@@ -195,9 +226,11 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: Optional[str] = None
     
     class Config:
-        env_file = ".env"
+        # Prefer repo-root .env when running uvicorn from backend/; also allow backend/.env
+        env_file = (".env", "../.env")
         env_file_encoding = "utf-8"
         case_sensitive = True
+        extra = "ignore"
         # Pydantic will read from environment variables first (set by Docker Compose),
         # then fall back to .env file if not found in environment
 

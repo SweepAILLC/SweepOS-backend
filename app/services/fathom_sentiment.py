@@ -43,7 +43,7 @@ def derive_sentiment(
 
     user = "DATA - Summary:\n" + sm + "\n\nDATA - Transcript excerpt:\n" + tr
     try:
-        raw = chat_json(SYSTEM, user, temperature=0.0, timeout=90.0, org_id=org_id)
+        raw = chat_json(SYSTEM, user, temperature=0.0, timeout=90.0, org_id=org_id, feature="fathom_sentiment")
     except RuntimeError as e:
         if "llm_budget" in str(e).lower():
             return "failed", {"error": "llm_budget_exceeded"}

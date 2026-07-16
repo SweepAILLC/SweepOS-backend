@@ -20,8 +20,10 @@ def process_stripe_event(db: Session, event: Dict[str, Any], org_id: uuid.UUID):
     Process a Stripe webhook event and update database.
     
     Handles:
-    - invoice.payment_succeeded / charge.succeeded -> create/update payment, update client lifetime revenue
-    - invoice.payment_failed / payment_intent.payment_failed -> create failed payment, create recovery recommendation
+    - invoice.payment_succeeded / invoice.paid / charge.succeeded / payment_intent.succeeded
+      -> create/update payment, update client lifetime revenue
+    - invoice.payment_failed / payment_intent.payment_failed / charge.failed
+      -> create failed payment, create recovery recommendation
     - customer.subscription.* -> create/update subscription, update MRR
     - charge.refunded -> mark payment as refunded
     """
@@ -34,7 +36,12 @@ def process_stripe_event(db: Session, event: Dict[str, Any], org_id: uuid.UUID):
     print(f"Event structure: type={event_type}, has_data={bool(data)}, data_type={type(data)}")
     
     try:
-        if event_type in ["invoice.payment_succeeded", "charge.succeeded", "invoice.paid"]:
+        if event_type in [
+            "invoice.payment_succeeded",
+            "charge.succeeded",
+            "invoice.paid",
+            "payment_intent.succeeded",
+        ]:
             print(f"Handling successful payment event: {event_type}")
             _process_successful_payment(db, data, event, event_type, org_id)
         
@@ -71,6 +78,7 @@ def process_stripe_event(db: Session, event: Dict[str, Any], org_id: uuid.UUID):
 def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[str, Any], event_type: str, org_id: uuid.UUID):
     """Process successful payment - create/update payment record and update client lifetime revenue"""
     
+    invoice_id = None
     # For invoice events, the charge ID is in data.charge
     # For charge events, the charge ID is in data.id
     if event_type.startswith("invoice."):
@@ -96,6 +104,30 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         # Test events might not have subscription.created events, so we derive MRR from invoice
         if subscription_id and amount_cents > 0:
             print(f"[PAYMENT] Invoice has subscription {subscription_id}, will update subscription MRR from invoice amount")
+        invoice_id = data.get("id") if isinstance(data.get("id"), str) and str(data.get("id")).startswith("in_") else None
+    elif event_type.startswith("payment_intent."):
+        # Checkout / Payment Element one-offs — do not ignore these.
+        payment_id = data.get("id")
+        amount_cents = data.get("amount_received") or data.get("amount") or 0
+        subscription_id = None
+        invoice_data = data.get("invoice")
+        invoice_id = invoice_data if isinstance(invoice_data, str) else (
+            invoice_data.get("id") if isinstance(invoice_data, dict) else None
+        )
+        if isinstance(invoice_data, dict):
+            subscription_id = invoice_data.get("subscription")
+        customer_id = data.get("customer")
+        currency = data.get("currency", "usd")
+        # Prefer the charge id when present so we don't also store a weaker PI/invoice later.
+        latest_charge = data.get("latest_charge")
+        if isinstance(latest_charge, dict) and latest_charge.get("id"):
+            payment_id = latest_charge.get("id")
+            receipt_url = latest_charge.get("receipt_url") or data.get("receipt_url")
+        elif isinstance(latest_charge, str) and latest_charge.startswith("ch_"):
+            payment_id = latest_charge
+            receipt_url = data.get("receipt_url")
+        else:
+            receipt_url = data.get("receipt_url")
     else:
         # Charge event
         payment_id = data.get("id")
@@ -103,15 +135,19 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         # Try to get subscription from invoice if charge has invoice field
         invoice_data = data.get("invoice")
         subscription_id = None
+        invoice_id = None
         if invoice_data:
             # If invoice is an object (expanded), get subscription from it
             if isinstance(invoice_data, dict):
                 subscription_id = invoice_data.get("subscription")
+                invoice_id = invoice_data.get("id")
             # If invoice is just an ID string, try to find a payment created from that invoice
             elif isinstance(invoice_data, str):
+                invoice_id = invoice_data
                 # Look for a payment that was created from this invoice (invoice ID as stripe_id)
                 invoice_payment = db.query(StripePayment).filter(
-                    StripePayment.stripe_id == invoice_data
+                    StripePayment.org_id == org_id,
+                    StripePayment.stripe_id == invoice_data,
                 ).first()
                 if invoice_payment and invoice_payment.subscription_id:
                     subscription_id = invoice_payment.subscription_id
@@ -129,6 +165,18 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         return
     
     print(f"Processing payment: ID={payment_id}, Amount=${amount_cents/100:.2f}, Customer={customer_id}")
+
+    # Prefer charge/PI rows over temporary invoice-id rows from invoice.* webhooks.
+    if invoice_id and payment_id != invoice_id:
+        inferior = db.query(StripePayment).filter(
+            StripePayment.org_id == org_id,
+            StripePayment.stripe_id == invoice_id,
+            StripePayment.type == "invoice",
+        ).first()
+        if inferior:
+            db.delete(inferior)
+            db.flush()
+            print(f"[WEBHOOK] Removed inferior invoice row {invoice_id} in favor of {payment_id}")
     
     # Find or create client by Stripe customer ID
     # First try to find by stripe_customer_id
@@ -185,7 +233,12 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
     from sqlalchemy.dialects.postgresql import insert
     import json
     
-    payment_type = 'charge' if not event_type.startswith("invoice.") else 'invoice'
+    if event_type.startswith("invoice."):
+        payment_type = "invoice"
+    elif event_type.startswith("payment_intent.") or (isinstance(payment_id, str) and payment_id.startswith("pi_")):
+        payment_type = "payment_intent" if str(payment_id).startswith("pi_") else "charge"
+    else:
+        payment_type = "charge"
     created_ts = data.get('created', int(datetime.utcnow().timestamp()))
     created_at = datetime.fromtimestamp(created_ts) if created_ts else datetime.utcnow()
 
@@ -206,6 +259,7 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         status="succeeded",
         type=payment_type,
         subscription_id=subscription_id,
+        invoice_id=invoice_id,
         receipt_url=receipt_url,
         raw_event=event,
         created_at=created_at,
@@ -220,6 +274,7 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
             currency=stmt.excluded.currency,
             client_id=stmt.excluded.client_id,
             subscription_id=stmt.excluded.subscription_id,
+            invoice_id=stmt.excluded.invoice_id,
             receipt_url=stmt.excluded.receipt_url,
             raw_event=stmt.excluded.raw_event,
             updated_at=datetime.utcnow()

@@ -192,6 +192,7 @@ def find_recoverable_failed_report_ids(
     from sqlalchemy import or_
 
     batch = limit or int(getattr(settings, "CALL_LIBRARY_STUCK_REQUEUE_BATCH", 25) or 25)
+    max_attempts = int(getattr(settings, "CALL_LIBRARY_MAX_ANALYSIS_ATTEMPTS", 3) or 3)
     rows = (
         db.query(CallLibraryReport.fathom_call_record_id)
         .join(
@@ -203,6 +204,11 @@ def find_recoverable_failed_report_ids(
             CallLibraryReport.status == "failed",
             CallLibraryReport.failure_reason.in_(
                 ("llm_failed", "llm_empty", "budget_deferred", "no_content")
+            ),
+            CallLibraryReport.failure_reason != "analysis_failed",
+            or_(
+                CallLibraryReport.attempt_count.is_(None),
+                CallLibraryReport.attempt_count < max_attempts,
             ),
             or_(
                 FathomCallRecord.summary_text != "",

@@ -406,24 +406,13 @@ def sync_stripe_data(
             ).first()
             
             if oauth_token:
-                # Temporarily set last_sync_at to 24 hours ago to force sync of recent payments
-                original_last_sync = oauth_token.last_sync_at
+                # Look back 24h for catch-up, then let sync advance last_sync_at to now
+                # (do not rewind — that prevented the incremental cursor from progressing).
                 oauth_token.last_sync_at = datetime.utcnow() - timedelta(hours=24)
                 db.commit()
-                print(f"[API] Temporarily set last_sync_at to {oauth_token.last_sync_at} to sync recent payments")
+                print(f"[API] Set last_sync_at to {oauth_token.last_sync_at} to sync recent payments")
         
         sync_result = sync_stripe_incremental(db, org_id=org_id, force_full=force_full, sync_recent=sync_recent)
-        
-        # Restore original last_sync_at if we modified it
-        if sync_recent and 'original_last_sync' in locals() and original_last_sync is not None:
-            oauth_token = db.query(OAuthToken).filter(
-                OAuthToken.provider == OAuthProvider.STRIPE,
-                OAuthToken.org_id == org_id
-            ).first()
-            if oauth_token:
-                oauth_token.last_sync_at = original_last_sync
-                db.commit()
-                print(f"[API] Restored last_sync_at to {original_last_sync}")
         
         if sync_result.get("error"):
             raise HTTPException(
@@ -431,10 +420,26 @@ def sync_stripe_data(
                 detail=sync_result.get("error")
             )
         
+        # Mark "data updated" so Terminal refetch works even without webhooks.
+        stripe_data_updated_ms = None
+        try:
+            oauth_token = db.query(OAuthToken).filter(
+                OAuthToken.provider == OAuthProvider.STRIPE,
+                OAuthToken.org_id == org_id,
+            ).first()
+            if oauth_token:
+                now = datetime.utcnow()
+                oauth_token.last_webhook_processed_at = now
+                db.commit()
+                stripe_data_updated_ms = int(now.timestamp() * 1000)
+        except Exception:
+            db.rollback()
+
         response_data = {
             "success": True,
             "message": "Stripe data synced successfully",
             "is_full_sync": sync_result.get("is_full_sync", False),
+            "stripe_data_updated_ms": stripe_data_updated_ms,
             "results": {
                 "customers_synced": sync_result.get("customers_synced", 0),
                 "customers_updated": sync_result.get("customers_updated", 0),
@@ -444,18 +449,6 @@ def sync_stripe_data(
                 "payments_updated": sync_result.get("payments_updated", 0),
             }
         }
-
-        # Mark "data updated" so Terminal refetch works even without webhooks.
-        try:
-            oauth_token = db.query(OAuthToken).filter(
-                OAuthToken.provider == OAuthProvider.STRIPE,
-                OAuthToken.org_id == org_id,
-            ).first()
-            if oauth_token:
-                oauth_token.last_webhook_processed_at = datetime.utcnow()
-                db.commit()
-        except Exception:
-            db.rollback()
         
         return response_data
     except HTTPException:
@@ -499,7 +492,6 @@ def sync_and_reconcile_stripe_data(
     from app.services.stripe_sync_v2 import sync_stripe_incremental, reconcile_stripe_data
     from app.models.oauth_token import OAuthToken, OAuthProvider
 
-    original_last_sync = None
     try:
         # 1. Sync (same logic as /sync)
         if sync_recent:
@@ -508,20 +500,11 @@ def sync_and_reconcile_stripe_data(
                 OAuthToken.org_id == org_id
             ).first()
             if oauth_token:
-                original_last_sync = oauth_token.last_sync_at
+                # Catch up last 24h, then allow sync to advance last_sync_at.
                 oauth_token.last_sync_at = datetime.utcnow() - timedelta(hours=24)
                 db.commit()
 
         sync_result = sync_stripe_incremental(db, org_id=org_id, force_full=force_full, sync_recent=sync_recent)
-
-        if sync_recent and original_last_sync is not None:
-            oauth_token = db.query(OAuthToken).filter(
-                OAuthToken.provider == OAuthProvider.STRIPE,
-                OAuthToken.org_id == org_id
-            ).first()
-            if oauth_token:
-                oauth_token.last_sync_at = original_last_sync
-                db.commit()
 
         if sync_result.get("error"):
             raise HTTPException(
@@ -532,10 +515,26 @@ def sync_and_reconcile_stripe_data(
         # 2. Reconcile immediately (same DB session)
         reconcile_result = reconcile_stripe_data(db, org_id=org_id)
 
+        # Bump last-updated so Terminal/Finances pollers refetch after sync.
+        stripe_data_updated_ms = None
+        try:
+            oauth_token = db.query(OAuthToken).filter(
+                OAuthToken.provider == OAuthProvider.STRIPE,
+                OAuthToken.org_id == org_id,
+            ).first()
+            if oauth_token:
+                now = datetime.utcnow()
+                oauth_token.last_webhook_processed_at = now
+                db.commit()
+                stripe_data_updated_ms = int(now.timestamp() * 1000)
+        except Exception:
+            db.rollback()
+
         return {
             "success": True,
             "message": "Sync and reconciliation complete",
             "is_full_sync": sync_result.get("is_full_sync", False),
+            "stripe_data_updated_ms": stripe_data_updated_ms,
             "sync": {
                 "customers_synced": sync_result.get("customers_synced", 0),
                 "customers_updated": sync_result.get("customers_updated", 0),

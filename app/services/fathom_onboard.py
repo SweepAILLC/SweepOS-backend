@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from urllib.parse import urlparse
 from typing import Any, Optional
@@ -26,6 +27,77 @@ def _is_public_webhook_destination(url: str) -> bool:
     if parsed.scheme != "https" or not host:
         return False
     return host not in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} and not host.endswith(".local")
+
+
+def _is_local_dev_environment() -> bool:
+    env = (os.environ.get("ENVIRONMENT") or "").strip().lower()
+    return env in {"development", "dev", "local"}
+
+
+def _allow_fathom_webhook_register() -> bool:
+    """Opt-in escape hatch for tunnels / intentional local Fathom destination changes."""
+    return (os.environ.get("ALLOW_FATHOM_WEBHOOK_REGISTER") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _dev_must_skip_webhook_mutation(
+    *,
+    existing_wh_id: Optional[str],
+    existing_wh_url: str,
+    destination: str,
+) -> dict[str, Any] | None:
+    """
+    Never call Fathom's create/replace webhook API from local dev by default.
+
+    Local .env often copies prod BACKEND_PUBLIC_URL. Registering would rotate the
+    live webhook secret and write it only to the local DB — breaking production
+    signature verification while leaving Fathom pointed at prod.
+    """
+    if not _is_local_dev_environment() or _allow_fathom_webhook_register():
+        return None
+
+    if existing_wh_id and existing_wh_url:
+        logger.info(
+            "fathom_onboard: local dev preserving existing Fathom webhook org destination=%s "
+            "(set ALLOW_FATHOM_WEBHOOK_REGISTER=true to override)",
+            existing_wh_url,
+        )
+        return {
+            "success": True,
+            "webhook_active": True,
+            "skipped": True,
+            "registration_skipped": True,
+            "reason": "local_dev_preserve",
+            "webhook_id": existing_wh_id,
+            "destination_url": existing_wh_url,
+            "requested_destination_url": destination,
+            "message": (
+                "Existing Fathom webhook preserved in local development. "
+                "Inbound receive handlers still work; use Integrations sync or curl to test locally. "
+                "Set ALLOW_FATHOM_WEBHOOK_REGISTER=true only if you intentionally want to retarget Fathom."
+            ),
+        }
+
+    logger.info(
+        "fathom_onboard: local dev skipping Fathom webhook registration requested=%s",
+        destination,
+    )
+    return {
+        "success": True,
+        "webhook_active": False,
+        "skipped": True,
+        "registration_skipped": True,
+        "reason": "local_dev_skip",
+        "destination_url": destination,
+        "message": (
+            "Fathom API key saved. Webhook registration is skipped in local development "
+            "so production destinations/secrets are not rotated. "
+            "Set ALLOW_FATHOM_WEBHOOK_REGISTER=true with a public tunnel URL to register from local."
+        ),
+    }
 
 
 def register_fathom_webhook_for_org(org_id_str: str, *, force: bool = True) -> dict[str, Any]:
@@ -177,6 +249,14 @@ def _register_webhook(db, org_id: uuid.UUID, api_key: str, *, force: bool) -> di
             "webhook_id": existing_wh_id,
             "destination_url": existing_wh_url,
         }
+
+    skipped = _dev_must_skip_webhook_mutation(
+        existing_wh_id=existing_wh_id,
+        existing_wh_url=existing_wh_url,
+        destination=destination,
+    )
+    if skipped is not None:
+        return skipped
 
     if not _is_public_webhook_destination(destination):
         if existing_wh_id and existing_wh_url:

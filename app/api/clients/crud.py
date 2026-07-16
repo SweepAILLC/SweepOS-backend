@@ -228,6 +228,24 @@ def get_client(
 
     return client
 
+
+@router.get("/{client_id}/profile")
+def get_client_profile(
+    client_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Aggregated client profile package (contact, stage, finances, offer, call analysis, workspace)."""
+    from app.services.client_profile_bundle import build_client_profile_bundle
+
+    client_uuid = parse_client_uuid(client_id)
+    org_id = scope_org_id(current_user)
+    bundle = build_client_profile_bundle(db, org_id, client_uuid)
+    if not bundle:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return bundle
+
+
 @router.patch("/{client_id}", response_model=ClientSchema)
 def update_client(
     client_id: str,

@@ -208,7 +208,7 @@ INTELLIGENCE_PROFILE (optional context for the operator):
 TRANSCRIPT:
 {transcript[:48000]}"""
 
-    return chat_json(system, user, temperature=0.2, org_id=org_id)
+    return chat_json(system, user, temperature=0.2, org_id=org_id, feature="content_studio")
 
 
 def persist_transcript_analysis(
