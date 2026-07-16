@@ -196,6 +196,27 @@ def summarize_platform_llm_usage(db: Session, *, days: int = 30) -> Dict[str, An
         }
         for r in by_org_rows
     ]
+    by_feature_rows = (
+        db.query(
+            LlmUsageEvent.feature,
+            func.count(LlmUsageEvent.id),
+            func.coalesce(func.sum(LlmUsageEvent.total_tokens), 0),
+            func.coalesce(func.sum(LlmUsageEvent.estimated_cost_usd), 0.0),
+        )
+        .filter(LlmUsageEvent.created_at >= since)
+        .group_by(LlmUsageEvent.feature)
+        .order_by(func.sum(LlmUsageEvent.estimated_cost_usd).desc())
+        .all()
+    )
+    by_feature: List[Dict[str, Any]] = [
+        {
+            "feature": r[0],
+            "calls": int(r[1]),
+            "total_tokens": int(r[2]),
+            "estimated_cost_usd": float(r[3] or 0),
+        }
+        for r in by_feature_rows
+    ]
     return {
         "days": days,
         "calls": int(totals[0] or 0),
@@ -203,6 +224,7 @@ def summarize_platform_llm_usage(db: Session, *, days: int = 30) -> Dict[str, An
         "completion_tokens": int(totals[2] or 0),
         "total_tokens": int(totals[3] or 0),
         "estimated_cost_usd": float(totals[4] or 0),
+        "by_feature": by_feature,
         "by_org": by_org,
     }
 

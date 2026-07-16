@@ -281,7 +281,7 @@ def filter_fathom_records_needing_library_analysis(
     org_id: uuid.UUID,
     record_ids: List[uuid.UUID],
 ) -> List[uuid.UUID]:
-    """Drop rows that already have a complete report or are already queued (pending)."""
+    """Drop rows that already have a complete report, are in-flight, or permanently failed."""
     if not record_ids:
         return []
     from datetime import timedelta
@@ -311,7 +311,31 @@ def filter_fathom_records_needing_library_analysis(
         .all()
         if r[0] is not None
     }
-    skip = complete_ids | pending_recent_ids
+    permanent_failed_ids = {
+        r[0]
+        for r in db.query(CallLibraryReport.fathom_call_record_id)
+        .filter(
+            CallLibraryReport.org_id == org_id,
+            CallLibraryReport.fathom_call_record_id.in_(record_ids),
+            CallLibraryReport.status == "failed",
+            CallLibraryReport.failure_reason == "analysis_failed",
+        )
+        .all()
+        if r[0] is not None
+    }
+    max_attempts = _max_analysis_attempts()
+    exhausted_ids = {
+        r[0]
+        for r in db.query(CallLibraryReport.fathom_call_record_id)
+        .filter(
+            CallLibraryReport.org_id == org_id,
+            CallLibraryReport.fathom_call_record_id.in_(record_ids),
+            CallLibraryReport.attempt_count >= max_attempts,
+        )
+        .all()
+        if r[0] is not None
+    }
+    skip = complete_ids | pending_recent_ids | permanent_failed_ids | exhausted_ids
     return [rid for rid in record_ids if rid not in skip]
 
 

@@ -290,6 +290,13 @@ def requeue_pending_reports(
     if len(ids) > max_requeue:
         ids = ids[:max_requeue]
 
+    # Drop complete / in-flight / permanent failures before enqueue + status bump.
+    from app.services.call_library_service import filter_fathom_records_needing_library_analysis
+
+    ids = filter_fathom_records_needing_library_analysis(db, org_id, ids)
+    if not ids:
+        return 0
+
     # Enqueue before touching updated_at — filter skips pending rows updated in the
     # last few minutes as "in flight", so resetting updated_at first drops all jobs.
     scheduled = schedule_call_library_reports(org_id, ids, background_tasks)
@@ -301,8 +308,13 @@ def requeue_pending_reports(
         )
         .all()
     ):
-        row.status = "pending"
-        row.failure_reason = None
+        # Never revive permanent analysis_failed rows.
+        if row.failure_reason == "analysis_failed":
+            continue
+        if row.status == "failed":
+            row.status = "pending"
+            # Keep attempt_count; clear only transient reason so UI shows pending.
+            row.failure_reason = None
         row.updated_at = datetime.now(timezone.utc)
     db.commit()
     logger.info(

@@ -222,7 +222,20 @@ def upsert_call_record(
     return row
 
 
-def apply_sentiment_to_record(db: Session, record: FathomCallRecord) -> None:
+def apply_sentiment_to_record(
+    db: Session,
+    record: FathomCallRecord,
+    *,
+    force: bool = False,
+) -> None:
+    """Run sentiment LLM. Skip when already complete unless force or content just changed."""
+    if (
+        not force
+        and (record.sentiment_status or "") == "complete"
+        and record.sentiment_label
+        and record.sentiment_score is not None
+    ):
+        return
     summary = record.summary_text or ""
     trans = record.transcript_snippet or ""
     status, payload = derive_sentiment(summary, trans, org_id=record.org_id)
@@ -361,6 +374,77 @@ def ingest_meeting_payload(
     return "ok", client_id, rec.id
 
 
+def _fathom_record_needs_enrichment(
+    db: Session, org_id: uuid.UUID, fathom_row_id: uuid.UUID
+) -> bool:
+    """True when summary/transcript is thin or sentiment is not complete yet."""
+    from app.services.call_insight_context import is_meeting_snapshot_thin
+
+    rec = (
+        db.query(FathomCallRecord)
+        .filter(FathomCallRecord.id == fathom_row_id, FathomCallRecord.org_id == org_id)
+        .first()
+    )
+    if not rec:
+        return False
+    if (rec.sentiment_status or "") != "complete":
+        return True
+    return is_meeting_snapshot_thin(rec.summary_text, rec.transcript_snippet)
+
+
+def _fathom_record_needs_library_queue(
+    db: Session, org_id: uuid.UUID, fathom_row_id: uuid.UUID
+) -> bool:
+    """True when Call Library report is missing, pending, or recoverable-failed."""
+    from app.models.call_library_report import CallLibraryReport
+
+    row = (
+        db.query(CallLibraryReport)
+        .filter(
+            CallLibraryReport.org_id == org_id,
+            CallLibraryReport.fathom_call_record_id == fathom_row_id,
+        )
+        .first()
+    )
+    if not row:
+        return True
+    if row.status == "complete":
+        return False
+    if row.status == "pending":
+        return True
+    if row.status == "failed":
+        if row.failure_reason == "analysis_failed":
+            return False
+        return row.failure_reason in (
+            "llm_failed",
+            "llm_empty",
+            "budget_deferred",
+            "no_content",
+        )
+    return False
+
+
+def _fathom_record_needs_call_insight(
+    db: Session, org_id: uuid.UUID, fathom_row_id: uuid.UUID
+) -> bool:
+    """True when a client-linked record has no complete insight yet."""
+    from app.models.client_call_insight import ClientCallInsight
+
+    rec = (
+        db.query(FathomCallRecord)
+        .filter(FathomCallRecord.id == fathom_row_id, FathomCallRecord.org_id == org_id)
+        .first()
+    )
+    if not rec or not rec.client_id:
+        return False
+    existing = (
+        db.query(ClientCallInsight)
+        .filter(ClientCallInsight.fathom_call_record_id == fathom_row_id)
+        .first()
+    )
+    return not (existing and existing.status == "complete" and existing.insight_json)
+
+
 def sync_recent_meetings_for_org(
     db: Session,
     org_id: uuid.UUID,
@@ -422,10 +506,16 @@ def sync_recent_meetings_for_org(
                 )
                 continue
             if status in ("ok", "ok_unlinked") and fathom_row_id:
-                pending_library_record_ids.append(fathom_row_id)
-                pending_enrichment_record_ids.append(fathom_row_id)
-                if status == "ok":
-                    pending_insight_record_ids.append(fathom_row_id)
+                # Only queue enrichment/insights for records that still need work.
+                # Re-syncing historical meetings must not re-burn sentiment/insight LLM.
+                if _fathom_record_needs_enrichment(db, org_id, fathom_row_id):
+                    pending_enrichment_record_ids.append(fathom_row_id)
+                    if status == "ok" and _fathom_record_needs_call_insight(
+                        db, org_id, fathom_row_id
+                    ):
+                        pending_insight_record_ids.append(fathom_row_id)
+                if _fathom_record_needs_library_queue(db, org_id, fathom_row_id):
+                    pending_library_record_ids.append(fathom_row_id)
             if status == "ok":
                 ingested += 1
             elif status == "ok_unlinked":
@@ -445,12 +535,15 @@ def sync_recent_meetings_for_org(
     if relinked:
         db.commit()
         for rec_id, _client_id in relinked:
-            if rec_id not in pending_insight_record_ids:
-                pending_insight_record_ids.append(rec_id)
-            if rec_id not in pending_library_record_ids:
-                pending_library_record_ids.append(rec_id)
-            if rec_id not in pending_enrichment_record_ids:
-                pending_enrichment_record_ids.append(rec_id)
+            if _fathom_record_needs_call_insight(db, org_id, rec_id):
+                if rec_id not in pending_insight_record_ids:
+                    pending_insight_record_ids.append(rec_id)
+            if _fathom_record_needs_library_queue(db, org_id, rec_id):
+                if rec_id not in pending_library_record_ids:
+                    pending_library_record_ids.append(rec_id)
+            if _fathom_record_needs_enrichment(db, org_id, rec_id):
+                if rec_id not in pending_enrichment_record_ids:
+                    pending_enrichment_record_ids.append(rec_id)
 
     return {
         "skipped": False,
@@ -602,9 +695,10 @@ def run_fathom_webhook_enrichment_and_followups(
             return
 
         api_key = resolve_fathom_api_key(db, org_id)
-        _refresh_fathom_row_from_api(db, rec, api_key)
-        apply_sentiment_to_record(db, rec)
-        if rec.client_id:
+        content_refreshed = _refresh_fathom_row_from_api(db, rec, api_key)
+        # Re-run sentiment only when content changed or sentiment is incomplete.
+        apply_sentiment_to_record(db, rec, force=content_refreshed)
+        if rec.client_id and content_refreshed:
             invalidate_health_score_cache(db, rec.client_id, org_id, do_commit=False)
         db.commit()
         db.refresh(rec)
@@ -648,8 +742,18 @@ def run_fathom_webhook_enrichment_and_followups(
             .filter(CallLibraryReport.fathom_call_record_id == rec_id)
             .first()
         )
-        if not lib_row or lib_row.status != "complete":
-            skip_library = attempt == 1 and not still_thin
+        needs_library = (
+            not lib_row
+            or lib_row.status == "pending"
+            or (
+                lib_row.status == "failed"
+                and lib_row.failure_reason
+                in ("llm_failed", "llm_empty", "budget_deferred", "no_content")
+            )
+        )
+        if needs_library and not (lib_row and lib_row.failure_reason == "analysis_failed"):
+            # Fast-path already queued library on attempt 1 when content was rich.
+            skip_library = attempt == 1 and not still_thin and not content_refreshed
             if not skip_library:
                 from app.services.call_library_queue import schedule_call_library_reports
 
@@ -665,14 +769,15 @@ def run_fathom_webhook_enrichment_and_followups(
                     lib_row.updated_at = datetime.now(timezone.utc)
                     db.commit()
                 schedule_call_library_reports(org_id, [rec_id], None)
-        if rec.client_id:
+        if rec.client_id and _fathom_record_needs_call_insight(db, org_id, rec_id):
             schedule_background_work(run_call_insight_background, None, org_id_str, fathom_record_uuid_str)
         logger.info(
-            "fathom webhook followups queued org=%s record=%s attempts_used=%s linked=%s",
+            "fathom webhook followups queued org=%s record=%s attempts_used=%s linked=%s refreshed=%s",
             org_id,
             rec_id,
             attempt,
             bool(rec.client_id),
+            content_refreshed,
         )
     except Exception:
         logger.exception(
