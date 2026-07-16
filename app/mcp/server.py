@@ -50,6 +50,14 @@ SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-03-26")
 
 TOOLS = [
     {
+        "name": "get_connection_context",
+        "description": (
+            "Return which SweepOS organization and user this Claude connector is authenticated as. "
+            "Call this first if org data looks wrong — reconnect and pick the correct org when prompted."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "list_clients",
         "description": "List clients in the connected SweepOS organization. Optionally filter by text query or lifecycle_state.",
         "inputSchema": {
@@ -317,8 +325,29 @@ def _run_tool(
     db: Session,
     *,
     user_id: Optional[uuid.UUID] = None,
+    auth_ctx: Optional[dict] = None,
 ) -> dict:
     args = arguments or {}
+    if name == "get_connection_context":
+        from app.models.organization import Organization
+        from app.models.user import User
+
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+        user = db.query(User).filter(User.id == user_id).first() if user_id else None
+        return _text_result(
+            {
+                "org_id": str(org_id),
+                "org_name": org.name if org else (auth_ctx or {}).get("org_name"),
+                "user_id": str(user_id) if user_id else None,
+                "user_email": (user.email if user else (auth_ctx or {}).get("sub")),
+                "role": (auth_ctx or {}).get("role"),
+                "scopes": (auth_ctx or {}).get("scope"),
+                "hint": (
+                    "If this org is wrong, disconnect the Claude connector and reconnect. "
+                    "When your Google account belongs to multiple Sweep orgs, you will be asked to pick one."
+                ),
+            }
+        )
     if name == "list_clients":
         rows = list_clients_for_mcp(
             db,
@@ -448,6 +477,7 @@ def _handle_jsonrpc(
     db: Session,
     *,
     user_id: Optional[uuid.UUID] = None,
+    auth_ctx: Optional[dict] = None,
 ) -> dict:
     req_id = body.get("id")
     method = body.get("method") or ""
@@ -456,6 +486,7 @@ def _handle_jsonrpc(
     if method == "initialize":
         requested = params.get("protocolVersion") or SERVER_INFO["protocolVersion"]
         negotiated = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else SERVER_INFO["protocolVersion"]
+        org_name = (auth_ctx or {}).get("org_name")
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -463,7 +494,11 @@ def _handle_jsonrpc(
                 "protocolVersion": negotiated,
                 # Empty object advertises tools capability so Claude requests tools/list
                 "capabilities": {"tools": {}, "resources": {}},
-                "serverInfo": {"name": SERVER_INFO["name"], "version": SERVER_INFO["version"]},
+                "serverInfo": {
+                    "name": SERVER_INFO["name"],
+                    "version": SERVER_INFO["version"],
+                    "title": f"SweepOS ({org_name})" if org_name else "SweepOS",
+                },
             },
         }
     if method in ("notifications/initialized", "initialized"):
@@ -473,7 +508,7 @@ def _handle_jsonrpc(
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        result = _run_tool(name, arguments, org_id, db, user_id=user_id)
+        result = _run_tool(name, arguments, org_id, db, user_id=user_id, auth_ctx=auth_ctx)
         return {"jsonrpc": "2.0", "id": req_id, "result": result}
     if method == "resources/list":
         return {
@@ -713,7 +748,7 @@ async def mcp_endpoint(request: Request):
     try:
         if isinstance(body, list):
             results = [
-                _handle_jsonrpc(item, org_id, db, user_id=user_id)
+                _handle_jsonrpc(item, org_id, db, user_id=user_id, auth_ctx=ctx)
                 for item in body
                 if isinstance(item, dict)
             ]
@@ -726,8 +761,11 @@ async def mcp_endpoint(request: Request):
             )
         # Notifications may omit id
         if body.get("method") and body.get("id") is None and str(body.get("method", "")).startswith("notifications/"):
-            _handle_jsonrpc(body, org_id, db, user_id=user_id)
+            _handle_jsonrpc(body, org_id, db, user_id=user_id, auth_ctx=ctx)
             return Response(status_code=202, headers=_mcp_headers())
-        return JSONResponse(_handle_jsonrpc(body, org_id, db, user_id=user_id), headers=_mcp_headers())
+        return JSONResponse(
+            _handle_jsonrpc(body, org_id, db, user_id=user_id, auth_ctx=ctx),
+            headers=_mcp_headers(),
+        )
     finally:
         db.close()

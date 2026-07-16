@@ -445,7 +445,7 @@ async def google_oauth_callback(
 
         mcp_nonce = state_data.get("mcp_nonce")
         try:
-            redirect_url = complete_mcp_grant_after_google(
+            result = complete_mcp_grant_after_google(
                 db,
                 mcp_nonce=mcp_nonce,
                 google_id=google_id,
@@ -453,6 +453,25 @@ async def google_oauth_callback(
             )
         except HTTPException as e:
             return _frontend_redirect("/login", google_error=str(e.detail))
+
+        if result.get("status") == "select_org":
+            # Multi-org: pause Claude OAuth and let the user pick which Sweep org to bind
+            select_token = _sign_state(
+                {
+                    "purpose": "mcp_org_select",
+                    "mcp_nonce": mcp_nonce,
+                    "google_id": google_id,
+                    "email": email,
+                }
+            )
+            return _frontend_redirect(
+                "/auth/mcp/select-organization",
+                select_token=select_token,
+            )
+
+        redirect_url = result.get("redirect_url")
+        if not redirect_url:
+            return _frontend_redirect("/login", google_error="mcp_redirect_missing")
         # 303 See Other: Claude's auth_callback only accepts GET; avoid method-preserving redirects
         return RedirectResponse(url=redirect_url, status_code=303)
 

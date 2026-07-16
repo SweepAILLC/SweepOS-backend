@@ -211,17 +211,7 @@ def google_start_url_for_mcp(mcp_nonce: str) -> str:
     return f"{mcp_issuer()}/auth/google/start?mode=mcp&mcp_nonce={mcp_nonce}&redirect=1"
 
 
-def complete_mcp_grant_after_google(
-    db: Session,
-    *,
-    mcp_nonce: Optional[str],
-    google_id: str,
-    email: str,
-) -> str:
-    """
-    After Google identity succeeds, bind user+org to the pending grant,
-    issue an authorization code, and return the Claude redirect URL.
-    """
+def _pending_mcp_grant(db: Session, mcp_nonce: str) -> McpOAuthGrant:
     if not mcp_nonce:
         raise HTTPException(status_code=400, detail="Missing MCP nonce")
     grant = (
@@ -235,40 +225,116 @@ def complete_mcp_grant_after_google(
     )
     if not grant:
         raise HTTPException(status_code=400, detail="MCP authorization request expired or invalid")
+    return grant
 
-    user = db.query(User).filter(User.google_id == google_id).first()
-    if not user:
-        matches = (
-            db.query(User)
-            .filter(func.lower(User.email) == email.lower().strip())
-            .order_by(User.created_at.asc())
-            .all()
-        )
-        if not matches:
-            raise HTTPException(
-                status_code=400,
-                detail="No SweepOS account for this Google email. Sign up via invite first.",
-            )
-        user = matches[0]
-        for u in matches:
-            if not u.google_id:
-                u.google_id = google_id
-                u.google_email = email
-        db.commit()
 
-    # Prefer user's primary org
-    org_id = user.org_id
-    uo = (
-        db.query(UserOrganization)
-        .filter(UserOrganization.user_id == user.id, UserOrganization.is_primary.is_(True))
-        .first()
+def resolve_org_choices_for_google(
+    db: Session,
+    *,
+    google_id: str,
+    email: str,
+) -> list[dict]:
+    """
+    All orgs this Google identity can access.
+
+    SweepOS multi-org is often multiple User rows sharing an email (one per org),
+    plus optional UserOrganization memberships.
+    """
+    from app.models.organization import Organization
+
+    email_norm = (email or "").lower().strip()
+    by_gid = db.query(User).filter(User.google_id == google_id).all() if google_id else []
+    by_email = (
+        db.query(User)
+        .filter(func.lower(User.email) == email_norm)
+        .order_by(User.created_at.asc())
+        .all()
+        if email_norm
+        else []
     )
-    if uo:
-        org_id = uo.org_id
+    users = {u.id: u for u in (by_gid + by_email)}
+    if not users:
+        raise HTTPException(
+            status_code=400,
+            detail="No SweepOS account for this Google email. Sign up via invite first.",
+        )
+
+    for u in users.values():
+        if google_id and not u.google_id:
+            u.google_id = google_id
+            u.google_email = email
+    db.commit()
+
+    choices: dict = {}
+    for u in users.values():
+        org = db.query(Organization).filter(Organization.id == u.org_id).first()
+        if org:
+            choices[str(org.id)] = {
+                "org_id": str(org.id),
+                "org_name": org.name,
+                "user_id": str(u.id),
+                "role": role_to_api(u.role) if u.role else "member",
+                "email": u.email,
+            }
+        for uo in (
+            db.query(UserOrganization)
+            .filter(UserOrganization.user_id == u.id)
+            .all()
+        ):
+            org = db.query(Organization).filter(Organization.id == uo.org_id).first()
+            if not org:
+                continue
+            key = str(org.id)
+            if key in choices:
+                continue
+            # Prefer a User row that already belongs to this org
+            org_user = next((x for x in users.values() if x.org_id == org.id), u)
+            choices[key] = {
+                "org_id": key,
+                "org_name": org.name,
+                "user_id": str(org_user.id),
+                "role": role_to_api(org_user.role) if org_user.role else "member",
+                "email": org_user.email,
+            }
+
+    return sorted(choices.values(), key=lambda c: (c.get("org_name") or "").lower())
+
+
+def bind_mcp_grant_to_org(
+    db: Session,
+    *,
+    mcp_nonce: str,
+    org_id: str,
+    user_id: str,
+) -> str:
+    """Bind pending grant to a chosen org/user and return Claude redirect URL."""
+    grant = _pending_mcp_grant(db, mcp_nonce)
+    try:
+        org_uuid = uuid.UUID(str(org_id))
+        user_uuid = uuid.UUID(str(user_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid org_id or user_id") from e
+
+    user = db.query(User).filter(User.id == user_uuid).first()
+    if not user:
+        raise HTTPException(status_code=400, detail="User not found for organization")
+
+    # Ensure the chosen user can access this org
+    if user.org_id != org_uuid:
+        membership = (
+            db.query(UserOrganization)
+            .filter(
+                UserOrganization.user_id == user.id,
+                UserOrganization.org_id == org_uuid,
+            )
+            .first()
+        )
+        if not membership:
+            raise HTTPException(status_code=400, detail="User is not a member of that organization")
 
     auth_code = secrets.token_urlsafe(32)
     grant.user_id = user.id
-    grant.org_id = org_id
+    grant.org_id = org_uuid
     grant.authorization_code = auth_code
     grant.code_expires_at = datetime.utcnow() + timedelta(minutes=10)
     grant.pending_nonce = None
@@ -279,6 +345,51 @@ def complete_mcp_grant_after_google(
         params["state"] = grant.state
     return f"{grant.redirect_uri}?{urlencode(params)}"
 
+
+def complete_mcp_grant_after_google(
+    db: Session,
+    *,
+    mcp_nonce: Optional[str],
+    google_id: str,
+    email: str,
+    org_id: Optional[str] = None,
+) -> dict:
+    """
+    After Google identity succeeds, bind user+org to the pending grant.
+
+    Returns either:
+      {"status": "redirect", "redirect_url": "..."} when org is unambiguous / selected
+      {"status": "select_org", "organizations": [...]} when the user must pick an org
+    """
+    grant = _pending_mcp_grant(db, mcp_nonce or "")
+    choices = resolve_org_choices_for_google(db, google_id=google_id, email=email)
+    if not choices:
+        raise HTTPException(status_code=400, detail="No organizations for this account")
+
+    selected = None
+    if org_id:
+        selected = next((c for c in choices if c["org_id"] == str(org_id)), None)
+        if not selected:
+            raise HTTPException(status_code=400, detail="Selected organization is not available for this account")
+    elif len(choices) == 1:
+        selected = choices[0]
+    else:
+        # Keep pending_nonce so the picker can finish the grant
+        _ = grant
+        return {"status": "select_org", "organizations": choices, "mcp_nonce": mcp_nonce}
+
+    redirect_url = bind_mcp_grant_to_org(
+        db,
+        mcp_nonce=mcp_nonce or "",
+        org_id=selected["org_id"],
+        user_id=selected["user_id"],
+    )
+    return {
+        "status": "redirect",
+        "redirect_url": redirect_url,
+        "org_id": selected["org_id"],
+        "org_name": selected["org_name"],
+    }
 
 def exchange_authorization_code(
     db: Session,
@@ -372,12 +483,20 @@ def refresh_access_token(
 
 
 def _mint_tokens(db: Session, grant: McpOAuthGrant, user: User) -> tuple[str, str, int]:
+    from app.models.organization import Organization
+
+    org_name = None
+    if grant.org_id:
+        org = db.query(Organization).filter(Organization.id == grant.org_id).first()
+        org_name = org.name if org else None
+
     expires_minutes = settings.MCP_ACCESS_TOKEN_EXPIRE_MINUTES or 60
     access = create_access_token(
         data={
             "sub": user.email,
             "user_id": str(user.id),
             "org_id": str(grant.org_id),
+            "org_name": org_name,
             "role": role_to_api(user.role) if user.role else "member",
             "scope": grant.scope or " ".join(mcp_scopes()),
             "aud": mcp_resource(),

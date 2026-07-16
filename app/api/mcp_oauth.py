@@ -11,6 +11,10 @@ DCR + authorize + token:
   POST /mcp/oauth/register
   GET|POST /mcp/oauth/authorize
   POST /mcp/oauth/token
+
+Multi-org selection (after Google identity):
+  GET  /mcp/oauth/org-choices
+  POST /mcp/oauth/select-org
 """
 from __future__ import annotations
 
@@ -19,9 +23,11 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
+from jose import JWTError, jwt
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.session import get_db
 from app.services import mcp_oauth_service as svc
 
@@ -36,6 +42,28 @@ class DCRRequest(BaseModel):
     grant_types: Optional[List[str]] = None
     response_types: Optional[List[str]] = None
     scope: Optional[str] = None
+
+
+class SelectOrgRequest(BaseModel):
+    select_token: str
+    org_id: str
+
+
+def _decode_mcp_select_token(select_token: str) -> Dict[str, Any]:
+    try:
+        data = jwt.decode(
+            select_token,
+            settings.SECRET_KEY,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+    except JWTError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid or expired select token: {e}") from e
+    if data.get("purpose") != "mcp_org_select":
+        raise HTTPException(status_code=400, detail="Invalid select token purpose")
+    if not data.get("mcp_nonce") or not data.get("email"):
+        raise HTTPException(status_code=400, detail="Incomplete select token")
+    return data
 
 
 def _as_metadata() -> dict:
@@ -78,6 +106,52 @@ def oauth_authorization_server(path: str = ""):
 def openid_configuration(path: str = ""):
     """OIDC discovery fallback used by some MCP clients when AS metadata 404s."""
     return _as_metadata()
+
+
+@router.get("/mcp/oauth/org-choices")
+def mcp_org_choices(select_token: str = Query(...), db: Session = Depends(get_db)):
+    """List Sweep orgs available for the in-progress Claude MCP Google OAuth."""
+    data = _decode_mcp_select_token(select_token)
+    # Ensure pending grant still exists
+    svc._pending_mcp_grant(db, data["mcp_nonce"])
+    choices = svc.resolve_org_choices_for_google(
+        db,
+        google_id=data.get("google_id") or "",
+        email=data["email"],
+    )
+    return {
+        "email": data["email"],
+        "organizations": [
+            {"id": c["org_id"], "name": c["org_name"], "role": c.get("role")} for c in choices
+        ],
+    }
+
+
+@router.post("/mcp/oauth/select-org")
+def mcp_select_org(body: SelectOrgRequest, db: Session = Depends(get_db)):
+    """Finish Claude MCP OAuth by binding the chosen org; returns Claude redirect URL."""
+    data = _decode_mcp_select_token(body.select_token)
+    choices = svc.resolve_org_choices_for_google(
+        db,
+        google_id=data.get("google_id") or "",
+        email=data["email"],
+    )
+    selected = next((c for c in choices if c["org_id"] == str(body.org_id)), None)
+    if not selected:
+        raise HTTPException(status_code=400, detail="Organization not available for this account")
+    redirect_url = svc.bind_mcp_grant_to_org(
+        db,
+        mcp_nonce=data["mcp_nonce"],
+        org_id=selected["org_id"],
+        user_id=selected["user_id"],
+    )
+    _logger.info(
+        "mcp_oauth_select_org email=%s org_id=%s org_name=%s",
+        data["email"],
+        selected["org_id"],
+        selected["org_name"],
+    )
+    return {"redirect_url": redirect_url, "org_id": selected["org_id"], "org_name": selected["org_name"]}
 
 
 @router.post("/mcp/oauth/register")
