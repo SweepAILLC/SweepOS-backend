@@ -39,9 +39,13 @@ router = APIRouter()
 
 SERVER_INFO = {
     "name": "sweepos",
-    "version": "1.2.0",
+    "version": "1.2.1",
     "protocolVersion": "2025-03-26",
 }
+
+# Claude.ai currently prefers 2025-11-25; accept both.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-03-26")
+
 
 TOOLS = [
     {
@@ -449,11 +453,14 @@ def _handle_jsonrpc(
     params = body.get("params") or {}
 
     if method == "initialize":
+        requested = params.get("protocolVersion") or SERVER_INFO["protocolVersion"]
+        negotiated = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else SERVER_INFO["protocolVersion"]
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "protocolVersion": params.get("protocolVersion") or SERVER_INFO["protocolVersion"],
+                "protocolVersion": negotiated,
+                # Empty object advertises tools capability so Claude requests tools/list
                 "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {"name": SERVER_INFO["name"], "version": SERVER_INFO["version"]},
             },
@@ -630,19 +637,45 @@ async def mcp_endpoint(request: Request):
     except ValueError:
         user_id = None
 
+    session_id = request.headers.get("mcp-session-id") or request.headers.get("Mcp-Session-Id") or str(uuid.uuid4())
+
+    def _mcp_headers(extra: Optional[dict] = None) -> dict:
+        headers = {
+            "Mcp-Session-Id": session_id,
+            "MCP-Protocol-Version": request.headers.get("mcp-protocol-version")
+            or request.headers.get("MCP-Protocol-Version")
+            or SERVER_INFO["protocolVersion"],
+        }
+        if extra:
+            headers.update(extra)
+        return headers
+
     if request.method == "GET":
-        # Streamable HTTP may open SSE; we acknowledge with server info for simple clients
+        accept = (request.headers.get("accept") or "").lower()
+        if "text/event-stream" in accept:
+            # Minimal SSE stream so Streamable HTTP clients can hold a GET session open
+            payload = (
+                "event: message\n"
+                f"data: {json.dumps({'jsonrpc': '2.0', 'method': 'notifications/message', 'params': {'level': 'info', 'data': 'connected'}})}\n\n"
+            )
+            return Response(
+                content=payload,
+                status_code=200,
+                media_type="text/event-stream",
+                headers=_mcp_headers({"Cache-Control": "no-cache", "Connection": "keep-alive"}),
+            )
         return JSONResponse(
             {
                 "status": "ok",
                 "server": SERVER_INFO,
                 "org_id": str(org_id),
                 "tools": [t["name"] for t in TOOLS],
-            }
+            },
+            headers=_mcp_headers(),
         )
 
     if request.method == "DELETE":
-        return JSONResponse({"status": "closed"})
+        return JSONResponse({"status": "closed"}, headers=_mcp_headers())
 
     try:
         body = await request.json()
@@ -650,6 +683,7 @@ async def mcp_endpoint(request: Request):
         return JSONResponse(
             status_code=400,
             content={"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}},
+            headers=_mcp_headers(),
         )
 
     db = SessionLocal()
@@ -660,16 +694,17 @@ async def mcp_endpoint(request: Request):
                 for item in body
                 if isinstance(item, dict)
             ]
-            return JSONResponse(results)
+            return JSONResponse(results, headers=_mcp_headers())
         if not isinstance(body, dict):
             return JSONResponse(
                 status_code=400,
                 content={"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}},
+                headers=_mcp_headers(),
             )
         # Notifications may omit id
         if body.get("method") and body.get("id") is None and str(body.get("method", "")).startswith("notifications/"):
             _handle_jsonrpc(body, org_id, db, user_id=user_id)
-            return Response(status_code=202)
-        return JSONResponse(_handle_jsonrpc(body, org_id, db, user_id=user_id))
+            return Response(status_code=202, headers=_mcp_headers())
+        return JSONResponse(_handle_jsonrpc(body, org_id, db, user_id=user_id), headers=_mcp_headers())
     finally:
         db.close()

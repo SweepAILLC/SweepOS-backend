@@ -39,7 +39,14 @@ def get_org_id_from_token(token: str) -> Optional[str]:
 
 def decode_access_token(token: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        # MCP tokens include an `aud` claim (RFC 8707). python-jose rejects those unless
+        # audience= is passed or verify_aud is disabled — we validate aud in MCP code.
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
         return payload
     except JWTError:
         return None

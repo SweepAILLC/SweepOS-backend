@@ -17,7 +17,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
+    expose_headers=["*", "Mcp-Session-Id", "MCP-Protocol-Version", "WWW-Authenticate"],
 )
 # Global throttle (after CORS registration so this runs first on each request — see Starlette order)
 app.add_middleware(GlobalRateLimitMiddleware)
