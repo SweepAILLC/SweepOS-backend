@@ -185,14 +185,20 @@ TOOLS = [
     {
         "name": "get_terminal_dashboard",
         "description": (
-            "Full SweepOS Terminal dashboard snapshot: cash collected/MRR/top contributors, "
-            "monthly trends, finances KPIs, Stripe summary, calendar show-up/close rates, "
-            "upcoming appointments, failed-payment queue, and funnel/leads analytics. "
-            "Optionally pass sections to request a subset."
+            "SweepOS Terminal dashboard. DEFAULT mode='overview' is fast (summary, monthly_trends, "
+            "appointments, failed_payments) and should be preferred. Use mode='full' or an explicit "
+            "sections list only when you need finances/stripe/calendar/leads. If the response has "
+            "incomplete_sections or partial=true, retry those sections only — do not re-fetch everything."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["overview", "full"],
+                    "default": "overview",
+                    "description": "overview (default, fast) or full (all sections; slower)",
+                },
                 "sections": {
                     "type": "array",
                     "items": {
@@ -208,14 +214,14 @@ TOOLS = [
                             "leads",
                         ],
                     },
-                    "description": "Optional subset of dashboard sections (default: all)",
+                    "description": "Optional subset of dashboard sections (overrides mode when set)",
                 },
                 "finances_range_days": {"type": "integer", "default": 30, "minimum": 1, "maximum": 365},
                 "finances_scope": {
                     "type": "string",
                     "description": "Optional finances window scope: mtd | all",
                 },
-                "appointments_limit": {"type": "integer", "default": 40, "minimum": 1, "maximum": 100},
+                "appointments_limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             },
         },
     },
@@ -434,9 +440,10 @@ def _run_tool(
                 org_id,
                 user_id=user_id,
                 sections=sections,
+                mode=args.get("mode") or "overview",
                 finances_range_days=int(args.get("finances_range_days") or 30),
                 finances_scope=args.get("finances_scope"),
-                appointments_limit=int(args.get("appointments_limit") or 40),
+                appointments_limit=int(args.get("appointments_limit") or 20),
             )
         )
     if name == "list_brevo_senders":
@@ -612,7 +619,9 @@ def _handle_jsonrpc(
                 },
             }
         if uri == "sweep://terminal/dashboard":
-            payload = build_terminal_dashboard_for_mcp(db, org_id, user_id=user_id)
+            payload = build_terminal_dashboard_for_mcp(
+                db, org_id, user_id=user_id, mode="overview"
+            )
             text = json.dumps(payload, default=str)
             return {
                 "jsonrpc": "2.0",

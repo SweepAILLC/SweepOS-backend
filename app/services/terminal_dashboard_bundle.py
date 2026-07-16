@@ -3,17 +3,26 @@ Terminal dashboard packages for MCP (Claude custom connector).
 
 Reuses existing Terminal / finances / calendar / Stripe / funnel endpoints so Claude
 sees the same numbers as the in-app Terminal tab.
+
+Reliability notes (Claude.ai HTTP MCP):
+- First response byte often must arrive within ~60s or the client times out and retries.
+- Default path is a fast "overview"; full sections are opt-in.
+- Sections build in parallel with a soft deadline and short TTL cache.
 """
 from __future__ import annotations
 
 import logging
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session, joinedload
 
+from app.db.session import SessionLocal
 from app.models.client_checkin import ClientCheckIn
 from app.models.organization import Organization
 from app.services.calendar_booking_time import effective_end_sql_expression
@@ -22,6 +31,33 @@ from app.services.checkin_sync import is_calendar_placeholder_email
 from app.services.terminal_metrics_service import get_or_build_terminal_monthly_trends
 
 logger = logging.getLogger(__name__)
+
+# Fast default — enough for most Claude prompts without cold-path timeouts.
+_OVERVIEW_SECTIONS: Tuple[str, ...] = (
+    "summary",
+    "monthly_trends",
+    "appointments",
+    "failed_payments",
+)
+
+_SECTION_KEYS = (
+    "summary",
+    "monthly_trends",
+    "finances",
+    "stripe",
+    "calendar",
+    "appointments",
+    "failed_payments",
+    "leads",
+)
+
+# Soft budget so Claude's ~60s first-byte window is respected with margin.
+_SOFT_DEADLINE_SEC = 40.0
+_CACHE_TTL_SEC = 45.0
+_MAX_FUNNELS_FOR_LEADS = 5
+
+_dashboard_cache: dict[str, tuple[float, Dict[str, Any]]] = {}
+_dashboard_cache_lock = threading.Lock()
 
 
 def _user_proxy(org_id: uuid.UUID, user_id: Optional[uuid.UUID] = None) -> SimpleNamespace:
@@ -134,9 +170,9 @@ def _upcoming_appointments(
     db: Session,
     org_id: uuid.UUID,
     *,
-    limit: int = 40,
+    limit: int = 20,
 ) -> Dict[str, Any]:
-    lim = max(1, min(int(limit or 40), 100))
+    lim = max(1, min(int(limit or 20), 100))
     now = datetime.now(timezone.utc)
     effective_end = effective_end_sql_expression()
     rows = (
@@ -225,7 +261,8 @@ def _leads_by_source(db: Session, org_id: uuid.UUID, user_id: Optional[uuid.UUID
         funnel_list = []
 
     analytics_out: List[Dict[str, Any]] = []
-    for f in funnel_list[:20]:
+    # Cap funnel deep-dives — this was the main cold-path timeout source.
+    for f in funnel_list[:_MAX_FUNNELS_FOR_LEADS]:
         if not isinstance(f, dict):
             continue
         fid = f.get("id")
@@ -258,19 +295,97 @@ def _leads_by_source(db: Session, org_id: uuid.UUID, user_id: Optional[uuid.UUID
                 {"funnel_id": str(fid), "funnel_name": f.get("name"), "error": str(e)}
             )
 
-    return {"funnels": funnel_list, "analytics_by_funnel": analytics_out}
+    return {
+        "funnels": funnel_list,
+        "analytics_by_funnel": analytics_out,
+        "analytics_funnel_limit": _MAX_FUNNELS_FOR_LEADS,
+        "funnels_total": len(funnel_list),
+    }
 
 
-_SECTION_KEYS = (
-    "summary",
-    "monthly_trends",
-    "finances",
-    "stripe",
-    "calendar",
-    "appointments",
-    "failed_payments",
-    "leads",
-)
+def _cache_key(
+    org_id: uuid.UUID,
+    wanted: Set[str],
+    *,
+    finances_range_days: int,
+    finances_scope: Optional[str],
+    appointments_limit: int,
+) -> str:
+    return "|".join(
+        [
+            str(org_id),
+            ",".join(sorted(wanted)),
+            str(finances_range_days),
+            str(finances_scope or ""),
+            str(appointments_limit),
+        ]
+    )
+
+
+def _cache_get(key: str) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with _dashboard_cache_lock:
+        hit = _dashboard_cache.get(key)
+        if not hit:
+            return None
+        ts, payload = hit
+        if now - ts > _CACHE_TTL_SEC:
+            _dashboard_cache.pop(key, None)
+            return None
+        return payload
+
+
+def _cache_set(key: str, payload: Dict[str, Any]) -> None:
+    with _dashboard_cache_lock:
+        _dashboard_cache[key] = (time.monotonic(), payload)
+        # Bound memory: drop oldest if map grows large
+        if len(_dashboard_cache) > 64:
+            oldest = sorted(_dashboard_cache.items(), key=lambda kv: kv[1][0])[:16]
+            for k, _ in oldest:
+                _dashboard_cache.pop(k, None)
+
+
+def _build_one_section(
+    section: str,
+    org_id: uuid.UUID,
+    user_id: Optional[uuid.UUID],
+    *,
+    finances_range_days: int,
+    finances_scope: Optional[str],
+    appointments_limit: int,
+) -> Tuple[str, Any]:
+    db = SessionLocal()
+    t0 = time.monotonic()
+    try:
+        if section == "summary":
+            value = _terminal_summary(db, org_id, user_id)
+        elif section == "monthly_trends":
+            value = _monthly_trends(db, org_id)
+        elif section == "finances":
+            value = _finances_summary(
+                db, org_id, user_id, range_days=finances_range_days, scope=finances_scope
+            )
+        elif section == "stripe":
+            value = _stripe_summary(db, org_id, user_id)
+        elif section == "calendar":
+            value = _calendar_trend(db, org_id)
+        elif section == "appointments":
+            value = _upcoming_appointments(db, org_id, limit=appointments_limit)
+        elif section == "failed_payments":
+            value = _failed_payments(db, org_id, user_id)
+        elif section == "leads":
+            value = _leads_by_source(db, org_id, user_id)
+        else:
+            value = {"error": f"unknown section: {section}"}
+        return section, value
+    except Exception as e:
+        logger.warning("mcp dashboard section %s failed: %s", section, e)
+        return section, {"error": str(e)}
+    finally:
+        elapsed = time.monotonic() - t0
+        if elapsed > 5:
+            logger.info("mcp dashboard section %s took %.2fs", section, elapsed)
+        db.close()
 
 
 def build_terminal_dashboard_for_mcp(
@@ -279,52 +394,133 @@ def build_terminal_dashboard_for_mcp(
     *,
     user_id: Optional[uuid.UUID] = None,
     sections: Optional[List[str]] = None,
+    mode: Optional[str] = None,
     finances_range_days: int = 30,
     finances_scope: Optional[str] = None,
-    appointments_limit: int = 40,
+    appointments_limit: int = 20,
 ) -> Dict[str, Any]:
     """
-    Full Terminal dashboard snapshot for Claude.
-    `sections` optional subset of: summary, monthly_trends, finances, stripe,
-    calendar, appointments, failed_payments, leads.
+    Terminal dashboard snapshot for Claude.
+
+    Default `mode=overview` returns a fast subset. Pass `mode=full` or an explicit
+    `sections` list for heavier blocks (finances/stripe/calendar/leads).
     """
+    mode_norm = (mode or "").strip().lower()
     wanted: Set[str]
     if sections:
         wanted = {str(s).strip().lower() for s in sections if str(s).strip()}
         wanted &= set(_SECTION_KEYS)
         if not wanted:
-            wanted = set(_SECTION_KEYS)
-    else:
+            wanted = set(_OVERVIEW_SECTIONS)
+    elif mode_norm in ("full", "all", "complete"):
         wanted = set(_SECTION_KEYS)
+    else:
+        # overview / default
+        wanted = set(_OVERVIEW_SECTIONS)
+
+    appt_lim = max(1, min(int(appointments_limit or 20), 100))
+    key = _cache_key(
+        org_id,
+        wanted,
+        finances_range_days=finances_range_days,
+        finances_scope=finances_scope,
+        appointments_limit=appt_lim,
+    )
+    cached = _cache_get(key)
+    if cached is not None:
+        out = dict(cached)
+        out["cache"] = {"hit": True, "ttl_seconds": _CACHE_TTL_SEC}
+        return out
+
+    started = time.monotonic()
+    deadline = started + _SOFT_DEADLINE_SEC
 
     out: Dict[str, Any] = {
         "org_id": str(org_id),
         "generated_at": datetime.utcnow().isoformat() + "Z",
+        "mode": "full" if wanted == set(_SECTION_KEYS) else "overview",
         "sections_included": sorted(wanted),
+        "sections_available": list(_SECTION_KEYS),
         "usage": (
-            "This mirrors the SweepOS Terminal dashboard: cash/MRR, monthly trends, "
-            "finances KPIs, Stripe summary, calendar show-up/close rates, upcoming "
-            "appointments, failed-payment queue, and funnel/leads analytics."
+            "Default is a fast overview (summary, monthly_trends, appointments, failed_payments). "
+            "For finances/stripe/calendar/leads, call again with mode='full' or sections=[...]. "
+            "If incomplete_sections is present, retry those sections only."
         ),
+        "cache": {"hit": False, "ttl_seconds": _CACHE_TTL_SEC},
     }
 
-    if "summary" in wanted:
-        out["summary"] = _terminal_summary(db, org_id, user_id)
-    if "monthly_trends" in wanted:
-        out["monthly_trends"] = _monthly_trends(db, org_id)
-    if "finances" in wanted:
-        out["finances"] = _finances_summary(
-            db, org_id, user_id, range_days=finances_range_days, scope=finances_scope
-        )
-    if "stripe" in wanted:
-        out["stripe"] = _stripe_summary(db, org_id, user_id)
-    if "calendar" in wanted:
-        out["calendar"] = _calendar_trend(db, org_id)
-    if "appointments" in wanted:
-        out["appointments"] = _upcoming_appointments(db, org_id, limit=appointments_limit)
-    if "failed_payments" in wanted:
-        out["failed_payments"] = _failed_payments(db, org_id, user_id)
-    if "leads" in wanted:
-        out["leads"] = _leads_by_source(db, org_id, user_id)
+    # Prefer overview order so critical KPIs finish first under the soft deadline.
+    ordered = [s for s in _OVERVIEW_SECTIONS if s in wanted] + [
+        s for s in _SECTION_KEYS if s in wanted and s not in _OVERVIEW_SECTIONS
+    ]
 
+    incomplete: List[str] = []
+    timings: Dict[str, float] = {}
+
+    # Parallel build — each worker uses its own DB session.
+    max_workers = min(4, max(1, len(ordered)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(
+                _build_one_section,
+                section,
+                org_id,
+                user_id,
+                finances_range_days=finances_range_days,
+                finances_scope=finances_scope,
+                appointments_limit=appt_lim,
+            ): section
+            for section in ordered
+        }
+        try:
+            for fut in as_completed(futures, timeout=max(1.0, deadline - time.monotonic())):
+                section = futures[fut]
+                try:
+                    name, value = fut.result()
+                    out[name] = value
+                    timings[name] = round(time.monotonic() - started, 3)
+                except Exception as e:
+                    out[section] = {"error": str(e)}
+                    incomplete.append(section)
+                if time.monotonic() >= deadline:
+                    break
+        except TimeoutError:
+            pass
+
+        for fut, section in futures.items():
+            if section in out:
+                continue
+            if fut.done():
+                try:
+                    name, value = fut.result()
+                    out[name] = value
+                except Exception as e:
+                    out[section] = {"error": str(e)}
+                    incomplete.append(section)
+            else:
+                fut.cancel()
+                incomplete.append(section)
+                out[section] = {
+                    "error": "deadline_exceeded",
+                    "hint": f"Retry get_terminal_dashboard with sections=['{section}']",
+                }
+
+    if incomplete:
+        out["incomplete_sections"] = sorted(set(incomplete))
+        out["partial"] = True
+    out["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    out["section_timings_seconds"] = timings
+
+    # Only cache complete successful builds (no deadline cuts).
+    if not incomplete:
+        _cache_set(key, out)
+
+    logger.info(
+        "mcp terminal dashboard org=%s mode=%s sections=%s elapsed=%.2fs incomplete=%s",
+        org_id,
+        out.get("mode"),
+        sorted(wanted),
+        out["elapsed_seconds"],
+        incomplete,
+    )
     return out

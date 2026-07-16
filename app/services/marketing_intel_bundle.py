@@ -7,11 +7,17 @@ triggering expensive reanalyze jobs.
 """
 from __future__ import annotations
 
+import threading
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
+
+_marketing_cache: dict[str, tuple[float, Dict[str, Any]]] = {}
+_marketing_cache_lock = threading.Lock()
+_MARKETING_CACHE_TTL_SEC = 60.0
 
 from app.models.client import Client
 from app.models.client_call_insight import ClientCallInsight
@@ -182,6 +188,15 @@ def get_marketing_intel_bootstrap_for_mcp(
     optimized for Claude to ideate TOF/MOF/BOF content autonomously.
     Does not kick off reanalyze / LLM regen.
     """
+    cache_key = f"{org_id}:sop={1 if include_sop else 0}"
+    now = time.monotonic()
+    with _marketing_cache_lock:
+        hit = _marketing_cache.get(cache_key)
+        if hit and now - hit[0] <= _MARKETING_CACHE_TTL_SEC:
+            cached = dict(hit[1])
+            cached["cache"] = {"hit": True, "ttl_seconds": _MARKETING_CACHE_TTL_SEC}
+            return cached
+
     knowledge = css.load_knowledge_grouped(db, org_id)
     sp_source, sp_paragraphs = build_sales_playbook_for_studio(db, org_id, use_llm_synthesis=False)
     signals = get_org_sales_signals_for_mcp(db, org_id)
@@ -211,6 +226,7 @@ def get_marketing_intel_bootstrap_for_mcp(
             "and objection_quotes. If content_bundle is present, treat it as the last drafted "
             "Marketing Intel concepts and refine or extend it rather than ignoring it."
         ),
+        "cache": {"hit": False, "ttl_seconds": _MARKETING_CACHE_TTL_SEC},
     }
     if include_sop:
         # Cap SOP size for MCP payload limits
@@ -218,6 +234,13 @@ def get_marketing_intel_bootstrap_for_mcp(
         if len(sop) > 24_000:
             sop = content_ideation_sop_block()[:12_000] + "\n\n…[sop truncated]"
         out["content_ideation_guidance"] = sop[:24_000]
+
+    with _marketing_cache_lock:
+        _marketing_cache[cache_key] = (time.monotonic(), out)
+        if len(_marketing_cache) > 64:
+            oldest = sorted(_marketing_cache.items(), key=lambda kv: kv[1][0])[:16]
+            for k, _ in oldest:
+                _marketing_cache.pop(k, None)
     return out
 
 
