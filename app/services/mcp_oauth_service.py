@@ -28,17 +28,65 @@ _logger = logging.getLogger(__name__)
 
 def mcp_issuer() -> str:
     base = (settings.MCP_ISSUER_URL or settings.BACKEND_PUBLIC_URL or "http://localhost:8000").rstrip("/")
-    return base
+    return canonicalize_resource(base)
 
 
 def mcp_resource() -> str:
     if settings.MCP_RESOURCE_URL:
-        return settings.MCP_RESOURCE_URL.rstrip("/")
-    return f"{mcp_issuer()}/mcp"
+        return canonicalize_resource(settings.MCP_RESOURCE_URL)
+    return canonicalize_resource(f"{mcp_issuer()}/mcp")
+
+
+def canonicalize_resource(url: str) -> str:
+    """
+    RFC 8707 / MCP canonical resource form:
+    lowercase scheme+host, no trailing slash, no fragment, omit default ports.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    parts = urlsplit(raw)
+    scheme = (parts.scheme or "https").lower()
+    host = (parts.hostname or "").lower()
+    if not host:
+        return raw.rstrip("/")
+    port = parts.port
+    if port and not (
+        (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    ):
+        netloc = f"{host}:{port}"
+    else:
+        netloc = host
+    path = (parts.path or "").rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
+
+
+def resources_match(a: Optional[str], b: Optional[str]) -> bool:
+    if not a or not b:
+        return False
+    return canonicalize_resource(a) == canonicalize_resource(b)
 
 
 def mcp_scopes() -> list[str]:
     return [s.strip() for s in (settings.MCP_SCOPES or "clients:read").split() if s.strip()]
+
+
+def assert_resource_allowed(resource: Optional[str]) -> str:
+    """Validate Claude's RFC 8707 resource param (when present) against our MCP URL."""
+    expected = mcp_resource()
+    if not resource:
+        return expected
+    if not resources_match(resource, expected):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_target",
+                "error_description": f"resource must be {expected}",
+            },
+        )
+    return expected
 
 
 def hash_refresh_token(raw: str) -> str:
@@ -121,6 +169,7 @@ def start_authorize(
     scope: Optional[str],
     code_challenge: str,
     code_challenge_method: str = "S256",
+    resource: Optional[str] = None,
 ) -> McpOAuthGrant:
     client = get_or_reject_client(db, client_id)
     if not redirect_uri_allowed(client, redirect_uri):
@@ -130,6 +179,7 @@ def start_authorize(
     method = (code_challenge_method or "S256").upper()
     if method != "S256":
         raise HTTPException(status_code=400, detail="Only S256 PKCE is supported")
+    assert_resource_allowed(resource)
 
     nonce = secrets.token_urlsafe(32)
     grant = McpOAuthGrant(
@@ -149,8 +199,8 @@ def start_authorize(
 
 
 def google_start_url_for_mcp(mcp_nonce: str) -> str:
-    """Relative path Claude authorize redirects into for Google identity."""
-    return f"/auth/google/start?mode=mcp&mcp_nonce={mcp_nonce}&redirect=1"
+    """Absolute URL Claude authorize redirects into for Google identity."""
+    return f"{mcp_issuer()}/auth/google/start?mode=mcp&mcp_nonce={mcp_nonce}&redirect=1"
 
 
 def complete_mcp_grant_after_google(
@@ -229,7 +279,9 @@ def exchange_authorization_code(
     client_id: str,
     redirect_uri: str,
     code_verifier: str,
+    resource: Optional[str] = None,
 ) -> dict:
+    assert_resource_allowed(resource)
     grant = (
         db.query(McpOAuthGrant)
         .filter(
@@ -265,10 +317,18 @@ def exchange_authorization_code(
         "expires_in": expires_in,
         "refresh_token": refresh,
         "scope": grant.scope or " ".join(mcp_scopes()),
+        "resource": mcp_resource(),
     }
 
 
-def refresh_access_token(db: Session, *, refresh_token: str, client_id: str) -> dict:
+def refresh_access_token(
+    db: Session,
+    *,
+    refresh_token: str,
+    client_id: str,
+    resource: Optional[str] = None,
+) -> dict:
+    assert_resource_allowed(resource)
     token_hash = hash_refresh_token(refresh_token)
     grant = (
         db.query(McpOAuthGrant)
@@ -299,6 +359,7 @@ def refresh_access_token(db: Session, *, refresh_token: str, client_id: str) -> 
         "expires_in": expires_in,
         "refresh_token": refresh,
         "scope": grant.scope or " ".join(mcp_scopes()),
+        "resource": mcp_resource(),
     }
 
 
@@ -328,12 +389,13 @@ def verify_mcp_access_token(token: str) -> Optional[dict]:
     payload = decode_access_token(token)
     if not payload:
         return None
+    expected = mcp_resource()
+    aud = payload.get("aud")
     if payload.get("token_use") != "mcp":
         # Also accept standard app JWTs for local testing of tools
-        if payload.get("aud") and payload.get("aud") != mcp_resource():
+        if aud and not resources_match(str(aud), expected):
             return None
-    aud = payload.get("aud")
-    if aud and aud != mcp_resource():
+    elif aud and not resources_match(str(aud), expected):
         return None
     if not payload.get("user_id") or not payload.get("org_id"):
         return None

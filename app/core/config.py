@@ -21,6 +21,9 @@ _DEFAULT_CORS_ORIGINS = [
     # VS Code / Cursor “Live Server” / Go Live default
     "http://localhost:5500",
     "http://127.0.0.1:5500",
+    # Claude.ai custom connector OAuth (browser DCR / token exchange)
+    "https://claude.ai",
+    "https://www.claude.ai",
 ]
 
 

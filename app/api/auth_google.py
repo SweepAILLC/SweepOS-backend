@@ -453,7 +453,8 @@ async def google_oauth_callback(
             )
         except HTTPException as e:
             return _frontend_redirect("/login", google_error=str(e.detail))
-        return RedirectResponse(url=redirect_url, status_code=302)
+        # 303 See Other: Claude's auth_callback only accepts GET; avoid method-preserving redirects
+        return RedirectResponse(url=redirect_url, status_code=303)
 
     # --- login (default) ---
     user = _find_user_by_google_id(db, google_id)

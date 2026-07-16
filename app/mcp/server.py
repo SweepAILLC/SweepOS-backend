@@ -261,11 +261,15 @@ TOOLS = [
 
 
 def _www_authenticate() -> str:
-    meta = f"{mcp_resource().rsplit('/mcp', 1)[0]}/.well-known/oauth-protected-resource"
-    # Prefer absolute issuer-based metadata URL
-    from app.services.mcp_oauth_service import mcp_issuer
+    from app.services.mcp_oauth_service import mcp_issuer, mcp_resource
 
-    meta = f"{mcp_issuer()}/.well-known/oauth-protected-resource"
+    issuer = mcp_issuer()
+    resource = mcp_resource()
+    meta = f"{issuer}/.well-known/oauth-protected-resource"
+    if resource.startswith(issuer + "/"):
+        suffix = resource[len(issuer) + 1 :]
+        if suffix:
+            meta = f"{meta}/{suffix}"
     return (
         f'Bearer realm="SweepOS", resource_metadata="{meta}", '
         f'scope="clients:read marketing:read terminal:read email:send"'
