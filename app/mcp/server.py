@@ -12,8 +12,9 @@ import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
+import asyncio
 
 from app.db.session import SessionLocal
 from app.services.client_profile_bundle import (
@@ -652,17 +653,39 @@ async def mcp_endpoint(request: Request):
 
     if request.method == "GET":
         accept = (request.headers.get("accept") or "").lower()
-        if "text/event-stream" in accept:
-            # Minimal SSE stream so Streamable HTTP clients can hold a GET session open
-            payload = (
-                "event: message\n"
-                f"data: {json.dumps({'jsonrpc': '2.0', 'method': 'notifications/message', 'params': {'level': 'info', 'data': 'connected'}})}\n\n"
-            )
-            return Response(
-                content=payload,
+        # Streamable HTTP: GET opens a server→client SSE stream. Claude/Cowork expect
+        # a held-open stream (not a one-shot body). Spec also allows 405; Claude.ai
+        # often fails if GET is not a real SSE stream.
+        wants_sse = (not accept) or ("text/event-stream" in accept) or ("*/*" in accept)
+        if wants_sse:
+
+            async def _sse_gen():
+                # Prime stream (MCP resumability guidance)
+                yield f"id: {uuid.uuid4().hex}\ndata:\n\n"
+                yield (
+                    "event: message\n"
+                    f"data: {json.dumps({'jsonrpc': '2.0', 'method': 'notifications/message', 'params': {'level': 'info', 'data': 'connected'}})}\n\n"
+                )
+                # Keep connection open with comment heartbeats until client disconnects
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(15)
+
+            return StreamingResponse(
+                _sse_gen(),
                 status_code=200,
                 media_type="text/event-stream",
-                headers=_mcp_headers({"Cache-Control": "no-cache", "Connection": "keep-alive"}),
+                headers=_mcp_headers(
+                    {
+                        "Cache-Control": "no-cache, no-transform",
+                        "Connection": "keep-alive",
+                        # Some Claude clients reject charset suffix on SSE
+                        "Content-Type": "text/event-stream",
+                        "X-Accel-Buffering": "no",
+                    }
+                ),
             )
         return JSONResponse(
             {

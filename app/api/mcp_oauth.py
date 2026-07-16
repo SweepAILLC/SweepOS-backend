@@ -82,6 +82,11 @@ def openid_configuration(path: str = ""):
 
 @router.post("/mcp/oauth/register")
 def dynamic_client_registration(body: DCRRequest, db: Session = Depends(get_db)):
+    _logger.info(
+        "mcp_oauth_register client_name=%s redirect_uris=%s",
+        body.client_name,
+        body.redirect_uris,
+    )
     client = svc.register_client(
         db,
         redirect_uris=body.redirect_uris,
@@ -240,6 +245,15 @@ async def token(
     except HTTPException:
         return JSONResponse(status_code=400, content={"error": "invalid_client"})
 
+    _logger.info(
+        "mcp_oauth_token grant_type=%s client_id=%s resource=%s has_code=%s has_refresh=%s",
+        grant_type,
+        client_id,
+        resource,
+        bool(code),
+        bool(refresh_token),
+    )
+
     try:
         if grant_type == "authorization_code":
             if not code or not redirect_uri or not code_verifier:
@@ -255,19 +269,23 @@ async def token(
                 code_verifier=code_verifier,
                 resource=resource,
             )
+            _logger.info("mcp_oauth_token authorization_code exchange ok client_id=%s", client_id)
             return result
         if grant_type == "refresh_token":
             if not refresh_token:
                 return JSONResponse(status_code=400, content={"error": "invalid_request"})
-            return svc.refresh_access_token(
+            result = svc.refresh_access_token(
                 db,
                 refresh_token=refresh_token,
                 client_id=client_id,
                 resource=resource,
             )
+            _logger.info("mcp_oauth_token refresh ok client_id=%s", client_id)
+            return result
         return JSONResponse(status_code=400, content={"error": "unsupported_grant_type"})
     except HTTPException as e:
         detail = e.detail
+        _logger.warning("mcp_oauth_token failed grant_type=%s detail=%s", grant_type, detail)
         if isinstance(detail, dict) and "error" in detail:
             return JSONResponse(status_code=400, content=detail)
         return JSONResponse(status_code=400, content={"error": "invalid_grant", "error_description": str(detail)})

@@ -79,11 +79,19 @@ def assert_resource_allowed(resource: Optional[str]) -> str:
     if not resource:
         return expected
     if not resources_match(resource, expected):
+        _logger.warning(
+            "mcp_oauth resource mismatch got=%r expected=%r",
+            resource,
+            expected,
+        )
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "invalid_target",
-                "error_description": f"resource must be {expected}",
+                "error_description": (
+                    f"resource must be {expected} (got {canonicalize_resource(resource)}). "
+                    "Paste that exact URL into Claude, and set MCP_RESOURCE_URL to match."
+                ),
             },
         )
     return expected
