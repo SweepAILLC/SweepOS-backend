@@ -144,8 +144,11 @@ TOOLS = [
     {
         "name": "get_org_intelligence_profile",
         "description": (
-            "Org Intelligence bank for content: ICP / positioning / brand voice fields and offer ladder "
-            "(when configured in SweepOS Intelligence settings)."
+            "Org Intelligence bank: business context (business description, target audience/ICP, "
+            "unique selling proposition, coaching style, marketing strategy/channels), sales approach "
+            "(framework + tactics), pipeline priorities, brand voice, and the configured offer ladder "
+            "with pricing. Call this for insight into the org's offer and business context before "
+            "advising on positioning, pricing, or strategy."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -545,6 +548,15 @@ def _handle_jsonrpc(
                         "mimeType": "application/json",
                     },
                     {
+                        "uri": "sweep://org/intelligence",
+                        "name": "Org Intelligence profile",
+                        "description": (
+                            "Business context, ICP, unique selling proposition, sales approach, "
+                            "brand voice, and offer ladder for the connected org"
+                        ),
+                        "mimeType": "application/json",
+                    },
+                    {
                         "uri": "sweep://terminal/dashboard",
                         "name": "Terminal dashboard",
                         "description": "Cash, MRR, trends, calendar, appointments, failed payments, leads",
@@ -608,6 +620,18 @@ def _handle_jsonrpc(
             }
         if uri == "sweep://marketing/signals":
             payload = get_org_sales_signals_for_mcp(db, org_id)
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://org/intelligence":
+            payload = get_org_intelligence_for_mcp(db, org_id, user_id=user_id)
             text = json.dumps(payload, default=str)
             return {
                 "jsonrpc": "2.0",

@@ -73,13 +73,90 @@ def _trim_profile_for_marketing(profile: Optional[Dict[str, Any]]) -> Dict[str, 
     return out
 
 
+_BUSINESS_CONTEXT_KEYS = (
+    "business_description",
+    "target_audience",
+    "unique_selling_proposition",
+    "coaching_style",
+    "client_management_philosophy",
+    "marketing_strategy",
+    "marketing_channels",
+)
+
+_SALES_APPROACH_KEYS = (
+    "sales_framework",
+    "sales_tactics",
+)
+
+
+def _full_intelligence_for_mcp(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Full sanitized Intelligence bank export for Claude: business context, sales
+    approach, priorities, and asset links. Writing samples are reduced to
+    metadata to stay within MCP payload limits.
+    """
+    if not isinstance(profile, dict):
+        return {}
+    out: Dict[str, Any] = {}
+
+    business: Dict[str, Any] = {}
+    for k in _BUSINESS_CONTEXT_KEYS:
+        v = profile.get(k)
+        if isinstance(v, str) and v.strip():
+            business[k] = v.strip()[:2000]
+    if business:
+        out["business_context"] = business
+
+    sales: Dict[str, Any] = {}
+    for k in _SALES_APPROACH_KEYS:
+        v = profile.get(k)
+        if isinstance(v, str) and v.strip():
+            sales[k] = v.strip()[:2000]
+    if sales:
+        out["sales_approach"] = sales
+
+    priorities = profile.get("pipeline_priorities")
+    if isinstance(priorities, list):
+        cleaned = [str(x).strip() for x in priorities if isinstance(x, str) and str(x).strip()]
+        if cleaned:
+            out["pipeline_priorities"] = cleaned[:10]
+
+    assets = profile.get("asset_links")
+    if isinstance(assets, list):
+        links = [
+            {"label": str(a.get("label", "")), "url": str(a.get("url", ""))}
+            for a in assets
+            if isinstance(a, dict) and a.get("url")
+        ][:20]
+        if links:
+            out["asset_links"] = links
+
+    voice: Dict[str, Any] = {}
+    for k in ("writing_style", "writing_tone", "brand_voice", "voice"):
+        v = profile.get(k)
+        if isinstance(v, str) and v.strip():
+            voice[k] = v.strip()[:1000]
+    if voice:
+        out["brand_voice"] = voice
+
+    samples = profile.get("writing_samples")
+    if isinstance(samples, list) and samples:
+        out["writing_samples_available"] = [
+            {"kind": str(s.get("kind") or "other"), "title": str(s.get("title") or "")[:120]}
+            for s in samples
+            if isinstance(s, dict)
+        ][:12]
+
+    return out
+
+
 def get_org_intelligence_for_mcp(
     db: Session,
     org_id: uuid.UUID,
     *,
     user_id: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
-    """ICP / Intelligence bank + offer ladder for content ideation."""
+    """Full Intelligence bank + offer ladder: ICP, business context, sales approach."""
     profile: Optional[Dict[str, Any]] = None
     if user_id:
         user = db.query(User).filter(User.id == user_id).first()
@@ -103,11 +180,26 @@ def get_org_intelligence_for_mcp(
             profile = row.ai_profile
 
     ladder = resolve_org_offer_ladder(db, org_id)
-    return {
+    out = {
         "org_id": str(org_id),
         "ai_profile": _trim_profile_for_marketing(profile),
+        "intelligence_profile": _full_intelligence_for_mcp(profile),
         "offer_ladder": offer_ladder_for_llm(ladder),
+        "usage": (
+            "intelligence_profile carries the org's business context (description, USP, "
+            "target audience, coaching style, marketing strategy), sales_approach "
+            "(framework + tactics), pipeline_priorities, and brand_voice. offer_ladder is "
+            "the configured offer/pricing ladder. Ground offer positioning and business "
+            "advice in these fields; ai_profile is a marketing-trimmed subset kept for "
+            "backward compatibility."
+        ),
     }
+    if not out["intelligence_profile"] and not out["offer_ladder"]:
+        out["hint"] = (
+            "No Intelligence profile configured for this org yet. Fill in the Intelligence "
+            "tab in SweepOS (business description, offers, ICP) to unlock business context."
+        )
+    return out
 
 
 def get_org_sales_signals_for_mcp(db: Session, org_id: uuid.UUID) -> Dict[str, Any]:
