@@ -54,6 +54,7 @@ def get_docs(
     """List all docs for the current org (metadata only, no content)."""
     from uuid import UUID
 
+    ensure_resource_documents_table(db)
     items = list_docs(db, UUID(_org_id(current_user)))
     return [
         {
@@ -98,6 +99,7 @@ def update_doc_document(
     from uuid import UUID
 
     _require_system_owner(current_user, db)
+    ensure_resource_documents_table(db)
     org = UUID(_org_id(current_user))
     category = str(body.get("category") or "SOP").strip() or "SOP"
     sop_category = body.get("sop_category")
@@ -162,6 +164,7 @@ def create_doc_document(
     from uuid import UUID
 
     _require_system_owner(current_user, db)
+    ensure_resource_documents_table(db)
     category = str(body.get("category") or "SOP").strip() or "SOP"
     sop_category = body.get("sop_category")
     if sop_category is not None:
@@ -218,6 +221,7 @@ def reorder_doc_documents(
     from uuid import UUID
 
     _require_system_owner(current_user, db)
+    ensure_resource_documents_table(db)
     raw_ids = body.get("resource_ids")
     if not isinstance(raw_ids, list):
         raise HTTPException(status_code=400, detail="resource_ids must be a list.")

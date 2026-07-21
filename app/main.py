@@ -203,13 +203,24 @@ def _ensure_schema_columns_on_startup() -> None:
             )
         )
 
-        # resource_documents: owner-editable SOPs for the Resources tab
-        from app.services.resource_documents import ensure_resource_documents_table
-        ensure_resource_documents_table(db)
+        # resource_documents: owner-editable SOPs for the Resources / portal library
+        # Isolated so earlier startup DDL failures cannot skip these column migrations.
+        try:
+            from app.services.resource_documents import ensure_resource_documents_table
+
+            ensure_resource_documents_table(db)
+        except Exception as e:
+            log.warning("resource_documents schema ensure failed: %s", e)
+            db.rollback()
 
         # org_resource_library: org-specific uploads/links library
-        from app.services.resource_library import ensure_resource_library_table
-        ensure_resource_library_table(db)
+        try:
+            from app.services.resource_library import ensure_resource_library_table
+
+            ensure_resource_library_table(db)
+        except Exception as e:
+            log.warning("resource_library schema ensure failed: %s", e)
+            db.rollback()
 
         db.commit()
 
