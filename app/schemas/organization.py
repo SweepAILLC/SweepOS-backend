@@ -16,11 +16,16 @@ class OrganizationCreate(OrganizationBase):
 class OrganizationUpdate(BaseModel):
     name: Optional[str] = None
     max_user_seats: Optional[int] = None  # null = unlimited
+    # Empty string clears tier; omit field to leave unchanged
+    consulting_tier: Optional[str] = None  # pro_consulting | core_consulting | ""
+    booking_url: Optional[str] = None
 
 
 class Organization(OrganizationBase):
     id: UUID
     max_user_seats: Optional[int] = None
+    consulting_tier: Optional[str] = None
+    booking_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

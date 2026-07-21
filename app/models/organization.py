@@ -17,6 +17,10 @@ class Organization(Base):
     fathom_webhook_id = Column(Text, nullable=True)
     fathom_webhook_secret = Column(Text, nullable=True)
     fathom_webhook_url = Column(Text, nullable=True)
+    # Consulting program tier for org portal access (pro_consulting | core_consulting | null)
+    consulting_tier = Column(String, nullable=True)
+    # External booking link (Cal.com / Calendly) shown in the org portal
+    booking_url = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

@@ -17,6 +17,7 @@ from app.services.resource_documents import (
     upsert_doc,
     create_doc,
     delete_doc,
+    reorder_docs,
     BUILTIN_DOCS,
 )
 from app.services.resource_library import (
@@ -58,12 +59,15 @@ def get_docs(
         {
             "resource_id": i["resource_id"],
             "category": i.get("category") or "SOP",
+            "sop_category": i.get("sop_category"),
             "title": i["title"],
             "description": i["description"],
             "powered_by": i.get("powered_by"),
+            "video_url": i.get("video_url"),
             "is_custom": i.get("is_custom", False),
             "is_builtin": i.get("is_builtin", False),
             "updated_at": i.get("updated_at"),
+            "sort_order": i.get("sort_order"),
         }
         for i in items
     ]
@@ -96,12 +100,18 @@ def update_doc_document(
     _require_system_owner(current_user, db)
     org = UUID(_org_id(current_user))
     category = str(body.get("category") or "SOP").strip() or "SOP"
+    sop_category = body.get("sop_category")
+    if sop_category is not None:
+        sop_category = str(sop_category).strip() or None
     title = str(body.get("title") or "").strip()
     description = str(body.get("description") or "").strip()
     content = str(body.get("content") or "")
     powered_by = body.get("powered_by")
     if powered_by is not None:
         powered_by = str(powered_by).strip() or None
+    video_url = body.get("video_url")
+    if video_url is not None:
+        video_url = str(video_url).strip() or None
 
     if not title:
         raise HTTPException(status_code=400, detail="Title is required.")
@@ -117,13 +127,24 @@ def update_doc_document(
             org,
             resource_id,
             category=category,
+            sop_category=sop_category,
             title=title,
             description=description,
             content=content,
             powered_by=powered_by,
+            video_url=video_url,
             user_id=current_user.id,
             is_custom=is_custom,
         )
+    except ValueError as e:
+        if str(e) == "invalid_video_url":
+            raise HTTPException(
+                status_code=400,
+                detail="Embed URL must be a valid http or https URL (video or Figma).",
+            )
+        if str(e) == "invalid_sop_category":
+            raise HTTPException(status_code=400, detail="SOP category must be foundations, marketing, sales, operations, or fulfillment.")
+        raise HTTPException(status_code=400, detail="Invalid document.")
     except Exception as e:
         _log.error("resource_documents upsert failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to save document.")
@@ -142,6 +163,9 @@ def create_doc_document(
 
     _require_system_owner(current_user, db)
     category = str(body.get("category") or "SOP").strip() or "SOP"
+    sop_category = body.get("sop_category")
+    if sop_category is not None:
+        sop_category = str(sop_category).strip() or None
     title = str(body.get("title") or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="Title is required.")
@@ -151,23 +175,87 @@ def create_doc_document(
     powered_by = body.get("powered_by")
     if powered_by is not None:
         powered_by = str(powered_by).strip() or None
+    video_url = body.get("video_url")
+    if video_url is not None:
+        video_url = str(video_url).strip() or None
 
     try:
         doc = create_doc(
             db,
             UUID(_org_id(current_user)),
             category=category,
+            sop_category=sop_category,
             title=title,
             description=description,
             content=content,
             powered_by=powered_by,
+            video_url=video_url,
             user_id=current_user.id,
         )
+    except ValueError as e:
+        if str(e) == "invalid_video_url":
+            raise HTTPException(
+                status_code=400,
+                detail="Embed URL must be a valid http or https URL (video or Figma).",
+            )
+        if str(e) == "invalid_sop_category":
+            raise HTTPException(status_code=400, detail="SOP category must be foundations, marketing, sales, operations, or fulfillment.")
+        raise HTTPException(status_code=400, detail="Invalid document.")
     except Exception as e:
         _log.error("resource_documents create failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to create document.")
 
     return doc
+
+
+@router.post("/docs/reorder")
+def reorder_doc_documents(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Persist SOP / doc display order. System owners only."""
+    from uuid import UUID
+
+    _require_system_owner(current_user, db)
+    raw_ids = body.get("resource_ids")
+    if not isinstance(raw_ids, list):
+        raise HTTPException(status_code=400, detail="resource_ids must be a list.")
+
+    try:
+        items = reorder_docs(
+            db,
+            UUID(_org_id(current_user)),
+            [str(x) for x in raw_ids],
+            user_id=current_user.id,
+        )
+    except ValueError as e:
+        msg = str(e)
+        if msg == "empty_reorder":
+            raise HTTPException(status_code=400, detail="resource_ids cannot be empty.")
+        if msg.startswith("unknown_resource:"):
+            raise HTTPException(status_code=404, detail=f"Document not found: {msg.split(':', 1)[1]}")
+        raise HTTPException(status_code=400, detail="Invalid reorder request.")
+    except Exception as e:
+        _log.error("resource_documents reorder failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to reorder documents.")
+
+    return [
+        {
+            "resource_id": i["resource_id"],
+            "category": i.get("category") or "SOP",
+            "sop_category": i.get("sop_category"),
+            "title": i["title"],
+            "description": i["description"],
+            "powered_by": i.get("powered_by"),
+            "video_url": i.get("video_url"),
+            "is_custom": i.get("is_custom", False),
+            "is_builtin": i.get("is_builtin", False),
+            "updated_at": i.get("updated_at"),
+            "sort_order": i.get("sort_order"),
+        }
+        for i in items
+    ]
 
 
 @router.delete("/docs/{resource_id}")

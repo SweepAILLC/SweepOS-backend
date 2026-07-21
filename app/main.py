@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -77,6 +77,7 @@ app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])
 app.include_router(resources.router, prefix="/resources", tags=["resources"])
+app.include_router(portal.router, prefix="/portal", tags=["portal"])
 
 @app.on_event("startup")
 def _ensure_schema_columns_on_startup() -> None:
@@ -132,6 +133,50 @@ def _ensure_schema_columns_on_startup() -> None:
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))
         db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_url TEXT"))
+        # organizations: consulting program / org portal
+        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS consulting_tier VARCHAR"))
+        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS booking_url TEXT"))
+
+        # portal_todos: org portal to-do list
+        from app.models.portal_todo import PortalTodo
+
+        PortalTodo.__table__.create(db.bind, checkfirst=True)
+
+        # portal_shared_pads: multi-tab live consulting notepad
+        db.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS portal_shared_pads (
+                    id UUID PRIMARY KEY,
+                    org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                    title VARCHAR(120) NOT NULL DEFAULT 'Onboarding',
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    content TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    updated_by UUID REFERENCES users(id),
+                    updated_by_name VARCHAR(255),
+                    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+                    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL
+                )
+                """
+            )
+        )
+        db.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_portal_shared_pads_org_id ON portal_shared_pads (org_id)"
+            )
+        )
+        db.execute(
+            text(
+                "ALTER TABLE portal_shared_pads ADD COLUMN IF NOT EXISTS title VARCHAR(120) NOT NULL DEFAULT 'Onboarding'"
+            )
+        )
+        db.execute(
+            text(
+                "ALTER TABLE portal_shared_pads ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        db.execute(text("ALTER TABLE portal_shared_pads DROP CONSTRAINT IF EXISTS uq_portal_shared_pads_org_id"))
 
         # fathom_call_records: ensure table exists (some DBs stamped past 031 without the table)
         from app.models.fathom_call_record import FathomCallRecord

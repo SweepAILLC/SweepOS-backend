@@ -29,7 +29,11 @@ from app.services.content_studio_fathom_context import (
     build_sales_playbook_for_studio,
     collect_fathom_sales_signals,
 )
-from app.services.offer_ladder import offer_ladder_for_llm, resolve_org_offer_ladder
+from app.services.offer_ladder import (
+    extract_offer_ladder,
+    offer_ladder_for_llm,
+    resolve_org_offer_ladder,
+)
 from app.services.org_intelligence_profile import get_org_ai_profile
 from app.services.org_sales_theme_service import (
     ensure_org_sales_content_themes_table,
@@ -63,7 +67,12 @@ def _trim_profile_for_marketing(profile: Optional[Dict[str, Any]]) -> Dict[str, 
     out: Dict[str, Any] = {}
     for k in keep_keys:
         if k in profile and profile[k] is not None:
-            out[k] = profile[k]
+            if k == "offer_ladder":
+                ladder = offer_ladder_for_llm(extract_offer_ladder(profile))
+                if ladder:
+                    out[k] = ladder
+            else:
+                out[k] = profile[k]
     # Also pass through common free-text fields if present
     for k, v in profile.items():
         if k in out:

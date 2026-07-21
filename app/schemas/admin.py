@@ -219,6 +219,26 @@ class OrganizationDashboardSummary(BaseModel):
     monthly_health_since_onboarding: List[HealthTrendPeriod] = Field(default_factory=list)
     """Calendar months from onboarding through now: show-up %, close %, cash collected."""
 
+    # Terminal-style KPIs for the requested time scope (Finances combined + calendar)
+    kpi_scope: Optional[str] = None  # mtd | all | None (rolling days)
+    kpi_range_days: Optional[int] = None
+    kpi_cash_usd: float = 0.0
+    kpi_mrr_usd: float = 0.0
+    kpi_avg_ltv_usd: Optional[float] = None
+    kpi_upcoming_count: int = 0
+    kpi_aov_usd: Optional[float] = None
+    kpi_order_count: int = 0
+    kpi_close_rate_pct: Optional[float] = None
+    kpi_show_up_rate_pct: Optional[float] = None
+
+    # Growth / coaching signals (org-scoped, mirrors Owner Health product cards)
+    show_up_rate_last_30d_pct: Optional[float] = None
+    close_rate_last_30d_pct: Optional[float] = None
+    calls_booked_last_30d: int = 0
+    calls_booked_previous_30d: int = 0
+    lifecycle_active_clients_current: int = 0
+    lifecycle_active_clients_previous_30d_cohort: int = 0
+
     llm_usage_last_30d: Optional[LlmUsageSummary] = None
     """This organization's LLM API usage for the last 30 days."""
 

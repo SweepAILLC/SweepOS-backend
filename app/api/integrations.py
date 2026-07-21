@@ -3933,6 +3933,13 @@ def update_calendar_booking_sales(
     
     db.commit()
     db.refresh(row)
+    # Sales flags feed Terminal graph (calls booked / close rate) — bust cache even without Stripe.
+    try:
+        from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+        invalidate_terminal_monthly_trends_cache(org_id)
+    except Exception:
+        pass
     return {
         "event_id": event_id,
         "provider": provider,

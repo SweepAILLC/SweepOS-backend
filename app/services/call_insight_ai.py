@@ -185,10 +185,12 @@ SYSTEM_PROMPT = (
 _OFFER_LADDER_RULES = (
     "OFFER_LADDER (optional): if DATA.offer_ladder is present, treat it as the org's product menu. "
     "When the lifecycle and transcript support it, ground roi_signals.upsell_signal.rationale and "
-    "roi_signals.referral_signal.rationale in the ladder (e.g. name the upsell that fits the client's "
-    "expressed goal). Do NOT invent offers that are not in the ladder. For leads, you may reference the "
-    "core offer or downsells in next_steps when conversion is the right move. Never override the lifecycle "
-    "rules — referral_signal stays restricted to active/offboarding."
+    "roi_signals.referral_signal.rationale in the ladder (e.g. name the upsell or add-on that fits the "
+    "client's expressed goal). Treat ladder.upsells as the unified upsells/add-ons collection and use its "
+    "ideal_for, triggers, and contraindications to determine fit. Do NOT invent offers that are not in the "
+    "ladder. For leads, reference the core offer when conversion is the right move; do not recommend an "
+    "upsell/add-on before lifecycle and evidence support expansion. Never override the lifecycle rules — "
+    "referral_signal stays restricted to active/offboarding."
 )
 
 _SALES_LENS_RULES = (

@@ -405,7 +405,7 @@ _AI_SYSTEM = (
     "(writing_style, writing_tone, coaching_style, client_management_philosophy), business "
     "(business_description, target_audience, unique_selling_proposition), sales and marketing "
     "(sales_framework, sales_tactics, marketing_strategy, marketing_channels), pipeline_priorities, "
-    "offer_ladder (core, downsells, upsells, referral_offer, positioning_notes, objection_handlers), "
+    "offer_ladder (core, unified upsells/add-ons, referral_offer, positioning_notes, objection_handlers), "
     "writing_samples (voice/campaign examples), and asset_links (Resource Library — label + url). "
     "Match the operator's voice using intelligence_profile. When asset_links or the operator's "
     "extra instructions mention sharing a resource, workbook, calendar, or link, include the exact "

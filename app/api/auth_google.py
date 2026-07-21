@@ -491,20 +491,28 @@ async def google_oauth_callback(
                 _link_google(u, google_id, email)
         db.commit()
 
-    # Multi-org: if more than one org, send to select-organization with a short-lived google session token
-    orgs = (
-        db.query(UserOrganization)
-        .filter(UserOrganization.user_id == user.id)
-        .all()
-    )
-    # Also count other user rows with same email (multi-org pattern)
+    # Multi-org: land on primary account; user can switch later in Settings → Accounts.
     all_email_users = _find_users_by_email(db, user.email)
     org_ids = list({u.org_id for u in all_email_users})
     if len(org_ids) > 1 and not request.query_params.get("org_id"):
-        # Issue token for primary org; frontend can switch. Prefer oldest.
-        primary = sorted(all_email_users, key=lambda u: u.created_at or datetime.min)[0]
+        primary = None
+        for u in sorted(all_email_users, key=lambda x: x.created_at or datetime.min):
+            uo = (
+                db.query(UserOrganization)
+                .filter(
+                    UserOrganization.user_id == u.id,
+                    UserOrganization.org_id == u.org_id,
+                    UserOrganization.is_primary == True,  # noqa: E712
+                )
+                .first()
+            )
+            if uo:
+                primary = u
+                break
+        if primary is None:
+            primary = sorted(all_email_users, key=lambda u: u.created_at or datetime.min)[0]
         token = _issue_app_token(primary, primary.org_id)
-        return _frontend_redirect("/auth/google/complete", token=token, multi_org="1")
+        return _frontend_redirect("/auth/google/complete", token=token)
 
     token = _issue_app_token(user, user.org_id)
     return _frontend_redirect("/auth/google/complete", token=token)

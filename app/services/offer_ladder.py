@@ -1,5 +1,5 @@
 """
-Intelligence "offer ladder": core offer + downsells + upsells + referral offer.
+Intelligence "offer ladder": core offer + upsells/add-ons + referral offer.
 
 Stored at `user.ai_profile.offer_ladder` (matches the rest of the Intelligence settings).
 For background jobs that have no current user, `resolve_org_offer_ladder` picks the org's
@@ -15,6 +15,7 @@ which now includes the ladder.
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,14 +26,16 @@ from sqlalchemy.orm import Session
 # Schema + validation
 # ---------------------------------------------------------------------------
 
-OFFER_LADDER_VERSION = 1
+OFFER_LADDER_VERSION = 2
 
 MAX_NAME = 200
 MAX_PROMISE = 600
 MAX_TEXT = 400
 MAX_SHORT = 300
 MAX_PRICE = 200
-MAX_ITEMS = 5
+# The former schema allowed five upsells and five downsells. Keep the same
+# combined capacity so consolidating legacy profiles cannot silently lose data.
+MAX_ITEMS = 10
 MAX_TRIGGERS_PER_ITEM = 6
 MAX_POSITIONING_NOTES = 5
 MAX_OBJECTION_HANDLERS = 8
@@ -75,8 +78,6 @@ def _validate_offer(raw: Any, *, kind: str) -> Optional[Dict[str, Any]]:
         "not_for": _str(raw.get("not_for"), MAX_SHORT),
         "price_terms": _str(raw.get("price_terms"), MAX_PRICE),
     }
-    if kind == "downsell":
-        out["when_to_use"] = _str(raw.get("when_to_use"), MAX_TEXT)
     if kind == "upsell":
         out["triggers"] = _str_list(
             raw.get("triggers"),
@@ -85,6 +86,31 @@ def _validate_offer(raw: Any, *, kind: str) -> Optional[Dict[str, Any]]:
         )
         out["contraindications"] = _str(raw.get("contraindications"), MAX_SHORT)
     return out
+
+
+def _legacy_downsell_as_add_on(raw: Any) -> Optional[Dict[str, Any]]:
+    """Convert a v1 downsell to the unified upsell/add-on shape."""
+    if not isinstance(raw, dict):
+        return None
+    converted = dict(raw)
+    if not converted.get("triggers"):
+        when_to_use = _str(converted.get("when_to_use"), MAX_TEXT)
+        if when_to_use:
+            converted["triggers"] = [when_to_use]
+    return _validate_offer(converted, kind="upsell")
+
+
+def _offer_identity(offer: Dict[str, Any]) -> Tuple[str, str]:
+    """Stable, case-insensitive identity used to avoid migration duplicates."""
+    return (
+        str(offer.get("name") or "").strip().casefold(),
+        str(offer.get("promise") or "").strip().casefold(),
+    )
+
+
+def _offer_items(value: Any) -> List[Any]:
+    """Reject malformed collections instead of iterating arbitrary user input."""
+    return value if isinstance(value, list) else []
 
 
 def _validate_referral(raw: Any) -> Optional[Dict[str, Any]]:
@@ -123,17 +149,26 @@ def validate_offer_ladder(raw: Any) -> Optional[Dict[str, Any]]:
 
     core = _validate_offer(raw.get("core_offer"), kind="core")
 
-    downsells = []
-    for item in (raw.get("downsells") or [])[:MAX_ITEMS]:
-        v = _validate_offer(item, kind="downsell")
-        if v:
-            downsells.append(v)
-
-    upsells = []
-    for item in (raw.get("upsells") or [])[:MAX_ITEMS]:
+    # v2 stores one collection. Read legacy downsells as add-ons so existing
+    # organizations retain their offers without exposing two competing models
+    # to matching or LLM prompts.
+    upsells: List[Dict[str, Any]] = []
+    seen = set()
+    for item in _offer_items(raw.get("upsells")):
         v = _validate_offer(item, kind="upsell")
-        if v:
+        if v and _offer_identity(v) not in seen:
             upsells.append(v)
+            seen.add(_offer_identity(v))
+        if len(upsells) >= MAX_ITEMS:
+            break
+    if len(upsells) < MAX_ITEMS:
+        for item in _offer_items(raw.get("downsells")):
+            v = _legacy_downsell_as_add_on(item)
+            if v and _offer_identity(v) not in seen:
+                upsells.append(v)
+                seen.add(_offer_identity(v))
+            if len(upsells) >= MAX_ITEMS:
+                break
 
     referral = _validate_referral(raw.get("referral_offer"))
 
@@ -150,7 +185,7 @@ def validate_offer_ladder(raw: Any) -> Optional[Dict[str, Any]]:
             handlers.append(v)
 
     has_anything = bool(
-        core or downsells or upsells or referral or positioning or handlers
+        core or upsells or referral or positioning or handlers
     )
     if not has_anything:
         return None
@@ -158,8 +193,6 @@ def validate_offer_ladder(raw: Any) -> Optional[Dict[str, Any]]:
     out: Dict[str, Any] = {"version": OFFER_LADDER_VERSION}
     if core:
         out["core_offer"] = core
-    if downsells:
-        out["downsells"] = downsells
     if upsells:
         out["upsells"] = upsells
     if referral:
@@ -229,8 +262,6 @@ def offer_ladder_for_llm(ladder: Optional[Dict[str, Any]]) -> Optional[Dict[str,
     out: Dict[str, Any] = {"version": ladder.get("version", OFFER_LADDER_VERSION)}
     if ladder.get("core_offer"):
         out["core_offer"] = _flat(ladder["core_offer"], ("price_terms", "not_for"))
-    if ladder.get("downsells"):
-        out["downsells"] = [_flat(o, ("when_to_use",)) for o in ladder["downsells"]]
     if ladder.get("upsells"):
         out["upsells"] = [
             _flat(o, ("triggers", "contraindications", "price_terms"))
@@ -294,35 +325,88 @@ def _mirror_phrase(prospect_voice: Optional[Dict[str, Any]]) -> str:
     return f'Mirror their own words ("{p[:120]}") in the opener.' if p else ""
 
 
-def _best_upsell(
+_MATCH_STOP_WORDS = frozenset(
+    {
+        "about",
+        "after",
+        "before",
+        "client",
+        "from",
+        "into",
+        "offer",
+        "ready",
+        "that",
+        "their",
+        "they",
+        "this",
+        "with",
+    }
+)
+
+
+def _meaningful_tokens(value: Any) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").casefold())
+        if len(token) >= 4 and token not in _MATCH_STOP_WORDS
+    }
+
+
+def _fit_score(rule: Any, signal_blob: str, signal_tokens: set[str]) -> int:
+    text = str(rule or "").strip().casefold()
+    if not text:
+        return 0
+    if text in signal_blob:
+        return 4
+    overlap = _meaningful_tokens(text) & signal_tokens
+    return min(3, len(overlap))
+
+
+def _contraindication_matches(
+    contraindications: Any, signal_blob: str, signal_tokens: set[str]
+) -> bool:
+    text = str(contraindications or "").strip().casefold()
+    if not text:
+        return False
+    if text in signal_blob:
+        return True
+    terms = _meaningful_tokens(text)
+    if not terms:
+        return False
+    required_overlap = 1 if len(terms) == 1 else 2
+    return len(terms & signal_tokens) >= required_overlap
+
+
+def select_best_upsell_or_add_on(
     upsells: List[Dict[str, Any]],
-    roi_tags: List[str],
-    headline: str,
-    prospect_voice: Optional[Dict[str, Any]],
+    *,
+    signals: List[Any],
+    has_upsell_signal: bool,
 ) -> Optional[Dict[str, Any]]:
     """
-    Pick the upsell whose `triggers` overlap most with available signals
-    (roi tags + recent call headline + resonating phrases).
+    Pick the offer that best fits client signals while enforcing guardrails.
+
+    Trigger matches carry the most weight, `ideal_for` is supporting context,
+    and any contraindication match excludes the offer. Token overlap makes the
+    matcher resilient to small wording differences in call summaries.
     """
     if not upsells:
         return None
-    signal_blob = " ".join(roi_tags) + " " + (headline or "")
-    if isinstance(prospect_voice, dict):
-        for p in (prospect_voice.get("phrases_that_resonated") or [])[:6]:
-            signal_blob += " " + str(p)
-    signal_blob = signal_blob.lower()
+    signal_blob = " ".join(str(signal or "") for signal in signals).casefold()
+    signal_tokens = _meaningful_tokens(signal_blob)
 
     best: Optional[Dict[str, Any]] = None
     best_score = -1
     for offer in upsells:
-        triggers = offer.get("triggers") or []
         score = 0
-        for t in triggers:
-            if not t:
-                continue
-            if str(t).lower() in signal_blob:
-                score += 2
-        if "upsell" in roi_tags and score == 0:
+        if _contraindication_matches(
+            offer.get("contraindications"), signal_blob, signal_tokens
+        ):
+            continue
+        for trigger in offer.get("triggers") or []:
+            score += 3 * _fit_score(trigger, signal_blob, signal_tokens)
+        score += _fit_score(offer.get("ideal_for"), signal_blob, signal_tokens)
+        if has_upsell_signal and score == 0:
             score = 1
         if score > best_score:
             best_score = score
@@ -334,7 +418,6 @@ def _kind_label(kind: str) -> str:
     return {
         "core": "core offer",
         "upsell": "upsell",
-        "downsell": "downsell",
         "referral": "referral offer",
     }.get(kind, kind)
 
@@ -361,7 +444,6 @@ def match_offer_for_client(
     tags = [str(t).lower().strip() for t in (roi_tags or []) if str(t).strip()]
     core = ladder.get("core_offer")
     upsells = ladder.get("upsells") or []
-    downsells = ladder.get("downsells") or []
     referral = ladder.get("referral_offer")
 
     chosen_kind: Optional[str] = None
@@ -375,7 +457,15 @@ def match_offer_for_client(
             "client is showing referral intent on the call, so prescribe the referral offer directly."
         )
     elif "upsell" in tags and upsells:
-        pick = _best_upsell(upsells, tags, headline, prospect_voice)
+        signals: List[Any] = [*tags, headline]
+        if isinstance(prospect_voice, dict):
+            signals.append(prospect_voice.get("summary_one_liner"))
+            signals.extend((prospect_voice.get("phrases_that_resonated") or [])[:6])
+        pick = select_best_upsell_or_add_on(
+            upsells,
+            signals=signals,
+            has_upsell_signal=True,
+        )
         if pick:
             chosen_kind = "upsell"
             chosen = pick
@@ -410,10 +500,6 @@ def match_offer_for_client(
             chosen_kind = "core"
             chosen = core
             rationale_bits.append("lead is showing buying signal; frame the core offer as the next step.")
-        elif downsells:
-            chosen_kind = "downsell"
-            chosen = downsells[0]
-            rationale_bits.append("no core defined — prescribe the first downsell as a low-friction entry.")
 
     if not chosen and core and ls in ("active", "offboarding"):
         chosen_kind = "core"

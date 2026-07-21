@@ -50,6 +50,8 @@ class User(UserBase):
     is_admin: bool
     is_system_owner: bool = False
     is_sudo_admin: bool = False
+    consulting_tier: Optional[str] = None
+    booking_url: Optional[str] = None
     created_at: datetime
 
     class Config:

@@ -42,6 +42,7 @@ from app.models.whop_payment import WhopPayment
 from app.services.offer_ladder import (
     extract_offer_ladder,
     resolve_org_offer_ladder,
+    select_best_upsell_or_add_on,
 )
 from app.services.user_ai_profile_context import extract_intelligence_profile_for_automation_llm
 
@@ -236,8 +237,8 @@ def select_upsell_for_client(
     """
     Pick the upsell offer whose `triggers` best match the client's signals.
 
-    Mirrors `offer_ladder._best_upsell` but stays self-contained so the engine doesn't
-    drag in the deterministic prescription path's other dependencies.
+    Uses the same fit/contraindication logic as deterministic prescriptions so
+    automation and client-facing recommendations cannot select different offers.
     """
     if not ladder:
         return None
@@ -246,22 +247,17 @@ def select_upsell_for_client(
         return None
 
     roi_tags, wins, headline = _insight_summary(insight)
-    blob = " ".join(roi_tags + wins + ([headline] if headline else [])).lower()
-
-    best: Optional[Dict[str, Any]] = None
-    best_score = -1
-    for offer in upsells:
-        triggers = [str(t).lower() for t in (offer.get("triggers") or []) if str(t).strip()]
-        score = 0
-        for t in triggers:
-            if t and t in blob:
-                score += 2
-        if "upsell" in roi_tags and score == 0:
-            score = 1
-        if score > best_score:
-            best_score = score
-            best = offer
-    return best
+    signals: List[Any] = [*roi_tags, *wins]
+    if headline:
+        signals.append(headline)
+    notes = str(getattr(client, "notes", "") or "").strip()
+    if notes:
+        signals.append(notes[:1000])
+    return select_best_upsell_or_add_on(
+        upsells,
+        signals=signals,
+        has_upsell_signal="upsell" in roi_tags,
+    )
 
 
 def score_opportunities(

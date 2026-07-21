@@ -180,49 +180,31 @@ def login(
         # User belongs to only one org
         target_org_id = user_orgs[0].org_id
     else:
-        # User belongs to multiple orgs
+        # User belongs to multiple orgs — land on primary (or explicit org_id).
+        # Account switching is done in Settings → Accounts, not at login.
         if user_credentials.org_id is None:
-            # Get organization details for selection
-            org_ids = [uo.org_id for uo in user_orgs]
-            orgs = db.query(Organization).filter(Organization.id.in_(org_ids)).all()
-            org_dict = {org.id: org for org in orgs}
-            
-            organizations = []
-            for uo in user_orgs:
-                if uo.org_id in org_dict:
-                    organizations.append({
-                        "id": str(uo.org_id),
-                        "name": org_dict[uo.org_id].name,
-                        "is_primary": uo.is_primary
-                    })
-            
-            # Sort by is_primary (primary first), then by name
-            organizations.sort(key=lambda x: (not x["is_primary"], x["name"]))
-            
-            return LoginResponse(
-                requires_org_selection=True,
-                organizations=organizations
-            )
-        
-        # Verify user has access to the requested org
-        # Convert to UUID if it's a string (from frontend)
-        requested_org_id = user_credentials.org_id
-        if isinstance(requested_org_id, str):
-            try:
-                requested_org_id = uuid.UUID(requested_org_id)
-            except (ValueError, TypeError) as e:
+            primary_uo = next((uo for uo in user_orgs if uo.is_primary), None)
+            target_org_id = primary_uo.org_id if primary_uo is not None else user.org_id
+        else:
+            # Verify user has access to the requested org
+            # Convert to UUID if it's a string (from frontend)
+            requested_org_id = user_credentials.org_id
+            if isinstance(requested_org_id, str):
+                try:
+                    requested_org_id = uuid.UUID(requested_org_id)
+                except (ValueError, TypeError) as e:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid organization ID format: {str(e)}"
+                    )
+
+            user_org = next((uo for uo in user_orgs if uo.org_id == requested_org_id), None)
+            if not user_org:
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid organization ID format: {str(e)}"
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User does not have access to this organization"
                 )
-        
-        user_org = next((uo for uo in user_orgs if uo.org_id == requested_org_id), None)
-        if not user_org:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="User does not have access to this organization"
-            )
-        target_org_id = requested_org_id
+            target_org_id = requested_org_id
     
     # Use the user row for the target org (same email can have different roles per org)
     user_for_token = next((u for u in matching_users if u.org_id == target_org_id), None)
@@ -274,10 +256,22 @@ def _organization_name(db: Session, org_id: UUID) -> Optional[str]:
     return row.name if row else None
 
 
+def _organization_portal_fields(db: Session, org_id: UUID) -> tuple:
+    """Return (org_name, consulting_tier, booking_url) for the given org."""
+    row = db.query(Organization).filter(Organization.id == org_id).first()
+    if not row:
+        return None, None, None
+    return (
+        row.name,
+        getattr(row, "consulting_tier", None),
+        getattr(row, "booking_url", None),
+    )
+
+
 def _user_schema_response(current_user: User, db: Session) -> UserSchema:
     role_value = role_to_api(current_user.role)
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    org_name = _organization_name(db, org_id)
+    org_name, consulting_tier, booking_url = _organization_portal_fields(db, org_id)
     return UserSchema(
         id=current_user.id,
         org_id=org_id,
@@ -287,6 +281,8 @@ def _user_schema_response(current_user: User, db: Session) -> UserSchema:
         is_admin=current_user.is_admin,
         is_system_owner=user_is_system_owner(current_user, db),
         is_sudo_admin=is_sudo_admin(current_user),
+        consulting_tier=consulting_tier,
+        booking_url=booking_url,
         created_at=current_user.created_at,
     )
 
@@ -389,7 +385,7 @@ def update_user_settings(
 
     role_value = role_to_api(user_row.role)
     org_id = getattr(current_user, "selected_org_id", user_row.org_id)
-    org_name = _organization_name(db, org_id)
+    org_name, consulting_tier, booking_url = _organization_portal_fields(db, org_id)
     return UserSchema(
         id=user_row.id,
         org_id=org_id,
@@ -399,6 +395,8 @@ def update_user_settings(
         is_admin=user_row.is_admin,
         is_system_owner=user_is_system_owner(current_user, db),
         is_sudo_admin=is_sudo_admin(current_user),
+        consulting_tier=consulting_tier,
+        booking_url=booking_url,
         created_at=user_row.created_at,
     )
 

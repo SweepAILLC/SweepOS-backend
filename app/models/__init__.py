@@ -40,6 +40,7 @@ from app.models.automation import (
     ContentMode,
 )
 from app.models.mcp_oauth import McpOAuthClient, McpOAuthGrant
+from app.models.portal_todo import PortalTodo
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -66,5 +67,6 @@ __all__ = [
     "ContentMode",
     "McpOAuthClient",
     "McpOAuthGrant",
+    "PortalTodo",
 ]
 

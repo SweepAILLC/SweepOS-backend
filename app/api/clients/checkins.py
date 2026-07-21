@@ -315,6 +315,14 @@ def update_check_in(
             ).first()
             if client and process_pipeline_lifecycle_for_client(db, client):
                 db.commit()
+
+        # Terminal graph reads is_sales_call / sale_closed — invalidate even without Stripe.
+        try:
+            from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+            invalidate_terminal_monthly_trends_cache(org_id)
+        except Exception:
+            pass
         
         return {
             "id": str(check_in.id),
@@ -525,6 +533,13 @@ def create_manual_check_in(
 
         if is_sales_call and process_pipeline_lifecycle_for_client(db, client):
             db.commit()
+
+        try:
+            from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+            invalidate_terminal_monthly_trends_cache(org_id)
+        except Exception:
+            pass
         
         return {
             "id": str(manual_check_in.id),

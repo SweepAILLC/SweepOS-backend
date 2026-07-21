@@ -4,7 +4,7 @@ Only accessible to admin/owner users.
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
-from sqlalchemy import func, desc, asc, and_, text, exists
+from sqlalchemy import func, desc, asc, and_, or_, text, exists
 from typing import List, Optional
 from uuid import UUID
 
@@ -50,9 +50,20 @@ from app.schemas.permission import (
     OrganizationTabPermissionUpdate
 )
 from app.models.organization_tab_permission import OrganizationTabPermission
+from app.models.portal_todo import PortalTodo
+from app.schemas.portal import (
+    PortalTodoCreate,
+    PortalTodoUpdate,
+    PortalTodoResponse,
+    PortalSharedPadCreate,
+    PortalSharedPadRename,
+    PortalSharedPadUpdate,
+    PortalSharedPadResponse,
+    PortalSharedPadSummary,
+)
+from app.services import portal_shared_pads as pads_svc
 from app.core.config import settings
 from app.core.rate_limit import rate_limit
-from datetime import datetime
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -183,6 +194,12 @@ def _org_close_rate_pct(
     period_end: datetime,
     now_utc: datetime,
 ) -> Optional[float]:
+    """
+    Close rate for Terminal / health trends.
+
+    Matches Calendar KPI: a past sales call is closed when the operator marked
+    sale_closed OR the client has a succeeded Stripe payment. Stripe is optional.
+    """
     has_succeeded_payment = exists().where(
         and_(
             StripePayment.client_id == ClientCheckIn.client_id,
@@ -190,6 +207,7 @@ def _org_close_rate_pct(
             StripePayment.status == "succeeded",
         )
     )
+    is_marked_closed = ClientCheckIn.sale_closed == True  # noqa: E712
     base = (
         db.query(func.count(ClientCheckIn.id))
         .filter(
@@ -215,8 +233,8 @@ def _org_close_rate_pct(
             ClientCheckIn.start_time >= period_start,
             ClientCheckIn.start_time < period_end,
             ClientCheckIn.start_time < now_utc,
+            or_(is_marked_closed, has_succeeded_payment),
         )
-        .filter(has_succeeded_payment)
         .scalar()
         or 0
     )
@@ -539,6 +557,15 @@ def update_organization(
                 detail="max_user_seats must be 0 or greater",
             )
         org.max_user_seats = org_data.max_user_seats
+    if org_data.consulting_tier is not None:
+        if org_data.consulting_tier not in ("pro_consulting", "core_consulting", ""):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid consulting tier",
+            )
+        org.consulting_tier = org_data.consulting_tier or None
+    if org_data.booking_url is not None:
+        org.booking_url = (org_data.booking_url or "").strip() or None
 
     db.commit()
     db.refresh(org)
@@ -1030,16 +1057,40 @@ def get_global_settings(
     }
 
 
+def _as_aware_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _org_upcoming_window_end(scope: Optional[str], range_days: int, now_utc: datetime) -> datetime:
+    """Match frontend getCalendarTrendsActivityWindow upcoming end."""
+    if scope == "all":
+        return now_utc + timedelta(days=3650)
+    if scope == "mtd":
+        y, m = now_utc.year, now_utc.month
+        if m == 12:
+            return datetime(y + 1, 1, 1, tzinfo=timezone.utc) - timedelta(microseconds=1)
+        return datetime(y, m + 1, 1, tzinfo=timezone.utc) - timedelta(microseconds=1)
+    return now_utc + timedelta(days=range_days)
+
+
 # Organization Dashboard View
 @router.get("/organizations/{org_id}/dashboard", response_model=OrganizationDashboardSummary)
 def get_organization_dashboard(
     org_id: UUID,
+    range_days: int = Query(30, alias="range", ge=1, le=3660),
+    scope: Optional[str] = Query(
+        None,
+        description="Use 'mtd' for month-to-date, 'all' for all-time (matches Terminal KPI filter).",
+    ),
     db: Session = Depends(get_db),
     admin_user: User = Depends(require_admin)
 ):
     """
     Get dashboard summary for a specific organization.
     Only accessible to admins in the main org.
+    Optional range/scope filters Terminal-style KPIs (combined cash, AOV, calendar rates).
     """
     # Verify organization exists
     org = db.query(Organization).filter(Organization.id == org_id).first()
@@ -1346,6 +1397,102 @@ def get_organization_dashboard(
     except Exception:
         pass
 
+    # ----- Terminal-style KPIs for requested time scope (Finances combined) -----
+    from app.services.finances_cash import finances_period_bounds
+    from app.api.finances import (
+        _stripe_succeeded_cents_since,
+        _whop_paid_cents_since,
+        _manual_cents_since,
+        _stripe_order_count_since,
+        _whop_order_count_since,
+        _manual_order_count_since,
+        _whop_connected,
+    )
+    from app.api.stripe import check_stripe_connected
+
+    scope_norm = (scope or "").strip().lower() or None
+    if scope_norm not in (None, "mtd", "all"):
+        scope_norm = None
+    period_start, period_end = finances_period_bounds(scope_norm, range_days, now_naive)
+    st_ok = check_stripe_connected(db, org_id)
+    wh_ok = _whop_connected(db, org_id)
+    s_cents = _stripe_succeeded_cents_since(db, org_id, period_start, period_end) if st_ok else 0
+    w_cents = _whop_paid_cents_since(db, org_id, period_start, period_end) if wh_ok else 0
+    m_cents = _manual_cents_since(db, org_id, period_start, period_end)
+    kpi_cash_usd = (s_cents + w_cents + m_cents) / 100.0
+    kpi_order_count = (
+        (_stripe_order_count_since(db, org_id, period_start, period_end) if st_ok else 0)
+        + (_whop_order_count_since(db, org_id, period_start, period_end) if wh_ok else 0)
+        + _manual_order_count_since(db, org_id, period_start, period_end)
+    )
+    kpi_aov_usd = (kpi_cash_usd / kpi_order_count) if kpi_order_count > 0 else None
+    kpi_avg_ltv_usd = (
+        (cash_collected_since_onboarding_usd / total_clients) if total_clients > 0 else None
+    )
+
+    past_start_utc = _as_aware_utc(period_start)
+    past_end_utc = _as_aware_utc(period_end)
+    upcoming_end_utc = _org_upcoming_window_end(scope_norm, range_days, now_utc_dash)
+    kpi_upcoming_count = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.cancelled == False,  # noqa: E712
+            ClientCheckIn.start_time >= now_utc_dash,
+            ClientCheckIn.start_time <= upcoming_end_utc,
+        )
+        .scalar()
+        or 0
+    )
+    kpi_show_up_rate_pct = _org_show_up_rate_pct(
+        db, org_id, past_start_utc, past_end_utc, now_utc_dash
+    )
+    kpi_close_rate_pct = _org_close_rate_pct(
+        db, org_id, past_start_utc, past_end_utc, now_utc_dash
+    )
+
+    # ----- Growth / coaching (30d), mirrors Owner Health product cards -----
+    thirty_utc = now_utc_dash - timedelta(days=30)
+    sixty_utc = now_utc_dash - timedelta(days=60)
+    show_up_rate_last_30d_pct = _org_show_up_rate_pct(
+        db, org_id, thirty_utc, now_utc_dash, now_utc_dash
+    )
+    close_rate_last_30d_pct = _org_close_rate_pct(
+        db, org_id, thirty_utc, now_utc_dash, now_utc_dash
+    )
+    calls_booked_last_30d = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.start_time >= thirty_utc,
+            ClientCheckIn.start_time < now_utc_dash,
+        )
+        .scalar()
+        or 0
+    )
+    calls_booked_previous_30d = (
+        db.query(func.count(ClientCheckIn.id))
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.start_time >= sixty_utc,
+            ClientCheckIn.start_time < thirty_utc,
+        )
+        .scalar()
+        or 0
+    )
+    lifecycle_active_clients_current = clients_by_status.get(LifecycleState.ACTIVE.value, 0)
+    thirty_naive = now_naive - timedelta(days=30)
+    lifecycle_active_clients_previous_30d_cohort = (
+        db.query(func.count(Client.id))
+        .filter(
+            Client.org_id == org_id,
+            Client.lifecycle_state == LifecycleState.ACTIVE,
+            Client.created_at < thirty_naive,
+        )
+        .scalar()
+        or 0
+    )
+
     return OrganizationDashboardSummary(
         organization_id=org_id,
         organization_name=org.name,
@@ -1371,6 +1518,24 @@ def get_organization_dashboard(
         manual_cash_all_time_usd=manual_cash_all_time_usd,
         total_processor_revenue_all_time_usd=total_processor_revenue_all_time_usd,
         monthly_health_since_onboarding=monthly_health_since_onboarding,
+        kpi_scope=scope_norm,
+        kpi_range_days=None if scope_norm in ("mtd", "all") else range_days,
+        kpi_cash_usd=kpi_cash_usd,
+        kpi_mrr_usd=total_mrr,
+        kpi_avg_ltv_usd=kpi_avg_ltv_usd,
+        kpi_upcoming_count=int(kpi_upcoming_count),
+        kpi_aov_usd=kpi_aov_usd,
+        kpi_order_count=int(kpi_order_count),
+        kpi_close_rate_pct=kpi_close_rate_pct,
+        kpi_show_up_rate_pct=kpi_show_up_rate_pct,
+        show_up_rate_last_30d_pct=show_up_rate_last_30d_pct,
+        close_rate_last_30d_pct=close_rate_last_30d_pct,
+        calls_booked_last_30d=int(calls_booked_last_30d),
+        calls_booked_previous_30d=int(calls_booked_previous_30d),
+        lifecycle_active_clients_current=int(lifecycle_active_clients_current),
+        lifecycle_active_clients_previous_30d_cohort=int(
+            lifecycle_active_clients_previous_30d_cohort
+        ),
         llm_usage_last_30d=llm_usage_last_30d,
     )
 
@@ -1669,4 +1834,268 @@ def update_organization_tab_permission(
     db.commit()
     db.refresh(permission)
     return OrgTabPermissionSchema.model_validate(permission, from_attributes=True)
+
+
+# ----- Admin: org portal to-dos (cross-org) ------------------------------------
+
+def _require_org(db: Session, org_id: UUID) -> Organization:
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+    return org
+
+
+@router.get("/organizations/{org_id}/portal-todos", response_model=List[PortalTodoResponse])
+def admin_list_portal_todos(
+    org_id: UUID,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """List portal to-dos for any organization (system owner)."""
+    _require_org(db, org_id)
+    return (
+        db.query(PortalTodo)
+        .filter(PortalTodo.org_id == org_id)
+        .order_by(PortalTodo.completed.asc(), PortalTodo.created_at.desc())
+        .all()
+    )
+
+
+@router.post(
+    "/organizations/{org_id}/portal-todos",
+    response_model=PortalTodoResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def admin_create_portal_todo(
+    org_id: UUID,
+    body: PortalTodoCreate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Create a portal to-do for any organization (system owner)."""
+    _require_org(db, org_id)
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Title is required")
+    now = datetime.utcnow()
+    todo = PortalTodo(
+        org_id=org_id,
+        title=title,
+        description=(body.description or None),
+        completed=False,
+        due_date=body.due_date,
+        created_by=admin_user.id,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(todo)
+    db.commit()
+    db.refresh(todo)
+    return todo
+
+
+@router.patch(
+    "/organizations/{org_id}/portal-todos/{todo_id}",
+    response_model=PortalTodoResponse,
+)
+def admin_update_portal_todo(
+    org_id: UUID,
+    todo_id: UUID,
+    body: PortalTodoUpdate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Update a portal to-do for any organization (system owner)."""
+    _require_org(db, org_id)
+    todo = (
+        db.query(PortalTodo)
+        .filter(PortalTodo.id == todo_id, PortalTodo.org_id == org_id)
+        .first()
+    )
+    if not todo:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="To-do not found")
+    if body.title is not None:
+        title = body.title.strip()
+        if not title:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Title is required")
+        todo.title = title
+    if body.description is not None:
+        todo.description = body.description or None
+    if body.completed is not None:
+        todo.completed = body.completed
+    if body.due_date is not None:
+        todo.due_date = body.due_date
+    todo.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(todo)
+    return todo
+
+
+@router.delete(
+    "/organizations/{org_id}/portal-todos/{todo_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def admin_delete_portal_todo(
+    org_id: UUID,
+    todo_id: UUID,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Delete a portal to-do for any organization (system owner)."""
+    _require_org(db, org_id)
+    todo = (
+        db.query(PortalTodo)
+        .filter(PortalTodo.id == todo_id, PortalTodo.org_id == org_id)
+        .first()
+    )
+    if not todo:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="To-do not found")
+    db.delete(todo)
+    db.commit()
+    return None
+
+
+# ----- Admin: org portal shared pads (multi-tab live notepad) -----------------
+
+
+@router.get(
+    "/organizations/{org_id}/portal-shared-pads",
+    response_model=List[PortalSharedPadSummary],
+)
+def admin_list_portal_shared_pads(
+    org_id: UUID,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """List shared-space tabs for any organization (system owner)."""
+    _require_org(db, org_id)
+    pads_svc.ensure_default_pad(db, org_id)
+    return [pads_svc.pad_summary(p) for p in pads_svc.list_pads(db, org_id)]
+
+
+@router.post(
+    "/organizations/{org_id}/portal-shared-pads",
+    response_model=PortalSharedPadResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def admin_create_portal_shared_pad(
+    org_id: UUID,
+    body: PortalSharedPadCreate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Create a shared-space tab for any organization (system owner)."""
+    _require_org(db, org_id)
+    pad = pads_svc.create_pad(db, org_id, title=body.title, user=admin_user)
+    return pads_svc.pad_response(pad)
+
+
+@router.get(
+    "/organizations/{org_id}/portal-shared-pads/{pad_id}",
+    response_model=PortalSharedPadResponse,
+)
+def admin_get_portal_shared_pad_by_id(
+    org_id: UUID,
+    pad_id: UUID,
+    since_revision: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Get one shared-space tab for any organization (system owner)."""
+    _require_org(db, org_id)
+    pad = pads_svc.get_pad(db, org_id, pad_id)
+    if since_revision is not None and int(since_revision) == int(pad.revision or 0):
+        return pads_svc.pad_response(pad, unchanged=True)
+    return pads_svc.pad_response(pad)
+
+
+@router.put(
+    "/organizations/{org_id}/portal-shared-pads/{pad_id}",
+    response_model=PortalSharedPadResponse,
+)
+def admin_put_portal_shared_pad_by_id(
+    org_id: UUID,
+    pad_id: UUID,
+    body: PortalSharedPadUpdate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Update shared-space tab content for any organization (system owner)."""
+    _require_org(db, org_id)
+    pad = pads_svc.get_pad(db, org_id, pad_id)
+    content = body.content if body.content is not None else ""
+    pad = pads_svc.write_pad_content(db, pad, content, admin_user)
+    return pads_svc.pad_response(pad)
+
+
+@router.patch(
+    "/organizations/{org_id}/portal-shared-pads/{pad_id}",
+    response_model=PortalSharedPadResponse,
+)
+def admin_rename_portal_shared_pad(
+    org_id: UUID,
+    pad_id: UUID,
+    body: PortalSharedPadRename,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Rename a shared-space tab for any organization (system owner)."""
+    _require_org(db, org_id)
+    pad = pads_svc.get_pad(db, org_id, pad_id)
+    pad = pads_svc.rename_pad(db, pad, body.title, admin_user)
+    return pads_svc.pad_response(pad)
+
+
+@router.delete(
+    "/organizations/{org_id}/portal-shared-pads/{pad_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def admin_delete_portal_shared_pad(
+    org_id: UUID,
+    pad_id: UUID,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Delete a shared-space tab for any organization (system owner)."""
+    _require_org(db, org_id)
+    pad = pads_svc.get_pad(db, org_id, pad_id)
+    pads_svc.delete_pad(db, org_id, pad)
+    return None
+
+
+# Legacy single-pad admin routes (first tab)
+@router.get(
+    "/organizations/{org_id}/portal-shared-pad",
+    response_model=PortalSharedPadResponse,
+)
+def admin_get_portal_shared_pad(
+    org_id: UUID,
+    since_revision: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Legacy: get the first shared pad for an organization."""
+    _require_org(db, org_id)
+    pad = pads_svc.ensure_default_pad(db, org_id)
+    if since_revision is not None and int(since_revision) == int(pad.revision or 0):
+        return pads_svc.pad_response(pad, unchanged=True)
+    return pads_svc.pad_response(pad)
+
+
+@router.put(
+    "/organizations/{org_id}/portal-shared-pad",
+    response_model=PortalSharedPadResponse,
+)
+def admin_put_portal_shared_pad(
+    org_id: UUID,
+    body: PortalSharedPadUpdate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Legacy: update the first shared pad for an organization."""
+    _require_org(db, org_id)
+    pad = pads_svc.ensure_default_pad(db, org_id)
+    content = body.content if body.content is not None else ""
+    pad = pads_svc.write_pad_content(db, pad, content, admin_user)
+    return pads_svc.pad_response(pad)
 
