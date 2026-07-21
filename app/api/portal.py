@@ -10,6 +10,7 @@ from datetime import datetime
 from app.db.session import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
+from app.models.organization import Organization
 from app.models.portal_todo import PortalTodo
 from app.models.portal_shared_pad import MAX_SHARED_PADS_PER_ORG
 from app.schemas.portal import (
@@ -26,9 +27,27 @@ from app.services import portal_shared_pads as pads_svc
 
 router = APIRouter()
 
+_VALID_CONSULTING_TIERS = frozenset({"pro_consulting", "core_consulting"})
+
 
 def _org_id(current_user: User) -> UUID:
     return UUID(str(getattr(current_user, "selected_org_id", None) or current_user.org_id))
+
+
+def require_consulting_org_id(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> UUID:
+    """Return the current org id only when that org has a consulting tier."""
+    org_id = _org_id(current_user)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    tier = getattr(org, "consulting_tier", None) if org else None
+    if tier not in _VALID_CONSULTING_TIERS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Consulting portal requires a consulting tier for this organization",
+        )
+    return org_id
 
 
 # ----- Shared pads (multi-tab live notepad) -----------------------------------
@@ -36,11 +55,10 @@ def _org_id(current_user: User) -> UUID:
 
 @router.get("/shared-pads", response_model=List[PortalSharedPadSummary])
 def list_shared_pads(
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """List named shared-space tabs for the current organization (max 10)."""
-    org_id = _org_id(current_user)
     pads_svc.ensure_default_pad(db, org_id)
     return [pads_svc.pad_summary(p) for p in pads_svc.list_pads(db, org_id)]
 
@@ -52,11 +70,11 @@ def list_shared_pads(
 )
 def create_shared_pad(
     body: PortalSharedPadCreate,
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Create a new shared-space tab (max 10 per org)."""
-    org_id = _org_id(current_user)
     pad = pads_svc.create_pad(db, org_id, title=body.title, user=current_user)
     return pads_svc.pad_response(pad)
 
@@ -65,11 +83,10 @@ def create_shared_pad(
 def get_shared_pad_by_id(
     pad_id: UUID,
     since_revision: Optional[int] = Query(None),
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Get one shared-space tab (supports since_revision for cheap live polls)."""
-    org_id = _org_id(current_user)
     pad = pads_svc.get_pad(db, org_id, pad_id)
     if since_revision is not None and int(since_revision) == int(pad.revision or 0):
         return pads_svc.pad_response(pad, unchanged=True)
@@ -80,11 +97,11 @@ def get_shared_pad_by_id(
 def put_shared_pad_by_id(
     pad_id: UUID,
     body: PortalSharedPadUpdate,
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Replace content for one shared-space tab."""
-    org_id = _org_id(current_user)
     pad = pads_svc.get_pad(db, org_id, pad_id)
     content = body.content if body.content is not None else ""
     pad = pads_svc.write_pad_content(db, pad, content, current_user)
@@ -95,11 +112,11 @@ def put_shared_pad_by_id(
 def rename_shared_pad(
     pad_id: UUID,
     body: PortalSharedPadRename,
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Rename a shared-space tab (double-click rename in UI)."""
-    org_id = _org_id(current_user)
     pad = pads_svc.get_pad(db, org_id, pad_id)
     pad = pads_svc.rename_pad(db, pad, body.title, current_user)
     return pads_svc.pad_response(pad)
@@ -108,11 +125,10 @@ def rename_shared_pad(
 @router.delete("/shared-pads/{pad_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_shared_pad(
     pad_id: UUID,
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Delete a shared-space tab (cannot delete the last one)."""
-    org_id = _org_id(current_user)
     pad = pads_svc.get_pad(db, org_id, pad_id)
     pads_svc.delete_pad(db, org_id, pad)
     return None
@@ -124,11 +140,10 @@ def delete_shared_pad(
 @router.get("/shared-pad", response_model=PortalSharedPadResponse)
 def get_shared_pad(
     since_revision: Optional[int] = Query(None),
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Legacy: get the first shared pad for the current org."""
-    org_id = _org_id(current_user)
     pad = pads_svc.ensure_default_pad(db, org_id)
     if since_revision is not None and int(since_revision) == int(pad.revision or 0):
         return pads_svc.pad_response(pad, unchanged=True)
@@ -138,11 +153,11 @@ def get_shared_pad(
 @router.put("/shared-pad", response_model=PortalSharedPadResponse)
 def put_shared_pad(
     body: PortalSharedPadUpdate,
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Legacy: update the first shared pad for the current org."""
-    org_id = _org_id(current_user)
     pad = pads_svc.ensure_default_pad(db, org_id)
     content = body.content if body.content is not None else ""
     pad = pads_svc.write_pad_content(db, pad, content, current_user)
@@ -159,11 +174,10 @@ def shared_pads_limit():
 
 @router.get("/todos", response_model=List[PortalTodoResponse])
 def list_portal_todos(
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """List to-dos for the current organization."""
-    org_id = _org_id(current_user)
     rows = (
         db.query(PortalTodo)
         .filter(PortalTodo.org_id == org_id)
@@ -176,6 +190,7 @@ def list_portal_todos(
 @router.post("/todos", response_model=PortalTodoResponse, status_code=status.HTTP_201_CREATED)
 def create_portal_todo(
     body: PortalTodoCreate,
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -184,7 +199,6 @@ def create_portal_todo(
     if not title:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Title is required")
 
-    org_id = _org_id(current_user)
     now = datetime.utcnow()
     todo = PortalTodo(
         org_id=org_id,
@@ -206,11 +220,10 @@ def create_portal_todo(
 def update_portal_todo(
     todo_id: UUID,
     body: PortalTodoUpdate,
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Update a to-do (title, description, completed, due_date)."""
-    org_id = _org_id(current_user)
     todo = (
         db.query(PortalTodo)
         .filter(PortalTodo.id == todo_id, PortalTodo.org_id == org_id)
@@ -240,11 +253,10 @@ def update_portal_todo(
 @router.delete("/todos/{todo_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_portal_todo(
     todo_id: UUID,
+    org_id: UUID = Depends(require_consulting_org_id),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Delete a to-do for the current organization."""
-    org_id = _org_id(current_user)
     todo = (
         db.query(PortalTodo)
         .filter(PortalTodo.id == todo_id, PortalTodo.org_id == org_id)
