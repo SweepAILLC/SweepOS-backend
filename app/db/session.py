@@ -32,5 +32,12 @@ def get_db():
         db.rollback()
         raise
     finally:
+        # Always end the transaction before returning the connection to the pool.
+        # Leaving SELECT transactions open causes AccessShareLocks that block
+        # startup/runtime ALTER TABLE and cascade into auth/me timeouts.
+        try:
+            db.rollback()
+        except Exception:
+            pass
         db.close()
 

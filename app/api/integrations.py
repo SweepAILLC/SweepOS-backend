@@ -4381,14 +4381,13 @@ def get_fathom_status(
 
 
 def _ensure_org_fathom_webhook_columns(db: Session) -> None:
-    """Idempotent ADD COLUMN for org webhook config (for DBs without alembic)."""
-    try:
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_url TEXT"))
-        db.commit()
-    except Exception:
-        db.rollback()
+    """No-op: fathom webhook columns are managed by Alembic migrations.
+
+    Previously ran ALTER TABLE at request time. That takes ACCESS EXCLUSIVE and,
+    when blocked by any idle-in-transaction reader, queued every organizations
+    SELECT behind it — cascading into auth/me statement timeouts.
+    """
+    return
 
 
 @router.post("/fathom/webhook/setup")

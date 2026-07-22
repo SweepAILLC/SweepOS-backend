@@ -212,7 +212,6 @@ def reconcile_fathom_webhooks_for_existing_orgs() -> dict[str, int]:
 def _register_webhook(db, org_id: uuid.UUID, api_key: str, *, force: bool) -> dict[str, Any]:
     from app.services.fathom_client import create_webhook
     from app.models.organization import Organization
-    from sqlalchemy import text
 
     destination = fathom_webhook_destination_for_org(org_id) or ""
 
@@ -225,13 +224,8 @@ def _register_webhook(db, org_id: uuid.UUID, api_key: str, *, force: bool) -> di
             "destination_url": destination or None,
         }
 
-    try:
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_url TEXT"))
-        db.commit()
-    except Exception:
-        db.rollback()
+    # Columns are managed by Alembic — do NOT run ALTER TABLE here.
+    # Runtime DDL takes ACCESS EXCLUSIVE and can lock out all org reads (auth/me).
 
     existing_wh_url = getattr(org, "fathom_webhook_url", None) or ""
     existing_wh_id = getattr(org, "fathom_webhook_id", None)

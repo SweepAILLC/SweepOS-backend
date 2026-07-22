@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, calendar_webhooks, resources, auth_google, mcp_oauth, portal, n8n_integration
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -57,8 +57,6 @@ app.include_router(auth_google.router, prefix="/auth", tags=["auth-google"])
 app.include_router(mcp_oauth.router, tags=["mcp-oauth"])
 app.include_router(mcp_server.router, tags=["mcp"])
 app.include_router(clients.router, prefix="/clients", tags=["clients"])
-app.include_router(automations.router, prefix="/automations", tags=["automations"])
-app.include_router(outreach.router, prefix="/outreach", tags=["outreach"])
 app.include_router(content_studio.router, prefix="/content-studio", tags=["content-studio"])
 app.include_router(call_library.router, prefix="/call-library", tags=["call-library"])
 app.include_router(events.router, prefix="/events", tags=["events"])
@@ -70,6 +68,7 @@ app.include_router(integrations.router, prefix="/integrations", tags=["integrati
 app.include_router(finances.router, prefix="/integrations/finances", tags=["finances"])
 app.include_router(whop.router, prefix="/integrations/whop", tags=["whop"])
 app.include_router(stripe.router, prefix="/integrations/stripe", tags=["stripe"])
+app.include_router(n8n_integration.router, prefix="/integrations/n8n", tags=["n8n"])
 app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 app.include_router(fathom_webhooks.router, prefix="/webhooks", tags=["fathom"])
 app.include_router(calendar_webhooks.router, prefix="/webhooks", tags=["calendar-webhooks"])
@@ -87,17 +86,48 @@ def _ensure_schema_columns_on_startup() -> None:
     We occasionally add columns to ORM models and rely on runtime `ALTER TABLE ... IF NOT EXISTS`
     to keep the app bootable. If these columns don't exist, *any* query touching the model
     (including login) can 500 due to UndefinedColumn.
+
+    IMPORTANT: DDL uses ACCESS EXCLUSIVE. Always set a short lock_timeout and skip
+    columns that already exist, otherwise a single idle-in-transaction reader can
+    queue every organizations SELECT behind a blocked ALTER (prod outage pattern).
     """
     from sqlalchemy import text
     from app.db.session import SessionLocal
 
     log = logging.getLogger("app")
     db = SessionLocal()
+
+    def _column_exists(table: str, column: str) -> bool:
+        row = db.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = :t AND column_name = :c"
+            ),
+            {"t": table, "c": column},
+        ).first()
+        return row is not None
+
+    def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
+        if _column_exists(table, column):
+            return
+        db.execute(text("SET LOCAL lock_timeout = '3s'"))
+        db.execute(
+            text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl_type}")
+        )
+
     try:
+        # Fail fast on lock contention rather than blocking the whole fleet.
+        db.execute(text("SET LOCAL lock_timeout = '3s'"))
+
         # users: Google OAuth identity columns (non-unique index — multi-org rows share google_id)
-        db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT"))
-        db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_email TEXT"))
-        db.execute(text("ALTER TABLE users ALTER COLUMN hashed_password DROP NOT NULL"))
+        _add_column_if_missing("users", "google_id", "TEXT")
+        _add_column_if_missing("users", "google_email", "TEXT")
+        try:
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
+            db.execute(text("ALTER TABLE users ALTER COLUMN hashed_password DROP NOT NULL"))
+        except Exception:
+            db.rollback()
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
         db.execute(text("DROP INDEX IF EXISTS ix_users_google_id"))
         db.execute(text("CREATE INDEX IF NOT EXISTS ix_users_google_id ON users (google_id)"))
 
@@ -108,7 +138,7 @@ def _ensure_schema_columns_on_startup() -> None:
         McpOAuthGrant.__table__.create(db.bind, checkfirst=True)
 
         # user_organizations: per-org Intelligence bank
-        db.execute(text("ALTER TABLE user_organizations ADD COLUMN IF NOT EXISTS ai_profile JSONB"))
+        _add_column_if_missing("user_organizations", "ai_profile", "JSONB")
 
         # lifecyclestate: ensure lowercase labels exist (migration 047) for ORM + API writes
         for label in (
@@ -129,13 +159,12 @@ def _ensure_schema_columns_on_startup() -> None:
                 )
             )
 
-        # organizations: fathom webhook fields
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_id TEXT"))
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_secret TEXT"))
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS fathom_webhook_url TEXT"))
-        # organizations: consulting program / org portal
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS consulting_tier VARCHAR"))
-        db.execute(text("ALTER TABLE organizations ADD COLUMN IF NOT EXISTS booking_url TEXT"))
+        # organizations: fathom webhook fields + consulting portal
+        _add_column_if_missing("organizations", "fathom_webhook_id", "TEXT")
+        _add_column_if_missing("organizations", "fathom_webhook_secret", "TEXT")
+        _add_column_if_missing("organizations", "fathom_webhook_url", "TEXT")
+        _add_column_if_missing("organizations", "consulting_tier", "VARCHAR")
+        _add_column_if_missing("organizations", "booking_url", "TEXT")
 
         # portal_todos: org portal to-do list
         from app.models.portal_todo import PortalTodo
@@ -184,16 +213,16 @@ def _ensure_schema_columns_on_startup() -> None:
         FathomCallRecord.__table__.create(db.bind, checkfirst=True)
 
         # fathom_call_records: media URLs from payload
-        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS share_url TEXT"))
-        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS video_url TEXT"))
-        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS meeting_title TEXT"))
-        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS recording_url TEXT"))
-        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS attendees_json JSONB"))
-        db.execute(text("ALTER TABLE fathom_call_records ADD COLUMN IF NOT EXISTS related_client_ids JSONB"))
+        _add_column_if_missing("fathom_call_records", "share_url", "TEXT")
+        _add_column_if_missing("fathom_call_records", "video_url", "TEXT")
+        _add_column_if_missing("fathom_call_records", "meeting_title", "TEXT")
+        _add_column_if_missing("fathom_call_records", "recording_url", "TEXT")
+        _add_column_if_missing("fathom_call_records", "attendees_json", "JSONB")
+        _add_column_if_missing("fathom_call_records", "related_client_ids", "JSONB")
 
         # call_library_reports: media URLs for embedding
-        db.execute(text("ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS share_url TEXT"))
-        db.execute(text("ALTER TABLE call_library_reports ADD COLUMN IF NOT EXISTS video_url TEXT"))
+        _add_column_if_missing("call_library_reports", "share_url", "TEXT")
+        _add_column_if_missing("call_library_reports", "video_url", "TEXT")
 
         # Calendar tab: speed up GET /integrations/calendar/synced-bookings (org + provider + time range)
         db.execute(
@@ -212,6 +241,7 @@ def _ensure_schema_columns_on_startup() -> None:
         except Exception as e:
             log.warning("resource_documents schema ensure failed: %s", e)
             db.rollback()
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
 
         # org_resource_library: org-specific uploads/links library
         try:
@@ -221,6 +251,7 @@ def _ensure_schema_columns_on_startup() -> None:
         except Exception as e:
             log.warning("resource_library schema ensure failed: %s", e)
             db.rollback()
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
 
         db.commit()
 
