@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, calendar_webhooks, resources, auth_google, mcp_oauth, portal, n8n_integration
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -57,6 +57,8 @@ app.include_router(auth_google.router, prefix="/auth", tags=["auth-google"])
 app.include_router(mcp_oauth.router, tags=["mcp-oauth"])
 app.include_router(mcp_server.router, tags=["mcp"])
 app.include_router(clients.router, prefix="/clients", tags=["clients"])
+app.include_router(automations.router, prefix="/automations", tags=["automations"])
+app.include_router(outreach.router, prefix="/outreach", tags=["outreach"])
 app.include_router(content_studio.router, prefix="/content-studio", tags=["content-studio"])
 app.include_router(call_library.router, prefix="/call-library", tags=["call-library"])
 app.include_router(events.router, prefix="/events", tags=["events"])
@@ -68,7 +70,6 @@ app.include_router(integrations.router, prefix="/integrations", tags=["integrati
 app.include_router(finances.router, prefix="/integrations/finances", tags=["finances"])
 app.include_router(whop.router, prefix="/integrations/whop", tags=["whop"])
 app.include_router(stripe.router, prefix="/integrations/stripe", tags=["stripe"])
-app.include_router(n8n_integration.router, prefix="/integrations/n8n", tags=["n8n"])
 app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 app.include_router(fathom_webhooks.router, prefix="/webhooks", tags=["fathom"])
 app.include_router(calendar_webhooks.router, prefix="/webhooks", tags=["calendar-webhooks"])
