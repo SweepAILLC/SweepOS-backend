@@ -17,7 +17,8 @@ if TYPE_CHECKING:
 from app.models.call_library_report import CallLibraryReport
 from app.models.fathom_call_record import FathomCallRecord
 from app.core.config import settings
-from app.services.call_library_ai import generate_call_library_report
+from app.services.call_library_ai import generate_call_library_report, generate_glance_call_report
+from app.services.call_library_sales_gate import resolve_call_library_analysis_kind
 from app.services.fathom_call_labels import (
     derive_call_library_title,
     primary_external_attendee_label,
@@ -60,6 +61,7 @@ _call_title_override_column_ensured = False
 _call_media_columns_ensured = False
 _call_deal_columns_ensured = False
 _fathom_meeting_title_column_ensured = False
+_call_analysis_kind_column_ensured = False
 
 
 def _ensure_call_title_override_column(db: Session) -> None:
@@ -150,6 +152,42 @@ def _ensure_fathom_meeting_title_column(db: Session) -> None:
         _fathom_meeting_title_column_ensured = True
 
 
+def _ensure_call_analysis_kind_column(db: Session) -> None:
+    """Idempotent ADD COLUMN for analysis_kind on call_library_reports."""
+    global _call_analysis_kind_column_ensured
+    if _call_analysis_kind_column_ensured:
+        return
+    if getattr(settings, "DISABLE_RUNTIME_SCHEMA_ENSURE", False):
+        _call_analysis_kind_column_ensured = True
+        return
+    try:
+        db.execute(
+            text(
+                "ALTER TABLE call_library_reports "
+                "ADD COLUMN IF NOT EXISTS analysis_kind VARCHAR(16)"
+            )
+        )
+        db.commit()
+        _call_analysis_kind_column_ensured = True
+    except Exception as e:
+        db.rollback()
+        logger.warning("call_library: ensure analysis_kind column failed: %s", e)
+        _call_analysis_kind_column_ensured = True
+
+
+def _stored_analysis_kind(row: CallLibraryReport) -> Optional[str]:
+    """Return persisted analysis_kind when known; None for legacy rows."""
+    kind = getattr(row, "analysis_kind", None)
+    if isinstance(kind, str) and kind.strip():
+        return kind.strip().lower()
+    report = row.report_json if isinstance(row.report_json, dict) else None
+    if report:
+        rk = report.get("analysis_kind")
+        if isinstance(rk, str) and rk.strip():
+            return rk.strip().lower()
+    return None
+
+
 def _coerce_deal_outcome(report_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Pull the persisted columns out of an LLM report's deal_outcome block."""
     fallback = {
@@ -218,6 +256,7 @@ def ensure_pending_call_library_report(
     """Create or refresh a pending library row so the UI can show 'Analyzing…' immediately."""
     _ensure_call_title_override_column(db)
     _ensure_call_media_columns(db)
+    _ensure_call_analysis_kind_column(db)
     _ensure_call_deal_columns(db)
     _ensure_fathom_meeting_title_column(db)
     rec = (
@@ -354,6 +393,7 @@ def generate_and_persist_report(
     _ensure_call_media_columns(db)
     _ensure_call_deal_columns(db)
     _ensure_fathom_meeting_title_column(db)
+    _ensure_call_analysis_kind_column(db)
     existing = (
         db.query(CallLibraryReport)
         .filter(CallLibraryReport.fathom_call_record_id == fathom_record_id)
@@ -398,8 +438,10 @@ def generate_and_persist_report(
     summary = rec.summary_text or ""
     call_title = _derive_call_title(rec, db, org_id)
     input_hash = _hash_call_inputs(summary, transcript)
-
     if existing and existing.status == "complete" and not force_regenerate:
+        # Never re-analyze completed reports on normal queue/sync paths.
+        # Sales vs glance routing applies only to new/pending generations
+        # (and explicit force_regenerate Refresh).
         if row_has_substantive_report(existing):
             if isinstance(existing.report_json, dict):
                 rep = dict(existing.report_json)
@@ -418,6 +460,15 @@ def generate_and_persist_report(
         existing.updated_at = datetime.now(timezone.utc)
         db.commit()
         return "skipped"
+
+    # Resolve sales vs glance only when we are about to generate (future/pending).
+    analysis_kind, is_sales_flag = resolve_call_library_analysis_kind(db, org_id, rec)
+    logger.info(
+        "call_library analysis_kind=%s sales_flag=%s record=%s",
+        analysis_kind,
+        is_sales_flag,
+        fathom_record_id,
+    )
 
     if not transcript and not summary:
         # Content can be briefly absent during a Fathom re-ingest/enrichment window.
@@ -439,35 +490,43 @@ def generate_and_persist_report(
             "no_content",
             call_title=call_title,
             call_score=None,
+            analysis_kind=analysis_kind,
         )
         logger.info("call_library deferred: no_content record=%s", fathom_record_id)
         return "deferred"
 
     try:
-        from app.services.resource_documents import get_document_content
-        from app.services.call_library_ai import (
-            DISCOVERY_AUDIT_SOP,
-            PITCHING_SOP,
-            OBJECTION_HANDLING_SOP,
-        )
+        if analysis_kind == "glance":
+            report_json = generate_glance_call_report(
+                transcript=transcript,
+                summary=summary,
+                org_id=org_id,
+            )
+        else:
+            from app.services.resource_documents import get_document_content
+            from app.services.call_library_ai import (
+                DISCOVERY_AUDIT_SOP,
+                PITCHING_SOP,
+                OBJECTION_HANDLING_SOP,
+            )
 
-        discovery_sop = get_document_content(
-            db, org_id, "discovery-audit-sop", fallback=DISCOVERY_AUDIT_SOP
-        )
-        pitching_sop = get_document_content(
-            db, org_id, "pitching-sop", fallback=PITCHING_SOP
-        )
-        objection_sop = get_document_content(
-            db, org_id, "objection-handling-sop", fallback=OBJECTION_HANDLING_SOP
-        )
-        report_json = generate_call_library_report(
-            transcript=transcript,
-            summary=summary,
-            org_id=org_id,
-            discovery_audit_sop=discovery_sop,
-            pitching_sop=pitching_sop,
-            objection_handling_sop=objection_sop,
-        )
+            discovery_sop = get_document_content(
+                db, org_id, "discovery-audit-sop", fallback=DISCOVERY_AUDIT_SOP
+            )
+            pitching_sop = get_document_content(
+                db, org_id, "pitching-sop", fallback=PITCHING_SOP
+            )
+            objection_sop = get_document_content(
+                db, org_id, "objection-handling-sop", fallback=OBJECTION_HANDLING_SOP
+            )
+            report_json = generate_call_library_report(
+                transcript=transcript,
+                summary=summary,
+                org_id=org_id,
+                discovery_audit_sop=discovery_sop,
+                pitching_sop=pitching_sop,
+                objection_handling_sop=objection_sop,
+            )
     except RuntimeError as e:
         if "llm_budget" in str(e).lower():
             _upsert_report(
@@ -480,6 +539,7 @@ def generate_and_persist_report(
                 "budget_deferred",
                 call_title=call_title,
                 call_score=None,
+                analysis_kind=analysis_kind,
             )
             from app.services.call_library_queue import schedule_budget_retry
 
@@ -493,6 +553,7 @@ def generate_and_persist_report(
 
     if isinstance(report_json, dict):
         report_json["_input_hash"] = input_hash
+        report_json["analysis_kind"] = analysis_kind
 
     if not report_json:
         if _restore_substantive_report_after_failure(
@@ -515,6 +576,7 @@ def generate_and_persist_report(
             "llm_failed",
             call_title=call_title,
             call_score=None,
+            analysis_kind=analysis_kind,
         )
         logger.warning("call_library AI failed record=%s", fathom_record_id)
         return "failed"
@@ -542,6 +604,7 @@ def generate_and_persist_report(
             "llm_empty",
             call_title=call_title,
             call_score=None,
+            analysis_kind=analysis_kind,
         )
         logger.warning("call_library empty template rejected record=%s", fathom_record_id)
         return "failed"
@@ -564,8 +627,13 @@ def generate_and_persist_report(
         None,
         call_title=call_title,
         call_score=call_score_f,
+        analysis_kind=analysis_kind,
     )
-    logger.info("call_library complete record=%s", fathom_record_id)
+    logger.info(
+        "call_library complete kind=%s record=%s",
+        analysis_kind,
+        fathom_record_id,
+    )
 
     # Refresh AI call insights for the primary client now that the call is fully processed.
     if rec.client_id and rec.sentiment_status == "complete":
@@ -596,6 +664,7 @@ def _upsert_report(
     call_title: Optional[str] = None,
     *,
     call_score: Optional[float] = None,
+    analysis_kind: Optional[str] = None,
 ) -> CallLibraryReport:
     row = (
         db.query(CallLibraryReport)
@@ -627,6 +696,16 @@ def _upsert_report(
     row.failure_reason = failure_reason
     row.call_title = call_title or row.call_title
     row.call_score = call_score
+    if analysis_kind:
+        try:
+            row.analysis_kind = analysis_kind
+        except Exception:
+            pass
+    elif isinstance(report_json, dict) and report_json.get("analysis_kind"):
+        try:
+            row.analysis_kind = str(report_json.get("analysis_kind"))
+        except Exception:
+            pass
     row.recording_url = (rec.recording_url or "")[:2000] or None
     try:
         row.share_url = (getattr(rec, "share_url", None) or "")[:2000] or None
@@ -712,6 +791,7 @@ def get_call_library_for_org(
     _ensure_call_media_columns(db)
     _ensure_call_deal_columns(db)
     _ensure_fathom_meeting_title_column(db)
+    _ensure_call_analysis_kind_column(db)
     from app.models.fathom_call_record import FathomCallRecord
 
     total = (
@@ -765,6 +845,14 @@ def get_call_library_for_org(
         if status != "complete" and row_has_substantive_report(row):
             status = "complete"
 
+        analysis_kind = _stored_analysis_kind(row)
+        if analysis_kind is None and isinstance(row.report_json, dict):
+            # Legacy full audits without a stored kind still render as sales.
+            if row.report_json.get("glance") or row.report_json.get("fathom_summary"):
+                analysis_kind = "glance"
+            elif row_has_substantive_report(row):
+                analysis_kind = "sales"
+
         items.append(
             {
                 "id": str(row.id),
@@ -774,6 +862,7 @@ def get_call_library_for_org(
                 "status": status,
                 "failure_reason": row.failure_reason,
                 "client_name": client_name,
+                "analysis_kind": analysis_kind,
                 "call_score": row.call_score,
                 "deal_closed": bool(getattr(row, "deal_closed", False) or False),
                 "deal_value_cents": getattr(row, "deal_value_cents", None),

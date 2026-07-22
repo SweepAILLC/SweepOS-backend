@@ -24,6 +24,8 @@ class CallLibraryReport(Base):
     )
 
     status = Column(String(32), nullable=False, default="pending")  # pending | complete | failed
+    # sales = full discovery/pitch/objection audit; glance = Fathom summary + light LLM
+    analysis_kind = Column(String(16), nullable=True)  # sales | glance
     report_json = Column(JSON, nullable=True)  # 5-section structured AI analysis
     failure_reason = Column(Text, nullable=True)
     # Increments on each failed LLM analysis; capped by CALL_LIBRARY_MAX_ANALYSIS_ATTEMPTS.

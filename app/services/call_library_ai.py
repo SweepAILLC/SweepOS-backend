@@ -290,7 +290,104 @@ def generate_call_library_report(
             len(user_msg),
         )
         return None
+    normalized["analysis_kind"] = "sales"
     return normalized
+
+
+_GLANCE_SYSTEM = """\
+You summarize a NON-sales call (check-in, coaching, ops, or internal). Return ONE JSON object only.
+
+Keys:
+- analysis: 2-4 sentence at-a-glance summary of what happened and the outcome tone
+- action_items: array of concrete next steps mentioned or clearly implied (0-8 short strings)
+
+Rules:
+- Prefer the Fathom SUMMARY in DATA; use transcript only to fill gaps.
+- Do not invent names, numbers, or commitments.
+- If DATA is thin, keep analysis short and action_items [].
+- Valid JSON only — no markdown.
+"""
+
+
+def generate_glance_call_report(
+    *,
+    transcript: str,
+    summary: str,
+    org_id: Optional[uuid.UUID] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Lightweight report for non-sales calls: keep Fathom summary + one LLM glance
+    (analysis + action_items). No discovery/pitch/objection audits.
+    """
+    fathom_summary = (summary or "").strip()
+    summary_part = truncate_for_tokens(fathom_summary, 8000) if fathom_summary else ""
+    transcript_part = ""
+    if len(summary_part) < 400 and (transcript or "").strip():
+        transcript_part = truncate_for_tokens((transcript or "").strip(), 6000)
+
+    if not summary_part and not transcript_part:
+        return None
+
+    data_blocks = []
+    if summary_part:
+        data_blocks.append("FATHOM_SUMMARY:\n" + summary_part)
+    if transcript_part:
+        data_blocks.append("TRANSCRIPT_EXCERPT:\n" + transcript_part)
+    user_msg = "DATA:\n" + "\n\n".join(data_blocks)
+
+    timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
+    model_override = _resolve_call_library_model()
+    try:
+        raw = chat_json(
+            _GLANCE_SYSTEM,
+            user_msg,
+            temperature=0.2,
+            timeout=min(timeout, 60.0),
+            org_id=org_id,
+            model=model_override,
+            max_tokens=800,
+            max_input_chars=14000,
+            min_user_chars=0,
+            feature="call_library_glance",
+        )
+    except RuntimeError as e:
+        if "llm_budget" in str(e).lower():
+            raise
+        logger.warning("call_library glance LLM runtime error: %s", e)
+        raw = None
+    except Exception as e:
+        logger.warning("call_library glance LLM failed: %s", e)
+        raw = None
+
+    analysis = ""
+    action_items: List[str] = []
+    if isinstance(raw, dict):
+        analysis = str(raw.get("analysis") or raw.get("at_a_glance") or "").strip()[:4000]
+        items = raw.get("action_items") or raw.get("actions") or []
+        if isinstance(items, list):
+            for it in items[:8]:
+                s = str(it or "").strip()
+                if s:
+                    action_items.append(s[:500])
+        elif isinstance(items, str) and items.strip():
+            action_items = [items.strip()[:500]]
+
+    if not analysis and fathom_summary:
+        analysis = truncate_for_tokens(fathom_summary, 1200)
+
+    if not analysis and not fathom_summary:
+        return None
+
+    return {
+        "analysis_kind": "glance",
+        "fathom_summary": fathom_summary[:20000] if fathom_summary else "",
+        "glance": {
+            "analysis": analysis,
+            "action_items": action_items,
+        },
+        "call_score": None,
+        "low_signal": False,
+    }
 
 
 def _collect_audit_scores(block: Dict[str, Any]) -> List[float]:
@@ -358,6 +455,18 @@ def is_substantive_call_library_report(report_json: Any) -> bool:
     if not isinstance(report_json, dict):
         return False
     if report_json.get("low_signal"):
+        return False
+    # Non-sales glance reports: Fathom summary and/or glance analysis/actions.
+    if str(report_json.get("analysis_kind") or "") == "glance":
+        if str(report_json.get("fathom_summary") or "").strip():
+            return True
+        glance = report_json.get("glance")
+        if isinstance(glance, dict):
+            if str(glance.get("analysis") or "").strip():
+                return True
+            items = glance.get("action_items")
+            if isinstance(items, list) and any(str(x or "").strip() for x in items):
+                return True
         return False
     if report_json.get("call_score") is not None:
         return True
@@ -610,6 +719,7 @@ def _normalize_objection_handling_audit(raw: Any) -> Dict[str, Any]:
 def _normalize_report(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Validate and normalize the LLM output into a safe shape."""
     out: Dict[str, Any] = {
+        "analysis_kind": "sales",
         "call_context": {
             "salesperson": "",
             "prospect": "",

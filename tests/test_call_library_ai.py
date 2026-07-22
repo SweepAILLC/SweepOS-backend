@@ -77,3 +77,29 @@ class TestSubstantiveReportGuard:
                 }
             }
         )
+
+    def test_accepts_glance_with_fathom_summary(self):
+        assert is_substantive_call_library_report(
+            {
+                "analysis_kind": "glance",
+                "fathom_summary": "Checked in on progress.",
+                "glance": {"analysis": "", "action_items": []},
+            }
+        )
+
+    def test_accepts_glance_with_action_items(self):
+        assert is_substantive_call_library_report(
+            {
+                "analysis_kind": "glance",
+                "fathom_summary": "",
+                "glance": {
+                    "analysis": "Solid check-in.",
+                    "action_items": ["Send follow-up notes"],
+                },
+            }
+        )
+
+    def test_rejects_empty_glance(self):
+        assert not is_substantive_call_library_report(
+            {"analysis_kind": "glance", "fathom_summary": "", "glance": {}}
+        )
