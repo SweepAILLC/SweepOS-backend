@@ -23,7 +23,11 @@ class ContentStudioTranscriptAnalysis(Base):
     analysis_json = Column(JSON, nullable=False, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    organization = relationship("Organization", backref="content_studio_transcript_analyses")
+    organization = relationship(
+        "Organization",
+        backref="content_studio_transcript_analyses",
+        passive_deletes=True,
+    )
     user = relationship("User", foreign_keys=[user_id])
 
     __table_args__ = (Index("ix_cs_transcript_org_created", "org_id", "created_at"),)

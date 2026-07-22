@@ -584,79 +584,131 @@ def delete_organization(
     """
     from app.models.funnel import FunnelStep
     from app.models.session import Session as SessionModel
-    from app.models.event_error import EventError
     from app.models.campaign import Campaign
     from app.models.recommendation import Recommendation
     from app.models.stripe_event import StripeEvent
     from app.models.feature import Feature
-    
+    from app.models.content_studio_generation import ContentStudioGeneration
+    from app.models.content_studio_knowledge_item import ContentStudioKnowledgeItem
+    from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
+    from app.models.call_library_report import CallLibraryReport
+    from app.models.fathom_call_record import FathomCallRecord
+    from app.models.client_call_insight import ClientCallInsight, ClientInsightSummary
+    from app.models.client_health_score_cache import ClientHealthScoreCache
+    from app.models.client_ai_recommendation_state import ClientAIRecommendationState
+    from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
+    from app.models.llm_usage_event import LlmUsageEvent
+    from app.models.org_sales_content_theme import OrgSalesContentTheme
+    from app.models.portal_shared_pad import PortalSharedPad
+    from app.models.user_organization import UserOrganization
+    from app.models.health_outcome_snapshot import HealthOutcomeSnapshot
+    from app.models.audit_log import AuditLog
+    from app.models.organization_tab_permission import OrganizationTabPermission
+    from app.models.user_tab_permission import UserTabPermission
+
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Organization not found"
         )
-    
+
     # Prevent deleting the main org (safety check)
     if str(org_id) == str(MAIN_ORG_ID):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete the main organization"
         )
-    
+
+    def _del(model) -> None:
+        db.query(model).filter(model.org_id == org_id).delete(synchronize_session=False)
+
+    def _del_table(table: str) -> None:
+        """Delete from optional/raw tables only if they exist (no transaction poison)."""
+        exists = db.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = :t"
+            ),
+            {"t": table},
+        ).first()
+        if exists:
+            db.execute(text(f"DELETE FROM {table} WHERE org_id = :oid"), {"oid": org_id})
+
     try:
-        # Delete in order to respect foreign key constraints
-        # Start with child tables that reference other child tables
-        
-        # Delete funnel steps (references funnels)
-        db.query(FunnelStep).filter(FunnelStep.org_id == org_id).delete()
-        
-        # Delete funnels (references clients, but we'll delete clients after)
-        db.query(Funnel).filter(Funnel.org_id == org_id).delete()
-        
-        # Delete events (references funnels, clients, sessions)
-        db.query(Event).filter(Event.org_id == org_id).delete()
-        
-        # Delete sessions
-        db.query(SessionModel).filter(SessionModel.org_id == org_id).delete()
-        
-        # Delete event errors that reference this org's funnels
-        # Since EventError doesn't have org_id, we need to find events that reference
-        # funnels from this org, then delete corresponding errors
-        # For simplicity, we'll delete all event errors (they're just logs anyway)
-        # Or we can skip this if event_errors are meant to be kept for debugging
-        # For now, let's skip deleting event_errors since they don't have org_id
-        # and are just error logs that might be useful for debugging
-        
-        # Delete Stripe-related data
-        db.query(StripePayment).filter(StripePayment.org_id == org_id).delete()
-        db.query(StripeSubscription).filter(StripeSubscription.org_id == org_id).delete()
-        db.query(StripeEvent).filter(StripeEvent.org_id == org_id).delete()
-        
-        # Delete OAuth tokens
-        db.query(OAuthToken).filter(OAuthToken.org_id == org_id).delete()
-        
-        # Delete campaigns
-        db.query(Campaign).filter(Campaign.org_id == org_id).delete()
-        
-        # Delete recommendations
-        db.query(Recommendation).filter(Recommendation.org_id == org_id).delete()
-        
-        # Delete features
-        db.query(Feature).filter(Feature.org_id == org_id).delete()
-        
-        # Delete clients (references users, but users reference org, so delete clients first)
-        db.query(Client).filter(Client.org_id == org_id).delete()
-        
-        # Delete users (must be last as other tables might reference users)
-        db.query(User).filter(User.org_id == org_id).delete()
-        
-        # Finally, delete the organization
-        db.delete(org)
+        # Delete in dependency order. Prefer bulk DELETE over ORM relationship
+        # cascades — SQLAlchemy otherwise SETs nullable=False org_id FKs to NULL
+        # via backrefs (e.g. content_studio_generations) and fails with NotNullViolation.
+
+        # Content Studio / Call Library / Fathom
+        _del(ContentStudioGeneration)
+        _del(ContentStudioKnowledgeItem)
+        _del(ContentStudioTranscriptAnalysis)
+        _del(CallLibraryReport)
+        _del(ClientCallInsight)
+        _del(ClientInsightSummary)
+        _del(FathomCallRecord)
+        _del(OrgSalesContentTheme)
+
+        # Portal / resources (raw SQL tables may lack ORM models)
+        _del(PortalTodo)
+        _del(PortalSharedPad)
+        _del_table("resource_documents")
+        _del_table("org_resource_library")
+        _del_table("n8n_event_deliveries")
+        _del_table("automation_email_jobs")
+        _del_table("automation_rules")
+        _del_table("whop_payments")
+
+        # Client-adjacent
+        _del(ClientCheckIn)
+        _del(ManualPayment)
+        _del(CalendarBookingSales)
+        _del(EventTypeSalesCall)
+        _del(ClientHealthScoreCache)
+        _del(ClientAIRecommendationState)
+        _del(HealthOutcomeSnapshot)
+
+        # Funnel / events
+        _del(FunnelStep)
+        _del(Event)
+        _del(SessionModel)
+        _del(Funnel)
+
+        # Billing / integrations
+        _del(StripePayment)
+        _del(StripeSubscription)
+        _del(StripeEvent)
+        _del(StripeTreasuryTransaction)
+        _del(OAuthToken)
+
+        # Misc org-scoped
+        _del(Campaign)
+        _del(Recommendation)
+        _del(Feature)
+        _del(LlmUsageEvent)
+        _del(AuditLog)
+        _del(OrganizationTabPermission)
+        _del(OrganizationInvitation)
+        _del(UserOrganization)
+
+        # Clients before users
+        _del(Client)
+
+        # Per-user tab permissions for users in this org, then users
+        user_ids = [row[0] for row in db.query(User.id).filter(User.org_id == org_id).all()]
+        if user_ids:
+            db.query(UserTabPermission).filter(UserTabPermission.user_id.in_(user_ids)).delete(
+                synchronize_session=False
+            )
+        _del(User)
+
+        # Bypass ORM relationship nulling — delete the org row directly.
+        db.execute(text("DELETE FROM organizations WHERE id = :oid"), {"oid": org_id})
         db.commit()
-        
+
         return None
-        
+
     except Exception as e:
         db.rollback()
         raise HTTPException(

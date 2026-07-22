@@ -22,6 +22,10 @@ class ContentStudioKnowledgeItem(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-    organization = relationship("Organization", backref="content_studio_knowledge_items")
+    organization = relationship(
+        "Organization",
+        backref="content_studio_knowledge_items",
+        passive_deletes=True,
+    )
 
     __table_args__ = (Index("ix_cs_knowledge_org_kind", "org_id", "kind", "sort_order"),)
