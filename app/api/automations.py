@@ -21,15 +21,18 @@ from app.db.session import get_db
 from app.models.automation import (
     AutomationEmailJob,
     AutomationRule,
+    FLOW_VALUES,
     JobState,
     PLAYBOOK_VALUES,
-    Playbook,
+    ScheduleMode,
+    TriggerKind,
 )
 from app.models.client import Client
 from app.models.user import User
 from app.schemas.automation import (
     AutomationEmailJobListResponse,
     AutomationEmailJobRead,
+    AutomationFlowStepCreate,
     AutomationPreviewRequest,
     AutomationPreviewResponse,
     AutomationRuleRead,
@@ -64,7 +67,12 @@ def list_rules(
     rows = (
         db.query(AutomationRule)
         .filter(AutomationRule.org_id == org_id)
-        .order_by(AutomationRule.playbook)
+        .order_by(
+            AutomationRule.flow.asc().nulls_last(),
+            AutomationRule.trigger_kind.asc().nulls_last(),
+            AutomationRule.step_index.asc(),
+            AutomationRule.playbook.asc(),
+        )
         .all()
     )
     return [AutomationRuleRead.model_validate(r) for r in rows]
@@ -77,8 +85,9 @@ def update_rule(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin_or_owner),
 ):
-    if playbook not in PLAYBOOK_VALUES:
-        raise HTTPException(status_code=400, detail=f"unknown playbook '{playbook}'")
+    import re
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", playbook or ""):
+        raise HTTPException(status_code=400, detail=f"invalid playbook '{playbook}'")
     org_id = _resolve_org_id(current_user)
 
     rule = (
@@ -106,11 +115,116 @@ def update_rule(
     rule.combine_top_n = max(0, min(3, int(body.combine_top_n)))
     rule.require_approval = bool(body.require_approval)
     rule.approval_ttl_hours = int(body.approval_ttl_hours) if body.approval_ttl_hours else None
+    if body.flow is not None:
+        rule.flow = body.flow
+    if body.trigger_kind is not None:
+        rule.trigger_kind = body.trigger_kind
+    if body.schedule_mode is not None:
+        rule.schedule_mode = body.schedule_mode
+    if body.step_index is not None:
+        rule.step_index = int(body.step_index)
+    if body.node_kind is not None:
+        rule.node_kind = body.node_kind
     rule.last_modified_by = current_user.id
     rule.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(rule)
     return AutomationRuleRead.model_validate(rule)
+
+
+@router.post("/flows/{flow}/steps", response_model=AutomationRuleRead, status_code=201)
+def add_flow_step(
+    flow: str,
+    body: AutomationFlowStepCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """Add a wait or action node to a flow."""
+    if flow not in FLOW_VALUES:
+        raise HTTPException(status_code=400, detail=f"unknown flow '{flow}'")
+    org_id = _resolve_org_id(current_user)
+    seed_default_rules(db, org_id)
+
+    siblings = (
+        db.query(AutomationRule)
+        .filter(
+            AutomationRule.org_id == org_id,
+            AutomationRule.flow == flow,
+            AutomationRule.trigger_kind == body.trigger_kind,
+        )
+        .order_by(AutomationRule.step_index.asc())
+        .all()
+    )
+
+    insert_index = 10
+    if body.insert_before_playbook:
+        target = next((r for r in siblings if r.playbook == body.insert_before_playbook), None)
+        if target is not None:
+            insert_index = int(target.step_index)
+            for r in siblings:
+                if int(r.step_index) >= insert_index:
+                    r.step_index = int(r.step_index) + 10
+        else:
+            insert_index = (max((int(r.step_index) for r in siblings), default=-10) + 10)
+    else:
+        before_meeting = [
+            r for r in siblings if (r.schedule_mode or "") == ScheduleMode.BEFORE_MEETING.value
+        ]
+        if before_meeting and body.schedule_mode != ScheduleMode.BEFORE_MEETING.value:
+            insert_index = min(int(r.step_index) for r in before_meeting)
+            for r in siblings:
+                if int(r.step_index) >= insert_index:
+                    r.step_index = int(r.step_index) + 10
+        else:
+            insert_index = (max((int(r.step_index) for r in siblings), default=-10) + 10)
+
+    kind = body.node_kind or "action"
+    delay_default = int(body.delay_seconds or 0)
+    if kind == "wait" and delay_default <= 0:
+        delay_default = 3600
+
+    playbook = f"{flow}_{body.trigger_kind}_{kind}_{uuid.uuid4().hex[:8]}"
+    rule = AutomationRule(
+        id=uuid.uuid4(),
+        org_id=org_id,
+        playbook=playbook,
+        enabled=True,
+        flow=flow,
+        trigger_kind=body.trigger_kind,
+        schedule_mode=body.schedule_mode,
+        step_index=insert_index,
+        node_kind=kind,
+        delay_seconds=delay_default,
+        content_mode="ai_generated",
+        subject_template=None if kind == "wait" else body.subject_template,
+        combine_top_n=1,
+        require_approval=False,
+        last_modified_by=current_user.id,
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return AutomationRuleRead.model_validate(rule)
+
+
+@router.delete("/rules/{playbook}", status_code=204)
+def delete_flow_step(
+    playbook: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """Delete any automation step (wait or action) from the canvas."""
+    org_id = _resolve_org_id(current_user)
+    rule = (
+        db.query(AutomationRule)
+        .filter(AutomationRule.org_id == org_id, AutomationRule.playbook == playbook)
+        .first()
+    )
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    db.delete(rule)
+    db.commit()
+    return None
 
 
 # ----- Jobs -------------------------------------------------------------------

@@ -32,7 +32,12 @@ from app.models.automation import (
     AutomationRule,
     ContentMode,
     JobState,
+    PLAYBOOK_FLOW_DEFAULTS,
     Playbook,
+    ScheduleMode,
+    TriggerKind,
+    AutomationFlow,
+    NodeKind,
 )
 from app.models.client import Client, LifecycleState
 from app.models.client_call_insight import ClientCallInsight
@@ -334,6 +339,135 @@ def _get_rule(db: Session, org_id: uuid.UUID, playbook: str) -> Optional[Automat
     )
 
 
+def _list_trigger_steps(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    flow: str,
+    trigger_kind: str,
+) -> List[AutomationRule]:
+    """Ordered enabled+disabled steps for a flow trigger; caller filters enabled."""
+    rows = (
+        db.query(AutomationRule)
+        .filter(
+            AutomationRule.org_id == org_id,
+            AutomationRule.flow == flow,
+            AutomationRule.trigger_kind == trigger_kind,
+        )
+        .order_by(AutomationRule.step_index.asc(), AutomationRule.created_at.asc())
+        .all()
+    )
+    # Fallback for orgs that haven't been backfilled yet: map legacy playbooks.
+    if not rows:
+        legacy = [
+            pb
+            for pb, meta in PLAYBOOK_FLOW_DEFAULTS.items()
+            if meta.get("flow") == flow and meta.get("trigger_kind") == trigger_kind
+        ]
+        for pb in legacy:
+            rule = _get_rule(db, org_id, pb)
+            if rule:
+                rows.append(rule)
+        rows.sort(key=lambda r: int(getattr(r, "step_index", 0) or 0))
+    return rows
+
+
+def _schedule_for_step(
+    rule: AutomationRule,
+    *,
+    now: datetime,
+    prev_scheduled_at: Optional[datetime],
+    meeting_start: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Compute scheduled_at for one step. Returns None when the step should be skipped."""
+    mode = (rule.schedule_mode or ScheduleMode.AFTER_TRIGGER.value).strip()
+    delay = max(0, int(rule.delay_seconds or 0))
+
+    if mode == ScheduleMode.BEFORE_MEETING.value:
+        if meeting_start is None:
+            return None
+        start = meeting_start.replace(tzinfo=None) if meeting_start.tzinfo else meeting_start
+        if start <= now:
+            return None
+        scheduled = start - timedelta(seconds=delay)
+        return now if scheduled < now else scheduled
+
+    if mode == ScheduleMode.AFTER_PREVIOUS.value:
+        base = prev_scheduled_at or now
+        return base + timedelta(seconds=delay)
+
+    # after_booking / after_trigger
+    return now + timedelta(seconds=delay)
+
+
+def _enqueue_flow_steps(
+    db: Session,
+    *,
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+    client: Client,
+    flow: str,
+    trigger_kind: str,
+    trigger_event: str,
+    discriminator_base: str,
+    payload: Dict[str, Any],
+    meeting_start: Optional[datetime] = None,
+) -> List[uuid.UUID]:
+    """Enqueue every enabled step for a flow trigger with chained schedules."""
+    steps = _list_trigger_steps(db, org_id, flow=flow, trigger_kind=trigger_kind)
+    created: List[uuid.UUID] = []
+    now = _now()
+    prev_scheduled: Optional[datetime] = now
+
+    for idx, rule in enumerate(steps):
+        if not rule.enabled:
+            continue
+        if not audience_filter_passes(client, rule.audience_filter):
+            continue
+        scheduled = _schedule_for_step(
+            rule,
+            now=now,
+            prev_scheduled_at=prev_scheduled,
+            meeting_start=meeting_start,
+        )
+        if scheduled is None:
+            LOG.info(
+                "automation: skipping %s step %s — schedule unresolved (mode=%s)",
+                flow,
+                rule.playbook,
+                rule.schedule_mode,
+            )
+            continue
+
+        # Wait-only nodes shift the chain clock but never send email.
+        kind = (getattr(rule, "node_kind", None) or NodeKind.ACTION.value).strip().lower()
+        if kind == NodeKind.WAIT.value:
+            prev_scheduled = scheduled
+            continue
+
+        nid = _enqueue_job(
+            db,
+            org_id=org_id,
+            client_id=client_id,
+            rule=rule,
+            trigger_event=trigger_event,
+            discriminator=f"{discriminator_base}:{rule.playbook}:{idx}",
+            payload={
+                **payload,
+                "flow": flow,
+                "trigger_kind": trigger_kind,
+                "schedule_mode": rule.schedule_mode,
+                "step_index": rule.step_index,
+                "node_kind": kind,
+            },
+            scheduled_at=scheduled,
+        )
+        if nid:
+            created.append(nid)
+            prev_scheduled = scheduled
+    return created
+
+
 def _resolve_initial_state_and_schedule(
     rule: AutomationRule,
     *,
@@ -361,6 +495,10 @@ def _enqueue_job(
 ) -> Optional[uuid.UUID]:
     """Insert one job row idempotently. Returns the row id, or None when the conflict was hit."""
     if not rule.enabled:
+        return None
+    kind = (getattr(rule, "node_kind", None) or NodeKind.ACTION.value).strip().lower()
+    if kind == NodeKind.WAIT.value:
+        # Defense in depth — wait nodes must never become email jobs.
         return None
 
     state, scheduled = _resolve_initial_state_and_schedule(rule, scheduled_at=scheduled_at)
@@ -595,74 +733,28 @@ def on_payment_received(
         "paid_at": (paid_at or _now()).isoformat(),
     }
 
-    onboarding_rule = _get_rule(db, org_id, Playbook.FIRST_PAYMENT_ONBOARDING.value)
     onboarding_blocked = _client_has_any_onboarding_automation_job(db, org_id, client_id)
     if onboarding_blocked:
         LOG.info(
-            "automation: skipping first-payment onboarding for client %s -- "
+            "automation: skipping first-payment flow for client %s -- "
             "an onboarding automation job already exists for this client.",
             client_id,
         )
-    elif not onboarding_rule:
-        LOG.info(
-            "automation: skipping first-payment onboarding for client %s -- "
-            "no first_payment_onboarding rule for org %s.",
-            client_id,
-            org_id,
-        )
-    elif not onboarding_rule.enabled:
-        LOG.info(
-            "automation: skipping first-payment onboarding for client %s -- "
-            "rule exists but is disabled for org %s.",
-            client_id,
-            org_id,
-        )
-    elif not audience_filter_passes(client, onboarding_rule.audience_filter):
-        LOG.info(
-            "automation: skipping first-payment onboarding for client %s -- "
-            "audience filter rejected lifecycle=%s filter=%s.",
-            client_id,
-            getattr(client.lifecycle_state, "value", client.lifecycle_state),
-            onboarding_rule.audience_filter,
-        )
-    onboarding_discriminator = f"lifetime_once:{client_id}"
-    if (
-        onboarding_rule
-        and onboarding_rule.enabled
-        and audience_filter_passes(client, onboarding_rule.audience_filter)
-        and not onboarding_blocked
-    ):
-        nid = _enqueue_job(
-            db,
-            org_id=org_id,
-            client_id=client_id,
-            rule=onboarding_rule,
-            trigger_event="payment.first.onboarding",
-            discriminator=onboarding_discriminator,
-            payload=payload,
-        )
-        if nid:
-            created.append(nid)
-            LOG.info(
-                "automation: enqueued first_payment_onboarding job %s for client %s.",
-                nid,
-                client_id,
-            )
+        return []
 
-    referral_rule = _get_rule(db, org_id, Playbook.FIRST_PAYMENT_REFERRAL.value)
-    if referral_rule and referral_rule.enabled and audience_filter_passes(client, referral_rule.audience_filter):
-        nid = _enqueue_job(
-            db,
-            org_id=org_id,
-            client_id=client_id,
-            rule=referral_rule,
-            trigger_event="payment.first.referral",
-            discriminator=discriminator,
-            payload=payload,
-        )
-        if nid:
-            created.append(nid)
-    return created
+    # Lifetime-once gate for the first (step_index 0) onboarding email; subsequent
+    # payment-flow emails share the payment discriminator so retries stay idempotent.
+    return _enqueue_flow_steps(
+        db,
+        org_id=org_id,
+        client_id=client_id,
+        client=client,
+        flow=AutomationFlow.ONBOARDING.value,
+        trigger_kind=TriggerKind.PAYMENT.value,
+        trigger_event="payment.first",
+        discriminator_base=f"lifetime_once:{client_id}:{discriminator}",
+        payload=payload,
+    )
 
 
 def on_call_insight_processed(
@@ -673,16 +765,12 @@ def on_call_insight_processed(
     insight_id: uuid.UUID,
 ) -> List[uuid.UUID]:
     """
-    Enqueue the win_combined_ask playbook when an insight has a win signal.
+    Enqueue wins-ascension emails when an insight has a win signal.
 
     The "combined ask" decision (referral vs upsell vs testimonial) is computed at
     worker render time from the same insight + ladder + ai_profile, so previews and
     actual sends agree. We only enqueue here.
     """
-    rule = _get_rule(db, org_id, Playbook.WIN_COMBINED_ASK.value)
-    if not rule or not rule.enabled:
-        return []
-
     insight = db.query(ClientCallInsight).filter(ClientCallInsight.id == insight_id).first()
     if not insight or insight.status != "complete":
         return []
@@ -700,8 +788,6 @@ def on_call_insight_processed(
     )
     if not client:
         return []
-    if not audience_filter_passes(client, rule.audience_filter):
-        return []
 
     payload = {
         "trigger": "win_detected",
@@ -710,16 +796,17 @@ def on_call_insight_processed(
         "opportunity_tags": roi_tags,
         "wins": wins[:8],
     }
-    nid = _enqueue_job(
+    return _enqueue_flow_steps(
         db,
         org_id=org_id,
         client_id=client_id,
-        rule=rule,
+        client=client,
+        flow=AutomationFlow.WINS_ASCENSION.value,
+        trigger_kind=TriggerKind.WIN.value,
         trigger_event="call_insight.win",
-        discriminator=f"insight:{insight_id}",
+        discriminator_base=f"insight:{insight_id}",
         payload=payload,
     )
-    return [nid] if nid else []
 
 
 def _has_no_recorded_sale(
@@ -799,28 +886,35 @@ def on_booking_created_pre_sale(
     start_time: Optional[datetime] = None,
 ) -> List[uuid.UUID]:
     """
-    Enqueue post-booking emails for a freshly created booking:
+    Enqueue post-booking flow emails for a freshly created booking.
 
-    1. ``pre_sale_post_booking`` — delayed by ``delay_seconds`` after booking lands.
-    2. ``pre_sale_pre_meeting`` — scheduled ``delay_seconds`` before meeting start
-       (requires a known ``start_time``).
+    Steps use ``schedule_mode``:
+      - after_booking / after_previous — delay from booking (chained)
+      - before_meeting — delay before meeting start (requires start_time)
 
-    Both share the post-booking rule's ``trigger_config`` (event picker). The
-    pre-meeting rule only needs to be enabled and have its own content + wait.
+    Event matching uses the lowest step_index booking step that has trigger_config,
+    preferring the canonical ``pre_sale_post_booking`` rule when present.
     """
-    post_rule = _get_rule(db, org_id, Playbook.PRE_SALE_POST_BOOKING.value)
-    pre_meeting_rule = _get_rule(db, org_id, Playbook.PRE_SALE_PRE_MEETING.value)
-
-    # Event matching uses the post-booking rule's trigger_config as the shared source.
-    # If only pre-meeting is configured somehow, fall back to its config.
-    match_rule = post_rule or pre_meeting_rule
-    if not match_rule:
+    steps = _list_trigger_steps(
+        db,
+        org_id,
+        flow=AutomationFlow.POST_BOOKING.value,
+        trigger_kind=TriggerKind.BOOKING.value,
+    )
+    if not steps:
         return []
 
-    trigger_config = match_rule.trigger_config if isinstance(match_rule.trigger_config, dict) else None
-    # Prefer post_booking trigger_config when both exist.
-    if post_rule and isinstance(post_rule.trigger_config, dict):
-        trigger_config = post_rule.trigger_config
+    post_rule = next(
+        (r for r in steps if r.playbook == Playbook.PRE_SALE_POST_BOOKING.value),
+        steps[0],
+    )
+    trigger_config = post_rule.trigger_config if isinstance(post_rule.trigger_config, dict) else None
+    for r in steps:
+        if isinstance(r.trigger_config, dict) and (
+            r.trigger_config.get("event_type_ids") or r.trigger_config.get("match_all_events")
+        ):
+            trigger_config = r.trigger_config
+            break
 
     if not _booking_matches_trigger_config(
         provider=str(provider).lower(),
@@ -876,64 +970,20 @@ def on_booking_created_pre_sale(
         "attendee_email": attendee_email,
         "start_time": start_time.isoformat() if start_time else None,
     }
-    created: List[uuid.UUID] = []
     disc_base = f"{str(provider).lower()}:{external_booking_id}"
 
-    if (
-        post_rule
-        and post_rule.enabled
-        and audience_filter_passes(client, post_rule.audience_filter)
-    ):
-        nid = _enqueue_job(
-            db,
-            org_id=org_id,
-            client_id=client_id,
-            rule=post_rule,
-            trigger_event="booking.created.pre_sale",
-            discriminator=disc_base,
-            payload=payload,
-        )
-        if nid:
-            created.append(nid)
-
-    if (
-        pre_meeting_rule
-        and pre_meeting_rule.enabled
-        and audience_filter_passes(client, pre_meeting_rule.audience_filter)
-    ):
-        if start_naive is None:
-            LOG.info(
-                "automation: skipping pre_sale_pre_meeting for client %s -- "
-                "booking has no start_time.",
-                client_id,
-            )
-        else:
-            offset = max(0, int(pre_meeting_rule.delay_seconds or 0))
-            scheduled = start_naive - timedelta(seconds=offset)
-            now = _now()
-            if start_naive <= now:
-                LOG.info(
-                    "automation: skipping pre_sale_pre_meeting for client %s -- "
-                    "meeting already started.",
-                    client_id,
-                )
-            else:
-                if scheduled < now:
-                    scheduled = now
-                nid = _enqueue_job(
-                    db,
-                    org_id=org_id,
-                    client_id=client_id,
-                    rule=pre_meeting_rule,
-                    trigger_event="booking.created.pre_meeting",
-                    discriminator=f"{disc_base}:pre_meeting",
-                    payload={**payload, "schedule_mode": "before_meeting", "offset_seconds": offset},
-                    scheduled_at=scheduled,
-                )
-                if nid:
-                    created.append(nid)
-
-    return created
+    return _enqueue_flow_steps(
+        db,
+        org_id=org_id,
+        client_id=client_id,
+        client=client,
+        flow=AutomationFlow.POST_BOOKING.value,
+        trigger_kind=TriggerKind.BOOKING.value,
+        trigger_event="booking.created.pre_sale",
+        discriminator_base=disc_base,
+        payload=payload,
+        meeting_start=start_naive,
+    )
 
 
 def on_lifecycle_entered_offboarding(
@@ -942,10 +992,7 @@ def on_lifecycle_entered_offboarding(
     org_id: uuid.UUID,
     client_id: uuid.UUID,
 ) -> List[uuid.UUID]:
-    """Enqueue offboarding_recap_ask once per client per offboarding window (date-bucketed)."""
-    rule = _get_rule(db, org_id, Playbook.OFFBOARDING_RECAP_ASK.value)
-    if not rule or not rule.enabled:
-        return []
+    """Enqueue offboarding flow emails once per client per offboarding window (date-bucketed)."""
     client = (
         db.query(Client)
         .filter(Client.id == client_id, Client.org_id == org_id)
@@ -953,21 +1000,20 @@ def on_lifecycle_entered_offboarding(
     )
     if not client:
         return []
-    if not audience_filter_passes(client, rule.audience_filter):
-        return []
 
     today = _now().strftime("%Y-%m-%d")
     payload = {"trigger": "lifecycle.offboarding", "entered_at": _now().isoformat()}
-    nid = _enqueue_job(
+    return _enqueue_flow_steps(
         db,
         org_id=org_id,
         client_id=client_id,
-        rule=rule,
+        client=client,
+        flow=AutomationFlow.WINS_ASCENSION.value,
+        trigger_kind=TriggerKind.OFFBOARDING.value,
         trigger_event="lifecycle.offboarding",
-        discriminator=f"offboarding:{today}",
+        discriminator_base=f"offboarding:{today}",
         payload=payload,
     )
-    return [nid] if nid else []
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +1024,7 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
     """
     Insert disabled default rules for any playbooks the org doesn't have yet.
 
-    This is called from the ``GET /automations/rules`` handler so the four defaults
+    This is called from the ``GET /automations/rules`` handler so the defaults
     show up the first time a user opens the Automations tab.
     """
     existing = {
@@ -992,13 +1038,7 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
                 "delay_seconds": 0,
                 "content_mode": ContentMode.AI_GENERATED.value,
                 "subject_template": "Quick note before our call, {{first_name}}",
-                # Lifecycle filter intentionally permissive: pre-sale leads can be in any
-                # non-paying state. The "no recorded sale" check inside the engine is the
-                # real gate; audience_filter is left for advanced segmentation if needed.
                 "audience_filter": None,
-                # Trigger config defaults to "no events selected" so seeding doesn't
-                # accidentally email every new booking. Operator opens the card and picks
-                # the specific Cal.com / Calendly events that should fire.
                 "trigger_config": {
                     "provider": "any",
                     "event_type_ids": [],
@@ -1006,21 +1046,20 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
                 },
                 "combine_top_n": 1,
                 "require_approval": False,
+                **PLAYBOOK_FLOW_DEFAULTS[Playbook.PRE_SALE_POST_BOOKING.value],
             },
         ),
         (
             Playbook.PRE_SALE_PRE_MEETING.value,
             {
-                # delay_seconds = how long BEFORE the meeting to send (not after trigger).
-                "delay_seconds": 2 * 60 * 60,  # 2 hours before meeting
+                "delay_seconds": 2 * 60 * 60,
                 "content_mode": ContentMode.AI_GENERATED.value,
                 "subject_template": "Looking forward to talking soon, {{first_name}}",
                 "audience_filter": None,
-                # Shares the post-booking rule's trigger_config at enqueue time;
-                # no separate event picker needed on this card.
                 "trigger_config": None,
                 "combine_top_n": 1,
                 "require_approval": False,
+                **PLAYBOOK_FLOW_DEFAULTS[Playbook.PRE_SALE_PRE_MEETING.value],
             },
         ),
         (
@@ -1032,17 +1071,19 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
                 "audience_filter": {"lifecycle_in": ["active"]},
                 "combine_top_n": 1,
                 "require_approval": False,
+                **PLAYBOOK_FLOW_DEFAULTS[Playbook.FIRST_PAYMENT_ONBOARDING.value],
             },
         ),
         (
             Playbook.FIRST_PAYMENT_REFERRAL.value,
             {
-                "delay_seconds": 60 * 60,  # one hour after onboarding
+                "delay_seconds": 60 * 60,
                 "content_mode": ContentMode.AI_GENERATED.value,
                 "subject_template": "One quick favor — share with a friend",
                 "audience_filter": {"lifecycle_in": ["active"]},
                 "combine_top_n": 1,
                 "require_approval": False,
+                **PLAYBOOK_FLOW_DEFAULTS[Playbook.FIRST_PAYMENT_REFERRAL.value],
             },
         ),
         (
@@ -1052,13 +1093,11 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
                 "content_mode": ContentMode.AI_GENERATED.value,
                 "subject_template": None,
                 "audience_filter": {"lifecycle_in": ["active", "offboarding"]},
-                # Empty opportunity_priority + combine_top_n=3 = full LLM autonomy.
-                # The picker is free to choose 1, 2, or all 3 of
-                # {referral, upsell, testimonial} based on the client's signals.
                 "opportunity_priority": [],
                 "combine_top_n": 3,
                 "require_approval": True,
                 "approval_ttl_hours": 48,
+                **PLAYBOOK_FLOW_DEFAULTS[Playbook.WIN_COMBINED_ASK.value],
             },
         ),
         (
@@ -1072,6 +1111,7 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
                 "combine_top_n": 3,
                 "require_approval": True,
                 "approval_ttl_hours": 72,
+                **PLAYBOOK_FLOW_DEFAULTS[Playbook.OFFBOARDING_RECAP_ASK.value],
             },
         ),
     ]
@@ -1079,6 +1119,16 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
     created: List[AutomationRule] = []
     for playbook, defaults_dict in defaults:
         if playbook in existing:
+            # Backfill flow metadata on older rows.
+            row = existing[playbook]
+            meta = PLAYBOOK_FLOW_DEFAULTS.get(playbook) or {}
+            dirty = False
+            for key, val in meta.items():
+                if getattr(row, key, None) in (None, ""):
+                    setattr(row, key, val)
+                    dirty = True
+            if dirty:
+                row.updated_at = datetime.utcnow()
             continue
         rule = AutomationRule(
             id=uuid.uuid4(),
@@ -1089,6 +1139,7 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
         )
         db.add(rule)
         created.append(rule)
+
     if created:
         db.flush()
     return created

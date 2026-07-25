@@ -45,6 +45,87 @@ class Playbook(str, enum.Enum):
 
 PLAYBOOK_VALUES = tuple(p.value for p in Playbook)
 
+# UI / product flows that group playbook steps into Automations tab panels.
+class AutomationFlow(str, enum.Enum):
+    POST_BOOKING = "post_booking"
+    ONBOARDING = "onboarding"
+    WINS_ASCENSION = "wins_ascension"
+
+
+FLOW_VALUES = tuple(f.value for f in AutomationFlow)
+
+
+class ScheduleMode(str, enum.Enum):
+    AFTER_TRIGGER = "after_trigger"  # delay from the domain event (payment/win/offboarding)
+    AFTER_BOOKING = "after_booking"  # delay from booking lands
+    AFTER_PREVIOUS = "after_previous"  # delay chained from previous step's scheduled_at
+    BEFORE_MEETING = "before_meeting"  # delay before meeting start_time
+
+
+SCHEDULE_MODE_VALUES = tuple(m.value for m in ScheduleMode)
+
+
+class TriggerKind(str, enum.Enum):
+    BOOKING = "booking"
+    PAYMENT = "payment"
+    WIN = "win"
+    OFFBOARDING = "offboarding"
+
+
+TRIGGER_KIND_VALUES = tuple(t.value for t in TriggerKind)
+
+
+class NodeKind(str, enum.Enum):
+    ACTION = "action"  # email / playbook send
+    WAIT = "wait"  # delay only — does not enqueue a send job
+
+
+NODE_KIND_VALUES = tuple(k.value for k in NodeKind)
+
+# Canonical seeded playbooks (still used as defaults). Deletable from the canvas —
+# operators own the full graph. Kept as a set for soft labeling only.
+PROTECTED_PLAYBOOKS = frozenset(PLAYBOOK_VALUES)
+
+# Default flow metadata for the six seeded playbooks.
+PLAYBOOK_FLOW_DEFAULTS: dict[str, dict[str, object]] = {
+    Playbook.PRE_SALE_POST_BOOKING.value: {
+        "flow": AutomationFlow.POST_BOOKING.value,
+        "trigger_kind": TriggerKind.BOOKING.value,
+        "schedule_mode": ScheduleMode.AFTER_BOOKING.value,
+        "step_index": 0,
+    },
+    Playbook.PRE_SALE_PRE_MEETING.value: {
+        "flow": AutomationFlow.POST_BOOKING.value,
+        "trigger_kind": TriggerKind.BOOKING.value,
+        "schedule_mode": ScheduleMode.BEFORE_MEETING.value,
+        "step_index": 100,
+    },
+    Playbook.FIRST_PAYMENT_ONBOARDING.value: {
+        "flow": AutomationFlow.ONBOARDING.value,
+        "trigger_kind": TriggerKind.PAYMENT.value,
+        "schedule_mode": ScheduleMode.AFTER_TRIGGER.value,
+        "step_index": 0,
+    },
+    Playbook.FIRST_PAYMENT_REFERRAL.value: {
+        "flow": AutomationFlow.ONBOARDING.value,
+        "trigger_kind": TriggerKind.PAYMENT.value,
+        "schedule_mode": ScheduleMode.AFTER_PREVIOUS.value,
+        "step_index": 10,
+    },
+    Playbook.WIN_COMBINED_ASK.value: {
+        "flow": AutomationFlow.WINS_ASCENSION.value,
+        "trigger_kind": TriggerKind.WIN.value,
+        "schedule_mode": ScheduleMode.AFTER_TRIGGER.value,
+        "step_index": 0,
+    },
+    Playbook.OFFBOARDING_RECAP_ASK.value: {
+        "flow": AutomationFlow.WINS_ASCENSION.value,
+        "trigger_kind": TriggerKind.OFFBOARDING.value,
+        "schedule_mode": ScheduleMode.AFTER_TRIGGER.value,
+        "step_index": 0,
+    },
+}
+
 
 class JobState(str, enum.Enum):
     SCHEDULED = "scheduled"
@@ -80,6 +161,17 @@ class AutomationRule(Base):
 
     playbook = Column(String(64), nullable=False)
     enabled = Column(Boolean, nullable=False, default=False)
+
+    # Flow grouping for the Automations tab (post_booking / onboarding / wins_ascension).
+    flow = Column(String(32), nullable=True, index=True)
+    # Which domain event starts this step's chain within the flow.
+    trigger_kind = Column(String(32), nullable=True, index=True)
+    # How delay_seconds is interpreted when the job is enqueued.
+    schedule_mode = Column(String(32), nullable=True)
+    # Order within (org, flow, trigger_kind). Lower runs first.
+    step_index = Column(Integer, nullable=False, default=0)
+    # action = send email; wait = delay-only node (no outbound job).
+    node_kind = Column(String(16), nullable=False, default="action", server_default="action")
 
     delay_seconds = Column(Integer, nullable=False, default=0)
     content_mode = Column(String(32), nullable=False, default=ContentMode.AI_GENERATED.value)

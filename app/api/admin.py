@@ -655,7 +655,6 @@ def delete_organization(
         _del(PortalSharedPad)
         _del_table("resource_documents")
         _del_table("org_resource_library")
-        _del_table("n8n_event_deliveries")
         _del_table("automation_email_jobs")
         _del_table("automation_rules")
         _del_table("whop_payments")

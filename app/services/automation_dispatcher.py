@@ -34,6 +34,7 @@ from app.models.automation import (
     AutomationRule,
     AutomationWorkerHeartbeat,
     JobState,
+    NodeKind,
 )
 from app.models.client import Client
 from app.services.automation_drafts import (
@@ -262,6 +263,14 @@ def _process_one(db: Session, job: AutomationEmailJob) -> None:
     if rule is None or not rule.enabled:
         job.state = JobState.SKIPPED.value
         job.error_text = "Rule missing or disabled at send time"
+        job.updated_at = datetime.utcnow()
+        db.commit()
+        return
+
+    kind = (getattr(rule, "node_kind", None) or NodeKind.ACTION.value).strip().lower()
+    if kind == NodeKind.WAIT.value:
+        job.state = JobState.SKIPPED.value
+        job.error_text = "Wait node cannot send email"
         job.updated_at = datetime.utcnow()
         db.commit()
         return

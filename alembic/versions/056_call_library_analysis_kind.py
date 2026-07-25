@@ -1,16 +1,18 @@
 """Add analysis_kind to call_library_reports (sales vs glance).
 
 Revision ID: 056
-Revises: 055
+Revises: 054
 
 Full sales-call audits vs lightweight non-sales glance summaries.
+
+Note: revision 055 never landed in this repo; chain is 054 -> 056 -> 057.
 """
 
 from alembic import op
 import sqlalchemy as sa
 
 revision = "056"
-down_revision = "055"
+down_revision = "054"
 branch_labels = None
 depends_on = None
 

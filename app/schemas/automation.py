@@ -9,8 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.automation import (
     CONTENT_MODE_VALUES,
+    FLOW_VALUES,
     JOB_STATE_VALUES,
+    NODE_KIND_VALUES,
     PLAYBOOK_VALUES,
+    SCHEDULE_MODE_VALUES,
+    TRIGGER_KIND_VALUES,
 )
 
 
@@ -62,6 +66,12 @@ class AutomationRuleBase(BaseModel):
     combine_top_n: int = Field(1, ge=0, le=3)
     require_approval: bool = False
     approval_ttl_hours: Optional[int] = Field(None, ge=1, le=24 * 14)
+    # Flow metadata (optional on update — preserve existing when omitted).
+    flow: Optional[str] = None
+    trigger_kind: Optional[str] = None
+    schedule_mode: Optional[str] = None
+    step_index: Optional[int] = Field(None, ge=0, le=10_000)
+    node_kind: Optional[str] = None
 
     @field_validator("ai_content_system_prompt")
     @classmethod
@@ -76,6 +86,42 @@ class AutomationRuleBase(BaseModel):
     def _validate_content_mode(cls, v: str) -> str:
         if v not in CONTENT_MODE_VALUES:
             raise ValueError(f"content_mode must be one of {CONTENT_MODE_VALUES}")
+        return v
+
+    @field_validator("flow")
+    @classmethod
+    def _validate_flow(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if v not in FLOW_VALUES:
+            raise ValueError(f"flow must be one of {FLOW_VALUES}")
+        return v
+
+    @field_validator("trigger_kind")
+    @classmethod
+    def _validate_trigger_kind(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if v not in TRIGGER_KIND_VALUES:
+            raise ValueError(f"trigger_kind must be one of {TRIGGER_KIND_VALUES}")
+        return v
+
+    @field_validator("schedule_mode")
+    @classmethod
+    def _validate_schedule_mode(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if v not in SCHEDULE_MODE_VALUES:
+            raise ValueError(f"schedule_mode must be one of {SCHEDULE_MODE_VALUES}")
+        return v
+
+    @field_validator("node_kind")
+    @classmethod
+    def _validate_node_kind(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if v not in NODE_KIND_VALUES:
+            raise ValueError(f"node_kind must be one of {NODE_KIND_VALUES}")
         return v
 
     @field_validator("opportunity_priority")
@@ -99,9 +145,52 @@ class AutomationRuleRead(AutomationRuleBase):
     id: uuid.UUID
     org_id: uuid.UUID
     playbook: str
+    flow: Optional[str] = None
+    trigger_kind: Optional[str] = None
+    schedule_mode: Optional[str] = None
+    step_index: int = 0
+    node_kind: str = "action"
     last_modified_by: Optional[uuid.UUID] = None
     created_at: datetime
     updated_at: datetime
+    is_protected: bool = False
+
+    def model_post_init(self, __context: Any) -> None:
+        # Soft label only — canvas allows deleting any step.
+        object.__setattr__(self, "is_protected", False)
+        if not self.node_kind:
+            object.__setattr__(self, "node_kind", "action")
+
+
+class AutomationFlowStepCreate(BaseModel):
+    """Add a wait or action node to a flow trigger chain."""
+    trigger_kind: str
+    node_kind: str = "action"
+    schedule_mode: str = "after_previous"
+    delay_seconds: int = Field(0, ge=0, le=60 * 60 * 24 * 14)
+    subject_template: Optional[str] = "Quick follow-up, {{first_name}}"
+    insert_before_playbook: Optional[str] = None
+
+    @field_validator("trigger_kind")
+    @classmethod
+    def _validate_trigger_kind(cls, v: str) -> str:
+        if v not in TRIGGER_KIND_VALUES:
+            raise ValueError(f"trigger_kind must be one of {TRIGGER_KIND_VALUES}")
+        return v
+
+    @field_validator("schedule_mode")
+    @classmethod
+    def _validate_schedule_mode(cls, v: str) -> str:
+        if v not in SCHEDULE_MODE_VALUES:
+            raise ValueError(f"schedule_mode must be one of {SCHEDULE_MODE_VALUES}")
+        return v
+
+    @field_validator("node_kind")
+    @classmethod
+    def _validate_node_kind(cls, v: str) -> str:
+        if v not in NODE_KIND_VALUES:
+            raise ValueError(f"node_kind must be one of {NODE_KIND_VALUES}")
+        return v
 
 
 # -- Jobs ----------------------------------------------------------------------
@@ -180,8 +269,9 @@ class AutomationPreviewRequest(BaseModel):
     @field_validator("playbook")
     @classmethod
     def _validate_playbook(cls, v: str) -> str:
-        if v not in PLAYBOOK_VALUES:
-            raise ValueError(f"playbook must be one of {PLAYBOOK_VALUES}")
+        import re
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", v or ""):
+            raise ValueError("playbook must be a lowercase snake_case id (max 63 chars)")
         return v
 
 

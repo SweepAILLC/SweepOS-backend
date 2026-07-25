@@ -6,11 +6,12 @@ from app.db.session import Base
 
 MAX_SHARED_PADS_PER_ORG = 10
 
-# Default body for the first org pad (consulting onboarding checklist).
-DEFAULT_SHARED_PAD_CONTENT = """Onboarding Checklist:
-□ Complete Tally Forms Client Service Agreement (https://tally.so/r/mJyDAX)
-□ Fill out Tally Forms Onboarding Form (https://tally.so/r/KY0yqg)
-□ Join Discord — Join the Sweep Team Discord Server! (https://discord.gg/7BAPM45R7y)
+# Default body for the first org pad (Markdown — headings + task checkboxes).
+DEFAULT_SHARED_PAD_CONTENT = """## Onboarding Checklist
+
+- [ ] Complete Tally Forms Client Service Agreement (https://tally.so/r/mJyDAX)
+- [ ] Fill out Tally Forms Onboarding Form (https://tally.so/r/KY0yqg)
+- [ ] Join Discord — Join the Sweep Team Discord Server! (https://discord.gg/7BAPM45R7y)
 """
 
 DEFAULT_SHARED_PAD_TITLE = "Onboarding"
