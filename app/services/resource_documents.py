@@ -6,7 +6,8 @@ import logging
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 from sqlalchemy import text
@@ -408,7 +409,7 @@ def _default_for(resource_id: str) -> Optional[Dict[str, Any]]:
 
 
 def normalize_video_url(raw: Optional[str]) -> Optional[str]:
-    """Accept only absolute HTTP(S) URLs for resource video embeds."""
+    """Accept only absolute HTTP(S) URLs for resource embeds (video / Figma / Fathom / …)."""
     value = (raw or "").strip()
     if not value:
         return None
@@ -416,6 +417,70 @@ def normalize_video_url(raw: Optional[str]) -> Optional[str]:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError("invalid_video_url")
     return value[:2048]
+
+
+def parse_video_urls(stored: Optional[str]) -> List[str]:
+    """Expand a stored video_url field into a list (single URL or JSON array)."""
+    if not stored:
+        return []
+    value = stored.strip()
+    if not value:
+        return []
+    if value.startswith("["):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                out: List[str] = []
+                for item in parsed:
+                    if isinstance(item, str) and item.strip():
+                        out.append(item.strip()[:2048])
+                return out
+        except json.JSONDecodeError:
+            pass
+    if "\n" in value:
+        return [line.strip()[:2048] for line in value.splitlines() if line.strip()]
+    return [value[:2048]]
+
+
+def normalize_video_urls_storage(
+    raw: Optional[Union[str, List[Any]]],
+) -> Optional[str]:
+    """
+    Persist one or many embed URLs in video_url TEXT.
+    - Single URL → plain string (back-compat)
+    - Multiple → JSON array string
+    """
+    urls: List[str] = []
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        for item in raw:
+            if item is None:
+                continue
+            u = normalize_video_url(str(item))
+            if u and u not in urls:
+                urls.append(u)
+    else:
+        text = str(raw).strip()
+        if not text:
+            return None
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return normalize_video_urls_storage(parsed)
+            except json.JSONDecodeError:
+                pass
+        if "\n" in text:
+            return normalize_video_urls_storage(
+                [line.strip() for line in text.splitlines() if line.strip()]
+            )
+        return normalize_video_url(text)
+    if not urls:
+        return None
+    if len(urls) == 1:
+        return urls[0]
+    return json.dumps(urls)
 
 
 SOP_CATEGORIES = {"foundations", "marketing", "sales", "operations", "fulfillment"}
@@ -433,6 +498,7 @@ def normalize_sop_category(raw: Optional[str], category: str) -> Optional[str]:
 
 
 def _row_to_dict(row) -> Dict[str, Any]:
+    urls = parse_video_urls(row[7])
     return {
         "resource_id": row[0],
         "category": row[1],
@@ -441,7 +507,8 @@ def _row_to_dict(row) -> Dict[str, Any]:
         "description": row[4] or "",
         "content": row[5] or "",
         "powered_by": row[6],
-        "video_url": row[7],
+        "video_url": urls[0] if urls else None,
+        "video_urls": urls,
         "is_custom": bool(row[8]),
         "updated_at": row[9].isoformat() if row[9] else None,
         "sort_order": row[10] if len(row) > 10 else None,
@@ -480,9 +547,13 @@ def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
                 doc["sop_category"] = builtin.get("sop_category")
             if not doc.get("video_url"):
                 doc["video_url"] = builtin.get("video_url")
+            if not doc.get("video_urls"):
+                vu = doc.get("video_url") or builtin.get("video_url")
+                doc["video_urls"] = [vu] if vu else []
             doc["is_builtin"] = True
             out.append(doc)
         else:
+            vu = builtin.get("video_url")
             out.append(
                 {
                     "resource_id": rid,
@@ -492,7 +563,8 @@ def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
                     "description": builtin["description"],
                     "content": "",
                     "powered_by": builtin.get("powered_by"),
-                    "video_url": builtin.get("video_url"),
+                    "video_url": vu,
+                    "video_urls": [vu] if vu else [],
                     "is_custom": False,
                     "is_builtin": True,
                     "updated_at": None,
@@ -546,6 +618,9 @@ def get_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> Optional[Dict[s
             doc["sop_category"] = builtin.get("sop_category")
         if builtin and not doc.get("video_url"):
             doc["video_url"] = builtin.get("video_url")
+        if builtin and not doc.get("video_urls"):
+            vu = doc.get("video_url") or builtin.get("video_url")
+            doc["video_urls"] = [vu] if vu else []
         if builtin and not (doc.get("content") or "").strip():
             doc["content"] = _load_default_content(builtin["file_name"])
         doc["is_builtin"] = builtin is not None
@@ -555,6 +630,7 @@ def get_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> Optional[Dict[s
     if not builtin:
         return None
 
+    vu = builtin.get("video_url")
     return {
         "resource_id": resource_id,
         "category": builtin.get("category") or "SOP",
@@ -563,7 +639,8 @@ def get_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> Optional[Dict[s
         "description": builtin["description"],
         "content": _load_default_content(builtin["file_name"]),
         "powered_by": builtin.get("powered_by"),
-        "video_url": builtin.get("video_url"),
+        "video_url": vu,
+        "video_urls": [vu] if vu else [],
         "is_custom": False,
         "is_builtin": True,
         "updated_at": None,
@@ -596,7 +673,7 @@ def upsert_doc(
     description: str,
     content: str,
     powered_by: Optional[str],
-    video_url: Optional[str],
+    video_url: Optional[Union[str, List[Any]]],
     user_id: uuid.UUID,
     is_custom: bool = False,
 ) -> Dict[str, Any]:
@@ -630,7 +707,7 @@ def upsert_doc(
             "description": description[:800],
             "content": content,
             "powered_by": (powered_by or None),
-            "video_url": normalize_video_url(video_url),
+            "video_url": normalize_video_urls_storage(video_url),
             "is_custom": is_custom,
             "user_id": str(user_id),
         },
@@ -755,7 +832,7 @@ def create_doc(
     description: str,
     content: str,
     powered_by: Optional[str],
-    video_url: Optional[str],
+    video_url: Optional[Union[str, List[Any]]],
     user_id: uuid.UUID,
     resource_id: Optional[str] = None,
 ) -> Dict[str, Any]:

@@ -71,18 +71,41 @@ def get_stripe_connection_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Check if Stripe is connected via OAuth."""
+    """Check if Stripe is connected via OAuth (legacy v2 router)."""
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
     oauth_token = db.query(OAuthToken).filter(
-        OAuthToken.provider == OAuthProvider.STRIPE
+        OAuthToken.provider == OAuthProvider.STRIPE,
+        OAuthToken.org_id == org_id,
     ).first()
+
+    from app.services.stripe_webhook_onboard import (
+        stripe_webhook_destination_for_org,
+        webhook_status_for_token,
+    )
+    destination = stripe_webhook_destination_for_org(org_id)
     
     if oauth_token and oauth_token.access_token:
+        wh = webhook_status_for_token(
+            connected=True,
+            webhook_endpoint_id=oauth_token.webhook_endpoint_id,
+            webhook_secret=oauth_token.webhook_secret,
+            destination_url=destination,
+        )
         return StripeConnectionStatus(
             connected=True,
             message="Stripe is connected.",
-            account_id=oauth_token.account_id
+            account_id=oauth_token.account_id,
+            webhook_active=wh["webhook_active"],
+            webhook_status=wh["webhook_status"],
+            webhook_endpoint_id=wh["webhook_endpoint_id"],
+            webhook_url=wh["webhook_url"],
         )
-    return StripeConnectionStatus(connected=False, message="Stripe is not connected.")
+    return StripeConnectionStatus(
+        connected=False,
+        message="Stripe is not connected.",
+        webhook_status="not_configured",
+        webhook_url=destination,
+    )
 
 
 @router.get("/summary", response_model=StripeSummaryResponse)

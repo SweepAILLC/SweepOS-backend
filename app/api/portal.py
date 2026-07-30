@@ -2,6 +2,7 @@
 Org portal API — consulting program shared pads (and legacy todos).
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from uuid import UUID
@@ -28,6 +29,33 @@ from app.services import portal_shared_pads as pads_svc
 router = APIRouter()
 
 _VALID_CONSULTING_TIERS = frozenset({"pro_consulting", "core_consulting"})
+
+
+@router.get("/org-info")
+def get_portal_org_info(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return basic org stats visible in the client consulting portal."""
+    org_id = _org_id(current_user)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    user_count = db.query(func.count(User.id)).filter(User.org_id == org_id).scalar() or 0
+
+    funnel_count = 0
+    try:
+        from app.models.funnel import Funnel
+        funnel_count = db.query(func.count(Funnel.id)).filter(Funnel.org_id == org_id).scalar() or 0
+    except Exception:
+        pass
+
+    return {
+        "max_user_seats": org.max_user_seats,
+        "total_users": user_count,
+        "funnel_count": funnel_count,
+    }
 
 
 def _org_id(current_user: User) -> UUID:

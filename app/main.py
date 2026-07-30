@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, kpi
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -78,6 +78,7 @@ app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])
 app.include_router(resources.router, prefix="/resources", tags=["resources"])
 app.include_router(portal.router, prefix="/portal", tags=["portal"])
+app.include_router(kpi.router, prefix="/kpi", tags=["kpi"])
 
 @app.on_event("startup")
 def _ensure_schema_columns_on_startup() -> None:
@@ -263,6 +264,15 @@ def _ensure_schema_columns_on_startup() -> None:
                 target=reconcile_fathom_webhooks_for_existing_orgs,
                 daemon=True,
                 name="fathom-webhook-reconcile",
+            ).start()
+
+        if getattr(app_settings, "STRIPE_RECONCILE_WEBHOOKS_ON_STARTUP", True):
+            from app.services.stripe_webhook_onboard import reconcile_stripe_webhooks_for_existing_orgs
+
+            threading.Thread(
+                target=reconcile_stripe_webhooks_for_existing_orgs,
+                daemon=True,
+                name="stripe-webhook-reconcile",
             ).start()
     except Exception as e:
         db.rollback()

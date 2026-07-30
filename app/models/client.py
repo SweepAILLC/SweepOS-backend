@@ -203,3 +203,33 @@ def find_client_by_email(db: Session, org_id: uuid.UUID, email: str) -> Optional
             return c
     return None
 
+
+def normalize_phone(phone: Optional[str]) -> str:
+    """
+    Digits-only phone key for matching.
+    US numbers with a leading country code 1 are normalized to 10 digits.
+    """
+    if not phone or not isinstance(phone, str):
+        return ""
+    digits = re.sub(r"\D", "", phone.strip())
+    if len(digits) == 11 and digits.startswith("1"):
+        return digits[1:]
+    return digits
+
+
+def find_client_by_phone(db: Session, org_id: uuid.UUID, phone: str) -> Optional[Client]:
+    """Find a client in the org whose phone matches (digits-normalized)."""
+    target = normalize_phone(phone)
+    if not target or len(target) < 7:
+        # Too short to be a reliable match key
+        return None
+    candidates = (
+        db.query(Client)
+        .filter(Client.org_id == org_id, Client.phone.isnot(None))
+        .all()
+    )
+    for c in candidates:
+        if normalize_phone(c.phone) == target:
+            return c
+    return None
+

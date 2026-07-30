@@ -321,6 +321,12 @@ async def calendly_webhook(
     )
     db.commit()
     invalidate_terminal_monthly_trends_cache(org_uuid)
+    try:
+        from app.services.kpi_integration_sync import sync_kpi_for_datetime
+
+        sync_kpi_for_datetime(db, org_uuid, start_time, commit=True)
+    except Exception:
+        LOG.exception("calendly webhook: KPI live sync failed")
     _run_pipeline_after_webhook(db, org_uuid, client.id)
 
     fired_jobs: list[str] = []
@@ -454,6 +460,12 @@ async def calcom_webhook(
     )
     db.commit()
     invalidate_terminal_monthly_trends_cache(org_uuid)
+    try:
+        from app.services.kpi_integration_sync import sync_kpi_for_datetime
+
+        sync_kpi_for_datetime(db, org_uuid, start_time, commit=True)
+    except Exception:
+        LOG.exception("calendly webhook: KPI live sync failed")
     _run_pipeline_after_webhook(db, org_uuid, client.id)
 
     fired_jobs: list[str] = []

@@ -108,8 +108,12 @@ def _dispatcher_loop() -> None:
 
     last_heartbeat = 0.0
     last_call_library_drain = 0.0
+    last_stripe_catchup = 0.0
     call_library_drain_interval = float(
         getattr(settings, "CALL_LIBRARY_WORKER_DRAIN_INTERVAL_SEC", 180) or 180
+    )
+    stripe_catchup_interval = float(
+        getattr(settings, "STRIPE_CATCHUP_INTERVAL_SEC", 600) or 600
     )
     while not _SHUTDOWN:
         loop_started = time.time()
@@ -140,6 +144,16 @@ def _dispatcher_loop() -> None:
                     except Exception:
                         LOG.exception("call_library worker drain failed")
                     last_call_library_drain = now
+                if stripe_catchup_interval > 0 and now - last_stripe_catchup >= stripe_catchup_interval:
+                    try:
+                        from app.services.stripe_webhook_onboard import catchup_stripe_recent_for_all_orgs
+
+                        stats = catchup_stripe_recent_for_all_orgs()
+                        if stats.get("synced") or stats.get("failed"):
+                            LOG.info("stripe catch-up %s", stats)
+                    except Exception:
+                        LOG.exception("stripe catch-up failed")
+                    last_stripe_catchup = now
                 if attempted:
                     LOG.info("dispatcher: processed %d job(s)", attempted)
         except Exception:

@@ -51,6 +51,15 @@ from app.schemas.permission import (
 )
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.portal_todo import PortalTodo
+from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
+from app.models.org_kpi_benchmark import OrgKpiBenchmark
+from app.schemas.kpi import KpiSnapshotResponse
+from app.services.kpi_bottleneck_service import detect_bottlenecks, utcnow
+from app.services.kpi_compute import build_kpi_snapshot
+from app.services.kpi_integration_sync import (
+    has_calendar_source,
+    has_payment_source,
+)
 from app.schemas.portal import (
     PortalTodoCreate,
     PortalTodoUpdate,
@@ -65,7 +74,7 @@ from app.services import portal_shared_pads as pads_svc
 from app.core.config import settings
 from app.core.rate_limit import rate_limit
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 router = APIRouter()
 
@@ -1760,8 +1769,8 @@ def list_organization_tab_permissions(
     admin_user: User = Depends(require_admin)
 ):
     """List all tab permissions for an organization"""
-    from app.api.users import AVAILABLE_TABS
-    
+    from app.api.users import AVAILABLE_TABS, LEGACY_TAB_ALIASES
+
     # Verify organization exists
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
@@ -1769,20 +1778,36 @@ def list_organization_tab_permissions(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Organization not found"
         )
-    
+
     # Get existing permissions
     existing_permissions = db.query(OrganizationTabPermission).filter(
         OrganizationTabPermission.org_id == org_id
     ).all()
-    
+
     # Create a map of existing permissions
     permission_map = {p.tab_name: p for p in existing_permissions}
-    
-    # Return all tabs with their permissions (create defaults if missing)
+
+    # Return all current product tabs with their permissions (create defaults if missing)
     result = []
     for tab in AVAILABLE_TABS:
-        if tab in permission_map:
-            result.append(OrgTabPermissionSchema.model_validate(permission_map[tab], from_attributes=True))
+        row = permission_map.get(tab)
+        if row is None:
+            legacy = LEGACY_TAB_ALIASES.get(tab)
+            if legacy:
+                row = permission_map.get(legacy)
+        if row is not None:
+            # Prefer current tab_name in the response even when reading a legacy row
+            data = OrgTabPermissionSchema.model_validate(row, from_attributes=True)
+            result.append(
+                OrgTabPermissionSchema(
+                    id=data.id,
+                    org_id=data.org_id,
+                    tab_name=tab,
+                    enabled=data.enabled,
+                    created_at=data.created_at,
+                    updated_at=data.updated_at,
+                )
+            )
         else:
             # Return default (enabled) for tabs without explicit permissions
             result.append(OrgTabPermissionSchema(
@@ -1793,7 +1818,7 @@ def list_organization_tab_permissions(
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             ))
-    
+
     return result
 
 
@@ -2150,3 +2175,104 @@ def admin_put_portal_shared_pad(
     pad = pads_svc.write_pad_content(db, pad, content, admin_user)
     return pads_svc.pad_response(pad)
 
+
+@router.get("/organizations/{org_id}/kpi-entries")
+def admin_get_kpi_entries(
+    org_id: UUID,
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Return KPI daily entries for any organization (system owner)."""
+    _require_org(db, org_id)
+    q = db.query(OrgKpiDailyEntry).filter(OrgKpiDailyEntry.org_id == org_id)
+    if start:
+        q = q.filter(OrgKpiDailyEntry.entry_date >= start)
+    if end:
+        q = q.filter(OrgKpiDailyEntry.entry_date <= end)
+    entries = q.order_by(OrgKpiDailyEntry.entry_date).all()
+
+    def _rate(numer, denom):
+        if numer is None or denom is None or denom == 0:
+            return None
+        return round(float(numer) / float(denom) * 100, 1)
+
+    return [
+        {
+            "entry_date": str(e.entry_date),
+            "outreach_sent": e.outreach_sent,
+            "calls_booked": e.calls_booked,
+            "calls_taken": e.calls_taken,
+            "closes": e.closes,
+            "cash_collected": float(e.cash_collected) if e.cash_collected is not None else None,
+            "closing_rate_pct": _rate(e.closes, e.calls_taken),
+            "show_up_pct": _rate(
+                (e.calls_taken or 0),
+                (e.calls_booked or 0),
+            ),
+            "convo_to_booking_pct": _rate(e.calls_booked, e.outreach_sent),
+        }
+        for e in entries
+    ]
+
+
+
+@router.get("/organizations/{org_id}/kpi-snapshot", response_model=KpiSnapshotResponse)
+def admin_get_kpi_snapshot(
+    org_id: UUID,
+    days: int = Query(30, ge=1, le=365),
+    start: Optional[str] = Query(None, description="YYYY-MM-DD inclusive"),
+    end: Optional[str] = Query(None, description="YYYY-MM-DD inclusive"),
+    include_flags: bool = Query(True),
+    include_series: bool = Query(True),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Compact KPI insights snapshot for any org (owner dashboard / cross-tab)."""
+    _require_org(db, org_id)
+    today = date.today()
+
+    def _parse(raw: Optional[str]) -> Optional[date]:
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid date: {raw}") from exc
+
+    range_end = _parse(end) or today
+    range_start = _parse(start) or (range_end - timedelta(days=days - 1))
+    if range_end < range_start:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+
+    rows = (
+        db.query(OrgKpiDailyEntry)
+        .filter(
+            OrgKpiDailyEntry.org_id == org_id,
+            OrgKpiDailyEntry.entry_date >= range_start,
+            OrgKpiDailyEntry.entry_date <= range_end,
+        )
+        .order_by(OrgKpiDailyEntry.entry_date.asc())
+        .all()
+    )
+    bench = (
+        db.query(OrgKpiBenchmark)
+        .filter(OrgKpiBenchmark.org_id == org_id)
+        .first()
+    )
+    thresholds_raw = bench.thresholds if bench and isinstance(bench.thresholds, dict) else None
+    flags = []
+    if include_flags:
+        flags = detect_bottlenecks(db, org_id, thresholds_raw=thresholds_raw)
+    return build_kpi_snapshot(
+        rows,
+        range_start=range_start,
+        range_end=range_end,
+        thresholds_raw=thresholds_raw,
+        flags=flags,
+        include_series=include_series,
+        calendar_available=has_calendar_source(db, org_id),
+        payments_available=has_payment_source(db, org_id),
+        generated_at=utcnow(),
+    )

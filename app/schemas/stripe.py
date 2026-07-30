@@ -71,6 +71,11 @@ class StripeConnectionStatus(BaseModel):
     connected: bool
     message: Optional[str] = None
     account_id: Optional[str] = None
+    webhook_active: bool = False
+    webhook_status: Optional[str] = None  # active | not_registered | not_configured
+    webhook_endpoint_id: Optional[str] = None
+    webhook_url: Optional[str] = None
+    last_webhook_processed_at: Optional[str] = None
 
     class Config:
         from_attributes = True

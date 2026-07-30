@@ -31,6 +31,12 @@ from app.services.marketing_intel_bundle import (
     list_org_sales_themes_for_mcp,
     search_sales_clips_for_mcp,
 )
+from app.services.kpi_mcp_bundle import (
+    get_kpi_flags_for_mcp,
+    get_kpi_monthly_rollups_for_mcp,
+    get_kpi_snapshot_for_mcp,
+    get_kpi_trends_for_mcp,
+)
 from app.services.mcp_oauth_service import mcp_resource, verify_mcp_access_token
 from app.services.terminal_dashboard_bundle import build_terminal_dashboard_for_mcp
 
@@ -40,7 +46,7 @@ router = APIRouter()
 
 SERVER_INFO = {
     "name": "sweepos",
-    "version": "1.2.1",
+    "version": "1.3.0",
     "protocolVersion": "2025-03-26",
 }
 
@@ -191,7 +197,9 @@ TOOLS = [
             "SweepOS Terminal dashboard. DEFAULT mode='overview' is fast (summary, monthly_trends, "
             "appointments, failed_payments) and should be preferred. Use mode='full' or an explicit "
             "sections list only when you need finances/stripe/calendar/leads. If the response has "
-            "incomplete_sections or partial=true, retry those sections only — do not re-fetch everything."
+            "incomplete_sections or partial=true, retry those sections only — do not re-fetch everything. "
+            "For KPI Command Center funnel metrics (outreach, bookings, show-up, close rates), use "
+            "get_kpi_snapshot / get_kpi_monthly_rollups / get_kpi_trends instead."
         ),
         "inputSchema": {
             "type": "object",
@@ -227,6 +235,82 @@ TOOLS = [
                 "appointments_limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
             },
         },
+    },
+    {
+        "name": "get_kpi_snapshot",
+        "description": (
+            "KPI Command Center snapshot for the connected org: essential cards (outreach, bookings, "
+            "show-up, close rate, cash), optional daily series, current-month totals, and bottleneck "
+            "flags. Prefer this first for a KPI briefing. Not the Terminal cash/MRR dashboard."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 365,
+                    "description": "Trailing window length in days (ignored when start+end set)",
+                },
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "include_flags": {"type": "boolean", "default": True},
+                "include_series": {"type": "boolean", "default": True},
+                "sync": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Refresh live calendar/payment fields before building (slower)",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_kpi_monthly_rollups",
+        "description": (
+            "Monthly KPI totals for the org (same as Command Center month footer): sums for volume/"
+            "money and ratio-of-sums funnel rates, newest month first. Use for MoM comparisons."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "months": {
+                    "type": "integer",
+                    "default": 12,
+                    "minimum": 1,
+                    "maximum": 36,
+                    "description": "How many calendar months of history to return",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_kpi_trends",
+        "description": (
+            "KPI month-over-month trends: compact monthly series of funnel metrics plus multi-month "
+            "decline flags (reply/booking/show-up/close rates and outreach/follow-up daily averages) "
+            "and full bottleneck flags. Use after get_kpi_snapshot when advising on trajectory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "months": {
+                    "type": "integer",
+                    "default": 6,
+                    "minimum": 3,
+                    "maximum": 24,
+                    "description": "Months of history for the trend series",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_kpi_flags",
+        "description": (
+            "KPI bottleneck and trend flags only (below-benchmark metrics, stage comparisons, "
+            "multi-month declines). Lighter than get_kpi_trends when you only need alerts."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "list_brevo_senders",
@@ -294,7 +378,7 @@ def _www_authenticate() -> str:
             meta = f"{meta}/{suffix}"
     return (
         f'Bearer realm="SweepOS", resource_metadata="{meta}", '
-        f'scope="clients:read marketing:read terminal:read email:send"'
+        f'scope="clients:read marketing:read terminal:read kpi:read email:send"'
     )
 
 
@@ -449,6 +533,40 @@ def _run_tool(
                 appointments_limit=int(args.get("appointments_limit") or 20),
             )
         )
+    if name == "get_kpi_snapshot":
+        include_flags = args.get("include_flags")
+        include_series = args.get("include_series")
+        sync = args.get("sync")
+        return _text_result(
+            get_kpi_snapshot_for_mcp(
+                db,
+                org_id,
+                days=int(args.get("days") or 30),
+                start=args.get("start"),
+                end=args.get("end"),
+                include_flags=True if include_flags is None else bool(include_flags),
+                include_series=True if include_series is None else bool(include_series),
+                sync=bool(sync) if sync is not None else False,
+            )
+        )
+    if name == "get_kpi_monthly_rollups":
+        return _text_result(
+            get_kpi_monthly_rollups_for_mcp(
+                db,
+                org_id,
+                months=int(args.get("months") or 12),
+            )
+        )
+    if name == "get_kpi_trends":
+        return _text_result(
+            get_kpi_trends_for_mcp(
+                db,
+                org_id,
+                months=int(args.get("months") or 6),
+            )
+        )
+    if name == "get_kpi_flags":
+        return _text_result(get_kpi_flags_for_mcp(db, org_id))
     if name == "list_brevo_senders":
         active_only = args.get("active_only")
         if active_only is None:
@@ -563,6 +681,26 @@ def _handle_jsonrpc(
                         "mimeType": "application/json",
                     },
                     {
+                        "uri": "sweep://kpi/snapshot",
+                        "name": "KPI snapshot",
+                        "description": (
+                            "KPI Command Center snapshot: cards, daily series, current-month totals, flags"
+                        ),
+                        "mimeType": "application/json",
+                    },
+                    {
+                        "uri": "sweep://kpi/rollups",
+                        "name": "KPI monthly totals",
+                        "description": "Calendar-month KPI rollups (volume sums + funnel rates)",
+                        "mimeType": "application/json",
+                    },
+                    {
+                        "uri": "sweep://kpi/trends",
+                        "name": "KPI trends",
+                        "description": "Month-over-month KPI series plus decline/bottleneck flags",
+                        "mimeType": "application/json",
+                    },
+                    {
                         "uri": "sweep://brevo/senders",
                         "name": "Brevo senders",
                         "description": "Verified sender email/name options for outbound email",
@@ -646,6 +784,42 @@ def _handle_jsonrpc(
             payload = build_terminal_dashboard_for_mcp(
                 db, org_id, user_id=user_id, mode="overview"
             )
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://kpi/snapshot":
+            payload = get_kpi_snapshot_for_mcp(db, org_id)
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://kpi/rollups":
+            payload = get_kpi_monthly_rollups_for_mcp(db, org_id, months=12)
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://kpi/trends":
+            payload = get_kpi_trends_for_mcp(db, org_id, months=6)
             text = json.dumps(payload, default=str)
             return {
                 "jsonrpc": "2.0",

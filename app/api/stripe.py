@@ -177,7 +177,7 @@ def get_stripe_connection_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Check if Stripe is connected via OAuth."""
+    """Check if Stripe is connected and whether the per-org webhook is registered."""
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
     
@@ -186,14 +186,88 @@ def get_stripe_connection_status(
         OAuthToken.provider == OAuthProvider.STRIPE,
         OAuthToken.org_id == org_id
     ).first()
+
+    from app.services.stripe_webhook_onboard import (
+        stripe_webhook_destination_for_org,
+        webhook_status_for_token,
+    )
+    destination = stripe_webhook_destination_for_org(org_id)
     
     if oauth_token and oauth_token.access_token:
+        wh = webhook_status_for_token(
+            connected=True,
+            webhook_endpoint_id=oauth_token.webhook_endpoint_id,
+            webhook_secret=oauth_token.webhook_secret,
+            destination_url=destination,
+        )
+        last_wh = (
+            oauth_token.last_webhook_processed_at.isoformat() + "Z"
+            if oauth_token.last_webhook_processed_at
+            else None
+        )
+        msg = "Stripe is connected."
+        if not wh["webhook_active"]:
+            msg = "Stripe is connected, but instant webhooks are not registered. Use Repair webhook or Sync."
         return StripeConnectionStatus(
             connected=True,
-            message="Stripe is connected.",
-            account_id=oauth_token.account_id
+            message=msg,
+            account_id=oauth_token.account_id,
+            webhook_active=wh["webhook_active"],
+            webhook_status=wh["webhook_status"],
+            webhook_endpoint_id=wh["webhook_endpoint_id"],
+            webhook_url=wh["webhook_url"],
+            last_webhook_processed_at=last_wh,
         )
-    return StripeConnectionStatus(connected=False, message="Stripe is not connected.")
+    wh = webhook_status_for_token(
+        connected=False,
+        webhook_endpoint_id=None,
+        webhook_secret=None,
+        destination_url=destination,
+    )
+    return StripeConnectionStatus(
+        connected=False,
+        message="Stripe is not connected.",
+        webhook_active=False,
+        webhook_status=wh["webhook_status"],
+        webhook_url=destination,
+    )
+
+
+@router.post("/webhook/setup", status_code=status.HTTP_200_OK)
+def setup_stripe_webhook(
+    force: bool = Query(True, description="Recreate endpoint even if one is stored"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create or repair the per-org Stripe webhook endpoint for instant payment updates."""
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    if not check_stripe_connected(db, org_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Stripe not connected.",
+        )
+
+    from app.services.stripe_webhook_onboard import ensure_stripe_webhook_for_org
+
+    result = ensure_stripe_webhook_for_org(org_id, db=db, force=force)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.get("error") or "Webhook registration failed",
+        )
+    return {
+        "success": True,
+        "webhook_active": bool(result.get("webhook_active")),
+        "webhook_id": result.get("webhook_id"),
+        "webhook_url": result.get("destination_url"),
+        "skipped": bool(result.get("skipped")),
+        "message": result.get("message")
+        or (
+            "Stripe webhook active — new payments sync automatically."
+            if result.get("webhook_active")
+            else "Webhook setup completed."
+        ),
+    }
 
 
 @router.get("/debug", status_code=status.HTTP_200_OK)
@@ -512,6 +586,18 @@ def sync_and_reconcile_stripe_data(
                 detail=sync_result.get("error")
             )
 
+        # 1b. Keep Treasury in step with webhook-fed StripePayment (recent lookback).
+        treasury_result = None
+        try:
+            from app.services.stripe_treasury_sync import sync_treasury_transactions
+
+            created_since = None if force_full else (datetime.utcnow() - timedelta(days=7))
+            treasury_result = sync_treasury_transactions(
+                db, org_id=org_id, created_since=created_since
+            )
+        except Exception as treasury_err:
+            print(f"[API] Treasury sync during sync-and-reconcile skipped: {treasury_err}")
+
         # 2. Reconcile immediately (same DB session)
         reconcile_result = reconcile_stripe_data(db, org_id=org_id)
 
@@ -543,6 +629,10 @@ def sync_and_reconcile_stripe_data(
                 "payments_synced": sync_result.get("payments_synced", 0),
                 "payments_updated": sync_result.get("payments_updated", 0),
             },
+            "treasury": {
+                "transactions_synced": (treasury_result or {}).get("transactions_synced", 0),
+                "transactions_updated": (treasury_result or {}).get("transactions_updated", 0),
+            } if treasury_result is not None else None,
             "reconciliation": {
                 "clients_reconciled": reconcile_result.get("clients_reconciled", 0),
                 "revenue_recalculated": reconcile_result.get("revenue_recalculated", 0),
@@ -1096,10 +1186,9 @@ def get_stripe_summary(
         
         return deduplicated
     
-    # Calculate revenue using Treasury Transactions as source of truth
-    # Get ALL posted Treasury Transactions (for recent payments table - no date filter)
-    # Use raw SQL to avoid SQLAlchemy enum name conversion
-    # Handle case where Treasury Transactions table might not exist or have no data
+    # Calculate revenue using Treasury Transactions as source of truth when they are
+    # at least as fresh as webhook-fed StripePayment rows. If payments are ahead
+    # (instant webhooks), prefer StripePayment so UI isn't stuck waiting on Treasury sync.
     use_treasury_for_revenue = True
     all_succeeded_transactions = []
     
@@ -1114,18 +1203,44 @@ def get_stripe_summary(
             print(f"[REVENUE] No Treasury Transactions found, falling back to StripePayment")
             use_treasury_for_revenue = False
         else:
-            # Query transactions using raw SQL for status to avoid enum conversion issues
-            all_succeeded_transactions = db.query(StripeTreasuryTransaction).filter(
-                StripeTreasuryTransaction.org_id == org_id
+            newest_payment_at = db.query(func.max(StripePayment.created_at)).filter(
+                StripePayment.org_id == org_id,
+                StripePayment.status == "succeeded",
+            ).scalar()
+            newest_treasury_at = db.query(
+                func.max(
+                    func.coalesce(
+                        StripeTreasuryTransaction.posted_at,
+                        StripeTreasuryTransaction.created,
+                    )
+                )
             ).filter(
-                text("stripe_treasury_transactions.status = 'posted'::treasurytransactionstatus")
-            ).filter(
-                StripeTreasuryTransaction.amount > 0  # Only inbound transactions (positive amounts)
-            ).order_by(desc(StripeTreasuryTransaction.posted_at), desc(StripeTreasuryTransaction.created)).all()
-            
-            if len(all_succeeded_transactions) == 0:
-                print(f"[REVENUE] No posted Treasury Transactions found, falling back to StripePayment")
+                StripeTreasuryTransaction.org_id == org_id,
+            ).scalar()
+            if (
+                newest_payment_at
+                and newest_treasury_at
+                and newest_payment_at > newest_treasury_at + timedelta(minutes=2)
+            ):
+                print(
+                    f"[REVENUE] StripePayment ahead of Treasury "
+                    f"(payment={newest_payment_at}, treasury={newest_treasury_at}); "
+                    "using StripePayment for freshness"
+                )
                 use_treasury_for_revenue = False
+            else:
+                # Query transactions using raw SQL for status to avoid enum conversion issues
+                all_succeeded_transactions = db.query(StripeTreasuryTransaction).filter(
+                    StripeTreasuryTransaction.org_id == org_id
+                ).filter(
+                    text("stripe_treasury_transactions.status = 'posted'::treasurytransactionstatus")
+                ).filter(
+                    StripeTreasuryTransaction.amount > 0  # Only inbound transactions (positive amounts)
+                ).order_by(desc(StripeTreasuryTransaction.posted_at), desc(StripeTreasuryTransaction.created)).all()
+                
+                if len(all_succeeded_transactions) == 0:
+                    print(f"[REVENUE] No posted Treasury Transactions found, falling back to StripePayment")
+                    use_treasury_for_revenue = False
     except Exception as e:
         # If Treasury Transactions table doesn't exist or query fails, rollback and fall back to old system
         db.rollback()
@@ -1656,7 +1771,8 @@ def get_payments(
             detail="Stripe not connected."
         )
     
-    # Use Treasury Transactions if requested
+    # Use Treasury Transactions if requested — but prefer StripePayment when webhooks
+    # have newer succeeded rows than Treasury (avoids ~hour lag on Finances/Stripe UI).
     if use_treasury:
         from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
         
@@ -1671,7 +1787,30 @@ def get_payments(
             print(f"[PAYMENTS] No Treasury Transactions found for org {org_id}, falling back to StripePayment")
             use_treasury = False
         else:
-            print(f"[PAYMENTS] Found {treasury_count} Treasury Transactions for org {org_id}, using Treasury Transactions")
+            newest_payment_at = db.query(func.max(StripePayment.created_at)).filter(
+                StripePayment.org_id == org_id,
+                StripePayment.status == "succeeded",
+            ).scalar()
+            newest_treasury_at = db.query(
+                func.max(
+                    func.coalesce(
+                        StripeTreasuryTransaction.posted_at,
+                        StripeTreasuryTransaction.created,
+                    )
+                )
+            ).filter(StripeTreasuryTransaction.org_id == org_id).scalar()
+            if (
+                newest_payment_at
+                and newest_treasury_at
+                and newest_payment_at > newest_treasury_at + timedelta(minutes=2)
+            ):
+                print(
+                    f"[PAYMENTS] StripePayment ahead of Treasury for org {org_id}; "
+                    "using StripePayment for freshness"
+                )
+                use_treasury = False
+            else:
+                print(f"[PAYMENTS] Found {treasury_count} Treasury Transactions for org {org_id}, using Treasury Transactions")
         
     if use_treasury:
         # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)

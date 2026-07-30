@@ -1148,6 +1148,18 @@ def sync_all_checkins(
         else:
             results["pipeline_lifecycle_changes"] = 0
 
+        try:
+            from datetime import date as _date
+            from calendar import monthrange
+            from app.services.kpi_integration_sync import refresh_kpi_live_fields_for_range
+
+            today = _date.today()
+            month_start = today.replace(day=1)
+            month_end = today.replace(day=monthrange(today.year, today.month)[1])
+            refresh_kpi_live_fields_for_range(db, org_id, month_start, min(month_end, today))
+        except Exception as kpi_err:
+            print(f"[CHECKIN SYNC] KPI live refresh skipped: {kpi_err}")
+
         print(f"[CHECKIN SYNC] ===== SYNC COMPLETE ======")
         print(f"[CHECKIN SYNC] Total: {results['total']} check-ins (Cal.com: {results['calcom']}, Calendly: {results['calendly']})")
         print(f"[CHECKIN SYNC] Affected clients for Fathom: {len(results['affected_client_ids'])}")

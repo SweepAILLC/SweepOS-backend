@@ -39,7 +39,7 @@ from app.schemas.funnel import (
     UTMSourceStats,
     ReferrerStats,
 )
-from app.models.client import find_client_by_email
+from app.models.client import find_client_by_email, find_client_by_phone
 from app.models.client import LifecycleState
 from app.services.health_score_cache_service import invalidate_health_score_cache
 
@@ -463,6 +463,8 @@ def create_lead_from_funnel(
     Create or update a client from a funnel lead capture form or quiz.
     No authentication required - org_id is determined from funnel_id.
     Clients appear on the Client Board in Sweep OS.
+
+    Dedupes by email first, then by phone (digits-normalized) within the org.
     """
     funnel = db.query(Funnel).filter(Funnel.id == lead_data.funnel_id).first()
     if not funnel:
@@ -487,6 +489,8 @@ def create_lead_from_funnel(
     client = None
     if email:
         client = find_client_by_email(db, org_id, email)
+    if client is None and phone:
+        client = find_client_by_phone(db, org_id, phone)
 
     def _apply_prospect_meta(c: Client) -> None:
         has_prospect = any(
@@ -517,6 +521,8 @@ def create_lead_from_funnel(
             client.first_name = first_name
         if last_name is not None:
             client.last_name = last_name
+        if email and (not client.email or not str(client.email).strip()):
+            client.email = email
         if phone is not None and phone:
             client.phone = phone
         if instagram is not None and instagram:

@@ -31,9 +31,24 @@ from app.schemas.permission import (
 
 router = APIRouter()
 
-# Available tabs
-# Note: 'owner' tab is restricted to OWNER role only
-AVAILABLE_TABS = ['brevo', 'clients', 'stripe', 'funnels', 'performance', 'content_studio', 'call_library', 'resources', 'integrations', 'owner']
+# Org-toggleable product tabs (must match Navbar product tabs).
+# Not included: settings (always on), owner (role-gated), org_portal (consulting tier).
+AVAILABLE_TABS = [
+    'terminal',
+    'pipeline',
+    'funnels',
+    'content_studio',
+    'call_library',
+    'kpi_command_center',
+    'automations',
+    'resources',
+    'intelligence',
+]
+
+# Legacy DB tab_name → current tab (for resolving old org permission rows).
+LEGACY_TAB_ALIASES = {
+    'pipeline': 'clients',
+}
 
 
 def _role_python_from_db(role_db: object) -> str:

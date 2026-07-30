@@ -323,6 +323,13 @@ def update_check_in(
             invalidate_terminal_monthly_trends_cache(org_id)
         except Exception:
             pass
+
+        try:
+            from app.services.kpi_integration_sync import sync_kpi_for_datetime
+
+            sync_kpi_for_datetime(db, org_id, getattr(check_in, "start_time", None), commit=True)
+        except Exception:
+            pass
         
         return {
             "id": str(check_in.id),
@@ -538,6 +545,15 @@ def create_manual_check_in(
             from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
             invalidate_terminal_monthly_trends_cache(org_id)
+        except Exception:
+            pass
+
+        try:
+            from app.services.kpi_integration_sync import sync_kpi_for_datetime
+
+            sync_kpi_for_datetime(
+                db, org_id, getattr(manual_check_in, "start_time", None), commit=True
+            )
         except Exception:
             pass
         

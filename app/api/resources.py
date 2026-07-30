@@ -111,8 +111,10 @@ def update_doc_document(
     powered_by = body.get("powered_by")
     if powered_by is not None:
         powered_by = str(powered_by).strip() or None
-    video_url = body.get("video_url")
-    if video_url is not None:
+    video_url = body.get("video_urls", body.get("video_url"))
+    if isinstance(video_url, list):
+        video_url = [str(u).strip() for u in video_url if u is not None and str(u).strip()]
+    elif video_url is not None:
         video_url = str(video_url).strip() or None
 
     if not title:
@@ -142,7 +144,7 @@ def update_doc_document(
         if str(e) == "invalid_video_url":
             raise HTTPException(
                 status_code=400,
-                detail="Embed URL must be a valid http or https URL (video or Figma).",
+                detail="Each embed URL must be a valid http(s) link (YouTube, Loom, Figma, Fathom, …).",
             )
         if str(e) == "invalid_sop_category":
             raise HTTPException(status_code=400, detail="SOP category must be foundations, marketing, sales, operations, or fulfillment.")
@@ -178,8 +180,10 @@ def create_doc_document(
     powered_by = body.get("powered_by")
     if powered_by is not None:
         powered_by = str(powered_by).strip() or None
-    video_url = body.get("video_url")
-    if video_url is not None:
+    video_url = body.get("video_urls", body.get("video_url"))
+    if isinstance(video_url, list):
+        video_url = [str(u).strip() for u in video_url if u is not None and str(u).strip()]
+    elif video_url is not None:
         video_url = str(video_url).strip() or None
 
     try:
@@ -199,7 +203,7 @@ def create_doc_document(
         if str(e) == "invalid_video_url":
             raise HTTPException(
                 status_code=400,
-                detail="Embed URL must be a valid http or https URL (video or Figma).",
+                detail="Each embed URL must be a valid http(s) link (YouTube, Loom, Figma, Fathom, …).",
             )
         if str(e) == "invalid_sop_category":
             raise HTTPException(status_code=400, detail="SOP category must be foundations, marketing, sales, operations, or fulfillment.")

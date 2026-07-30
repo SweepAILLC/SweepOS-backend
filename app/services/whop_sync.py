@@ -182,6 +182,22 @@ def sync_whop_incremental(db: Session, org_id: uuid.UUID, force_full: bool = Fal
     token.last_sync_at = datetime.utcnow()
     db.commit()
 
+    # Keep KPI cash_collected in sync for days touched by this Whop sync.
+    try:
+        from app.services.kpi_integration_sync import sync_kpi_for_datetime
+
+        days_seen = set()
+        for sig in new_first_payment_signals:
+            paid_at = sig.get("paid_at")
+            if paid_at is None:
+                continue
+            day_key = paid_at.date() if hasattr(paid_at, "date") else None
+            if day_key and day_key not in days_seen:
+                days_seen.add(day_key)
+                sync_kpi_for_datetime(db, org_id, paid_at, commit=True)
+    except Exception:
+        pass
+
     # Enqueue first-payment automation jobs for newly synced Whop payments. The
     # automation_engine guards on idempotency_key so re-running a full sync is safe.
     if new_first_payment_signals:

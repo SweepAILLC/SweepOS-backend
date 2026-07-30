@@ -356,6 +356,13 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
     try:
         db.commit()
         print(f"✅ Successfully processed {event_type} event - payment {payment_id} committed to database")
+
+        try:
+            from app.services.kpi_integration_sync import sync_kpi_for_datetime
+
+            sync_kpi_for_datetime(db, org_id, created_at, commit=True)
+        except Exception as kpi_err:
+            print(f"[KPI_SYNC] ⚠️ Error syncing cash_collected: {kpi_err}")
         
         # Move client back to active if they received a payment (automation rule)
         if client:
@@ -459,6 +466,12 @@ def _mark_latest_sales_call_closed(db: Session, org_id: uuid.UUID, client: Clien
         )
     db.commit()
     print(f"[SALES_CLOSE] Marked sales call {check_in.event_id} as closed for client {client.id} after payment")
+    try:
+        from app.services.kpi_integration_sync import sync_kpi_for_datetime
+
+        sync_kpi_for_datetime(db, org_id, getattr(check_in, "start_time", None), commit=True)
+    except Exception as kpi_err:
+        print(f"[KPI_SYNC] ⚠️ Error syncing closes after sale_closed: {kpi_err}")
 
 
 def _unclose_sales_call_for_client(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> None:

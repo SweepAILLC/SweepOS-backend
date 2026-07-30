@@ -603,41 +603,25 @@ def connect_stripe_direct(
 
         db.commit()
 
-        # Create per-org webhook endpoint so Stripe pushes events (eliminates need for manual sync)
-        from app.core.config import settings
-        base_url = (settings.BACKEND_PUBLIC_URL or "").strip().rstrip("/")
-        if base_url:
-            webhook_url = f"{base_url}/webhooks/stripe/org/{org_id}"
-            try:
-                we = stripe.WebhookEndpoint.create(
-                    url=webhook_url,
-                    enabled_events=[
-                        "invoice.payment_succeeded",
-                        "invoice.payment_failed",
-                        "invoice.paid",
-                        "charge.succeeded",
-                        "charge.failed",
-                        "charge.refunded",
-                        "payment_intent.succeeded",
-                        "payment_intent.payment_failed",
-                        "customer.subscription.created",
-                        "customer.subscription.updated",
-                        "customer.subscription.deleted",
-                        "customer.created",
-                        "customer.updated",
-                    ],
-                    description=f"SweepOS org {org_id}",
-                    api_version="2024-06-20",
+        # Create/repair per-org webhook so Stripe pushes events (eliminates need for manual sync)
+        webhook_result = {"success": False, "webhook_active": False}
+        try:
+            from app.services.stripe_webhook_onboard import ensure_stripe_webhook_for_org
+
+            webhook_result = ensure_stripe_webhook_for_org(org_id, db=db, force=True)
+            if webhook_result.get("webhook_active"):
+                print(
+                    f"[DIRECT_CONNECT] Webhook ready {webhook_result.get('webhook_id')} "
+                    f"for org {org_id} → {webhook_result.get('destination_url')}"
                 )
-                oauth_token.webhook_secret = encrypt_token(we.secret)
-                oauth_token.webhook_endpoint_id = we.id
-                db.commit()
-                print(f"[DIRECT_CONNECT] Created webhook endpoint {we.id} for org {org_id}")
-            except Exception as we_err:
-                print(f"[DIRECT_CONNECT] Webhook creation failed (non-critical): {we_err}")
-                # Don't fail the connect - webhook is optional, manual sync still works
-        else:
-            print(f"[DIRECT_CONNECT] BACKEND_PUBLIC_URL not set - skipping webhook creation")
+            else:
+                print(
+                    f"[DIRECT_CONNECT] Webhook not active for org {org_id}: "
+                    f"{webhook_result.get('error') or webhook_result.get('message') or webhook_result}"
+                )
+        except Exception as we_err:
+            print(f"[DIRECT_CONNECT] Webhook creation failed (non-critical): {we_err}")
+            # Don't fail the connect - manual sync / worker catch-up still work
 
         # Trigger initial historical data sync (full backfill) in background thread
         # This prevents the connection endpoint from timing out during large syncs
@@ -706,15 +690,31 @@ def connect_stripe_direct(
         sync_thread = threading.Thread(target=sync_in_background, daemon=True)
         sync_thread.start()
         
+        webhook_active = bool(webhook_result.get("webhook_active"))
+        connect_message = (
+            "Stripe connected successfully using API key. Initial sync is running in the background."
+        )
+        if webhook_active:
+            connect_message += " Instant webhooks are active."
+        else:
+            connect_message += (
+                " Instant webhooks are not registered yet — use Repair webhook in Integrations "
+                "or rely on Sync / background catch-up."
+            )
+
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
                 "success": True,
-                "message": "Stripe connected successfully using API key. Initial sync is running in the background.",
+                "message": connect_message,
                 "account_id": account_id,
                 "org_id": str(org_id),
                 "mode": "test" if api_key.startswith(("sk_test_", "rk_test_")) else "live",
-                "sync_in_progress": True
+                "sync_in_progress": True,
+                "webhook_active": webhook_active,
+                "webhook_id": webhook_result.get("webhook_id"),
+                "webhook_url": webhook_result.get("destination_url"),
+                "webhook_error": webhook_result.get("error"),
             }
         )
         

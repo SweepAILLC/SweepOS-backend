@@ -294,6 +294,43 @@ def _tab_scope_org_id(user: User) -> uuid.UUID:
     return uuid.UUID(str(raw))
 
 
+def _lookup_tab_permission_enabled(
+    db: Session,
+    *,
+    user_id,
+    org_id,
+    tab_name: str,
+) -> Optional[bool]:
+    """Return explicit user/org permission for tab_name, or None if unset."""
+    from app.api.users import LEGACY_TAB_ALIASES
+
+    lookup_names = [tab_name]
+    legacy = LEGACY_TAB_ALIASES.get(tab_name)
+    if legacy:
+        lookup_names.append(legacy)
+    # Finances UI historically used "stripe" rows
+    if tab_name == "finances":
+        lookup_names.append("stripe")
+
+    for name in lookup_names:
+        user_permission = db.query(UserTabPermission).filter(
+            UserTabPermission.user_id == user_id,
+            UserTabPermission.tab_name == name,
+        ).first()
+        if user_permission is not None:
+            return bool(user_permission.enabled)
+
+    for name in lookup_names:
+        org_permission = db.query(OrganizationTabPermission).filter(
+            OrganizationTabPermission.org_id == org_id,
+            OrganizationTabPermission.tab_name == name,
+        ).first()
+        if org_permission is not None:
+            return bool(org_permission.enabled)
+
+    return None
+
+
 def check_tab_access(
     tab_name: str,
     user: User,
@@ -302,19 +339,19 @@ def check_tab_access(
     """
     Check if a user has access to a specific tab.
     Returns True if user has access, False otherwise.
-    
+
     Logic:
     1. Role-based restrictions:
        - 'owner' tab: Only OWNER role (and main org users)
+       - 'settings' always allowed
     2. Users in main org always have access to all tabs (including owner)
     3. Check user-specific permissions first (overrides org permissions)
-    4. Check organization-level permissions
+    4. Check organization-level permissions (incl. legacy aliases)
     5. Default: all tabs enabled for new orgs (except role-restricted tabs)
     """
     scope_org_id = _tab_scope_org_id(user)
 
-    # Resources (docs + org library) are available to every org member.
-    if tab_name == "resources":
+    if tab_name == "settings":
         return True
 
     # Role-based restrictions
@@ -328,33 +365,21 @@ def check_tab_access(
     if str(scope_org_id) == str(MAIN_ORG_ID):
         return True
 
-    # Finances UI uses the same permission rows as the legacy "stripe" tab name in DB
-    lookup_tab = "stripe" if tab_name == "finances" else tab_name
-    
     try:
-        # Check user-specific permissions first
-        user_permission = db.query(UserTabPermission).filter(
-            UserTabPermission.user_id == user.id,
-            UserTabPermission.tab_name == lookup_tab
-        ).first()
-        
-        if user_permission is not None:
-            return user_permission.enabled
-        
-        # Check organization-level permissions
-        org_permission = db.query(OrganizationTabPermission).filter(
-            OrganizationTabPermission.org_id == scope_org_id,
-            OrganizationTabPermission.tab_name == lookup_tab
-        ).first()
-        
-        if org_permission is not None:
-            return org_permission.enabled
+        explicit = _lookup_tab_permission_enabled(
+            db,
+            user_id=user.id,
+            org_id=scope_org_id,
+            tab_name=tab_name,
+        )
+        if explicit is not None:
+            return explicit
     except Exception as e:
         # If tables don't exist yet (migration not run), default to enabled
         # This allows the backend to start even before migrations are run
         import logging
         logging.warning(f"Tab permissions tables may not exist yet: {e}. Defaulting to enabled.")
-    
+
     # Default: enable all tabs for existing orgs (backward compatibility)
     # For new orgs, we'll set defaults when creating them
     return True
@@ -369,10 +394,12 @@ def get_user_tab_permissions(
     Returns a dictionary mapping tab names to access booleans.
     """
     from app.api.users import AVAILABLE_TABS
-    
+
     permissions = {}
     for tab in AVAILABLE_TABS:
         permissions[tab] = check_tab_access(tab, user, db)
-    permissions["finances"] = check_tab_access("finances", user, db)
-    
+    # Always-available / role-gated tabs for frontend completeness
+    permissions["settings"] = True
+    permissions["owner"] = check_tab_access("owner", user, db)
+
     return permissions

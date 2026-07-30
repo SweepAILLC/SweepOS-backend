@@ -295,17 +295,16 @@ def generate_call_library_report(
 
 
 _GLANCE_SYSTEM = """\
-You summarize a NON-sales call (check-in, coaching, ops, or internal). Return ONE JSON object only.
+You write ONE short paragraph summarizing a NON-sales call (check-in, coaching, ops, or internal).
 
-Keys:
-- analysis: 2-4 sentence at-a-glance summary of what happened and the outcome tone
-- action_items: array of concrete next steps mentioned or clearly implied (0-8 short strings)
+Return ONE JSON object only:
+{"summary":"<one paragraph>"}
 
 Rules:
-- Prefer the Fathom SUMMARY in DATA; use transcript only to fill gaps.
-- Do not invent names, numbers, or commitments.
-- If DATA is thin, keep analysis short and action_items [].
-- Valid JSON only — no markdown.
+- One paragraph, 2-4 sentences max.
+- Use only the Fathom summary in DATA. Do not invent names, numbers, or commitments.
+- No bullet lists, no markdown, no section headers.
+- Valid JSON only.
 """
 
 
@@ -316,14 +315,15 @@ def generate_glance_call_report(
     org_id: Optional[uuid.UUID] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Lightweight report for non-sales calls: keep Fathom summary + one LLM glance
-    (analysis + action_items). No discovery/pitch/objection audits.
+    Minimal non-sales report: raw Fathom summary + one short LLM paragraph.
+    No sales-audit framework, action items, or transcript-heavy prompts.
     """
     fathom_summary = (summary or "").strip()
-    summary_part = truncate_for_tokens(fathom_summary, 8000) if fathom_summary else ""
+    # Prefer Fathom summary only; tiny transcript assist if summary is missing.
+    summary_part = truncate_for_tokens(fathom_summary, 3500) if fathom_summary else ""
     transcript_part = ""
-    if len(summary_part) < 400 and (transcript or "").strip():
-        transcript_part = truncate_for_tokens((transcript or "").strip(), 6000)
+    if not summary_part and (transcript or "").strip():
+        transcript_part = truncate_for_tokens((transcript or "").strip(), 2500)
 
     if not summary_part and not transcript_part:
         return None
@@ -335,56 +335,40 @@ def generate_glance_call_report(
         data_blocks.append("TRANSCRIPT_EXCERPT:\n" + transcript_part)
     user_msg = "DATA:\n" + "\n\n".join(data_blocks)
 
-    timeout = float(getattr(settings, "CALL_LIBRARY_LLM_TIMEOUT_SEC", 90) or 90)
+    ai_summary = ""
     model_override = _resolve_call_library_model()
     try:
         raw = chat_json(
             _GLANCE_SYSTEM,
             user_msg,
-            temperature=0.2,
-            timeout=min(timeout, 60.0),
+            temperature=0.1,
+            timeout=30.0,
             org_id=org_id,
             model=model_override,
-            max_tokens=800,
-            max_input_chars=14000,
+            max_tokens=180,
+            max_input_chars=4500,
             min_user_chars=0,
             feature="call_library_glance",
         )
+        if isinstance(raw, dict):
+            ai_summary = str(
+                raw.get("summary") or raw.get("analysis") or raw.get("ai_summary") or ""
+            ).strip()[:1200]
     except RuntimeError as e:
         if "llm_budget" in str(e).lower():
             raise
         logger.warning("call_library glance LLM runtime error: %s", e)
-        raw = None
     except Exception as e:
         logger.warning("call_library glance LLM failed: %s", e)
-        raw = None
 
-    analysis = ""
-    action_items: List[str] = []
-    if isinstance(raw, dict):
-        analysis = str(raw.get("analysis") or raw.get("at_a_glance") or "").strip()[:4000]
-        items = raw.get("action_items") or raw.get("actions") or []
-        if isinstance(items, list):
-            for it in items[:8]:
-                s = str(it or "").strip()
-                if s:
-                    action_items.append(s[:500])
-        elif isinstance(items, str) and items.strip():
-            action_items = [items.strip()[:500]]
-
-    if not analysis and fathom_summary:
-        analysis = truncate_for_tokens(fathom_summary, 1200)
-
-    if not analysis and not fathom_summary:
+    # Fathom summary alone is enough to complete; AI paragraph is best-effort.
+    if not fathom_summary and not ai_summary:
         return None
 
     return {
         "analysis_kind": "glance",
         "fathom_summary": fathom_summary[:20000] if fathom_summary else "",
-        "glance": {
-            "analysis": analysis,
-            "action_items": action_items,
-        },
+        "ai_summary": ai_summary,
         "call_score": None,
         "low_signal": False,
     }
@@ -456,10 +440,13 @@ def is_substantive_call_library_report(report_json: Any) -> bool:
         return False
     if report_json.get("low_signal"):
         return False
-    # Non-sales glance reports: Fathom summary and/or glance analysis/actions.
+    # Non-sales glance reports: raw Fathom summary and/or one AI paragraph.
     if str(report_json.get("analysis_kind") or "") == "glance":
         if str(report_json.get("fathom_summary") or "").strip():
             return True
+        if str(report_json.get("ai_summary") or "").strip():
+            return True
+        # Backward compat with earlier glance shape.
         glance = report_json.get("glance")
         if isinstance(glance, dict):
             if str(glance.get("analysis") or "").strip():

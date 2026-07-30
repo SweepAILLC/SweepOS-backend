@@ -41,6 +41,8 @@ from app.models.automation import (
 )
 from app.models.mcp_oauth import McpOAuthClient, McpOAuthGrant
 from app.models.portal_todo import PortalTodo
+from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
+from app.models.org_kpi_benchmark import OrgKpiBenchmark
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -68,5 +70,7 @@ __all__ = [
     "McpOAuthClient",
     "McpOAuthGrant",
     "PortalTodo",
+    "OrgKpiDailyEntry",
+    "OrgKpiBenchmark",
 ]
 

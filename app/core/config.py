@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     MCP_RESOURCE_URL: Optional[str] = None  # e.g. https://api.sweepai.site/mcp
     MCP_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     MCP_REFRESH_TOKEN_EXPIRE_DAYS: int = 30
-    MCP_SCOPES: str = "clients:read marketing:read terminal:read email:send"
+    MCP_SCOPES: str = "clients:read marketing:read terminal:read kpi:read email:send"
     
     # Stripe
     STRIPE_CLIENT_ID: Optional[str] = None
@@ -104,6 +104,10 @@ class Settings(BaseSettings):
     STRIPE_REDIRECT_URI: str = "https://sweepai.site/api/oauth/stripe/callback"
     STRIPE_TEST_OAUTH_URL: Optional[str] = None  # For development: use test OAuth URL from External test tab
     STRIPE_WEBHOOK_SECRET: Optional[str] = None  # Webhook signing secret for signature verification
+    # On deploy, ensure Stripe-connected orgs have a live per-org webhook at BACKEND_PUBLIC_URL.
+    STRIPE_RECONCILE_WEBHOOKS_ON_STARTUP: bool = True
+    # Worker safety-net: incremental Stripe (+ recent Treasury) catch-up when webhooks miss.
+    STRIPE_CATCHUP_INTERVAL_SEC: int = 600
     
     # Brevo
     BREVO_CLIENT_ID: Optional[str] = None
@@ -179,6 +183,8 @@ class Settings(BaseSettings):
     FATHOM_WEBHOOK_ENRICH_DELAY_SEC: int = 90
     # On deploy, ensure orgs with saved Fathom API keys have a webhook pointed at this backend.
     FATHOM_RECONCILE_WEBHOOKS_ON_STARTUP: bool = True
+    # Local/tunnel escape hatch for Stripe webhook create/replace (mirrors ALLOW_FATHOM_WEBHOOK_REGISTER).
+    # ALLOW_STRIPE_WEBHOOK_REGISTER is read from os.environ in stripe_webhook_onboard.
 
     # Call insights (LLM per matched Fathom recording; safeguards for cost)
     CALL_INSIGHT_MIN_INPUT_CHARS: int = 400

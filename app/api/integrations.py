@@ -3940,6 +3940,14 @@ def update_calendar_booking_sales(
         invalidate_terminal_monthly_trends_cache(org_id)
     except Exception:
         pass
+    try:
+        from app.services.kpi_integration_sync import sync_kpi_for_datetime
+
+        sync_kpi_for_datetime(
+            db, org_id, getattr(check_in, "start_time", None) if check_in else None, commit=True
+        )
+    except Exception:
+        pass
     return {
         "event_id": event_id,
         "provider": provider,
