@@ -254,7 +254,7 @@ def post_client_call_insights_refresh(
         audit_user=current_user,
         audit_request=request,
     )
-    refresh_status, detail = refresh_latest_call_insight(db, org_id, client_uuid)
+    refresh_status, detail = refresh_latest_call_insight(db, org_id, client_uuid, force=True)
     return RefreshCallInsightsResponse(status=refresh_status, detail=detail)
 
 

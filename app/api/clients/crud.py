@@ -383,6 +383,7 @@ def update_client(
                 None,
                 str(org_id),
                 str(client.id),
+                force=True,
             )
         if "email" in update_data or "emails" in update_data:
             from app.services.fathom_client_link import relink_fathom_for_client_and_queue

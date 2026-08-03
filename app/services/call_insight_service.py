@@ -8,7 +8,7 @@ from collections import defaultdict
 import threading
 import time
 import uuid
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import desc, nullslast
@@ -594,20 +594,31 @@ def run_call_insight_background(org_id_str: str, fathom_record_id_str: str) -> N
         db.close()
 
 
-def refresh_latest_call_insight_background(org_id_str: str, client_id_str: str) -> None:
-    """New DB session for thread/RQ after check-in sync."""
+def refresh_latest_call_insight_background(
+    org_id_str: str,
+    client_id_str: str,
+    *,
+    force: bool = False,
+) -> None:
+    """New DB session for thread/RQ after check-in sync.
+
+    force=False (default): honours the recency guard — no-ops when the latest
+    insight is complete and was computed within _INSIGHT_RECENCY_HOURS.
+    force=True: deletes and re-runs regardless (manual user refresh).
+    """
     from app.db.session import SessionLocal
 
     db = SessionLocal()
     try:
         oid = uuid.UUID(org_id_str)
         cid = uuid.UUID(str(client_id_str))
-        status, detail = refresh_latest_call_insight(db, oid, cid)
+        status, detail = refresh_latest_call_insight(db, oid, cid, force=force)
         logger.info(
-            "refresh_latest_call_insight background done client=%s status=%s detail=%s",
+            "refresh_latest_call_insight background done client=%s status=%s detail=%s force=%s",
             client_id_str,
             status,
             detail,
+            force,
         )
     except Exception as e:
         logger.exception("refresh_latest_call_insight background failed: %s", e)
@@ -615,10 +626,23 @@ def refresh_latest_call_insight_background(org_id_str: str, client_id_str: str) 
         db.close()
 
 
+_INSIGHT_RECENCY_HOURS = 2  # Skip re-run if insight was computed within this window
+
+
 def refresh_latest_call_insight(
-    db: Session, org_id: uuid.UUID, client_id: uuid.UUID
+    db: Session,
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+    *,
+    force: bool = False,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """Re-run LLM for the latest Fathom recording (manual refresh)."""
+    """Re-run LLM for the latest Fathom recording.
+
+    By default (force=False) this is a no-op if a complete insight already
+    exists and was computed within _INSIGHT_RECENCY_HOURS.  The calendar-sync
+    background path calls this without force; the manual UI refresh endpoint
+    passes force=True so the user always gets a fresh result.
+    """
     rec = (
         db.query(FathomCallRecord)
         .filter(
@@ -631,6 +655,24 @@ def refresh_latest_call_insight(
     )
     if not rec:
         return "skipped", {"reason": "no_fathom_recording"}
+
+    if not force:
+        existing = (
+            db.query(ClientCallInsight)
+            .filter(ClientCallInsight.fathom_call_record_id == rec.id)
+            .first()
+        )
+        if existing and existing.status == "complete" and existing.insight_json:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=_INSIGHT_RECENCY_HOURS)
+            if existing.computed_at and existing.computed_at.replace(tzinfo=timezone.utc) > cutoff:
+                logger.debug(
+                    "refresh_latest_call_insight skipped recent_insight client=%s record=%s computed_at=%s",
+                    client_id,
+                    rec.id,
+                    existing.computed_at,
+                )
+                return "skipped", {"reason": "recent_insight"}
+
     db.query(ClientCallInsight).filter(ClientCallInsight.fathom_call_record_id == rec.id).delete()
     db.commit()
     return run_call_insight_for_fathom_record(db, org_id, rec.id, bypass_cooldown=True)

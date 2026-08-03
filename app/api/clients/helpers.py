@@ -93,12 +93,18 @@ def refresh_call_insights_after_checkin_sync(org_id_str: str, client_ids: list[s
     Run Fathom call-insight refreshes for clients touched by calendar sync.
 
     A short deferral lets the browser's follow-up bookings read complete before DB-heavy work.
+
+    Uses force=False so clients with a recent complete insight (< 2h old) are skipped.
+    This prevents the 30-second calendar-sync loop from re-running every historical
+    Fathom record on every sync cycle.  The user can still force a refresh via the
+    manual refresh button in the UI, which calls the endpoint with force=True.
     """
     import time
 
     time.sleep(2)
     for cid in client_ids:
-        refresh_latest_call_insight_background(org_id_str, str(cid))
+        # force=False: honours the recency guard in refresh_latest_call_insight
+        refresh_latest_call_insight_background(org_id_str, str(cid), force=False)
 
 
 def scope_org_id(user: User) -> UUID:

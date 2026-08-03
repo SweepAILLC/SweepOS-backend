@@ -450,9 +450,17 @@ def sync_treasury_transactions(
             params["created"] = {"gte": int(created_since.timestamp())}
         
         print(f"[TREASURY SYNC] Fetching Treasury Transactions with params: {params}")
-        
-        # Fetch transactions
-        transactions = stripe.treasury.Transaction.list(**params)
+
+        # Fetch transactions — catch the "not onboarded to Treasury" 400 before it
+        # propagates and pollutes error logs with recurring InvalidRequestError tracebacks.
+        try:
+            transactions = stripe.treasury.Transaction.list(**params)
+        except Exception as treasury_err:
+            err_str = str(treasury_err)
+            if "treasury" in err_str.lower() or "unrecognized request url" in err_str.lower():
+                print(f"[TREASURY SYNC] Treasury not enabled for this Stripe account — skipping sync. ({treasury_err})")
+                return {"success": False, "skipped": True, "reason": "treasury_not_onboarded", "transactions_synced": 0, "errors": []}
+            raise
         
         for transaction in transactions.auto_paging_iter():
             try:
