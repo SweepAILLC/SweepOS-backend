@@ -338,6 +338,8 @@ def detect_bottlenecks(
     db: Session,
     org_id: UUID,
     thresholds_raw: Optional[Dict[str, Any]] = None,
+    *,
+    focus_month: Optional[date] = None,
 ) -> List[KpiFlag]:
     thresholds = normalize_thresholds(thresholds_raw)
     entries = _load_entries(db, org_id)
@@ -345,15 +347,26 @@ def detect_bottlenecks(
         return []
 
     # Same monthly totals as the KPI grid footer rows (newest first)
-    rollups = build_monthly_rollups(entries, months=6)
+    rollups = build_monthly_rollups(entries, months=12)
     if not rollups:
         return []
 
+    # Default: newest month with data. Optional focus: dashboard-selected month.
     current = rollups[0]
+    trend_rollups = rollups
+    if focus_month is not None:
+        focus_start = date(focus_month.year, focus_month.month, 1)
+        idx = next((i for i, r in enumerate(rollups) if r.period_start == focus_start), None)
+        if idx is None:
+            return []
+        current = rollups[idx]
+        # Newest-first slice from focus month backward for 3-month trends.
+        trend_rollups = rollups[idx:]
+
     flags: List[KpiFlag] = []
     flags.extend(_flag_month_thresholds(current, thresholds))
     flags.extend(_flag_month_stage_comparisons(current, thresholds))
-    flags.extend(_flag_month_trends(rollups, thresholds))
+    flags.extend(_flag_month_trends(trend_rollups, thresholds))
 
     seen = set()
     unique: List[KpiFlag] = []

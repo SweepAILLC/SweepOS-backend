@@ -286,9 +286,28 @@ def update_client(
             apply_manual_lifecycle_change(client, new_state)
 
         # JSON columns need flag_modified so SQLAlchemy persists nested dict updates.
+        prev_contract_cents = None
+        if isinstance(getattr(client, "offer_enrollment", None), dict):
+            try:
+                prev_contract_cents = int(client.offer_enrollment.get("total_cents") or 0) or 0
+            except (TypeError, ValueError):
+                prev_contract_cents = 0
+        contract_delta_usd = None
         if "offer_enrollment" in update_data:
-            client.offer_enrollment = update_data.pop("offer_enrollment")
+            new_oe = update_data.pop("offer_enrollment")
+            client.offer_enrollment = new_oe
             flag_modified(client, "offer_enrollment")
+            # Mirror contract changes into KPI revenue so Terminal graph updates.
+            try:
+                new_total = 0
+                if isinstance(new_oe, dict) and new_oe.get("total_cents") is not None:
+                    new_total = int(new_oe.get("total_cents") or 0)
+                old_total = int(prev_contract_cents or 0)
+                delta_cents = new_total - old_total
+                if delta_cents != 0:
+                    contract_delta_usd = delta_cents / 100.0
+            except (TypeError, ValueError):
+                contract_delta_usd = None
         if "meta" in update_data:
             client.meta = update_data.pop("meta")
             flag_modified(client, "meta")
@@ -377,6 +396,27 @@ def update_client(
         db.commit()
         db.refresh(client)
         invalidate_health_score_cache(db, client.id, org_id)
+
+        # Push contract delta into KPI revenue + bust Terminal monthly trends cache.
+        # Use `is not None` so reductions (negative delta) also sync.
+        if contract_delta_usd is not None:
+            try:
+                from datetime import date as date_cls
+                from app.api.kpi import _upsert_kpi_entry_for_org
+                from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+                _upsert_kpi_entry_for_org(
+                    db,
+                    org_id,
+                    date_cls.today(),
+                    {"revenue": contract_delta_usd},
+                    additive=True,
+                )
+                invalidate_terminal_monthly_trends_cache(org_id)
+            except Exception as kpi_err:
+                db.rollback()
+                print(f"[UPDATE_CLIENT] KPI revenue sync after offer enrollment failed: {kpi_err}")
+
         if schedule_dead_llm_refresh:
             schedule_background_work(
                 refresh_latest_call_insight_background,

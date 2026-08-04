@@ -94,6 +94,7 @@ def get_calendar_monthly_coaching_metrics(
     response_model=TerminalMonthlyTrendsResponse,
 )
 def get_terminal_monthly_trends(
+    force_refresh: bool = Query(False, description="Bypass server cache and rebuild trends"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -102,7 +103,7 @@ def get_terminal_monthly_trends(
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
-    return get_or_build_terminal_monthly_trends(db, org)
+    return get_or_build_terminal_monthly_trends(db, org, force_refresh=force_refresh)
 
 
 @router.get("/terminal-summary", response_model=TerminalSummaryResponse)

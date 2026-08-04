@@ -449,6 +449,13 @@ def _upsert_kpi_entry_for_org(
     row.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(row)
+    # KPI volume + revenue feed Terminal monthly charts — bust trends cache.
+    try:
+        from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+        invalidate_terminal_monthly_trends_cache(org_id)
+    except Exception:
+        pass
     return _with_auto_zero_defaults(
         KpiDailyEntryRead.from_orm_row(row),
         entry_day,
@@ -474,6 +481,12 @@ def delete_kpi_entry(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not found")
     db.delete(row)
     db.commit()
+    try:
+        from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+        invalidate_terminal_monthly_trends_cache(org_id)
+    except Exception:
+        pass
     return None
 
 
@@ -646,15 +659,21 @@ def get_kpi_snapshot(
 
 @router.get("/flags", response_model=KpiFlagsResponse)
 def get_kpi_flags(
+    month: Optional[str] = Query(
+        None,
+        description="YYYY-MM-DD (any day) — evaluate bottlenecks for that calendar month",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     org_id = _org_id(current_user)
     bench = _get_or_seed_benchmarks(db, org_id)
+    focus = _parse_date(month) if month else None
     flags = detect_bottlenecks(
         db,
         org_id,
         thresholds_raw=bench.thresholds if isinstance(bench.thresholds, dict) else None,
+        focus_month=focus,
     )
     return KpiFlagsResponse(flags=flags, generated_at=utcnow())
 

@@ -109,11 +109,15 @@ def _dispatcher_loop() -> None:
     last_heartbeat = 0.0
     last_call_library_drain = 0.0
     last_stripe_catchup = 0.0
+    last_instagram_sync = 0.0
     call_library_drain_interval = float(
         getattr(settings, "CALL_LIBRARY_WORKER_DRAIN_INTERVAL_SEC", 180) or 180
     )
     stripe_catchup_interval = float(
         getattr(settings, "STRIPE_CATCHUP_INTERVAL_SEC", 600) or 600
+    )
+    instagram_sync_interval = float(
+        getattr(settings, "INSTAGRAM_SYNC_INTERVAL_SEC", 21600) or 21600
     )
     while not _SHUTDOWN:
         loop_started = time.time()
@@ -154,6 +158,25 @@ def _dispatcher_loop() -> None:
                     except Exception:
                         LOG.exception("stripe catch-up failed")
                     last_stripe_catchup = now
+                if instagram_sync_interval > 0 and now - last_instagram_sync >= instagram_sync_interval:
+                    try:
+                        from app.long_jobs import schedule_background_work
+                        from app.services.instagram_sync_service import sync_instagram_all_orgs_job
+
+                        # Offload so the automation dispatcher tick is never blocked by Composio.
+                        schedule_background_work(
+                            sync_instagram_all_orgs_job,
+                            None,
+                            prefer_rq=True,
+                            job_timeout=max(
+                                900,
+                                int(getattr(settings, "INSTAGRAM_SYNC_BUDGET_SEC", 90) or 90) * 20,
+                            ),
+                        )
+                        LOG.info("instagram sync enqueued (interval=%ss)", int(instagram_sync_interval))
+                    except Exception:
+                        LOG.exception("instagram sync enqueue failed")
+                    last_instagram_sync = now
                 if attempted:
                     LOG.info("dispatcher: processed %d job(s)", attempted)
         except Exception:

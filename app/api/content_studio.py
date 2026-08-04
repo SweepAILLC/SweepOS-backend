@@ -112,6 +112,7 @@ def _parse_bundle_dict(raw: Dict[str, Any]) -> ContentStudioBundleOut:
                     id=cid,
                     format=fmt,  # type: ignore[arg-type]
                     title=str(concept.get("title") or ""),
+                    hook=str(concept.get("hook") or ""),
                     bullets=bullets,
                     why_for_icp=str(concept.get("why_for_icp") or ""),
                     funnel_path_to_sale=str(concept.get("funnel_path_to_sale") or ""),

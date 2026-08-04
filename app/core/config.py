@@ -95,7 +95,15 @@ class Settings(BaseSettings):
     MCP_RESOURCE_URL: Optional[str] = None  # e.g. https://api.sweepai.site/mcp
     MCP_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     MCP_REFRESH_TOKEN_EXPIRE_DAYS: int = 30
-    MCP_SCOPES: str = "clients:read marketing:read terminal:read kpi:read email:send"
+    MCP_SCOPES: str = "clients:read marketing:read terminal:read kpi:read instagram:read email:send"
+
+    # Instagram Performance Intel (Composio API key is per-org via Integrations)
+    INSTAGRAM_SYNC_INTERVAL_SEC: int = 86400  # daily worker poll
+    INSTAGRAM_MAX_POSTS_PER_SYNC: int = 100
+    # Soft wall-clock budget per org so Composio round-trips cannot hang forever.
+    INSTAGRAM_SYNC_BUDGET_SEC: int = 90
+    # Cap insight refreshes for already-known posts (settling / recent).
+    INSTAGRAM_INSIGHTS_REFRESH_LIMIT: int = 25
     
     # Stripe
     STRIPE_CLIENT_ID: Optional[str] = None

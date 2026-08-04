@@ -14,7 +14,14 @@ class HealthTrendPeriod(BaseModel):
     close_rate_pct: Optional[float] = None
     stripe_revenue_usd: float = 0.0
     combined_revenue_usd: Optional[float] = None
+    # Contract / deal revenue (KPI revenue + close-survey / drawer contract amounts) for the month.
+    deal_revenue_usd: float = 0.0
     calls_booked_count: int = 0
+    # Monthly KPI Command Center volume (sum of daily entries).
+    kpi_closes_count: int = 0
+    kpi_show_ups_count: int = 0  # calls_taken
+    kpi_calls_booked_count: int = 0
+    kpi_outreach_sent_count: int = 0
     cumulative_total_clients: int = 0
     active_clients_cohort: int = 0
 

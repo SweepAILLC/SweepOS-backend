@@ -13,6 +13,8 @@ class OAuthProvider(str, enum.Enum):
     CALCOM = "calcom"
     CALENDLY = "calendly"
     WHOP = "whop"
+    INSTAGRAM = "instagram"
+    COMPOSIO = "composio"
 
 
 class OAuthToken(Base):

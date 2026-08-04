@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.models.client import LifecycleState
 
-_OFFER_SLOT_RE = re.compile(r"^(core|referral|upsell:\d+|downsell:\d+)$")
+_OFFER_SLOT_RE = re.compile(r"^(core|referral|custom|upsell:\d+|downsell:\d+)$")
 
 
 def _naive_utc_program(dt: datetime) -> datetime:
@@ -117,7 +117,7 @@ class ClientOfferEnrollmentPatch(BaseModel):
         s = (v or "").strip()
         if not _OFFER_SLOT_RE.match(s):
             raise ValueError(
-                "slot must be core, referral, upsell:N, or downsell:N (e.g. upsell:0)"
+                "slot must be core, referral, custom, upsell:N, or downsell:N (e.g. upsell:0)"
             )
         return s
 

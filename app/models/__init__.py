@@ -43,6 +43,8 @@ from app.models.mcp_oauth import McpOAuthClient, McpOAuthGrant
 from app.models.portal_todo import PortalTodo
 from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.models.org_kpi_benchmark import OrgKpiBenchmark
+from app.models.instagram_media import InstagramMedia
+from app.models.instagram_account_snapshot import InstagramAccountSnapshot
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -72,5 +74,7 @@ __all__ = [
     "PortalTodo",
     "OrgKpiDailyEntry",
     "OrgKpiBenchmark",
+    "InstagramMedia",
+    "InstagramAccountSnapshot",
 ]
 

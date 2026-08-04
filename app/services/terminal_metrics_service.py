@@ -10,12 +10,14 @@ from threading import Lock as ThreadingLock
 from typing import List, Optional
 from uuid import UUID
 
-from sqlalchemy import func
+from sqlalchemy import and_, exists, func, or_
 from sqlalchemy.orm import Session
 
+from app.models.calendar_booking_sales import CalendarBookingSales
 from app.models.client import Client, LifecycleState
 from app.models.client_checkin import ClientCheckIn
 from app.models.manual_payment import ManualPayment
+from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.models.organization import Organization
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction
 from app.models.whop_payment import WhopPayment
@@ -173,9 +175,17 @@ def invalidate_terminal_monthly_trends_cache(org_id: UUID) -> None:
         _terminal_monthly_trends_cache.pop(cache_key, None)
 
 
-def get_or_build_terminal_monthly_trends(db: Session, org: Organization) -> TerminalMonthlyTrendsResponse:
+def get_or_build_terminal_monthly_trends(
+    db: Session,
+    org: Organization,
+    *,
+    force_refresh: bool = False,
+) -> TerminalMonthlyTrendsResponse:
     """Return cached trends or build once per org (concurrent requests wait on the same lock)."""
     org_id = org.id
+    if force_refresh:
+        invalidate_terminal_monthly_trends_cache(org_id)
+
     cached = terminal_monthly_trends_cache_get(org_id)
     if cached is not None:
         return cached
@@ -221,7 +231,9 @@ def build_terminal_monthly_trends(db: Session, org: Organization) -> TerminalMon
     periods_out: List[HealthTrendPeriod] = []
 
     while month_cursor <= now_utc_dash:
-        month_end_exclusive = min(admin_api._add_one_calendar_month_first(month_cursor), now_utc_dash)
+        month_end_full = admin_api._add_one_calendar_month_first(month_cursor)
+        # Cash / show-up / close-rate are "as of now" for the current month.
+        month_end_exclusive = min(month_end_full, now_utc_dash)
         ps_naive = admin_api._utc_naive(month_cursor)
         pe_naive_exclusive = admin_api._utc_naive(month_end_exclusive)
 
@@ -240,18 +252,62 @@ def build_terminal_monthly_trends(db: Session, org: Organization) -> TerminalMon
         )
         combined_cash = stripe_cash + whop_cash + manual_cash
 
+        # KPI monthly sums: deal revenue + activity volume for Terminal charts.
+        month_start_date = month_cursor.date()
+        month_end_date = month_end_full.date()
+        kpi_row = (
+            db.query(
+                func.coalesce(func.sum(OrgKpiDailyEntry.revenue), 0),
+                func.coalesce(func.sum(OrgKpiDailyEntry.closes), 0),
+                func.coalesce(func.sum(OrgKpiDailyEntry.calls_taken), 0),
+                func.coalesce(func.sum(OrgKpiDailyEntry.calls_booked), 0),
+                func.coalesce(func.sum(OrgKpiDailyEntry.outreach_sent), 0),
+            )
+            .filter(
+                OrgKpiDailyEntry.org_id == org_id,
+                OrgKpiDailyEntry.entry_date >= month_start_date,
+                OrgKpiDailyEntry.entry_date < month_end_date,
+            )
+            .one()
+        )
+        try:
+            deal_revenue_usd = float(kpi_row[0] or 0)
+        except (TypeError, ValueError):
+            deal_revenue_usd = 0.0
+        kpi_closes_count = int(kpi_row[1] or 0)
+        kpi_show_ups_count = int(kpi_row[2] or 0)
+        kpi_calls_booked_from_tracker = int(kpi_row[3] or 0)
+        kpi_outreach_sent_count = int(kpi_row[4] or 0)
+
+        # Booked sales calls for the full calendar month — include upcoming meetings still
+        # ahead of "now". Capping at now made Aug show 0 while Upcoming KPI showed future calls.
+        # Also honor calendar_booking_sales flags when check-in row wasn't updated (id mismatch).
+        sales_meta_exists = exists().where(
+            and_(
+                CalendarBookingSales.org_id == ClientCheckIn.org_id,
+                CalendarBookingSales.provider == ClientCheckIn.provider,
+                CalendarBookingSales.event_id == ClientCheckIn.event_id,
+                CalendarBookingSales.is_sales_call == True,  # noqa: E712
+            )
+        )
         calls_ct = (
             db.query(func.count(ClientCheckIn.id))
             .filter(
                 ClientCheckIn.org_id == org_id,
-                ClientCheckIn.is_sales_call == True,
                 ClientCheckIn.cancelled == False,
                 ClientCheckIn.start_time >= month_cursor,
-                ClientCheckIn.start_time < month_end_exclusive,
+                ClientCheckIn.start_time < month_end_full,
+                or_(
+                    ClientCheckIn.is_sales_call == True,  # noqa: E712
+                    sales_meta_exists,
+                ),
             )
             .scalar()
             or 0
         )
+        # Terminal "Booked calls" prefers live calendar sales; KPI daily rows are often
+        # missing for months that were never opened in the tracker.
+        kpi_calls_booked_count = int(calls_ct) if int(calls_ct) > 0 else kpi_calls_booked_from_tracker
 
         cum_clients = (
             db.query(func.count(Client.id))
@@ -282,7 +338,12 @@ def build_terminal_monthly_trends(db: Session, org: Organization) -> TerminalMon
                 close_rate_pct=cr,
                 stripe_revenue_usd=stripe_cash,
                 combined_revenue_usd=combined_cash,
+                deal_revenue_usd=deal_revenue_usd,
                 calls_booked_count=calls_ct,
+                kpi_closes_count=kpi_closes_count,
+                kpi_show_ups_count=kpi_show_ups_count,
+                kpi_calls_booked_count=kpi_calls_booked_count,
+                kpi_outreach_sent_count=kpi_outreach_sent_count,
                 cumulative_total_clients=cum_clients,
                 active_clients_cohort=active_cohort,
             )

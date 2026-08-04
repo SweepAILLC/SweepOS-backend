@@ -3918,18 +3918,28 @@ def update_calendar_booking_sales(
         )
         db.add(row)
     
-    # Update any synced client_check_in for this event (match by event_id; Calendly uses uuid)
-    check_in = db.query(ClientCheckIn).filter(
-        ClientCheckIn.org_id == org_id,
-        ClientCheckIn.provider == provider,
-        ClientCheckIn.event_id == event_id,
-    ).first()
-    if check_in:
+    # Update synced client_check_in rows for this event.
+    # Match by event_id and optionally event_uri (Cal.com uid vs numeric id mismatches).
+    check_in_filters = [ClientCheckIn.event_id == event_id]
+    if event_uri:
+        check_in_filters.append(ClientCheckIn.event_uri == event_uri)
+    check_ins = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.provider == provider,
+            or_(*check_in_filters),
+        )
+        .all()
+    )
+    now = datetime.utcnow()
+    check_in = check_ins[0] if check_ins else None
+    for ci in check_ins:
         if is_sales_call is not None:
-            check_in.is_sales_call = is_sales_call
+            ci.is_sales_call = is_sales_call
         if sale_closed is not None:
-            check_in.sale_closed = sale_closed
-        check_in.updated_at = datetime.utcnow()
+            ci.sale_closed = sale_closed
+        ci.updated_at = now
     
     db.commit()
     db.refresh(row)
@@ -3953,6 +3963,7 @@ def update_calendar_booking_sales(
         "provider": provider,
         "is_sales_call": row.is_sales_call,
         "sale_closed": row.sale_closed,
+        "check_ins_updated": len(check_ins),
     }
 
 

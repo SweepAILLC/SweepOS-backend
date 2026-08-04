@@ -21,6 +21,8 @@ class Organization(Base):
     consulting_tier = Column(String, nullable=True)
     # External booking link (Cal.com / Calendly) shown in the org portal
     booking_url = Column(Text, nullable=True)
+    # Public post-sales close survey link token (no login)
+    close_form_token = Column(UUID(as_uuid=True), unique=True, nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

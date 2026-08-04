@@ -20,8 +20,9 @@ from app.services.user_ai_profile_context import extract_ai_profile_for_llm
 
 logger = logging.getLogger(__name__)
 
-# Bumped to invalidate every previously-generated bundle (4-section + voice_marketing shape).
-BUNDLE_VERSION = 3
+# Bumped to invalidate every previously-generated bundle when grounding shape changes.
+# v6: enforce prescribed BOF case-study ideas from call-library evidence.
+BUNDLE_VERSION = 6
 
 # Each entry: (stage, default title, default intro hint shown when LLM cannot run).
 STAGE_SPECS: List[Tuple[str, str, str]] = [
@@ -103,8 +104,125 @@ def _stage_grounding_block(signals: Dict[str, Any]) -> str:
     )
 
 
+def _instagram_perf_fingerprint(db: Session, org_id: uuid.UUID) -> str:
+    try:
+        from app.services.instagram_performance import performance_fingerprint
+
+        return performance_fingerprint(db, org_id)
+    except Exception:
+        logger.exception("instagram performance fingerprint failed org=%s", org_id)
+        return "ig:err"
+
+
+def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, Any]:
+    """Compact winners/losers for the content ideation prompt."""
+    try:
+        from app.services.instagram_performance import build_instagram_performance
+
+        perf = build_instagram_performance(db, org_id, days=90)
+    except Exception:
+        logger.exception("instagram performance block failed org=%s", org_id)
+        return {"connected": False}
+    if not perf.get("connected"):
+        return {"connected": False}
+    what = perf.get("what_works") or []
+    double_down = [w for w in what if w.get("verdict") == "double_down"]
+    by_dim: Dict[str, Dict[str, Any]] = {}
+    for row in sorted(
+        double_down,
+        key=lambda r: float(r.get("lift_vs_median_pct") or 0),
+        reverse=True,
+    ):
+        dim = str(row.get("dimension") or "")
+        if dim and dim not in by_dim:
+            by_dim[dim] = row
+    return {
+        "connected": True,
+        "summary": {
+            "posts": (perf.get("summary") or {}).get("posts"),
+            "engagement_rate_pct": (perf.get("summary") or {}).get("engagement_rate_pct"),
+            "reach": (perf.get("summary") or {}).get("reach"),
+            "saved": (perf.get("summary") or {}).get("saved"),
+        },
+        "verdicts": (perf.get("verdicts") or [])[:5],
+        "double_down": double_down[:6],
+        "double_down_by_dimension": {
+            "funnel_stage": by_dim.get("funnel_stage"),
+            "format_bucket": by_dim.get("format_bucket"),
+            "hook_pattern": by_dim.get("hook_pattern"),
+        },
+        "stop": [w for w in what if w.get("verdict") == "stop"][:4],
+        "top_hooks": [
+            {
+                "hook_text": p.get("hook_text"),
+                "format_bucket": p.get("format_bucket"),
+                "engagement_rate_pct": p.get("engagement_rate_pct"),
+                "saved": p.get("saved"),
+                "reach": p.get("reach"),
+            }
+            for p in (perf.get("top_posts") or [])[:5]
+        ],
+        "capabilities": perf.get("capabilities"),
+    }
+
+
+def _instagram_anchor_for_stage(stage_id: str, ig: Dict[str, Any]) -> str:
+    dd = ig.get("double_down_by_dimension") if isinstance(ig, dict) else None
+    stage_row = dd.get("funnel_stage") if isinstance(dd, dict) else None
+    format_row = dd.get("format_bucket") if isinstance(dd, dict) else None
+    hook_row = dd.get("hook_pattern") if isinstance(dd, dict) else None
+
+    top_hook = ""
+    for row in ig.get("top_hooks") or []:
+        txt = str((row or {}).get("hook_text") or "").strip()
+        if txt:
+            top_hook = txt[:100]
+            break
+
+    stage_hint = ""
+    if isinstance(stage_row, dict):
+        stage_hint = str(stage_row.get("value_label") or stage_row.get("value") or "").strip()
+    if not stage_hint and stage_id == "TOF":
+        stage_hint = "TOF awareness posts"
+    if not stage_hint:
+        stage_hint = "this funnel stage"
+
+    format_hint = "your top format"
+    if isinstance(format_row, dict):
+        format_label = str(format_row.get("value_label") or format_row.get("value") or "").strip()
+        if format_label:
+            format_hint = format_label
+
+    hook_hint = "your strongest opening style"
+    if isinstance(hook_row, dict):
+        hook_label = str(hook_row.get("value_label") or hook_row.get("value") or "").strip()
+        if hook_label:
+            hook_hint = hook_label
+
+    line = (
+        f"Instagram performance signal: {stage_hint} using {format_hint} and {hook_hint} "
+        "is a current winner, so this concept should double down on that pattern."
+    )
+    if top_hook:
+        line += f" Working example hook style: \"{top_hook}\"."
+    return line
+
+
+def _enforce_instagram_grounding(stages_out: List[Dict[str, Any]], ig: Dict[str, Any]) -> None:
+    """Guarantee each concept references winner patterns when Instagram is connected."""
+    if not ig.get("connected"):
+        return
+    for stage in stages_out:
+        sid = str(stage.get("id") or "").upper().strip()
+        anchor = _instagram_anchor_for_stage(sid, ig)
+        for concept in stage.get("concepts") or []:
+            why = str(concept.get("why_for_icp") or "").strip()
+            merged = f"{why} {anchor}".strip() if why else anchor
+            concept["why_for_icp"] = merged[:1200]
+
+
 def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
-    """Stable hash that flips when underlying Fathom / insight data meaningfully changes."""
+    """Stable hash that flips when underlying Fathom / insight / IG performance data changes."""
     sig = collect_fathom_sales_signals(db, org_id)
     transcript_analyses_count = (
         db.query(ContentStudioTranscriptAnalysis)
@@ -140,6 +258,7 @@ def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
         "tail": tail,
         "has_any": bool(sig.get("has_any")),
         "transcript_analyses": transcript_analyses_count,
+        "ig_fp": _instagram_perf_fingerprint(db, org_id),
     }
     raw = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -188,6 +307,103 @@ def _normalize_stage(raw: Dict[str, Any], stage: str, fallback_title: str, fallb
         "intro": str(raw.get("intro") or raw.get("body") or fallback_intro)[:1200],
         "concepts": concepts_out[:8],
     }
+
+
+def _collect_bof_call_library_examples(signals: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Real BOF proof snippets extracted from call-library derived insights."""
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _push(kind: str, text: Any) -> None:
+        s = str(text or "").strip()
+        if not s:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"kind": kind, "text": s[:360]})
+
+    insights = signals.get("insights") if isinstance(signals, dict) else []
+    if isinstance(insights, list):
+        for ins in insights[:12]:
+            if not isinstance(ins, dict):
+                continue
+            for t in (ins.get("testimonial_stories") or [])[:4]:
+                _push("testimonial_story", t)
+            for w in (ins.get("wins") or [])[:4]:
+                _push("win", w)
+
+    active = signals.get("active_client_insights") if isinstance(signals, dict) else []
+    if isinstance(active, list):
+        for ins in active[:12]:
+            if not isinstance(ins, dict):
+                continue
+            for w in (ins.get("wins") or [])[:4]:
+                _push("active_client_win", w)
+    return out[:8]
+
+
+def _build_prescribed_bof_concept(example: Dict[str, str], idx: int) -> Dict[str, Any]:
+    quote = str(example.get("text") or "").strip()
+    kind = str(example.get("kind") or "call_library_example").replace("_", " ")
+    hook_seed = quote[:120]
+    if len(quote) > 120:
+        hook_seed = hook_seed.rstrip() + "..."
+    return {
+        "id": str(uuid.uuid4()),
+        "format": "short" if idx % 2 == 0 else "long",
+        "title": f"Prescribed BOF Case Study: {quote[:80]}",
+        "hook": f"Client result replay: {hook_seed}",
+        "bullets": [
+            f"Proof: paraphrase this real call-library {kind} — {quote}",
+            "Mechanism: explain what changed and why it worked in plain language.",
+            "Re-hook: connect this outcome back to the viewer's current problem.",
+            "CTA: invite the viewer to book/apply if they want the same transformation path.",
+        ],
+        "why_for_icp": (
+            "This BOF idea is pulled from a real call-library example and should be presented as a concrete "
+            "testimonial/case-study replay that builds trust with your ICP."
+        ),
+        "funnel_path_to_sale": (
+            "Shows believable proof from a real client story so warm viewers trust the method and take the next buying step."
+        ),
+    }
+
+
+def _enforce_bof_prescribed_case_studies(
+    stages_out: List[Dict[str, Any]],
+    signals: Dict[str, Any],
+) -> None:
+    """Guarantee BOF includes prescribed case-study concepts from real call-library examples."""
+    examples = _collect_bof_call_library_examples(signals)
+    if not examples:
+        return
+    bof_stage = None
+    for stage in stages_out:
+        if str(stage.get("id") or "").upper().strip() == "BOF":
+            bof_stage = stage
+            break
+    if not isinstance(bof_stage, dict):
+        return
+
+    concepts = bof_stage.get("concepts") if isinstance(bof_stage.get("concepts"), list) else []
+    prescribed_count = sum(
+        1
+        for c in concepts
+        if "prescribed bof case study" in str((c or {}).get("title") or "").lower()
+    )
+    need = max(0, min(2, len(examples)) - prescribed_count)
+    if need <= 0:
+        return
+
+    injected = [_build_prescribed_bof_concept(examples[i], i) for i in range(need)]
+    bof_stage["concepts"] = (injected + concepts)[:8]
+    intro = str(bof_stage.get("intro") or "").strip()
+    marker = "Includes prescribed case-study concepts pulled from real call-library examples."
+    if marker not in intro:
+        joined = f"{intro} {marker}".strip()
+        bof_stage["intro"] = joined[:1200]
 
 
 def draft_content_studio_bundle_llm(
@@ -242,13 +458,26 @@ HARD RULES:
   - TOF: trending, scroll-stopping concepts that mine the most attention-grabbing pains/shocks/beliefs from Fathom data and tie back to the ICP's surface-level pain.
   - MOF: education concepts the operator already teaches on sales calls (frameworks, reframes, decision rules, myth-busts). Pre-handles objections.
   - BOF: client wins & case study breakdowns from `insights[].wins`, `insights[].testimonial_stories`, `active_client_insights[].wins`. If those are empty, return fewer or 0 BOF concepts and say so in the stage intro — never fabricate.
+  - BOF must include at least one concept whose title starts with "Prescribed BOF Case Study:" and is directly based on a real call-library example from SIGNALS.
 - Every concept MUST include `hook` (1 scripted line), `bullets` (proof → re-hook → body → CTA beats), `why_for_icp`, and `funnel_path_to_sale`.
 - `why_for_icp` MUST reference the ICP fields in INTELLIGENCE_PROFILE (target_audience, business_description, unique_selling_proposition, pipeline_priorities, offer_ladder) AND name the specific objection/goal from the Fathom SIGNALS the concept dissolves.
 - KNOWLEDGE_BASE (CONTENT_IDEATION_SOP + OFFER_BUILDING_SOP + CONVERSION IDEATION METHOD) is a MANDATORY creative constraint:
   - 3-layer funnel: the `hook` behaves as the HOOK (widest relevant audience, ZERO niche terms, one universal driver, passes the swap test); niche/ICP specificity only enters in the amplifier beats (context → symptom → system); the final beat is the CTA (one ask tied to the amplifier's specific promise). Pick hook types from the SOP's 13 that fit each stage's goal.
   - Reinforce the OFFER: where relevant, echo the operator's positioning levers (owned category, named enemy/wrong-cause, named mechanism, proof) and move the value equation (raise believable outcome/likelihood, lower perceived time/effort).
   - The frameworks are the STRUCTURE; INTELLIGENCE_PROFILE + Fathom SIGNALS are the SUBSTANCE.
+- When INSTAGRAM_PERFORMANCE is connected: bias new concepts toward double_down formats/hooks/themes,
+  avoid stop patterns, and reuse winning hook shapes (not copy captions).
+- If INSTAGRAM_PERFORMANCE.connected=true, every concept's why_for_icp MUST include one explicit line that starts
+  with "Instagram performance signal:" and names at least one current winner to double down on
+  (funnel_stage and/or format_bucket and/or hook_pattern).
 - No PII (no full names). Paraphrase any quotes."""
+
+    ig_perf = _instagram_perf_block_for_llm(db, org_id)
+    bof_examples = _collect_bof_call_library_examples(signals)
+    ig_block = json.dumps(ig_perf, ensure_ascii=False, default=str)
+    if len(ig_block) > 12000:
+        ig_block = ig_block[:12000] + "\n…[truncated]"
+    bof_block = json.dumps(bof_examples[:6], ensure_ascii=False, default=str)
 
     user = f"""INTELLIGENCE_PROFILE (ICP, offer ladder, USP, voice — anchor every concept to this):
 {profile_block}
@@ -261,6 +490,12 @@ GROUNDING (mandatory stage → Fathom field mapping):
 
 SIGNALS (Fathom meeting summaries, org themes, call insights, active-client insights):
 {data_block}
+
+CALL_LIBRARY_BOF_EXAMPLES (real snippets for prescribed BOF case-study concepts):
+{bof_block}
+
+INSTAGRAM_PERFORMANCE (real results — double_down / stop / top hooks; empty if not connected):
+{ig_block}
 
 Fingerprint (opaque): {fingerprint}
 """
@@ -288,6 +523,8 @@ Fingerprint (opaque): {fingerprint}
     for stage, default_title, default_intro in STAGE_SPECS:
         src = by_stage.get(stage, {})
         stages_out.append(_normalize_stage(src, stage, default_title, default_intro))
+    _enforce_instagram_grounding(stages_out, ig_perf)
+    _enforce_bof_prescribed_case_studies(stages_out, signals)
 
     batch_id = str(uuid.uuid4())
     return {

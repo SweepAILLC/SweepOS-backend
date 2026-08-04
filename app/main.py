@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, kpi
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, kpi, instagram, close_survey
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -79,6 +79,8 @@ app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webh
 app.include_router(resources.router, prefix="/resources", tags=["resources"])
 app.include_router(portal.router, prefix="/portal", tags=["portal"])
 app.include_router(kpi.router, prefix="/kpi", tags=["kpi"])
+app.include_router(close_survey.router, prefix="/close-survey", tags=["close-survey"])
+app.include_router(instagram.router, prefix="/instagram", tags=["instagram"])
 
 @app.on_event("startup")
 def _ensure_schema_columns_on_startup() -> None:
@@ -167,6 +169,18 @@ def _ensure_schema_columns_on_startup() -> None:
         _add_column_if_missing("organizations", "fathom_webhook_url", "TEXT")
         _add_column_if_missing("organizations", "consulting_tier", "VARCHAR")
         _add_column_if_missing("organizations", "booking_url", "TEXT")
+        _add_column_if_missing("organizations", "close_form_token", "UUID")
+        try:
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
+            db.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_organizations_close_form_token "
+                    "ON organizations (close_form_token)"
+                )
+            )
+        except Exception:
+            db.rollback()
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
 
         # portal_todos: org portal to-do list
         from app.models.portal_todo import PortalTodo

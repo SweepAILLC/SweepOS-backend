@@ -37,6 +37,20 @@ from app.services.kpi_mcp_bundle import (
     get_kpi_snapshot_for_mcp,
     get_kpi_trends_for_mcp,
 )
+from app.services.instagram_mcp_bundle import (
+    get_instagram_performance_for_mcp,
+    get_instagram_top_posts_for_mcp,
+)
+from app.services.resource_documents import (
+    ensure_resource_documents_table,
+    list_docs,
+    get_doc,
+)
+from app.services.resource_library import (
+    ensure_resource_library_table,
+    list_library_items,
+    get_library_item,
+)
 from app.services.mcp_oauth_service import mcp_resource, verify_mcp_access_token
 from app.services.terminal_dashboard_bundle import build_terminal_dashboard_for_mcp
 
@@ -46,7 +60,7 @@ router = APIRouter()
 
 SERVER_INFO = {
     "name": "sweepos",
-    "version": "1.3.0",
+    "version": "1.5.0",
     "protocolVersion": "2025-03-26",
 }
 
@@ -313,6 +327,98 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "get_instagram_performance",
+        "description": (
+            "Instagram content performance for the org: summary KPIs, weekly trends, top/bottom posts, "
+            "what_works dimensional lift (format/hook/theme), tactical verdicts, and decline flags. "
+            "Requires Instagram connected in SweepOS Integrations. Prefer this for 'what's working on IG'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "default": 90,
+                    "minimum": 7,
+                    "maximum": 365,
+                    "description": "Trailing window in days",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_instagram_top_posts",
+        "description": (
+            "Ranked Instagram posts by engagement rate. Optionally filter by format_bucket "
+            "(reel|carousel|image|video) or theme_key."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "default": 90, "minimum": 7, "maximum": 365},
+                "format_bucket": {"type": "string"},
+                "theme_key": {"type": "string"},
+                "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 25},
+            },
+        },
+    },
+    {
+        "name": "list_resource_docs",
+        "description": (
+            "List SOP / AI Skill resource docs for this org (built-ins + org overrides + custom docs). "
+            "Use this to browse the SOP library and per-org resource docs."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "Optional category filter: SOP or AI Skill"},
+                "include_content": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true, include full markdown content in each doc",
+                },
+                "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 500},
+            },
+        },
+    },
+    {
+        "name": "get_resource_doc",
+        "description": "Get one SOP/resource doc by resource_id, including markdown content.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "resource_id": {"type": "string", "description": "Document resource_id slug"},
+            },
+            "required": ["resource_id"],
+        },
+    },
+    {
+        "name": "list_org_resource_library",
+        "description": (
+            "List org resource-library items (text, markdown, image, video_url, url). "
+            "These are per-org resources uploaded/linked in the Resources tab."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "description": "Optional kind filter"},
+                "tag": {"type": "string", "description": "Optional tag filter"},
+                "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 500},
+            },
+        },
+    },
+    {
+        "name": "get_org_resource_library_item",
+        "description": "Get one org resource-library item by id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string", "description": "Library item UUID"},
+            },
+            "required": ["item_id"],
+        },
+    },
+    {
         "name": "list_brevo_senders",
         "description": (
             "List verified Brevo sender email/name options for this org. "
@@ -378,7 +484,7 @@ def _www_authenticate() -> str:
             meta = f"{meta}/{suffix}"
     return (
         f'Bearer realm="SweepOS", resource_metadata="{meta}", '
-        f'scope="clients:read marketing:read terminal:read kpi:read email:send"'
+        f'scope="clients:read marketing:read terminal:read kpi:read instagram:read email:send"'
     )
 
 
@@ -567,6 +673,85 @@ def _run_tool(
         )
     if name == "get_kpi_flags":
         return _text_result(get_kpi_flags_for_mcp(db, org_id))
+    if name == "get_instagram_performance":
+        return _text_result(
+            get_instagram_performance_for_mcp(
+                db,
+                org_id,
+                days=int(args.get("days") or 90),
+            )
+        )
+    if name == "get_instagram_top_posts":
+        return _text_result(
+            get_instagram_top_posts_for_mcp(
+                db,
+                org_id,
+                days=int(args.get("days") or 90),
+                format_bucket=args.get("format_bucket"),
+                theme_key=args.get("theme_key"),
+                limit=int(args.get("limit") or 10),
+            )
+        )
+    if name == "list_resource_docs":
+        ensure_resource_documents_table(db)
+        docs = list_docs(db, org_id)
+        category = str(args.get("category") or "").strip().lower()
+        include_content = bool(args.get("include_content") or False)
+        limit = int(args.get("limit") or 200)
+        if category:
+            docs = [d for d in docs if str(d.get("category") or "").strip().lower() == category]
+        docs = docs[: max(1, min(limit, 500))]
+        if not include_content:
+            docs = [
+                {
+                    "resource_id": d.get("resource_id"),
+                    "category": d.get("category"),
+                    "sop_category": d.get("sop_category"),
+                    "title": d.get("title"),
+                    "description": d.get("description"),
+                    "powered_by": d.get("powered_by"),
+                    "video_url": d.get("video_url"),
+                    "is_custom": d.get("is_custom"),
+                    "is_builtin": d.get("is_builtin"),
+                    "updated_at": d.get("updated_at"),
+                    "sort_order": d.get("sort_order"),
+                }
+                for d in docs
+            ]
+        return _text_result({"docs": docs, "count": len(docs)})
+    if name == "get_resource_doc":
+        rid = str(args.get("resource_id") or "").strip()
+        if not rid:
+            return _text_result({"error": "resource_id required"})
+        ensure_resource_documents_table(db)
+        doc = get_doc(db, org_id, rid)
+        if not doc:
+            return _text_result({"error": "resource doc not found"})
+        return _text_result(doc)
+    if name == "list_org_resource_library":
+        ensure_resource_library_table(db)
+        items = list_library_items(db, org_id)
+        kind = str(args.get("kind") or "").strip().lower()
+        tag = str(args.get("tag") or "").strip()
+        limit = int(args.get("limit") or 200)
+        if kind:
+            items = [i for i in items if str(i.get("kind") or "").strip().lower() == kind]
+        if tag:
+            items = [i for i in items if tag in (i.get("tags") or [])]
+        items = items[: max(1, min(limit, 500))]
+        return _text_result({"items": items, "count": len(items)})
+    if name == "get_org_resource_library_item":
+        raw = str(args.get("item_id") or "").strip()
+        if not raw:
+            return _text_result({"error": "item_id required"})
+        ensure_resource_library_table(db)
+        try:
+            item = get_library_item(db, org_id, uuid.UUID(raw))
+        except ValueError:
+            return _text_result({"error": "invalid item_id"})
+        if not item:
+            return _text_result({"error": "resource library item not found"})
+        return _text_result(item)
     if name == "list_brevo_senders":
         active_only = args.get("active_only")
         if active_only is None:
@@ -701,6 +886,26 @@ def _handle_jsonrpc(
                         "mimeType": "application/json",
                     },
                     {
+                        "uri": "sweep://instagram/performance",
+                        "name": "Instagram performance",
+                        "description": (
+                            "Content performance: verdicts, what_works, top posts, weekly trends"
+                        ),
+                        "mimeType": "application/json",
+                    },
+                    {
+                        "uri": "sweep://resources/docs",
+                        "name": "SOP / resource docs",
+                        "description": "SOP library and per-org resource documents (built-ins + custom)",
+                        "mimeType": "application/json",
+                    },
+                    {
+                        "uri": "sweep://resources/library",
+                        "name": "Org resource library",
+                        "description": "Per-org uploaded/linked resources (text, markdown, image, video_url, url)",
+                        "mimeType": "application/json",
+                    },
+                    {
                         "uri": "sweep://brevo/senders",
                         "name": "Brevo senders",
                         "description": "Verified sender email/name options for outbound email",
@@ -830,8 +1035,77 @@ def _handle_jsonrpc(
                     ]
                 },
             }
+        if uri == "sweep://instagram/performance":
+            payload = get_instagram_performance_for_mcp(db, org_id, days=90)
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
         if uri == "sweep://brevo/senders":
             payload = list_brevo_senders_for_mcp(db, org_id, user_id=user_id, active_only=True)
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://resources/docs":
+            ensure_resource_documents_table(db)
+            payload = {"docs": list_docs(db, org_id)}
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri.startswith("sweep://resources/docs/"):
+            rid = uri.split("sweep://resources/docs/", 1)[1]
+            ensure_resource_documents_table(db)
+            payload = get_doc(db, org_id, rid) or {"error": "resource doc not found"}
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://resources/library":
+            ensure_resource_library_table(db)
+            payload = {"items": list_library_items(db, org_id)}
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri.startswith("sweep://resources/library/"):
+            raw = uri.split("sweep://resources/library/", 1)[1]
+            ensure_resource_library_table(db)
+            try:
+                payload = get_library_item(db, org_id, uuid.UUID(raw)) or {"error": "resource library item not found"}
+            except ValueError:
+                payload = {"error": "invalid resource library item id"}
             text = json.dumps(payload, default=str)
             return {
                 "jsonrpc": "2.0",
