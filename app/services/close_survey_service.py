@@ -11,18 +11,20 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.client import Client, LifecycleState
+from app.models.client_checkin import ClientCheckIn
+from app.models.calendar_booking_sales import CalendarBookingSales
 from app.models.manual_payment import ManualPayment
 from app.models.organization import Organization
 from app.schemas.client import ClientOfferEnrollmentPatch
 from app.schemas.close_survey import (
     CloseSurveyClientOption,
+    DealOutcome,
     CloseSurveyMetaResponse,
     CloseSurveyOfferOption,
     CloseSurveySubmitRequest,
     CloseSurveySubmitResponse,
 )
 from app.services.offer_ladder import resolve_org_offer_ladder
-from app.services.stripe_processor import _mark_latest_sales_call_closed
 from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
 LOG = logging.getLogger("app.close_survey")
@@ -199,7 +201,7 @@ def _append_notes(
     client: Client,
     *,
     entry_day: date,
-    closed: bool,
+    deal_outcome: DealOutcome,
     payment_source: str,
     cash_cents: Optional[int],
     recording_url: Optional[str],
@@ -212,7 +214,7 @@ def _append_notes(
 
     lines = [
         f"### Post-sales {entry_day.isoformat()}",
-        f"Closed: {'yes' if closed else 'no'} · Payment: {pay_line}",
+        f"Outcome: {deal_outcome.replace('_', '-')} · Payment: {pay_line}",
     ]
     if recording_url:
         lines.append(f"Recording: {recording_url.strip()}")
@@ -261,11 +263,80 @@ def _force_active(client: Client) -> None:
     client.last_activity_at = datetime.utcnow()
 
 
+def _resolve_deal_outcome(body: CloseSurveySubmitRequest) -> DealOutcome:
+    if body.deal_outcome is not None:
+        return body.deal_outcome
+    return "yes" if body.closed else "no"
+
+
+def _apply_latest_sales_call_outcome(
+    db: Session,
+    *,
+    org_id: uuid.UUID,
+    client: Client,
+    outcome: DealOutcome,
+) -> Optional[datetime]:
+    """Apply yes/no/no-show to latest sales call and mirror close state row."""
+    check_in = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.client_id == client.id,
+            ClientCheckIn.is_sales_call == True,
+        )
+        .order_by(ClientCheckIn.start_time.desc())
+        .limit(1)
+        .first()
+    )
+    if not check_in:
+        return None
+
+    if outcome == "yes":
+        check_in.sale_closed = True
+        check_in.no_show = False
+    elif outcome == "no_show":
+        check_in.sale_closed = False
+        check_in.no_show = True
+    else:
+        check_in.sale_closed = False
+        check_in.no_show = False
+    check_in.updated_at = datetime.utcnow()
+
+    if getattr(check_in, "provider", None) in ("calcom", "calendly") and check_in.event_id:
+        sales_row = (
+            db.query(CalendarBookingSales)
+            .filter(
+                CalendarBookingSales.org_id == org_id,
+                CalendarBookingSales.provider == check_in.provider,
+                CalendarBookingSales.event_id == check_in.event_id,
+            )
+            .first()
+        )
+        if sales_row:
+            sales_row.is_sales_call = True
+            sales_row.sale_closed = check_in.sale_closed
+            sales_row.updated_at = datetime.utcnow()
+        else:
+            db.add(
+                CalendarBookingSales(
+                    org_id=org_id,
+                    provider=check_in.provider,
+                    event_id=check_in.event_id,
+                    event_uri=check_in.event_uri,
+                    is_sales_call=True,
+                    sale_closed=check_in.sale_closed,
+                )
+            )
+    return check_in.start_time
+
+
 def submit_close_survey(
     db: Session,
     org: Organization,
     body: CloseSurveySubmitRequest,
 ) -> CloseSurveySubmitResponse:
+    outcome = _resolve_deal_outcome(body)
+    is_closed = outcome == "yes"
     entry_day = _entry_day(body)
     when = _entry_datetime(entry_day)
     cash_cents = _parse_dollars_to_cents(body.cash_collected)
@@ -318,12 +389,19 @@ def submit_close_survey(
         except Exception as lc_err:
             LOG.warning("lifecycle after manual pay skipped for %s: %s", client.id, lc_err)
 
-    # 2) Closed → sale_closed + Active
-    if body.closed:
-        try:
-            _mark_latest_sales_call_closed(db, org.id, client)
-        except Exception as e:
-            LOG.warning("mark sale closed failed for %s: %s", client.id, e)
+    # 2) Outcome → latest sales check-in state + lifecycle
+    sales_event_when: Optional[datetime] = None
+    try:
+        sales_event_when = _apply_latest_sales_call_outcome(
+            db,
+            org_id=org.id,
+            client=client,
+            outcome=outcome,
+        )
+    except Exception as e:
+        LOG.warning("apply sales outcome failed for %s: %s", client.id, e)
+
+    if is_closed:
         _force_active(client)
 
     # 3) Offer enrollment — capture prior contract so KPI revenue uses a delta
@@ -349,7 +427,7 @@ def submit_close_survey(
     _append_notes(
         client,
         entry_day=entry_day,
-        closed=body.closed,
+        deal_outcome=outcome,
         payment_source=body.payment_source,
         cash_cents=cash_cents,
         recording_url=body.recording_url,
@@ -363,7 +441,7 @@ def submit_close_survey(
     try:
         from app.services.kpi_integration_sync import sync_kpi_for_datetime
 
-        sync_kpi_for_datetime(db, org.id, when, commit=True)
+        sync_kpi_for_datetime(db, org.id, sales_event_when or when, commit=True)
     except Exception as e:
         LOG.warning("KPI sync after close survey failed: %s", e)
 
@@ -394,7 +472,8 @@ def submit_close_survey(
     return CloseSurveySubmitResponse(
         ok=True,
         client_id=str(client.id),
-        closed=body.closed,
+        closed=is_closed,
+        deal_outcome=outcome,
         payment_source=body.payment_source,
         manual_payment_id=manual_payment_id,
         lifecycle_state=_lifecycle_str(client.lifecycle_state),

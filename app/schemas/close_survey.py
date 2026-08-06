@@ -33,11 +33,13 @@ class CloseSurveyMetaResponse(BaseModel):
 
 
 PaymentSource = Literal["manual", "stripe", "whop", "none"]
+DealOutcome = Literal["yes", "no", "no_show"]
 
 
 class CloseSurveySubmitRequest(BaseModel):
     client_id: UUID
     closed: bool = False
+    deal_outcome: Optional[DealOutcome] = None
     payment_source: PaymentSource = "none"
     cash_collected: Optional[float] = Field(None, ge=0, description="Dollars")
     offer_slot: Optional[str] = Field(None, max_length=48)
@@ -52,6 +54,7 @@ class CloseSurveySubmitResponse(BaseModel):
     ok: bool = True
     client_id: str
     closed: bool
+    deal_outcome: DealOutcome
     payment_source: PaymentSource
     manual_payment_id: Optional[str] = None
     lifecycle_state: Optional[str] = None
