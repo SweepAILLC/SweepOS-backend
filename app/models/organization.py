@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String, DateTime, Integer, Text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 import uuid
 from datetime import datetime
 from app.db.session import Base
@@ -23,6 +23,8 @@ class Organization(Base):
     booking_url = Column(Text, nullable=True)
     # Public post-sales close survey link token (no login)
     close_form_token = Column(UUID(as_uuid=True), unique=True, nullable=True, index=True)
+    # Extensible notification prefs, e.g. {"funnel_leads": {...}}
+    notification_settings = Column(JSONB, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

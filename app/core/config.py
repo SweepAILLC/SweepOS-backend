@@ -123,6 +123,8 @@ class Settings(BaseSettings):
     BREVO_REDIRECT_URI: str = "http://localhost:3002/oauth/brevo/callback"
     BREVO_LOGIN_URL: Optional[str] = None  # Optional custom login URL, defaults to standard Brevo auth URL
     BREVO_API_KEY: Optional[str] = None  # Global API key for onboarding emails (invitations); does not affect per-org Brevo OAuth/API
+    # Default fixed window for batched funnel-lead digest emails (overridable per org).
+    FUNNEL_LEAD_DIGEST_WINDOW_MINUTES: int = 15
     
     # Frontend
     FRONTEND_URL: str = "http://localhost:3002"  # Frontend URL for OAuth redirects

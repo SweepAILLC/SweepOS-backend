@@ -124,6 +124,20 @@ def _dispatcher_loop() -> None:
         try:
             with SessionLocal() as db:
                 attempted = tick(db)
+                try:
+                    from app.services.funnel_lead_notifications import (
+                        flush_due_funnel_lead_digests,
+                    )
+
+                    digest_n = flush_due_funnel_lead_digests(db)
+                    if digest_n:
+                        LOG.info("funnel lead digests: flushed %d org(s)", digest_n)
+                except Exception:
+                    LOG.exception("funnel lead digest flush failed")
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
                 now = time.time()
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     try:

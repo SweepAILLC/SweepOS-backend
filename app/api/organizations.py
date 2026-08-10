@@ -19,6 +19,17 @@ from app.core.config import settings
 from app.core.security import get_password_hash
 from app.core.rate_limit import rate_limit
 from app.schemas.invitation import InviteUserRequest, InvitationResponse
+from app.schemas.notification_settings import (
+    NotificationSettingsResponse,
+    NotificationSettingsUpdate,
+    NotificationTestResponse,
+    FunnelLeadNotificationSettings,
+)
+from app.services.funnel_lead_notifications import (
+    get_funnel_lead_settings,
+    merge_funnel_lead_settings,
+    send_test_digest,
+)
 
 router = APIRouter()
 
@@ -294,3 +305,71 @@ def add_system_owner_to_org(
     db.add(uo)
     db.commit()
     return {"message": "System owner has been added to your organization"}
+
+
+@router.get(
+    "/{org_id}/notification-settings",
+    response_model=NotificationSettingsResponse,
+)
+def get_notification_settings(
+    org_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return effective org notification settings (merged with defaults)."""
+    _require_org_admin(db, current_user, org_id)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    cfg = get_funnel_lead_settings(org)
+    return NotificationSettingsResponse(
+        funnel_leads=FunnelLeadNotificationSettings(**cfg),
+    )
+
+
+@router.patch(
+    "/{org_id}/notification-settings",
+    response_model=NotificationSettingsResponse,
+)
+def update_notification_settings(
+    org_id: UUID,
+    body: NotificationSettingsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update org notification settings (admin/owner only)."""
+    _require_org_admin(db, current_user, org_id)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    patch = {}
+    if body.funnel_leads is not None:
+        patch = body.funnel_leads.model_dump(exclude_unset=True)
+    try:
+        cfg = merge_funnel_lead_settings(org, patch) if patch else get_funnel_lead_settings(org)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    db.commit()
+    db.refresh(org)
+    return NotificationSettingsResponse(
+        funnel_leads=FunnelLeadNotificationSettings(**cfg),
+    )
+
+
+@router.post(
+    "/{org_id}/notification-settings/test",
+    response_model=NotificationTestResponse,
+)
+@rate_limit(max_requests=5, window_seconds=900)
+def send_notification_settings_test(
+    org_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Send a sample funnel-lead digest to resolved recipients."""
+    _require_org_admin(db, current_user, org_id)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    result = send_test_digest(db, org)
+    return NotificationTestResponse(**result)

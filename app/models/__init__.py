@@ -45,6 +45,7 @@ from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.models.org_kpi_benchmark import OrgKpiBenchmark
 from app.models.instagram_media import InstagramMedia
 from app.models.instagram_account_snapshot import InstagramAccountSnapshot
+from app.models.funnel_lead_notification import FunnelLeadNotification
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -76,5 +77,6 @@ __all__ = [
     "OrgKpiBenchmark",
     "InstagramMedia",
     "InstagramAccountSnapshot",
+    "FunnelLeadNotification",
 ]
 

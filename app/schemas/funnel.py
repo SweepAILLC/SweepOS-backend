@@ -126,6 +126,31 @@ class FunnelLeadResponse(BaseModel):
     message: str = "ok"
 
 
+class FunnelLeadListItem(BaseModel):
+    """One lead shown on the funnel Leads tab."""
+    id: str  # Stable row key for delete (client_id or notification id)
+    client_id: Optional[UUID] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    instagram: Optional[str] = None
+    source: Optional[str] = None
+    funnel_step_reached: Optional[str] = None
+    lifecycle_state: Optional[str] = None
+    is_new_client: Optional[bool] = None
+    captured_at: Optional[datetime] = None
+    # Quiz / opt-in / other prospect payload answers for the Answers column
+    answers: Dict[str, Any] = {}
+
+
+class FunnelLeadListResponse(BaseModel):
+    funnel_id: UUID
+    total: int
+    leads: List[FunnelLeadListItem]
+
+
 # Analytics schemas
 class StepCount(BaseModel):
     step_order: int

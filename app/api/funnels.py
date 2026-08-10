@@ -33,6 +33,8 @@ from app.schemas.funnel import (
     EventResponse,
     FunnelLeadIn,
     FunnelLeadResponse,
+    FunnelLeadListItem,
+    FunnelLeadListResponse,
     FunnelHealth,
     FunnelAnalytics,
     StepCount,
@@ -42,6 +44,7 @@ from app.schemas.funnel import (
 from app.models.client import find_client_by_email, find_client_by_phone
 from app.models.client import LifecycleState
 from app.services.health_score_cache_service import invalidate_health_score_cache
+from sqlalchemy.orm.attributes import flag_modified
 
 router = APIRouter()
 
@@ -493,27 +496,25 @@ def create_lead_from_funnel(
         client = find_client_by_phone(db, org_id, phone)
 
     def _apply_prospect_meta(c: Client) -> None:
-        has_prospect = any(
-            [
-                lead_data.source,
-                lead_data.quiz_answers,
-                lead_data.opt_in_data,
-                lead_data.funnel_step_reached,
-            ]
-        )
-        if not has_prospect:
-            return
+        # Always stamp funnel_id + captured_at so the Leads tab can list every capture.
         meta = c.meta if isinstance(c.meta, dict) else {}
+        prev = meta.get("prospect") if isinstance(meta.get("prospect"), dict) else {}
         prospect = {
-            "source": lead_data.source,
-            "quiz_answers": lead_data.quiz_answers or {},
-            "opt_in_data": lead_data.opt_in_data or {},
-            "funnel_step_reached": lead_data.funnel_step_reached,
+            **prev,
             "funnel_id": str(lead_data.funnel_id),
             "captured_at": datetime.now(timezone.utc).isoformat(),
         }
+        if lead_data.source is not None:
+            prospect["source"] = lead_data.source
+        if lead_data.quiz_answers is not None:
+            prospect["quiz_answers"] = lead_data.quiz_answers or {}
+        if lead_data.opt_in_data is not None:
+            prospect["opt_in_data"] = lead_data.opt_in_data or {}
+        if lead_data.funnel_step_reached is not None:
+            prospect["funnel_step_reached"] = lead_data.funnel_step_reached
         meta = {**meta, "prospect": prospect}
         c.meta = meta
+        flag_modified(c, "meta")
 
     if client:
         # Update existing client with provided fields
@@ -543,6 +544,19 @@ def create_lead_from_funnel(
         except Exception as lc_err:
             print(f"[FUNNEL LEAD] lifecycle reconcile skipped for {client.id}: {lc_err}")
         invalidate_health_score_cache(db, client.id, org_id)
+        try:
+            from app.services.funnel_lead_notifications import enqueue_funnel_lead_notification
+
+            enqueue_funnel_lead_notification(
+                db,
+                org_id=org_id,
+                client=client,
+                funnel=funnel,
+                lead=lead_data,
+                is_new_client=False,
+            )
+        except Exception as e:
+            print(f"[FUNNEL LEAD] notification enqueue skipped: {e}")
         return FunnelLeadResponse(client_id=client.id, created=False, message="Client updated")
     else:
         # Create new client (require at least email or name for a useful record)
@@ -566,6 +580,19 @@ def create_lead_from_funnel(
         db.commit()
         db.refresh(client)
         invalidate_health_score_cache(db, client.id, org_id)
+        try:
+            from app.services.funnel_lead_notifications import enqueue_funnel_lead_notification
+
+            enqueue_funnel_lead_notification(
+                db,
+                org_id=org_id,
+                client=client,
+                funnel=funnel,
+                lead=lead_data,
+                is_new_client=True,
+            )
+        except Exception as e:
+            print(f"[FUNNEL LEAD] notification enqueue skipped: {e}")
         return FunnelLeadResponse(client_id=client.id, created=True, message="Client created")
 
 
@@ -628,6 +655,285 @@ def _enrich_and_process_event(db: Session, event: Event, org_id: UUID):
             except Exception:
                 # URL parsing failed, skip
                 pass
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        raw = value.strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _flatten_answers(prospect: dict) -> dict:
+    """Merge quiz_answers + opt_in_data into a flat dict for the Answers column."""
+    out: dict = {}
+    for key in ("quiz_answers", "opt_in_data"):
+        block = prospect.get(key)
+        if isinstance(block, dict):
+            for k, v in block.items():
+                if k is None:
+                    continue
+                label = str(k).strip()
+                if not label:
+                    continue
+                # Prefer first non-empty; later keys don't overwrite
+                if label in out:
+                    continue
+                out[label] = v
+        elif block is not None and not isinstance(block, (dict, list)):
+            out[key] = block
+    # Any other simple prospect fields (excluding known structural keys)
+    skip = {
+        "source",
+        "quiz_answers",
+        "opt_in_data",
+        "funnel_step_reached",
+        "funnel_id",
+        "captured_at",
+    }
+    for k, v in prospect.items():
+        if k in skip or not isinstance(k, str):
+            continue
+        if isinstance(v, (dict, list)):
+            continue
+        if k not in out and v is not None and str(v).strip() != "":
+            out[k] = v
+    return out
+
+
+@router.get("/{funnel_id}/leads", response_model=FunnelLeadListResponse)
+def list_funnel_leads(
+    funnel_id: UUID,
+    limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List pipeline clients associated with this funnel.
+
+    Same ``clients`` table as the pipeline board — filtered to people who came
+    in via this funnel (``meta.prospect.funnel_id`` and/or digest queue links).
+    ``lifecycle_state`` is the live pipeline column.
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+
+    funnel = db.query(Funnel).filter(
+        Funnel.id == funnel_id,
+        Funnel.org_id == org_id,
+    ).first()
+    if not funnel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Funnel not found",
+        )
+
+    funnel_id_str = str(funnel_id)
+    client_ids: set = set()
+
+    # 1) Clients stamped with this funnel on prospect meta (canonical filter)
+    stamped = (
+        db.query(Client.id)
+        .filter(
+            Client.org_id == org_id,
+            Client.meta.isnot(None),
+            text("CAST(clients.meta AS jsonb)->'prospect'->>'funnel_id' = :funnel_id_str"),
+        )
+        .params(funnel_id_str=funnel_id_str)
+        .all()
+    )
+    for row in stamped:
+        client_ids.add(row[0])
+
+    # 2) Also include clients linked via digest queue (historical captures)
+    notif_by_client: dict = {}
+    try:
+        from app.models.funnel_lead_notification import FunnelLeadNotification
+
+        notif_rows = (
+            db.query(FunnelLeadNotification)
+            .filter(
+                FunnelLeadNotification.org_id == org_id,
+                FunnelLeadNotification.funnel_id == funnel_id,
+                FunnelLeadNotification.client_id.isnot(None),
+            )
+            .order_by(desc(FunnelLeadNotification.created_at))
+            .all()
+        )
+        for n in notif_rows:
+            if n.client_id is None:
+                continue
+            client_ids.add(n.client_id)
+            key = str(n.client_id)
+            # Keep newest notification enrichment per client
+            if key not in notif_by_client:
+                notif_by_client[key] = n
+    except Exception as e:
+        print(f"[FUNNEL LEADS] notification client lookup skipped: {e}")
+
+    if not client_ids:
+        return FunnelLeadListResponse(funnel_id=funnel_id, total=0, leads=[])
+
+    clients = (
+        db.query(Client)
+        .filter(Client.org_id == org_id, Client.id.in_(list(client_ids)))
+        .all()
+    )
+
+    leads: List[FunnelLeadListItem] = []
+    for c in clients:
+        meta = c.meta if isinstance(c.meta, dict) else {}
+        prospect = meta.get("prospect") if isinstance(meta.get("prospect"), dict) else {}
+        first = (c.first_name or "").strip() or None
+        last = (c.last_name or "").strip() or None
+        name_parts = [p for p in (first, last) if p]
+        name = " ".join(name_parts) if name_parts else None
+        captured = _parse_iso_datetime(prospect.get("captured_at"))
+        lifecycle = None
+        if c.lifecycle_state is not None:
+            lifecycle = getattr(c.lifecycle_state, "value", str(c.lifecycle_state))
+
+        notif = notif_by_client.get(str(c.id))
+        is_new = bool(notif.is_new_client) if notif is not None else None
+        source = (prospect.get("source") or None) or (notif.source if notif else None)
+        step = (prospect.get("funnel_step_reached") or None) or (
+            notif.funnel_step_reached if notif else None
+        )
+        if not captured and notif and notif.created_at:
+            ca = notif.created_at
+            captured = ca.replace(tzinfo=timezone.utc) if ca.tzinfo is None else ca
+        if not captured and c.created_at:
+            ca = c.created_at
+            captured = ca.replace(tzinfo=timezone.utc) if ca.tzinfo is None else ca
+
+        leads.append(
+            FunnelLeadListItem(
+                id=str(c.id),
+                client_id=c.id,
+                first_name=first,
+                last_name=last,
+                name=name,
+                email=(c.email or "").strip() or None,
+                phone=(c.phone or "").strip() or None,
+                instagram=(c.instagram or "").strip() or None,
+                source=source,
+                funnel_step_reached=step,
+                lifecycle_state=lifecycle,
+                is_new_client=is_new,
+                captured_at=captured,
+                answers=_flatten_answers(prospect),
+            )
+        )
+
+    leads.sort(
+        key=lambda x: x.captured_at or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    leads = leads[:limit]
+    return FunnelLeadListResponse(
+        funnel_id=funnel_id,
+        total=len(leads),
+        leads=leads,
+    )
+
+
+@router.delete("/{funnel_id}/leads/{lead_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_funnel_lead(
+    funnel_id: UUID,
+    lead_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Remove a lead from this funnel's Leads tab.
+
+    Clears prospect association on the client (if present) and deletes matching
+    funnel_lead_notifications rows. Does not delete the client from the pipeline.
+    """
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+
+    funnel = db.query(Funnel).filter(
+        Funnel.id == funnel_id,
+        Funnel.org_id == org_id,
+    ).first()
+    if not funnel:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Funnel not found",
+        )
+
+    from app.models.funnel_lead_notification import FunnelLeadNotification
+
+    removed = False
+    funnel_id_str = str(funnel_id)
+
+    def _clear_prospect_for_funnel(c: Client) -> bool:
+        meta = c.meta if isinstance(c.meta, dict) else {}
+        prospect = meta.get("prospect") if isinstance(meta.get("prospect"), dict) else None
+        if not prospect or str(prospect.get("funnel_id") or "") != funnel_id_str:
+            return False
+        meta = {k: v for k, v in meta.items() if k != "prospect"}
+        c.meta = meta if meta else None
+        flag_modified(c, "meta")
+        c.updated_at = datetime.utcnow()
+        return True
+
+    client = (
+        db.query(Client)
+        .filter(Client.id == lead_id, Client.org_id == org_id)
+        .first()
+    )
+    if client:
+        cleared = _clear_prospect_for_funnel(client)
+        deleted_n = (
+            db.query(FunnelLeadNotification)
+            .filter(
+                FunnelLeadNotification.org_id == org_id,
+                FunnelLeadNotification.funnel_id == funnel_id,
+                FunnelLeadNotification.client_id == client.id,
+            )
+            .delete(synchronize_session=False)
+        )
+        if cleared or deleted_n:
+            removed = True
+
+    notif = (
+        db.query(FunnelLeadNotification)
+        .filter(
+            FunnelLeadNotification.id == lead_id,
+            FunnelLeadNotification.org_id == org_id,
+            FunnelLeadNotification.funnel_id == funnel_id,
+        )
+        .first()
+    )
+    if notif:
+        # If notification points at a client, also clear that client's prospect for this funnel
+        if notif.client_id and (client is None or client.id != notif.client_id):
+            linked = (
+                db.query(Client)
+                .filter(Client.id == notif.client_id, Client.org_id == org_id)
+                .first()
+            )
+            if linked:
+                _clear_prospect_for_funnel(linked)
+        db.delete(notif)
+        removed = True
+
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Lead not found for this funnel",
+        )
+
+    db.commit()
+    return None
 
 
 # Analytics & Health

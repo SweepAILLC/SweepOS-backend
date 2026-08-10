@@ -223,6 +223,26 @@ def _ensure_schema_columns_on_startup() -> None:
         )
         db.execute(text("ALTER TABLE portal_shared_pads DROP CONSTRAINT IF EXISTS uq_portal_shared_pads_org_id"))
 
+        # organizations: notification settings bag for funnel-lead digests etc.
+        _add_column_if_missing("organizations", "notification_settings", "JSONB")
+
+        # funnel_lead_notifications: batched lead digest queue
+        from app.models.funnel_lead_notification import FunnelLeadNotification
+
+        FunnelLeadNotification.__table__.create(db.bind, checkfirst=True)
+        try:
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
+            db.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_funnel_lead_notifications_unsent_org_created "
+                    "ON funnel_lead_notifications (org_id, created_at) "
+                    "WHERE sent_at IS NULL"
+                )
+            )
+        except Exception:
+            db.rollback()
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
+
         # fathom_call_records: ensure table exists (some DBs stamped past 031 without the table)
         from app.models.fathom_call_record import FathomCallRecord
 
