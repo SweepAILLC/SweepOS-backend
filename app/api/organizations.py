@@ -26,6 +26,7 @@ from app.schemas.notification_settings import (
     FunnelLeadNotificationSettings,
 )
 from app.services.funnel_lead_notifications import (
+    ensure_funnel_lead_notifications_schema,
     get_funnel_lead_settings,
     merge_funnel_lead_settings,
     send_test_digest,
@@ -318,7 +319,13 @@ def get_notification_settings(
 ):
     """Return effective org notification settings (merged with defaults)."""
     _require_org_admin(db, current_user, org_id)
-    org = db.query(Organization).filter(Organization.id == org_id).first()
+    ensure_funnel_lead_notifications_schema(db)
+    try:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+    except Exception:
+        db.rollback()
+        ensure_funnel_lead_notifications_schema(db)
+        org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     cfg = get_funnel_lead_settings(org)
@@ -339,7 +346,13 @@ def update_notification_settings(
 ):
     """Update org notification settings (admin/owner only)."""
     _require_org_admin(db, current_user, org_id)
-    org = db.query(Organization).filter(Organization.id == org_id).first()
+    ensure_funnel_lead_notifications_schema(db)
+    try:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+    except Exception:
+        db.rollback()
+        ensure_funnel_lead_notifications_schema(db)
+        org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     patch = {}

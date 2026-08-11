@@ -557,6 +557,10 @@ def create_lead_from_funnel(
             )
         except Exception as e:
             print(f"[FUNNEL LEAD] notification enqueue skipped: {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
         return FunnelLeadResponse(client_id=client.id, created=False, message="Client updated")
     else:
         # Create new client (require at least email or name for a useful record)
@@ -593,6 +597,10 @@ def create_lead_from_funnel(
             )
         except Exception as e:
             print(f"[FUNNEL LEAD] notification enqueue skipped: {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
         return FunnelLeadResponse(client_id=client.id, created=True, message="Client created")
 
 
@@ -723,6 +731,12 @@ def list_funnel_leads(
     in via this funnel (``meta.prospect.funnel_id`` and/or digest queue links).
     ``lifecycle_state`` is the live pipeline column.
     """
+    from app.services.funnel_lead_notifications import (
+        ensure_funnel_lead_notifications_schema,
+        table_exists,
+    )
+    from app.models.funnel_lead_notification import FunnelLeadNotification
+
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
 
     funnel = db.query(Funnel).filter(
@@ -738,54 +752,81 @@ def list_funnel_leads(
     funnel_id_str = str(funnel_id)
     client_ids: set = set()
 
-    # 1) Clients stamped with this funnel on prospect meta (canonical filter)
-    stamped = (
-        db.query(Client.id)
-        .filter(
-            Client.org_id == org_id,
-            Client.meta.isnot(None),
-            text("CAST(clients.meta AS jsonb)->'prospect'->>'funnel_id' = :funnel_id_str"),
-        )
-        .params(funnel_id_str=funnel_id_str)
-        .all()
-    )
-    for row in stamped:
-        client_ids.add(row[0])
+    # 1) Clients stamped with this funnel on prospect meta (canonical filter).
+    # Use JSON path ops (meta is JSON) — avoid CAST(... AS jsonb) which can abort
+    # the whole statement on a single bad row.
+    try:
+        stamped = db.execute(
+            text(
+                """
+                SELECT id FROM clients
+                WHERE org_id = :org_id
+                  AND meta IS NOT NULL
+                  AND (meta -> 'prospect' ->> 'funnel_id') = :funnel_id_str
+                """
+            ),
+            {"org_id": str(org_id), "funnel_id_str": funnel_id_str},
+        ).fetchall()
+        for row in stamped:
+            client_ids.add(row[0])
+    except Exception as e:
+        # Never leave the request session in an aborted transaction
+        print(f"[FUNNEL LEADS] prospect filter failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
     # 2) Also include clients linked via digest queue (historical captures)
     notif_by_client: dict = {}
-    try:
-        from app.models.funnel_lead_notification import FunnelLeadNotification
+    if not table_exists(db, "funnel_lead_notifications"):
+        ensure_funnel_lead_notifications_schema(db)
 
-        notif_rows = (
-            db.query(FunnelLeadNotification)
-            .filter(
-                FunnelLeadNotification.org_id == org_id,
-                FunnelLeadNotification.funnel_id == funnel_id,
-                FunnelLeadNotification.client_id.isnot(None),
+    if table_exists(db, "funnel_lead_notifications"):
+        try:
+            notif_rows = (
+                db.query(FunnelLeadNotification)
+                .filter(
+                    FunnelLeadNotification.org_id == org_id,
+                    FunnelLeadNotification.funnel_id == funnel_id,
+                    FunnelLeadNotification.client_id.isnot(None),
+                )
+                .order_by(desc(FunnelLeadNotification.created_at))
+                .all()
             )
-            .order_by(desc(FunnelLeadNotification.created_at))
-            .all()
-        )
-        for n in notif_rows:
-            if n.client_id is None:
-                continue
-            client_ids.add(n.client_id)
-            key = str(n.client_id)
-            # Keep newest notification enrichment per client
-            if key not in notif_by_client:
-                notif_by_client[key] = n
-    except Exception as e:
-        print(f"[FUNNEL LEADS] notification client lookup skipped: {e}")
+            for n in notif_rows:
+                if n.client_id is None:
+                    continue
+                client_ids.add(n.client_id)
+                key = str(n.client_id)
+                if key not in notif_by_client:
+                    notif_by_client[key] = n
+        except Exception as e:
+            print(f"[FUNNEL LEADS] notification client lookup skipped: {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
     if not client_ids:
         return FunnelLeadListResponse(funnel_id=funnel_id, total=0, leads=[])
 
-    clients = (
-        db.query(Client)
-        .filter(Client.org_id == org_id, Client.id.in_(list(client_ids)))
-        .all()
-    )
+    try:
+        clients = (
+            db.query(Client)
+            .filter(Client.org_id == org_id, Client.id.in_(list(client_ids)))
+            .all()
+        )
+    except Exception as e:
+        print(f"[FUNNEL LEADS] client load failed: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load funnel leads",
+        )
 
     leads: List[FunnelLeadListItem] = []
     for c in clients:
@@ -870,6 +911,13 @@ def delete_funnel_lead(
         )
 
     from app.models.funnel_lead_notification import FunnelLeadNotification
+    from app.services.funnel_lead_notifications import (
+        ensure_funnel_lead_notifications_schema,
+        table_exists,
+    )
+
+    if not table_exists(db, "funnel_lead_notifications"):
+        ensure_funnel_lead_notifications_schema(db)
 
     removed = False
     funnel_id_str = str(funnel_id)

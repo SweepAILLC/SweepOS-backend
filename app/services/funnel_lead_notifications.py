@@ -30,6 +30,7 @@ LOG = logging.getLogger("app.funnel_lead_notifications")
 MAX_ATTEMPTS = 5
 DIGEST_ROW_CAP = 50
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_SCHEMA_READY = False
 
 DEFAULT_FUNNEL_LEAD_SETTINGS: Dict[str, Any] = {
     "enabled": True,
@@ -38,6 +39,68 @@ DEFAULT_FUNNEL_LEAD_SETTINGS: Dict[str, Any] = {
     "recipients": [],
     "include_returning_leads": True,
 }
+
+
+def ensure_funnel_lead_notifications_schema(db: Session) -> bool:
+    """
+    Ensure digest queue table + organizations.notification_settings exist.
+
+    Safe to call repeatedly. Used as a prod safety net when alembic 066 has not
+    been applied yet (missing table would abort Postgres transactions and 500
+    the leads tab).
+    """
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return True
+    try:
+        # Clear any aborted transaction before DDL
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        FunnelLeadNotification.__table__.create(db.bind, checkfirst=True)
+        db.execute(
+            text(
+                "ALTER TABLE organizations "
+                "ADD COLUMN IF NOT EXISTS notification_settings JSONB"
+            )
+        )
+        db.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_funnel_lead_notifications_unsent_org_created "
+                "ON funnel_lead_notifications (org_id, created_at) "
+                "WHERE sent_at IS NULL"
+            )
+        )
+        db.commit()
+        _SCHEMA_READY = True
+        return True
+    except Exception:
+        LOG.exception("ensure_funnel_lead_notifications_schema failed")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def table_exists(db: Session, table_name: str) -> bool:
+    """Return True if a public table exists (never leaves the session aborted)."""
+    try:
+        row = db.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = :t LIMIT 1"
+            ),
+            {"t": table_name},
+        ).first()
+        return row is not None
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
 
 
 def _default_window_minutes() -> int:
@@ -146,7 +209,19 @@ def enqueue_funnel_lead_notification(
     is_new_client: bool,
 ) -> Optional[uuid.UUID]:
     """Insert a notification queue row. Returns id or None if skipped."""
-    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not table_exists(db, "funnel_lead_notifications"):
+        if not ensure_funnel_lead_notifications_schema(db):
+            LOG.warning("skip enqueue: funnel_lead_notifications schema unavailable")
+            return None
+
+    try:
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+    except Exception:
+        # notification_settings column may be missing — ensure and retry once
+        db.rollback()
+        ensure_funnel_lead_notifications_schema(db)
+        org = db.query(Organization).filter(Organization.id == org_id).first()
+
     cfg = get_funnel_lead_settings(org)
     if not cfg.get("enabled", True):
         return None
@@ -159,23 +234,47 @@ def enqueue_funnel_lead_notification(
     source = (getattr(lead, "source", None) or "").strip() or None
     step = (getattr(lead, "funnel_step_reached", None) or "").strip() or None
 
-    row = FunnelLeadNotification(
-        id=uuid.uuid4(),
-        org_id=org_id,
-        client_id=client.id,
-        funnel_id=funnel.id if funnel else None,
-        funnel_name=(funnel.name if funnel else None) or None,
-        lead_name=_lead_display_name(client, lead),
-        lead_email=email,
-        lead_phone=phone,
-        lead_instagram=instagram,
-        source=source,
-        funnel_step_reached=step,
-        is_new_client=bool(is_new_client),
-    )
-    db.add(row)
-    db.commit()
-    return row.id
+    def _build_row() -> FunnelLeadNotification:
+        return FunnelLeadNotification(
+            id=uuid.uuid4(),
+            org_id=org_id,
+            client_id=client.id,
+            funnel_id=funnel.id if funnel else None,
+            funnel_name=(funnel.name if funnel else None) or None,
+            lead_name=_lead_display_name(client, lead),
+            lead_email=email,
+            lead_phone=phone,
+            lead_instagram=instagram,
+            source=source,
+            funnel_step_reached=step,
+            is_new_client=bool(is_new_client),
+        )
+
+    row = _build_row()
+    try:
+        db.add(row)
+        db.commit()
+        return row.id
+    except Exception:
+        LOG.exception("enqueue_funnel_lead_notification commit failed")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        # One retry after schema ensure (common on first deploy before alembic)
+        if ensure_funnel_lead_notifications_schema(db):
+            try:
+                row = _build_row()
+                db.add(row)
+                db.commit()
+                return row.id
+            except Exception:
+                LOG.exception("enqueue retry failed")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        return None
 
 
 def _admin_emails(db: Session, org_id: uuid.UUID) -> List[str]:
@@ -436,6 +535,9 @@ def flush_due_funnel_lead_digests(db: Session, *, max_orgs: int = 10) -> int:
 
 def flush_due_digests(db: Session, *, max_orgs: int = 10) -> int:
     """Worker entry point: send digests for orgs whose window has elapsed."""
+    if not table_exists(db, "funnel_lead_notifications"):
+        if not ensure_funnel_lead_notifications_schema(db):
+            return 0
     try:
         org_ids = _due_org_ids(db, max_orgs=max_orgs)
     except Exception:
