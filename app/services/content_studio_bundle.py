@@ -21,8 +21,8 @@ from app.services.user_ai_profile_context import extract_ai_profile_for_llm
 logger = logging.getLogger(__name__)
 
 # Bumped to invalidate every previously-generated bundle when grounding shape changes.
-# v6: enforce prescribed BOF case-study ideas from call-library evidence.
-BUNDLE_VERSION = 6
+# v7: ideas grounded in top/bottom post performance + period deltas (not advice dims).
+BUNDLE_VERSION = 7
 
 # Each entry: (stage, default title, default intro hint shown when LLM cannot run).
 STAGE_SPECS: List[Tuple[str, str, str]] = [
@@ -115,7 +115,7 @@ def _instagram_perf_fingerprint(db: Session, org_id: uuid.UUID) -> str:
 
 
 def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, Any]:
-    """Compact winners/losers for the content ideation prompt."""
+    """Observed Instagram performance for ideation — facts only, no advice dimensions."""
     try:
         from app.services.instagram_performance import build_instagram_performance
 
@@ -125,98 +125,119 @@ def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, A
         return {"connected": False}
     if not perf.get("connected"):
         return {"connected": False}
-    what = perf.get("what_works") or []
-    double_down = [w for w in what if w.get("verdict") == "double_down"]
-    by_dim: Dict[str, Dict[str, Any]] = {}
-    for row in sorted(
-        double_down,
-        key=lambda r: float(r.get("lift_vs_median_pct") or 0),
-        reverse=True,
-    ):
-        dim = str(row.get("dimension") or "")
-        if dim and dim not in by_dim:
-            by_dim[dim] = row
+
+    summary = perf.get("summary") or {}
+    top_posts = list(perf.get("top_posts") or [])[:5]
+    bottom_posts = list(perf.get("bottom_posts") or [])[:5]
+
+    # Observed format mix among top posts (counts), not "double down" verdicts.
+    format_counts: Dict[str, int] = {}
+    for p in top_posts:
+        fb = str(p.get("format_bucket") or "unknown").strip().lower() or "unknown"
+        format_counts[fb] = format_counts.get(fb, 0) + 1
+
     return {
         "connected": True,
         "summary": {
-            "posts": (perf.get("summary") or {}).get("posts"),
-            "engagement_rate_pct": (perf.get("summary") or {}).get("engagement_rate_pct"),
-            "reach": (perf.get("summary") or {}).get("reach"),
-            "saved": (perf.get("summary") or {}).get("saved"),
+            "posts": summary.get("posts"),
+            "engagement_rate_pct": summary.get("engagement_rate_pct"),
+            "reach": summary.get("reach"),
+            "saved": summary.get("saved"),
+            "views": summary.get("views"),
+            "reach_delta_pct": summary.get("reach_delta_pct"),
+            "views_delta_pct": summary.get("views_delta_pct"),
+            "saved_delta_pct": summary.get("saved_delta_pct"),
+            "engagement_rate_delta_pct": summary.get("engagement_rate_delta_pct"),
+            "comparison_label": summary.get("comparison_label"),
+            "prev_reach": summary.get("prev_reach"),
+            "prev_views": summary.get("prev_views"),
+            "prev_saved": summary.get("prev_saved"),
+            "prev_engagement_rate_pct": summary.get("prev_engagement_rate_pct"),
         },
-        "verdicts": (perf.get("verdicts") or [])[:5],
-        "double_down": double_down[:6],
-        "double_down_by_dimension": {
-            "funnel_stage": by_dim.get("funnel_stage"),
-            "format_bucket": by_dim.get("format_bucket"),
-            "hook_pattern": by_dim.get("hook_pattern"),
-        },
-        "stop": [w for w in what if w.get("verdict") == "stop"][:4],
-        "top_hooks": [
+        "top_posts": [
             {
                 "hook_text": p.get("hook_text"),
                 "format_bucket": p.get("format_bucket"),
                 "engagement_rate_pct": p.get("engagement_rate_pct"),
                 "saved": p.get("saved"),
                 "reach": p.get("reach"),
+                "caption_excerpt": (p.get("caption") or "")[:180],
             }
-            for p in (perf.get("top_posts") or [])[:5]
+            for p in top_posts
         ],
+        "underperformers": [
+            {
+                "hook_text": p.get("hook_text"),
+                "format_bucket": p.get("format_bucket"),
+                "engagement_rate_pct": p.get("engagement_rate_pct"),
+                "caption_excerpt": (p.get("caption") or "")[:120],
+            }
+            for p in bottom_posts
+        ],
+        "top_format_mix": format_counts,
         "capabilities": perf.get("capabilities"),
     }
 
 
 def _instagram_anchor_for_stage(stage_id: str, ig: Dict[str, Any]) -> str:
-    dd = ig.get("double_down_by_dimension") if isinstance(ig, dict) else None
-    stage_row = dd.get("funnel_stage") if isinstance(dd, dict) else None
-    format_row = dd.get("format_bucket") if isinstance(dd, dict) else None
-    hook_row = dd.get("hook_pattern") if isinstance(dd, dict) else None
+    """Cite observed top-post performance (not funnel/format/hook advice labels)."""
+    top = ig.get("top_posts") if isinstance(ig, dict) else None
+    hooks: List[str] = []
+    formats: List[str] = []
+    if isinstance(top, list):
+        for row in top[:3]:
+            if not isinstance(row, dict):
+                continue
+            ht = str(row.get("hook_text") or "").strip()
+            if ht:
+                hooks.append(ht[:90])
+            fb = str(row.get("format_bucket") or "").strip()
+            if fb and fb not in formats:
+                formats.append(fb)
 
-    top_hook = ""
-    for row in ig.get("top_hooks") or []:
-        txt = str((row or {}).get("hook_text") or "").strip()
-        if txt:
-            top_hook = txt[:100]
-            break
+    summary = ig.get("summary") if isinstance(ig, dict) else None
+    delta_bits: List[str] = []
+    if isinstance(summary, dict):
+        for key, label in (
+            ("reach_delta_pct", "reach"),
+            ("saved_delta_pct", "saves"),
+            ("engagement_rate_delta_pct", "engagement"),
+        ):
+            v = summary.get(key)
+            if isinstance(v, (int, float)):
+                delta_bits.append(f"{label} {v:+.0f}% {summary.get('comparison_label') or 'vs prior period'}")
 
-    stage_hint = ""
-    if isinstance(stage_row, dict):
-        stage_hint = str(stage_row.get("value_label") or stage_row.get("value") or "").strip()
-    if not stage_hint and stage_id == "TOF":
-        stage_hint = "TOF awareness posts"
-    if not stage_hint:
-        stage_hint = "this funnel stage"
-
-    format_hint = "your top format"
-    if isinstance(format_row, dict):
-        format_label = str(format_row.get("value_label") or format_row.get("value") or "").strip()
-        if format_label:
-            format_hint = format_label
-
-    hook_hint = "your strongest opening style"
-    if isinstance(hook_row, dict):
-        hook_label = str(hook_row.get("value_label") or hook_row.get("value") or "").strip()
-        if hook_label:
-            hook_hint = hook_label
-
-    line = (
-        f"Instagram performance signal: {stage_hint} using {format_hint} and {hook_hint} "
-        "is a current winner, so this concept should double down on that pattern."
-    )
-    if top_hook:
-        line += f" Working example hook style: \"{top_hook}\"."
-    return line
+    parts = [
+        f"Instagram performance signal ({stage_id}): ground this concept in patterns from recent top-performing posts."
+    ]
+    if formats:
+        parts.append(f"Observed high-performing formats: {', '.join(formats)}.")
+    if hooks:
+        quoted = "; ".join(f"“{h}”" for h in hooks[:2])
+        parts.append(f"Reuse the shape of winning hooks (do not copy verbatim): {quoted}.")
+    if delta_bits:
+        parts.append("Period movement: " + "; ".join(delta_bits[:2]) + ".")
+    under = ig.get("underperformers") if isinstance(ig, dict) else None
+    if isinstance(under, list) and under:
+        weak = str((under[0] or {}).get("hook_text") or "").strip()
+        if weak:
+            parts.append(f"Avoid weak opening patterns like “{weak[:80]}”.")
+    return " ".join(parts)
 
 
 def _enforce_instagram_grounding(stages_out: List[Dict[str, Any]], ig: Dict[str, Any]) -> None:
-    """Guarantee each concept references winner patterns when Instagram is connected."""
+    """Guarantee each concept references observed top-post performance when IG is connected."""
     if not ig.get("connected"):
+        return
+    if not (ig.get("top_posts") or ig.get("summary")):
         return
     for stage in stages_out:
         sid = str(stage.get("id") or "").upper().strip()
         anchor = _instagram_anchor_for_stage(sid, ig)
         for concept in stage.get("concepts") or []:
             why = str(concept.get("why_for_icp") or "").strip()
+            if "Instagram performance signal" in why:
+                continue
             merged = f"{why} {anchor}".strip() if why else anchor
             concept["why_for_icp"] = merged[:1200]
 
@@ -460,16 +481,16 @@ HARD RULES:
   - BOF: client wins & case study breakdowns from `insights[].wins`, `insights[].testimonial_stories`, `active_client_insights[].wins`. If those are empty, return fewer or 0 BOF concepts and say so in the stage intro — never fabricate.
   - BOF must include at least one concept whose title starts with "Prescribed BOF Case Study:" and is directly based on a real call-library example from SIGNALS.
 - Every concept MUST include `hook` (1 scripted line), `bullets` (proof → re-hook → body → CTA beats), `why_for_icp`, and `funnel_path_to_sale`.
-- `why_for_icp` MUST reference the ICP fields in INTELLIGENCE_PROFILE (target_audience, business_description, unique_selling_proposition, pipeline_priorities, offer_ladder) AND name the specific objection/goal from the Fathom SIGNALS the concept dissolves.
+- `why_for_icp` MUST reference the ICP fields in INTELLIGENCE_PROFILE (target_audience, business_description, unique_selling_proposition, personal_story, mission_statement, pipeline_priorities, offer_ladder) AND name the specific objection/goal from the Fathom SIGNALS the concept dissolves.
 - KNOWLEDGE_BASE (CONTENT_IDEATION_SOP + OFFER_BUILDING_SOP + CONVERSION IDEATION METHOD) is a MANDATORY creative constraint:
   - 3-layer funnel: the `hook` behaves as the HOOK (widest relevant audience, ZERO niche terms, one universal driver, passes the swap test); niche/ICP specificity only enters in the amplifier beats (context → symptom → system); the final beat is the CTA (one ask tied to the amplifier's specific promise). Pick hook types from the SOP's 13 that fit each stage's goal.
   - Reinforce the OFFER: where relevant, echo the operator's positioning levers (owned category, named enemy/wrong-cause, named mechanism, proof) and move the value equation (raise believable outcome/likelihood, lower perceived time/effort).
   - The frameworks are the STRUCTURE; INTELLIGENCE_PROFILE + Fathom SIGNALS are the SUBSTANCE.
-- When INSTAGRAM_PERFORMANCE is connected: bias new concepts toward double_down formats/hooks/themes,
-  avoid stop patterns, and reuse winning hook shapes (not copy captions).
+- When INSTAGRAM_PERFORMANCE is connected: ground concepts in observed top_posts (hooks, formats, captions)
+  and period deltas in summary; avoid patterns from underperformers. Do not invent funnel/format/hook
+  "advice labels" — only cite values that appear in the Instagram payload.
 - If INSTAGRAM_PERFORMANCE.connected=true, every concept's why_for_icp MUST include one explicit line that starts
-  with "Instagram performance signal:" and names at least one current winner to double down on
-  (funnel_stage and/or format_bucket and/or hook_pattern).
+  with "Instagram performance signal" and references a real top-post hook/format or a period delta from summary.
 - No PII (no full names). Paraphrase any quotes."""
 
     ig_perf = _instagram_perf_block_for_llm(db, org_id)
@@ -494,7 +515,7 @@ SIGNALS (Fathom meeting summaries, org themes, call insights, active-client insi
 CALL_LIBRARY_BOF_EXAMPLES (real snippets for prescribed BOF case-study concepts):
 {bof_block}
 
-INSTAGRAM_PERFORMANCE (real results — double_down / stop / top hooks; empty if not connected):
+INSTAGRAM_PERFORMANCE (observed results — top_posts, underperformers, period deltas; empty if not connected):
 {ig_block}
 
 Fingerprint (opaque): {fingerprint}

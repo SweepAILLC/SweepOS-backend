@@ -62,6 +62,8 @@ class SyncResponse(BaseModel):
     queued: bool = True
     result: Dict[str, Any] = Field(default_factory=dict)
     message: Optional[str] = None
+    cooldown_seconds: Optional[int] = None
+    last_sync_at: Optional[str] = None
 
 
 def _org_id(user: User) -> uuid.UUID:
@@ -387,19 +389,17 @@ def sync_instagram(
 ):
     """Enqueue Instagram sync in the background (never blocks the HTTP request).
 
-    Prefer the worker's daily poll; this endpoint exists for connect/callback
-    recovery and ops, not interactive UI syncing.
+    Rate-limited: per-org cooldown + sliding window (defaults: 15 min / 3 per hour).
     """
+    from datetime import datetime
+
     _require_content_studio(db, current_user)
     org_id = _org_id(current_user)
-    check_sliding_window(
-        f"ig_sync_{org_id}_{current_user.id}",
-        max_requests=3,
-        window_seconds=3600,
-        db=db,
-        audit_user=current_user,
-        endpoint_name="instagram_sync",
-    )
+    cooldown = int(getattr(settings, "INSTAGRAM_MANUAL_SYNC_COOLDOWN_SEC", 900) or 900)
+    cooldown = max(60, min(cooldown, 86400))
+    max_per_hour = int(getattr(settings, "INSTAGRAM_MANUAL_SYNC_MAX_PER_HOUR", 3) or 3)
+    max_per_hour = max(1, min(max_per_hour, 12))
+
     token = cc.get_instagram_token(db, org_id)
     if token is None:
         raise HTTPException(status_code=400, detail="Instagram is not connected for this org")
@@ -408,6 +408,36 @@ def sync_instagram(
             status_code=400,
             detail="Composio credentials missing — save them in Integrations first.",
         )
+
+    last_sync = token.last_sync_at
+    if last_sync is not None and cooldown > 0:
+        # Normalize naive UTC timestamps from DB
+        if getattr(last_sync, "tzinfo", None) is not None:
+            last_naive = last_sync.replace(tzinfo=None)
+        else:
+            last_naive = last_sync
+        elapsed = (datetime.utcnow() - last_naive).total_seconds()
+        remaining = int(cooldown - elapsed)
+        if remaining > 0:
+            mins = max(1, (remaining + 59) // 60)
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "message": f"Sync is rate-limited. Try again in about {mins} minute{'s' if mins != 1 else ''}.",
+                    "cooldown_seconds": remaining,
+                    "last_sync_at": last_naive.isoformat(),
+                },
+            )
+
+    check_sliding_window(
+        f"ig_sync_{org_id}",
+        max_requests=max_per_hour,
+        window_seconds=3600,
+        db=db,
+        audit_user=current_user,
+        endpoint_name="instagram_sync",
+    )
+
     budget = int(getattr(settings, "INSTAGRAM_SYNC_BUDGET_SEC", 90) or 90)
     schedule_background_work(
         _sync_org_outside_session,
@@ -421,7 +451,9 @@ def sync_instagram(
         ok=True,
         queued=True,
         result={"org_id": str(org_id), "full": full},
-        message="Instagram sync queued — metrics update automatically on the daily worker poll.",
+        message="Instagram sync queued. Metrics will refresh in the background shortly.",
+        cooldown_seconds=cooldown,
+        last_sync_at=token.last_sync_at.isoformat() if token.last_sync_at else None,
     )
 
 

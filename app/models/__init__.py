@@ -46,6 +46,9 @@ from app.models.org_kpi_benchmark import OrgKpiBenchmark
 from app.models.instagram_media import InstagramMedia
 from app.models.instagram_account_snapshot import InstagramAccountSnapshot
 from app.models.funnel_lead_notification import FunnelLeadNotification
+from app.models.funnel_simulator_scenario import FunnelSimulatorScenario
+from app.models.org_app_session import OrgAppSession
+from app.models.owner_org_notice import OwnerOrgNotice, OwnerOrgNoticeRead
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -78,5 +81,9 @@ __all__ = [
     "InstagramMedia",
     "InstagramAccountSnapshot",
     "FunnelLeadNotification",
+    "FunnelSimulatorScenario",
+    "OrgAppSession",
+    "OwnerOrgNotice",
+    "OwnerOrgNoticeRead",
 ]
 

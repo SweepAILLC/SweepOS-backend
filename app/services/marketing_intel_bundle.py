@@ -86,8 +86,11 @@ _BUSINESS_CONTEXT_KEYS = (
     "business_description",
     "target_audience",
     "unique_selling_proposition",
+    "personal_story",
+    "mission_statement",
     "coaching_style",
     "client_management_philosophy",
+    # Legacy Marketing fields — still used if previously saved.
     "marketing_strategy",
     "marketing_channels",
 )
@@ -325,7 +328,9 @@ def get_marketing_intel_bootstrap_for_mcp(
             "(operator objections/closings/reframes) + intelligence (ICP/offer ladder) to "
             "ideate short-form TOF→MOF→BOF content. Prefer prospect language from sample_quotes "
             "and objection_quotes. If content_bundle is present, treat it as the last drafted "
-            "Marketing Intel concepts and refine or extend it rather than ignoring it."
+            "Marketing Intel concepts and refine or extend it rather than ignoring it. "
+            "For Instagram pattern trends and top/underperformer posts with permalinks + metrics, "
+            "also call get_instagram_performance (or read sweep://instagram/performance)."
         ),
         "cache": {"hit": False, "ttl_seconds": _MARKETING_CACHE_TTL_SEC},
     }

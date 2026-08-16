@@ -116,9 +116,14 @@ def _dispatcher_loop() -> None:
     stripe_catchup_interval = float(
         getattr(settings, "STRIPE_CATCHUP_INTERVAL_SEC", 600) or 600
     )
-    instagram_sync_interval = float(
-        getattr(settings, "INSTAGRAM_SYNC_INTERVAL_SEC", 21600) or 21600
+    # Check hourly for due orgs; per-org freshness still uses INSTAGRAM_SYNC_INTERVAL_SEC.
+    instagram_sync_check_interval = float(
+        getattr(settings, "INSTAGRAM_SYNC_CHECK_INTERVAL_SEC", 3600) or 3600
     )
+    if instagram_sync_check_interval <= 0:
+        instagram_sync_check_interval = float(
+            getattr(settings, "INSTAGRAM_SYNC_INTERVAL_SEC", 86400) or 86400
+        )
     while not _SHUTDOWN:
         loop_started = time.time()
         try:
@@ -172,7 +177,10 @@ def _dispatcher_loop() -> None:
                     except Exception:
                         LOG.exception("stripe catch-up failed")
                     last_stripe_catchup = now
-                if instagram_sync_interval > 0 and now - last_instagram_sync >= instagram_sync_interval:
+                if (
+                    instagram_sync_check_interval > 0
+                    and now - last_instagram_sync >= instagram_sync_check_interval
+                ):
                     try:
                         from app.long_jobs import schedule_background_work
                         from app.services.instagram_sync_service import sync_instagram_all_orgs_job
@@ -187,7 +195,10 @@ def _dispatcher_loop() -> None:
                                 int(getattr(settings, "INSTAGRAM_SYNC_BUDGET_SEC", 90) or 90) * 20,
                             ),
                         )
-                        LOG.info("instagram sync enqueued (interval=%ss)", int(instagram_sync_interval))
+                        LOG.info(
+                            "instagram sync check enqueued (check_interval=%ss)",
+                            int(instagram_sync_check_interval),
+                        )
                     except Exception:
                         LOG.exception("instagram sync enqueue failed")
                     last_instagram_sync = now

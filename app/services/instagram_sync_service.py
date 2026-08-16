@@ -30,6 +30,9 @@ from app.services.composio_client import (
 logger = logging.getLogger(__name__)
 
 SETTLE_HOURS = 48
+# Instagram often returns core insights well before the full 48h settle window.
+# Still attempt pulls after this age so "this week" dashboards aren't blank.
+INSIGHTS_MIN_AGE_HOURS = 2
 
 CORE_METRICS = ["views", "reach", "saved", "total_interactions"]
 FEED_METRICS = [
@@ -304,6 +307,26 @@ def _as_float(v: Any) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _cover_image_url(item: Dict[str, Any]) -> Optional[str]:
+    """Pick a still image URL suitable for <img> (never a video media_url)."""
+    thumb = item.get("thumbnail_url") or item.get("thumb_url") or item.get("cover_url")
+    if isinstance(thumb, str) and thumb.strip().startswith("http"):
+        return thumb.strip()[:4000]
+    media_type = str(item.get("media_type") or "").upper()
+    product = str(item.get("media_product_type") or "").upper()
+    media_url = item.get("media_url") or item.get("url")
+    if not isinstance(media_url, str) or not media_url.strip().startswith("http"):
+        return None
+    url = media_url.strip()
+    # Video/Reel media_url is usually an .mp4 — unusable as an <img> cover.
+    if product == "REELS" or media_type in ("VIDEO", "REELS"):
+        return None
+    lower = url.lower().split("?", 1)[0]
+    if lower.endswith((".mp4", ".mov", ".m3u8", ".webm")):
+        return None
+    return url[:4000]
 
 
 def fetch_user_info(db: Session, org_id: uuid.UUID) -> Dict[str, Any]:
@@ -634,24 +657,36 @@ def sync_instagram_for_org(
         insights: Dict[str, float] = {}
         status = "unavailable"
         err: Optional[str] = None
-        if fetch_insights and settled and _budget_ok(6.0):
+        age_hours = None
+        if posted:
+            age_hours = (now - posted).total_seconds() / 3600.0
+        insights_ready_enough = age_hours is None or age_hours >= INSIGHTS_MIN_AGE_HOURS
+
+        if fetch_insights and insights_ready_enough and _budget_ok(6.0):
             insights_attempted += 1
             insights, status, err = fetch_media_insights(
                 db, org_id, mid, product_type=product_type
             )
             if status in ("ok", "partial"):
                 insights_ok += 1
+            # Brand-new posts may still return empty/error; keep a settling note.
+            if not settled and status in ("unavailable", "partial") and not insights:
+                err = err or "Metrics still settling (Instagram data can lag ~48h)"
+                status = "partial"
             time.sleep(0.15)
-        elif fetch_insights and settled and not _budget_ok(6.0):
+        elif fetch_insights and insights_ready_enough and not _budget_ok(6.0):
             budget_hit = True
             status = existing.insights_status if existing and existing.insights_status else "partial"
             err = "Sync budget exhausted — will retry on next scheduled sync"
-        elif not settled:
+        elif fetch_insights and not insights_ready_enough:
             status = "partial"
-            err = "Metrics still settling (Instagram data can lag ~48h)"
+            err = "Posted too recently for reliable insights — retrying on next sync"
         elif existing is not None and not fetch_insights:
             status = existing.insights_status or "unavailable"
             err = existing.insights_error
+        elif not settled:
+            status = "partial"
+            err = "Metrics still settling (Instagram data can lag ~48h)"
 
         views = _as_int(insights.get("views"))
         reach = _as_int(insights.get("reach"))
@@ -710,9 +745,15 @@ def sync_instagram_for_org(
         row.posted_at = posted or row.posted_at
         if caption_s is not None:
             row.caption = caption_s
-        thumb = item.get("thumbnail_url") or item.get("media_url")
+        thumb = _cover_image_url(item)
         if thumb:
             row.thumbnail_url = thumb
+        elif row.thumbnail_url and (
+            ".mp4" in (row.thumbnail_url or "").lower()
+            or ".mov" in (row.thumbnail_url or "").lower()
+        ):
+            # Clear previously stored video URLs that break <img> covers.
+            row.thumbnail_url = None
         if insights or existing is None:
             row.views = views
             row.reach = reach

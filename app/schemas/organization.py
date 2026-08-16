@@ -43,6 +43,14 @@ class OrganizationWithStats(Organization):
     user_count: int = 0
     client_count: int = 0
     funnel_count: int = 0
+    cash_collected_30d_usd: float = 0.0
+    cash_collected_prev_30d_usd: float = 0.0
+    cash_collected_all_time_usd: float = 0.0
+    mrr_usd: float = 0.0
+    active_seconds_7d: int = 0
+    active_seconds_30d: int = 0
+    last_seen_at: Optional[datetime] = None
+    currently_online: bool = False
 
 
 class UserOrganizationResponse(BaseModel):

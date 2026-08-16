@@ -17,6 +17,19 @@ DEFAULT_SHARED_PAD_CONTENT = """## Onboarding Checklist
 DEFAULT_SHARED_PAD_TITLE = "Onboarding"
 
 
+class PortalSharedPadDefault(Base):
+    """Singleton template copied into a new org's first shared pad."""
+
+    __tablename__ = "portal_shared_pad_defaults"
+
+    id = Column(Integer, primary_key=True)
+    title = Column(String(120), nullable=False, default=DEFAULT_SHARED_PAD_TITLE)
+    content = Column(Text, nullable=False, default=DEFAULT_SHARED_PAD_CONTENT)
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    updated_by_name = Column(String(255), nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class PortalSharedPad(Base):
     """Named shared live notepad tab for an org (consultant ↔ client consulting portal)."""
 

@@ -1,15 +1,16 @@
 """
-Resources tab — org-scoped resource documents and library.
+Resources tab — global platform SOPs/AI skills plus org-scoped library.
 
-Built-in docs (SOPs + AI skills) ship with default markdown. All org members may
-read docs and manage org library items; only system owners may create or edit docs.
+Platform docs (SOPs + AI skills) are stored on Sweep Internal and shown to every
+org. All org members may read them; only system owners may create or edit them.
+Org library items remain per-organization.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 import logging
 
 from app.db.session import get_db
-from app.api.deps import get_current_user, user_is_system_owner
+from app.api.deps import MAIN_ORG_ID, get_current_user, user_is_system_owner
 from app.services.resource_documents import (
     ensure_resource_documents_table,
     list_docs,
@@ -38,11 +39,22 @@ def _org_id(current_user) -> str:
     return str(getattr(current_user, "selected_org_id", None) or current_user.org_id)
 
 
+def _docs_org_id() -> str:
+    """Platform SOP catalog always lives on Sweep Internal (system-owner account)."""
+    return str(MAIN_ORG_ID)
+
+
 def _require_system_owner(current_user, db: Session) -> None:
     if not user_is_system_owner(current_user, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only system owners can edit platform resource documents.",
+        )
+    selected = str(getattr(current_user, "selected_org_id", None) or current_user.org_id)
+    if selected != str(MAIN_ORG_ID):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Platform SOPs can only be edited from the system owner organization.",
         )
 
 
@@ -51,11 +63,11 @@ def get_docs(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """List all docs for the current org (metadata only, no content)."""
+    """List the global platform SOP / AI-skill catalog (metadata only, no content)."""
     from uuid import UUID
 
     ensure_resource_documents_table(db)
-    items = list_docs(db, UUID(_org_id(current_user)))
+    items = list_docs(db, UUID(_docs_org_id()))
     return [
         {
             "resource_id": i["resource_id"],
@@ -80,9 +92,9 @@ def get_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Return full doc including markdown content."""
+    """Return full global platform doc including markdown content."""
     from uuid import UUID
-    doc = get_doc(db, UUID(_org_id(current_user)), resource_id)
+    doc = get_doc(db, UUID(_docs_org_id()), resource_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
     return doc
@@ -95,12 +107,12 @@ def update_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Create or update a document. System owners only."""
+    """Create or update a global platform document. System owners only."""
     from uuid import UUID
 
     _require_system_owner(current_user, db)
     ensure_resource_documents_table(db)
-    org = UUID(_org_id(current_user))
+    org = UUID(_docs_org_id())
     category = str(body.get("category") or "SOP").strip() or "SOP"
     sop_category = body.get("sop_category")
     if sop_category is not None:
@@ -162,7 +174,7 @@ def create_doc_document(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """Create a new custom doc. System owners only."""
+    """Create a new custom platform doc shown to every org. System owners only."""
     from uuid import UUID
 
     _require_system_owner(current_user, db)
@@ -189,7 +201,7 @@ def create_doc_document(
     try:
         doc = create_doc(
             db,
-            UUID(_org_id(current_user)),
+            UUID(_docs_org_id()),
             category=category,
             sop_category=sop_category,
             title=title,
@@ -233,7 +245,7 @@ def reorder_doc_documents(
     try:
         items = reorder_docs(
             db,
-            UUID(_org_id(current_user)),
+            UUID(_docs_org_id()),
             [str(x) for x in raw_ids],
             user_id=current_user.id,
         )
@@ -276,7 +288,7 @@ def remove_doc_document(
     from uuid import UUID
 
     _require_system_owner(current_user, db)
-    ok = delete_doc(db, UUID(_org_id(current_user)), resource_id)
+    ok = delete_doc(db, UUID(_docs_org_id()), resource_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Document not found or cannot be deleted.")
     return {"resource_id": resource_id, "deleted": True}

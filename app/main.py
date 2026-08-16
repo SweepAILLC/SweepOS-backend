@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, kpi, instagram, close_survey
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, kpi, instagram, close_survey
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -78,6 +78,7 @@ app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])
 app.include_router(resources.router, prefix="/resources", tags=["resources"])
 app.include_router(portal.router, prefix="/portal", tags=["portal"])
+app.include_router(portal_funnel_simulator.router, prefix="/portal", tags=["portal"])
 app.include_router(kpi.router, prefix="/kpi", tags=["kpi"])
 app.include_router(close_survey.router, prefix="/close-survey", tags=["close-survey"])
 app.include_router(instagram.router, prefix="/instagram", tags=["instagram"])
@@ -286,6 +287,41 @@ def _ensure_schema_columns_on_startup() -> None:
             ensure_resource_library_table(db)
         except Exception as e:
             log.warning("resource_library schema ensure failed: %s", e)
+            db.rollback()
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
+
+        try:
+            from app.services.funnel_simulator import ensure_funnel_simulator_scenarios_table
+
+            ensure_funnel_simulator_scenarios_table(db)
+        except Exception as e:
+            log.warning("funnel_simulator_scenarios schema ensure failed: %s", e)
+            db.rollback()
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
+
+        from app.models.org_app_session import OrgAppSession
+        from app.models.owner_org_notice import OwnerOrgNotice, OwnerOrgNoticeRead
+        from app.models.portal_shared_pad import PortalSharedPadDefault
+
+        OrgAppSession.__table__.create(db.bind, checkfirst=True)
+        OwnerOrgNotice.__table__.create(db.bind, checkfirst=True)
+        OwnerOrgNoticeRead.__table__.create(db.bind, checkfirst=True)
+        PortalSharedPadDefault.__table__.create(db.bind, checkfirst=True)
+        try:
+            db.execute(text("SET LOCAL lock_timeout = '3s'"))
+            db.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_org_app_sessions_org_last_seen "
+                    "ON org_app_sessions (org_id, last_seen_at)"
+                )
+            )
+            db.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_owner_org_notices_org_created "
+                    "ON owner_org_notices (org_id, created_at)"
+                )
+            )
+        except Exception:
             db.rollback()
             db.execute(text("SET LOCAL lock_timeout = '3s'"))
 

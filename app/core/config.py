@@ -98,12 +98,18 @@ class Settings(BaseSettings):
     MCP_SCOPES: str = "clients:read marketing:read terminal:read kpi:read instagram:read email:send"
 
     # Instagram Performance Intel (Composio API key is per-org via Integrations)
-    INSTAGRAM_SYNC_INTERVAL_SEC: int = 86400  # daily worker poll
+    INSTAGRAM_SYNC_INTERVAL_SEC: int = 86400  # orgs older than this are due for sync
+    # How often the worker checks for due Instagram orgs (independent of interval).
+    INSTAGRAM_SYNC_CHECK_INTERVAL_SEC: int = 3600
     INSTAGRAM_MAX_POSTS_PER_SYNC: int = 100
     # Soft wall-clock budget per org so Composio round-trips cannot hang forever.
     INSTAGRAM_SYNC_BUDGET_SEC: int = 90
     # Cap insight refreshes for already-known posts (settling / recent).
     INSTAGRAM_INSIGHTS_REFRESH_LIMIT: int = 25
+    # Manual Sync button cooldown per org (seconds).
+    INSTAGRAM_MANUAL_SYNC_COOLDOWN_SEC: int = 900
+    # Manual Sync sliding-window rate limit.
+    INSTAGRAM_MANUAL_SYNC_MAX_PER_HOUR: int = 3
     
     # Stripe
     STRIPE_CLIENT_ID: Optional[str] = None

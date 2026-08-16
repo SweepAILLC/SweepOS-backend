@@ -40,11 +40,15 @@ from app.services.kpi_mcp_bundle import (
 from app.services.instagram_mcp_bundle import (
     get_instagram_performance_for_mcp,
     get_instagram_top_posts_for_mcp,
+    get_instagram_underperforming_posts_for_mcp,
+    get_marketing_ideas_for_mcp,
 )
 from app.services.resource_documents import (
+    ensure_doc_content,
     ensure_resource_documents_table,
     list_docs,
     get_doc,
+    search_resource_docs,
 )
 from app.services.resource_library import (
     ensure_resource_library_table,
@@ -60,7 +64,7 @@ router = APIRouter()
 
 SERVER_INFO = {
     "name": "sweepos",
-    "version": "1.5.0",
+    "version": "1.7.0",
     "protocolVersion": "2025-03-26",
 }
 
@@ -124,7 +128,8 @@ TOOLS = [
             "(objection themes, struggles, wins, testimonial stories, prospect voice), operator knowledge "
             "(objections/closings/reframes), sales playbook paragraphs, ICP/offer ladder, last drafted "
             "TOF/MOF/BOF content bundle (if any), and content-ideation guidance. Prefer this tool first "
-            "when drafting short-form content from real sales data."
+            "when drafting short-form content from real sales data. Pair with get_instagram_performance "
+            "for pattern trends and top/underperformer posts with Instagram permalinks + metrics."
         ),
         "inputSchema": {
             "type": "object",
@@ -136,6 +141,15 @@ TOOLS = [
                 },
             },
         },
+    },
+    {
+        "name": "get_marketing_ideas",
+        "description": (
+            "Latest drafted Marketing Intel ideas only (TOF / MOF / BOF concepts: title, hook, bullets, "
+            "why_for_icp). Lighter than get_marketing_intel when you only need the content_bundle. "
+            "Cross-check hooks against get_instagram_performance top_posts / underperformers."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "get_org_sales_signals",
@@ -329,9 +343,11 @@ TOOLS = [
     {
         "name": "get_instagram_performance",
         "description": (
-            "Instagram content performance for the org: summary KPIs, weekly trends, top/bottom posts, "
-            "what_works dimensional lift (format/hook/theme), tactical verdicts, and decline flags. "
-            "Requires Instagram connected in SweepOS Integrations. Prefer this for 'what's working on IG'."
+            "Marketing Intel Instagram read model: period KPIs with prior-window comparison "
+            "(reach/views/saves/engagement deltas), weekly_trend pattern series, trend_flags, "
+            "and top_posts + underperformers each with instagram_url (permalink) and numerical "
+            "metrics (reach, views, saved, engagement_rate_pct, etc). Cite posts by URL + metrics. "
+            "Requires Instagram connected in SweepOS Integrations."
         ),
         "inputSchema": {
             "type": "object",
@@ -341,7 +357,7 @@ TOOLS = [
                     "default": 90,
                     "minimum": 7,
                     "maximum": 365,
-                    "description": "Trailing window in days",
+                    "description": "Trailing window in days (also compared to the prior equal window)",
                 },
             },
         },
@@ -349,8 +365,8 @@ TOOLS = [
     {
         "name": "get_instagram_top_posts",
         "description": (
-            "Ranked Instagram posts by engagement rate. Optionally filter by format_bucket "
-            "(reel|carousel|image|video) or theme_key."
+            "Top Instagram posts by engagement rate, each with instagram_url and numerical metrics. "
+            "Optionally filter by format_bucket (reel|carousel|image|video) or theme_key."
         ),
         "inputSchema": {
             "type": "object",
@@ -363,19 +379,75 @@ TOOLS = [
         },
     },
     {
-        "name": "list_resource_docs",
+        "name": "get_instagram_underperforming_posts",
         "description": (
-            "List SOP / AI Skill resource docs for this org (built-ins + org overrides + custom docs). "
-            "Use this to browse the SOP library and per-org resource docs."
+            "Lowest-engagement Instagram posts in the window, each with instagram_url and numerical "
+            "metrics. Use with get_instagram_top_posts to contrast winners vs underperformers."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "category": {"type": "string", "description": "Optional category filter: SOP or AI Skill"},
+                "days": {"type": "integer", "default": 90, "minimum": 7, "maximum": 365},
+                "format_bucket": {"type": "string"},
+                "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
+            },
+        },
+    },
+    {
+        "name": "search_resource_docs",
+        "description": (
+            "Search the Sweep consulting knowledge base: builtin SOP library + this org's custom/overridden "
+            "docs (offer building, ICP, funnels, sales, fulfillment, etc). Use for strategic consulting "
+            "questions alongside live Marketing Intel / Instagram / Terminal data. Returns ranked matches "
+            "with excerpts (and optional full markdown)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language topic, e.g. 'build an offer', 'objection handling', 'ICP'",
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Optional filter: SOP | AI Skill | Template | Guide",
+                },
+                "sop_category": {
+                    "type": "string",
+                    "description": "Optional track: foundations | marketing | sales | operations | fulfillment",
+                },
+                "limit": {"type": "integer", "default": 8, "minimum": 1, "maximum": 25},
+                "include_content": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Include markdown body (truncated) for each match",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "list_resource_docs",
+        "description": (
+            "Catalog the org SOP library and custom resource docs (built-ins + overrides + customs). "
+            "Prefer search_resource_docs for topical consulting questions; use this to browse by "
+            "category / sop_category, then get_resource_doc for full content."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Optional category filter: SOP | AI Skill | Template | Guide",
+                },
+                "sop_category": {
+                    "type": "string",
+                    "description": "Optional track: foundations | marketing | sales | operations | fulfillment",
+                },
                 "include_content": {
                     "type": "boolean",
                     "default": False,
-                    "description": "If true, include full markdown content in each doc",
+                    "description": "If true, include markdown content for each doc (can be large)",
                 },
                 "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 500},
             },
@@ -383,11 +455,17 @@ TOOLS = [
     },
     {
         "name": "get_resource_doc",
-        "description": "Get one SOP/resource doc by resource_id, including markdown content.",
+        "description": (
+            "Get one SOP / resource doc by resource_id, including full markdown. "
+            "Use after search_resource_docs or list_resource_docs when you need the complete framework."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "resource_id": {"type": "string", "description": "Document resource_id slug"},
+                "resource_id": {
+                    "type": "string",
+                    "description": "Document resource_id slug (e.g. building-an-offer-sop, defining-your-icp)",
+                },
             },
             "required": ["resource_id"],
         },
@@ -395,8 +473,9 @@ TOOLS = [
     {
         "name": "list_org_resource_library",
         "description": (
-            "List org resource-library items (text, markdown, image, video_url, url). "
-            "These are per-org resources uploaded/linked in the Resources tab."
+            "List org-specific resource-library items (text, markdown, image, video_url, url) uploaded "
+            "in Resources — testimonials, case studies, custom SOPs, etc. Complementary to the "
+            "platform SOP library (list_resource_docs / search_resource_docs)."
         ),
         "inputSchema": {
             "type": "object",
@@ -409,7 +488,7 @@ TOOLS = [
     },
     {
         "name": "get_org_resource_library_item",
-        "description": "Get one org resource-library item by id.",
+        "description": "Get one org-specific resource-library item by id (full text/markdown when present).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -673,6 +752,8 @@ def _run_tool(
         )
     if name == "get_kpi_flags":
         return _text_result(get_kpi_flags_for_mcp(db, org_id))
+    if name == "get_marketing_ideas":
+        return _text_result(get_marketing_ideas_for_mcp(db, org_id))
     if name == "get_instagram_performance":
         return _text_result(
             get_instagram_performance_for_mcp(
@@ -692,16 +773,56 @@ def _run_tool(
                 limit=int(args.get("limit") or 10),
             )
         )
+    if name == "get_instagram_underperforming_posts":
+        return _text_result(
+            get_instagram_underperforming_posts_for_mcp(
+                db,
+                org_id,
+                days=int(args.get("days") or 90),
+                format_bucket=args.get("format_bucket"),
+                limit=int(args.get("limit") or 5),
+            )
+        )
+    if name == "search_resource_docs":
+        ensure_resource_documents_table(db)
+        include_content = args.get("include_content")
+        return _text_result(
+            search_resource_docs(
+                db,
+                org_id,
+                query=str(args.get("query") or ""),
+                category=args.get("category"),
+                sop_category=args.get("sop_category"),
+                limit=int(args.get("limit") or 8),
+                include_content=True if include_content is None else bool(include_content),
+            )
+        )
     if name == "list_resource_docs":
         ensure_resource_documents_table(db)
         docs = list_docs(db, org_id)
         category = str(args.get("category") or "").strip().lower()
+        sop_category = str(args.get("sop_category") or "").strip().lower()
         include_content = bool(args.get("include_content") or False)
         limit = int(args.get("limit") or 200)
         if category:
             docs = [d for d in docs if str(d.get("category") or "").strip().lower() == category]
+        if sop_category:
+            docs = [
+                d for d in docs if str(d.get("sop_category") or "").strip().lower() == sop_category
+            ]
         docs = docs[: max(1, min(limit, 500))]
-        if not include_content:
+        if include_content:
+            docs = [ensure_doc_content(d) for d in docs]
+            # Cap bodies for MCP size
+            capped = []
+            for d in docs:
+                item = dict(d)
+                content = str(item.get("content") or "")
+                if len(content) > 18_000:
+                    item["content"] = content[:18_000] + "\n\n…[truncated for MCP]"
+                capped.append(item)
+            docs = capped
+        else:
             docs = [
                 {
                     "resource_id": d.get("resource_id"),
@@ -718,7 +839,16 @@ def _run_tool(
                 }
                 for d in docs
             ]
-        return _text_result({"docs": docs, "count": len(docs)})
+        return _text_result(
+            {
+                "docs": docs,
+                "count": len(docs),
+                "usage": (
+                    "SOP / resource catalog. For topical consulting questions prefer "
+                    "search_resource_docs; then get_resource_doc for a full framework."
+                ),
+            }
+        )
     if name == "get_resource_doc":
         rid = str(args.get("resource_id") or "").strip()
         if not rid:
@@ -727,7 +857,7 @@ def _run_tool(
         doc = get_doc(db, org_id, rid)
         if not doc:
             return _text_result({"error": "resource doc not found"})
-        return _text_result(doc)
+        return _text_result(ensure_doc_content(doc))
     if name == "list_org_resource_library":
         ensure_resource_library_table(db)
         items = list_library_items(db, org_id)
@@ -845,6 +975,12 @@ def _handle_jsonrpc(
                         "mimeType": "application/json",
                     },
                     {
+                        "uri": "sweep://marketing/ideas",
+                        "name": "Marketing ideas",
+                        "description": "Latest drafted TOF/MOF/BOF Marketing Intel concepts",
+                        "mimeType": "application/json",
+                    },
+                    {
                         "uri": "sweep://marketing/signals",
                         "name": "Sales signals",
                         "description": "Objections, struggles, wins, stories, and themes from calls",
@@ -889,20 +1025,41 @@ def _handle_jsonrpc(
                         "uri": "sweep://instagram/performance",
                         "name": "Instagram performance",
                         "description": (
-                            "Content performance: verdicts, what_works, top posts, weekly trends"
+                            "Period comparison, weekly trends, top and underperforming posts "
+                            "with Instagram URLs and metrics"
+                        ),
+                        "mimeType": "application/json",
+                    },
+                    {
+                        "uri": "sweep://instagram/top-posts",
+                        "name": "Instagram top posts",
+                        "description": "Top posts by engagement with permalinks and numerical metrics",
+                        "mimeType": "application/json",
+                    },
+                    {
+                        "uri": "sweep://instagram/underperformers",
+                        "name": "Instagram underperformers",
+                        "description": (
+                            "Lowest-engagement posts with permalinks and numerical metrics"
                         ),
                         "mimeType": "application/json",
                     },
                     {
                         "uri": "sweep://resources/docs",
-                        "name": "SOP / resource docs",
-                        "description": "SOP library and per-org resource documents (built-ins + custom)",
+                        "name": "SOP / consulting knowledge base",
+                        "description": (
+                            "Catalog of builtin SOP library + org custom/overridden docs "
+                            "(strategic consulting frameworks)"
+                        ),
                         "mimeType": "application/json",
                     },
                     {
                         "uri": "sweep://resources/library",
                         "name": "Org resource library",
-                        "description": "Per-org uploaded/linked resources (text, markdown, image, video_url, url)",
+                        "description": (
+                            "Per-org uploaded/linked resources (testimonials, case studies, "
+                            "custom notes — text, markdown, image, video_url, url)"
+                        ),
                         "mimeType": "application/json",
                     },
                     {
@@ -951,6 +1108,18 @@ def _handle_jsonrpc(
             payload = get_marketing_intel_bootstrap_for_mcp(
                 db, org_id, user_id=user_id, include_sop=True
             )
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://marketing/ideas":
+            payload = get_marketing_ideas_for_mcp(db, org_id)
             text = json.dumps(payload, default=str)
             return {
                 "jsonrpc": "2.0",
@@ -1037,6 +1206,30 @@ def _handle_jsonrpc(
             }
         if uri == "sweep://instagram/performance":
             payload = get_instagram_performance_for_mcp(db, org_id, days=90)
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://instagram/top-posts":
+            payload = get_instagram_top_posts_for_mcp(db, org_id, days=90, limit=10)
+            text = json.dumps(payload, default=str)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [
+                        {"uri": uri, "mimeType": "application/json", "text": text[:140_000]}
+                    ]
+                },
+            }
+        if uri == "sweep://instagram/underperformers":
+            payload = get_instagram_underperforming_posts_for_mcp(db, org_id, days=90, limit=5)
             text = json.dumps(payload, default=str)
             return {
                 "jsonrpc": "2.0",

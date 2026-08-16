@@ -463,7 +463,7 @@ def _expert_email_system_prompt() -> str:
         "SENDER PERSONALIZATION: If DATA contains sender_ai_profile, treat it as the sender's own voice and brand directives — "
         "match their writing_style, writing_tone, and coaching_style; frame the message using their sales_framework / sales_tactics; "
         "reference asset_links when relevant (e.g. link to a sales page, lead magnet, or scheduling link). Weave in their business_description, "
-        "target_audience, and unique_selling_proposition naturally—do not quote them verbatim, absorb the voice. "
+        "target_audience, unique_selling_proposition, personal_story, and mission_statement naturally—do not quote them verbatim, absorb the voice. "
         "client_management_philosophy guides how empathetic vs. direct you should be. "
         "ASSET / SCHEDULING LINK SELECTION: When you need to attach a link, scan sender_ai_profile.asset_links and pick by intent: "
         "for testimonial / case-study / check-in asks, prefer a link whose label suggests a non-sales conversation "

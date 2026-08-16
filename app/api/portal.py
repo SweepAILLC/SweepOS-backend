@@ -296,3 +296,70 @@ def delete_portal_todo(
     db.delete(todo)
     db.commit()
     return None
+
+
+@router.get("/notices")
+def list_portal_notices(
+    org_id: UUID = Depends(require_consulting_org_id),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Notices from the system owner for this consulting org."""
+    from app.models.owner_org_notice import OwnerOrgNotice, OwnerOrgNoticeRead
+
+    rows = (
+        db.query(OwnerOrgNotice)
+        .filter(OwnerOrgNotice.org_id == org_id)
+        .order_by(OwnerOrgNotice.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    read_ids = set()
+    if rows:
+        read_ids = {
+            r.notice_id
+            for r in db.query(OwnerOrgNoticeRead).filter(
+                OwnerOrgNoticeRead.user_id == current_user.id,
+                OwnerOrgNoticeRead.notice_id.in_([n.id for n in rows]),
+            ).all()
+        }
+    return [
+        {
+            "id": str(n.id),
+            "title": n.title,
+            "body": n.body,
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+            "read": n.id in read_ids,
+        }
+        for n in rows
+    ]
+
+
+@router.post("/notices/{notice_id}/read")
+def mark_portal_notice_read(
+    notice_id: UUID,
+    org_id: UUID = Depends(require_consulting_org_id),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.models.owner_org_notice import OwnerOrgNotice, OwnerOrgNoticeRead
+
+    notice = (
+        db.query(OwnerOrgNotice)
+        .filter(OwnerOrgNotice.id == notice_id, OwnerOrgNotice.org_id == org_id)
+        .first()
+    )
+    if not notice:
+        raise HTTPException(status_code=404, detail="Notice not found")
+    existing = (
+        db.query(OwnerOrgNoticeRead)
+        .filter(
+            OwnerOrgNoticeRead.notice_id == notice_id,
+            OwnerOrgNoticeRead.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not existing:
+        db.add(OwnerOrgNoticeRead(notice_id=notice_id, user_id=current_user.id))
+        db.commit()
+    return {"ok": True}

@@ -39,7 +39,7 @@ class InstagramMedia(Base):
     media_product_type = Column(String(32), nullable=True)  # FEED, REELS, STORY
     posted_at = Column(DateTime, nullable=True, index=True)
     caption = Column(Text, nullable=True)
-    thumbnail_url = Column(String(1024), nullable=True)
+    thumbnail_url = Column(Text, nullable=True)
 
     # Raw metrics
     views = Column(Integer, nullable=True)

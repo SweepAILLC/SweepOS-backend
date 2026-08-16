@@ -159,6 +159,50 @@ class GlobalHealthResponse(BaseModel):
     llm_usage_last_30d: Optional[LlmUsageSummary] = None
     """Platform LLM API usage (tokens + estimated cost) for the last 30 days."""
 
+    org_activity: List["OrgActivityRow"] = Field(default_factory=list)
+    """Per-org in-app active time (visible-tab heartbeats)."""
+    currently_online_orgs: int = 0
+    currently_online_users: int = 0
+    active_seconds_7d: int = 0
+    active_seconds_30d: int = 0
+
+
+class OrgActivityRow(BaseModel):
+    org_id: str
+    organization_name: str
+    consulting_tier: Optional[str] = None
+    active_seconds_7d: int = 0
+    active_seconds_30d: int = 0
+    last_seen_at: Optional[datetime] = None
+    currently_online: bool = False
+    online_users: int = 0
+
+
+try:
+    GlobalHealthResponse.model_rebuild()
+except AttributeError:
+    GlobalHealthResponse.update_forward_refs()
+
+
+class OwnerOrgNoticeCreate(BaseModel):
+    title: str
+    body: str
+    org_ids: Optional[List[UUID]] = None
+    """If empty/omitted, send to every org with a consulting tier."""
+
+
+class OwnerOrgNoticeResponse(BaseModel):
+    id: UUID
+    org_id: UUID
+    organization_name: Optional[str] = None
+    title: str
+    body: str
+    created_at: datetime
+    read: Optional[bool] = None
+
+    class Config:
+        from_attributes = True
+
 
 class OrganizationFunnelCreate(BaseModel):
     """Schema for creating a funnel in an organization (admin only)"""

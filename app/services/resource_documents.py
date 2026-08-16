@@ -1,4 +1,9 @@
-"""Org-scoped resource document storage with built-in defaults."""
+"""Global platform resource documents (SOPs + AI skills) with built-in defaults.
+
+The system-owner (Sweep Internal) catalog is the single source of truth. Every
+org SOP library reads that catalog. Writes always persist to Sweep Internal,
+regardless of which org is selected in the JWT.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -17,43 +22,22 @@ _log = logging.getLogger(__name__)
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "resources"
 
+# Sweep Internal — canonical store for platform SOPs / AI skills shown to every org.
+GLOBAL_RESOURCE_ORG_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
 BUILTIN_DOCS: List[Dict[str, Any]] = [
     # --- AI Skills (editable by owners) ---
     {
-        "resource_id": "instagram-content-audit",
+        "resource_id": "sweep",
         "category": "AI Skill",
-        "title": "Instagram Content Audit",
+        "title": "/sweep",
         "description": (
-            "Thorough content strategy audit via SweepOS remote MCP — buyer objections, wins, "
-            "stories, ICP, and TOF/MOF/BOF fit. Optional Fathom for transcript gaps; optional pasted "
-            "Reel notes for platform metrics (no TokScript)."
+            "One Claude skill: type /sweep + a prompt. Routes SweepOS MCP for Marketing Intel, "
+            "Instagram performance, SOP library / org docs (strategic consulting KB), Terminal, "
+            "KPIs, sales diagnostics, and client email — no TokScript."
         ),
-        "file_name": "instagram-content-audit.md",
-        "powered_by": "SweepOS remote MCP (Marketing Intel + call insights)",
-    },
-
-    {
-        "resource_id": "shorts-content-ideation",
-        "category": "AI Skill",
-        "title": "Shorts Content Ideation",
-        "description": (
-            "Generate 10 conversion-engineered short-form ideas from SweepOS Marketing Intel — "
-            "themes, clips, wins, and ICP. Optional Fathom only when Sweep quotes are thin."
-        ),
-        "file_name": "shorts-content-ideation.md",
-        "powered_by": "SweepOS remote MCP (get_marketing_intel)",
-    },
-
-    {
-        "resource_id": "sales-call-analysis",
-        "category": "AI Skill",
-        "title": "Sales Call Analysis",
-        "description": (
-            "Complete sales diagnostic from SweepOS call themes, clips, and client insights — with "
-            "scores, quote banks, and root-cause losses. Fathom fills full-transcript gaps."
-        ),
-        "file_name": "sales-call-analysis.md",
-        "powered_by": "SweepOS remote MCP (+ optional Fathom)",
+        "file_name": "sweep.md",
+        "powered_by": "SweepOS remote MCP (Marketing Intel + Instagram + SOP library + Terminal/KPI)",
     },
 
     # --- SOPs (also editable by owners) ---
@@ -384,6 +368,61 @@ def ensure_resource_documents_table(db: Session) -> None:
     db.execute(text("ALTER TABLE resource_documents ADD COLUMN IF NOT EXISTS video_url TEXT"))
     db.execute(text("ALTER TABLE resource_documents ADD COLUMN IF NOT EXISTS sort_order INTEGER"))
     db.commit()
+    _promote_docs_to_global_catalog(db)
+
+
+def _catalog_org_id(_org_id: Optional[uuid.UUID] = None) -> uuid.UUID:
+    """Platform SOPs always live on Sweep Internal, not the caller's selected org."""
+    return GLOBAL_RESOURCE_ORG_ID
+
+
+def _promote_docs_to_global_catalog(db: Session) -> None:
+    """Copy owner-created / edited docs onto Sweep Internal when that slug is missing there."""
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO resource_documents (
+                    org_id, resource_id, category, sop_category, title, description, content,
+                    powered_by, video_url, sort_order, is_custom, updated_by, updated_at
+                )
+                SELECT
+                    CAST(:global_org_id AS uuid),
+                    src.resource_id,
+                    src.category,
+                    src.sop_category,
+                    src.title,
+                    src.description,
+                    src.content,
+                    src.powered_by,
+                    src.video_url,
+                    src.sort_order,
+                    src.is_custom,
+                    src.updated_by,
+                    src.updated_at
+                FROM (
+                    SELECT DISTINCT ON (resource_id)
+                        resource_id, category, sop_category, title, description, content,
+                        powered_by, video_url, sort_order, is_custom, updated_by, updated_at
+                    FROM resource_documents
+                    WHERE org_id <> CAST(:global_org_id AS uuid)
+                    ORDER BY resource_id, updated_at DESC NULLS LAST
+                ) src
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM resource_documents g
+                    WHERE g.org_id = CAST(:global_org_id AS uuid)
+                      AND g.resource_id = src.resource_id
+                )
+                ON CONFLICT (org_id, resource_id) DO NOTHING
+                """
+            ),
+            {"global_org_id": str(GLOBAL_RESOURCE_ORG_ID)},
+        )
+        db.commit()
+    except Exception as e:
+        _log.warning("resource_documents global catalog promote failed: %s", e)
+        db.rollback()
 
 
 def _slugify(title: str) -> str:
@@ -516,8 +555,8 @@ def _row_to_dict(row) -> Dict[str, Any]:
 
 
 def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
-    """Return all resource docs for an org: built-ins (with optional overrides) + custom docs."""
-    org_str = str(org_id)
+    """Return the global platform catalog: built-ins (with Sweep Internal overrides) + custom docs."""
+    org_str = str(_catalog_org_id(org_id))
     rows: Dict[str, Any] = {}
     try:
         result = db.execute(
@@ -595,7 +634,7 @@ def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
 
 
 def get_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> Optional[Dict[str, Any]]:
-    org_str = str(org_id)
+    org_str = str(_catalog_org_id(org_id))
     try:
         row = db.execute(
             text(
@@ -656,6 +695,131 @@ def get_document_content(db: Session, org_id: uuid.UUID, resource_id: str, *, fa
     return fallback.strip()
 
 
+def ensure_doc_content(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill builtin markdown from disk when the list payload has empty content."""
+    if (doc.get("content") or "").strip():
+        return doc
+    builtin = _default_for(str(doc.get("resource_id") or ""))
+    if not builtin:
+        return doc
+    out = dict(doc)
+    out["content"] = _load_default_content(builtin["file_name"])
+    return out
+
+
+def search_resource_docs(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    query: str,
+    category: Optional[str] = None,
+    sop_category: Optional[str] = None,
+    limit: int = 8,
+    include_content: bool = True,
+) -> Dict[str, Any]:
+    """
+    Rank SOP / resource docs for consulting questions.
+    Searches title, description, resource_id, sop_category, and body text.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return {
+            "query": query,
+            "count": 0,
+            "matches": [],
+            "hint": "Provide a query (e.g. 'offer building', 'ICP', 'objection handling').",
+        }
+    tokens = [t for t in re.split(r"\s+", q) if t]
+    docs = list_docs(db, org_id)
+    cat = (category or "").strip().lower()
+    sop_cat = (sop_category or "").strip().lower()
+    if cat:
+        docs = [d for d in docs if str(d.get("category") or "").strip().lower() == cat]
+    if sop_cat:
+        docs = [d for d in docs if str(d.get("sop_category") or "").strip().lower() == sop_cat]
+
+    scored: List[tuple] = []
+    for raw in docs:
+        # Skip the /sweep skill itself when browsing the knowledge base
+        if str(raw.get("resource_id") or "") == "sweep":
+            continue
+        doc = ensure_doc_content(raw)
+        title = str(doc.get("title") or "")
+        desc = str(doc.get("description") or "")
+        rid = str(doc.get("resource_id") or "")
+        sc = str(doc.get("sop_category") or "")
+        body = str(doc.get("content") or "")
+        hay_meta = f"{title} {desc} {rid} {sc}".lower()
+        hay_body = body.lower()
+        score = 0
+        for tok in tokens:
+            if tok in title.lower():
+                score += 12
+            if tok in rid.lower().replace("-", " ") or tok in rid.lower():
+                score += 8
+            if tok in desc.lower():
+                score += 5
+            if tok in sc.lower():
+                score += 4
+            if tok in hay_body:
+                score += 2
+            if tok in hay_meta:
+                score += 1
+        # Phrase bonus
+        if q in hay_meta:
+            score += 10
+        if q in hay_body:
+            score += 4
+        if score <= 0:
+            continue
+        excerpt = ""
+        if body:
+            idx = hay_body.find(tokens[0]) if tokens else -1
+            if idx < 0:
+                excerpt = body[:320].strip()
+            else:
+                start = max(0, idx - 80)
+                excerpt = body[start : start + 360].strip()
+                if start > 0:
+                    excerpt = "…" + excerpt
+                if start + 360 < len(body):
+                    excerpt = excerpt + "…"
+        item: Dict[str, Any] = {
+            "resource_id": rid,
+            "category": doc.get("category"),
+            "sop_category": doc.get("sop_category"),
+            "title": title,
+            "description": desc,
+            "score": score,
+            "excerpt": excerpt,
+            "is_custom": doc.get("is_custom"),
+            "is_builtin": doc.get("is_builtin"),
+        }
+        if include_content:
+            # Cap per-doc body for MCP payload limits
+            content = body
+            if len(content) > 18_000:
+                content = content[:18_000] + "\n\n…[truncated for MCP]"
+            item["content"] = content
+        scored.append((score, item))
+
+    scored.sort(key=lambda x: (-x[0], str(x[1].get("title") or "").lower()))
+    lim = max(1, min(int(limit or 8), 25))
+    matches = [item for _, item in scored[:lim]]
+    return {
+        "org_id": str(org_id),
+        "query": query,
+        "count": len(matches),
+        "matches": matches,
+        "usage": (
+            "Consulting knowledge base hits from the global SOP library (system-owner catalog). "
+            "Prefer higher score matches. For full doc after a thin excerpt, call get_resource_doc. "
+            "Pair with live Marketing Intel / Instagram / Terminal data for pattern reports; "
+            "use these SOPs for strategic frameworks (offer, ICP, funnel, sales, fulfillment)."
+        ),
+    }
+
+
 def sop_content_fingerprint(db: Session, org_id: uuid.UUID, resource_ids: List[str]) -> str:
     parts = [get_document_content(db, org_id, rid) for rid in resource_ids]
     raw = "\n---\n".join(parts)
@@ -677,7 +841,7 @@ def upsert_doc(
     user_id: uuid.UUID,
     is_custom: bool = False,
 ) -> Dict[str, Any]:
-    org_str = str(org_id)
+    org_str = str(_catalog_org_id(org_id))
     db.execute(
         text(
             """
@@ -718,7 +882,7 @@ def upsert_doc(
 
 
 def _next_sort_order(db: Session, org_id: uuid.UUID) -> int:
-    org_str = str(org_id)
+    org_str = str(_catalog_org_id(org_id))
     try:
         row = db.execute(
             text(
@@ -742,7 +906,8 @@ def reorder_docs(
     *,
     user_id: uuid.UUID,
 ) -> List[Dict[str, Any]]:
-    """Persist display order for the given resource IDs (system-owner managed)."""
+    """Persist display order for the given resource IDs (system-owner managed, global catalog)."""
+    org_id = _catalog_org_id(org_id)
     org_str = str(org_id)
     cleaned: List[str] = []
     seen = set()
@@ -836,6 +1001,7 @@ def create_doc(
     user_id: uuid.UUID,
     resource_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    org_id = _catalog_org_id(org_id)
     base_id = resource_id or _slugify(title)
     if base_id in _BUILTIN_IDS:
         base_id = f"{base_id}-custom"
@@ -882,9 +1048,9 @@ def create_doc(
 
 
 def delete_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> bool:
+    org_str = str(_catalog_org_id(org_id))
     if resource_id in _BUILTIN_IDS:
         # Reset built-in to defaults by removing override row
-        org_str = str(org_id)
         db.execute(
             text("DELETE FROM resource_documents WHERE org_id = :org_id AND resource_id = :resource_id"),
             {"org_id": org_str, "resource_id": resource_id},
@@ -892,7 +1058,6 @@ def delete_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> bool:
         db.commit()
         return True
 
-    org_str = str(org_id)
     result = db.execute(
         text(
             """

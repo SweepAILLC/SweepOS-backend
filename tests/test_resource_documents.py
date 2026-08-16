@@ -24,6 +24,15 @@ class TestSlugify:
         assert _slugify("!!!") == "sop"
 
 
+class TestCatalogOrgId:
+    def test_catalog_org_id_is_sweep_internal(self):
+        from app.services.resource_documents import GLOBAL_RESOURCE_ORG_ID, _catalog_org_id
+
+        other = uuid.uuid4()
+        assert _catalog_org_id(other) == GLOBAL_RESOURCE_ORG_ID
+        assert str(GLOBAL_RESOURCE_ORG_ID) == "00000000-0000-0000-0000-000000000001"
+
+
 class TestBuiltinCatalog:
     def test_all_builtins_have_unique_ids(self):
         ids = [d["resource_id"] for d in BUILTIN_DOCS]

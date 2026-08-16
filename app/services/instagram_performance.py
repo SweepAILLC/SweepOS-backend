@@ -194,10 +194,15 @@ def _pct_delta(cur: Optional[float], prev: Optional[float]) -> Optional[float]:
 
 
 def _post_card(m: InstagramMedia) -> Dict[str, Any]:
+    thumb = m.thumbnail_url
+    if isinstance(thumb, str):
+        lower = thumb.lower().split("?", 1)[0]
+        if lower.endswith((".mp4", ".mov", ".m3u8", ".webm")):
+            thumb = None
     return {
         "ig_media_id": m.ig_media_id,
         "permalink": m.permalink,
-        "thumbnail_url": m.thumbnail_url,
+        "thumbnail_url": thumb,
         "caption": (m.caption or "")[:280],
         "hook_text": m.hook_text,
         "hook_pattern": m.hook_pattern,
@@ -623,6 +628,14 @@ def build_instagram_performance(
         "followers_count": followers_end,
         "follower_growth": follower_growth,
         "prev_period_posts": len(prev_posts),
+        # Absolute prior-period values for comparative dashboard (same window length).
+        "prev_reach": prev_reach,
+        "prev_views": prev_views,
+        "prev_saved": prev_saved,
+        "prev_engagement_rate_pct": prev_eng,
+        "comparison_label": f"vs prior {days} days",
+        "prev_range_start": prev_start.date().isoformat(),
+        "prev_range_end": range_start.date().isoformat(),
     }
 
     # Rank posts
@@ -633,12 +646,17 @@ def build_instagram_performance(
         and (p.reach is None or p.reach >= REACH_FLOOR or p.insights_status != "ok")
     ]
     rankable.sort(key=lambda p: float(p.engagement_rate_pct or 0), reverse=True)
-    top = [_post_card(p) for p in rankable[:8]]
-    bottom = [_post_card(p) for p in reversed(rankable[-5:])] if len(rankable) >= 5 else []
+    top = [_post_card(p) for p in rankable[:5]]
+    # Always surface up to 5 underperformers when enough rankable posts exist.
+    bottom_src = list(reversed(rankable[-5:])) if len(rankable) >= 2 else []
+    # Avoid overlapping with top when the set is small
+    top_ids = {p["ig_media_id"] for p in top}
+    bottom = [p for p in [_post_card(x) for x in bottom_src] if p["ig_media_id"] not in top_ids][:5]
 
     what = _what_works(posts)
     trend = _weekly_trend(posts, days)
     flags = _trend_flags(trend)
+    # Keep dimensional analytics for fingerprint / MCP, but UI no longer surfaces verdict advice.
     verdicts = _verdicts(what)
 
     unsettled = sum(1 for p in posts if not p.metrics_settled)
@@ -667,10 +685,10 @@ def build_instagram_performance(
         "last_synced_at": token.last_sync_at.isoformat() if token.last_sync_at else None,
         "username": None,  # filled by API from user_info cache / token scope if needed
         "usage": (
-            "verdicts are the tactical calls. what_works shows dimensional lift vs your "
-            "median engagement. Even low-sample rows are shown as early signals. Prefer verdict=double_down; "
-            "avoid stop. top_posts/bottom_posts are ranked by engagement rate with a "
-            "reach floor to reduce small-sample noise."
+            "summary.*_delta_pct and prev_* compare the selected window to the immediately "
+            "preceding window of equal length. top_posts/bottom_posts are ranked by engagement "
+            "rate with a reach floor. Prefer top_posts hooks and period deltas for ideation; "
+            "what_works/verdicts are secondary analytics, not primary UI advice."
         ),
     }
 
@@ -683,13 +701,17 @@ def performance_fingerprint(db: Session, org_id: uuid.UUID) -> str:
     payload = build_instagram_performance(db, org_id, days=90)
     if not payload.get("connected"):
         return "ig:none"
-    winners = [
-        f"{w['dimension']}:{w['value']}:{w['verdict']}"
-        for w in (payload.get("what_works") or [])[:12]
+    top = [
+        f"{p.get('ig_media_id')}:{p.get('engagement_rate_pct')}:{p.get('hook_text') or ''}"
+        for p in (payload.get("top_posts") or [])[:8]
     ]
+    summary = payload.get("summary") or {}
     blob = {
-        "posts": (payload.get("summary") or {}).get("posts"),
-        "winners": winners,
+        "posts": summary.get("posts"),
+        "reach": summary.get("reach"),
+        "eng": summary.get("engagement_rate_pct"),
+        "reach_delta": summary.get("reach_delta_pct"),
+        "top": top,
         "last_sync": payload.get("last_synced_at"),
     }
     return "ig:" + hashlib.sha256(json.dumps(blob, sort_keys=True).encode()).hexdigest()[:16]
@@ -714,7 +736,33 @@ def top_posts_for_mcp(
         posts = [p for p in posts if tk in (p.get("theme_keys") or [])]
     return {
         "org_id": str(org_id),
+        "connected": bool(perf.get("connected")),
+        "days": days,
         "count": len(posts[:limit]),
         "posts": posts[:limit],
+        "capabilities": perf.get("capabilities"),
+    }
+
+
+def bottom_posts_for_mcp(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    days: int = 90,
+    format_bucket: Optional[str] = None,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    perf = build_instagram_performance(db, org_id, days=days)
+    posts = list(perf.get("bottom_posts") or [])
+    if format_bucket:
+        fb = format_bucket.lower().strip()
+        posts = [p for p in posts if str(p.get("format_bucket") or "").lower() == fb]
+    lim = max(1, min(int(limit or 5), 10))
+    return {
+        "org_id": str(org_id),
+        "connected": bool(perf.get("connected")),
+        "days": days,
+        "count": len(posts[:lim]),
+        "posts": posts[:lim],
         "capabilities": perf.get("capabilities"),
     }

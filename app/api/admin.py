@@ -29,6 +29,7 @@ from app.schemas.invitation import InviteOrgAdminRequest, InvitationResponse
 from app.models.organization_invitation import OrganizationInvitation
 from app.models.client_checkin import ClientCheckIn
 from app.models.manual_payment import ManualPayment
+from app.models.whop_payment import WhopPayment
 from app.schemas.admin import (
     OrganizationDashboardSummary,
     OrganizationFunnelCreate,
@@ -42,6 +43,9 @@ from app.schemas.admin import (
     LlmUsageOrgBreakdown,
     LlmUsageTimeseriesResponse,
     LlmUsageTimeseriesPoint,
+    OrgActivityRow,
+    OwnerOrgNoticeCreate,
+    OwnerOrgNoticeResponse,
 )
 from app.schemas.funnel import Funnel as FunnelSchema
 from app.schemas.permission import (
@@ -69,6 +73,9 @@ from app.schemas.portal import (
     PortalSharedPadUpdate,
     PortalSharedPadResponse,
     PortalSharedPadSummary,
+    PortalSharedPadDefaultUpdate,
+    PortalSharedPadDefaultResponse,
+    FunnelSimulatorScenarioResponse,
 )
 from app.services import portal_shared_pads as pads_svc
 from app.core.config import settings
@@ -77,6 +84,115 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 
 router = APIRouter()
+
+
+def _cents_map(rows) -> dict:
+    out = {}
+    for org_id, cents in rows:
+        out[org_id] = float(cents or 0) / 100.0
+    return out
+
+
+def _org_performance_maps(db: Session, now: datetime):
+    """Batched cash / MRR maps for the organizations grid."""
+    thirty = now - timedelta(days=30)
+    sixty = now - timedelta(days=60)
+
+    stripe_all = _cents_map(
+        db.query(StripePayment.org_id, func.coalesce(func.sum(StripePayment.amount_cents), 0))
+        .filter(StripePayment.status == "succeeded")
+        .group_by(StripePayment.org_id)
+        .all()
+    )
+    stripe_30 = _cents_map(
+        db.query(StripePayment.org_id, func.coalesce(func.sum(StripePayment.amount_cents), 0))
+        .filter(StripePayment.status == "succeeded", StripePayment.created_at >= thirty)
+        .group_by(StripePayment.org_id)
+        .all()
+    )
+    stripe_prev = _cents_map(
+        db.query(StripePayment.org_id, func.coalesce(func.sum(StripePayment.amount_cents), 0))
+        .filter(
+            StripePayment.status == "succeeded",
+            StripePayment.created_at >= sixty,
+            StripePayment.created_at < thirty,
+        )
+        .group_by(StripePayment.org_id)
+        .all()
+    )
+
+    whop_all = whop_30 = whop_prev = {}
+    try:
+        whop_all = _cents_map(
+            db.query(WhopPayment.org_id, func.coalesce(func.sum(WhopPayment.amount_cents), 0))
+            .filter(func.lower(WhopPayment.status) == "paid")
+            .group_by(WhopPayment.org_id)
+            .all()
+        )
+        whop_30 = _cents_map(
+            db.query(WhopPayment.org_id, func.coalesce(func.sum(WhopPayment.amount_cents), 0))
+            .filter(func.lower(WhopPayment.status) == "paid", WhopPayment.created_at >= thirty)
+            .group_by(WhopPayment.org_id)
+            .all()
+        )
+        whop_prev = _cents_map(
+            db.query(WhopPayment.org_id, func.coalesce(func.sum(WhopPayment.amount_cents), 0))
+            .filter(
+                func.lower(WhopPayment.status) == "paid",
+                WhopPayment.created_at >= sixty,
+                WhopPayment.created_at < thirty,
+            )
+            .group_by(WhopPayment.org_id)
+            .all()
+        )
+    except Exception:
+        db.rollback()
+
+    manual_all = manual_30 = manual_prev = {}
+    try:
+        pay_ts = func.coalesce(ManualPayment.payment_date, ManualPayment.created_at)
+        manual_all = _cents_map(
+            db.query(ManualPayment.org_id, func.coalesce(func.sum(ManualPayment.amount_cents), 0))
+            .group_by(ManualPayment.org_id)
+            .all()
+        )
+        manual_30 = _cents_map(
+            db.query(ManualPayment.org_id, func.coalesce(func.sum(ManualPayment.amount_cents), 0))
+            .filter(pay_ts >= thirty)
+            .group_by(ManualPayment.org_id)
+            .all()
+        )
+        manual_prev = _cents_map(
+            db.query(ManualPayment.org_id, func.coalesce(func.sum(ManualPayment.amount_cents), 0))
+            .filter(pay_ts >= sixty, pay_ts < thirty)
+            .group_by(ManualPayment.org_id)
+            .all()
+        )
+    except Exception:
+        db.rollback()
+
+    mrr = {}
+    try:
+        for org_id, val in (
+            db.query(StripeSubscription.org_id, func.coalesce(func.sum(StripeSubscription.mrr), 0))
+            .filter(StripeSubscription.status.in_(["active", "trialing"]))
+            .group_by(StripeSubscription.org_id)
+            .all()
+        ):
+            mrr[org_id] = float(val or 0)
+    except Exception:
+        db.rollback()
+
+    def merge(a, b, c):
+        keys = set(a) | set(b) | set(c)
+        return {k: a.get(k, 0) + b.get(k, 0) + c.get(k, 0) for k in keys}
+
+    return (
+        merge(stripe_30, whop_30, manual_30),
+        merge(stripe_prev, whop_prev, manual_prev),
+        merge(stripe_all, whop_all, manual_all),
+        mrr,
+    )
 
 
 def _utc_naive(dt_aware: datetime) -> datetime:
@@ -392,7 +508,12 @@ def list_organizations(
 ):
     """List all organizations with stats"""
     orgs = db.query(Organization).order_by(Organization.created_at.desc()).all()
-    
+    now = datetime.utcnow()
+    cash_30, cash_prev, cash_all, mrr_map = _org_performance_maps(db, now)
+    from app.services.org_app_activity import activity_maps
+
+    sec_7, sec_30, last_seen, online = activity_maps(db, now)
+
     result = []
     for org in orgs:
         user_count = db.query(func.count(User.id)).filter(
@@ -411,6 +532,14 @@ def list_organizations(
         org_dict.user_count = user_count
         org_dict.client_count = client_count
         org_dict.funnel_count = funnel_count
+        org_dict.cash_collected_30d_usd = cash_30.get(org.id, 0.0)
+        org_dict.cash_collected_prev_30d_usd = cash_prev.get(org.id, 0.0)
+        org_dict.cash_collected_all_time_usd = cash_all.get(org.id, 0.0)
+        org_dict.mrr_usd = mrr_map.get(org.id, 0.0)
+        org_dict.active_seconds_7d = sec_7.get(org.id, 0)
+        org_dict.active_seconds_30d = sec_30.get(org.id, 0)
+        org_dict.last_seen_at = last_seen.get(org.id)
+        org_dict.currently_online = online.get(org.id, 0) > 0
         result.append(org_dict)
     
     return result
@@ -1026,6 +1155,14 @@ def get_global_health(
         # Table may not exist until migration 049 is applied.
         pass
 
+    activity_rows, online_orgs, online_users, active_sec_7, active_sec_30 = [], 0, 0, 0, 0
+    try:
+        from app.services.org_app_activity import health_activity_rows
+
+        activity_rows, online_orgs, online_users, active_sec_7, active_sec_30 = health_activity_rows(db, now)
+    except Exception:
+        db.rollback()
+
     return GlobalHealthResponse(
         total_organizations=total_orgs,
         organizations_created_last_30_days=orgs_created_30d,
@@ -1065,6 +1202,11 @@ def get_global_health(
         close_rate_last_30d_pct=close_rate_last_30d_pct,
         health_trend_periods=health_trend_periods,
         llm_usage_last_30d=llm_usage_last_30d,
+        org_activity=[OrgActivityRow(**r) for r in activity_rows],
+        currently_online_orgs=online_orgs,
+        currently_online_users=online_users,
+        active_seconds_7d=active_sec_7,
+        active_seconds_30d=active_sec_30,
     )
 
 
@@ -2176,6 +2318,42 @@ def admin_put_portal_shared_pad(
     return pads_svc.pad_response(pad)
 
 
+@router.get("/portal-shared-pad-default", response_model=PortalSharedPadDefaultResponse)
+def admin_get_portal_shared_pad_default(
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Template copied into a new consulting org's first shared space."""
+    row = pads_svc.get_or_create_pad_default(db)
+    return PortalSharedPadDefaultResponse(
+        title=row.title or "",
+        content=row.content or "",
+        updated_by_name=row.updated_by_name,
+        updated_at=row.updated_at,
+    )
+
+
+@router.put("/portal-shared-pad-default", response_model=PortalSharedPadDefaultResponse)
+def admin_put_portal_shared_pad_default(
+    body: PortalSharedPadDefaultUpdate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Update the new-portal shared-space template. Existing org pads are not changed."""
+    row = pads_svc.update_pad_default(
+        db,
+        title=body.title,
+        content=body.content,
+        user=admin_user,
+    )
+    return PortalSharedPadDefaultResponse(
+        title=row.title or "",
+        content=row.content or "",
+        updated_by_name=row.updated_by_name,
+        updated_at=row.updated_at,
+    )
+
+
 @router.get("/organizations/{org_id}/kpi-entries")
 def admin_get_kpi_entries(
     org_id: UUID,
@@ -2216,6 +2394,33 @@ def admin_get_kpi_entries(
         for e in entries
     ]
 
+
+
+@router.get(
+    "/organizations/{org_id}/funnel-simulator/scenarios",
+    response_model=List[FunnelSimulatorScenarioResponse],
+)
+def admin_list_funnel_simulator_scenarios(
+    org_id: UUID,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Saved Funnel Simulator scenarios created in this org's consulting portal."""
+    from app.models.funnel_simulator_scenario import FunnelSimulatorScenario
+    from app.services.funnel_simulator import ensure_funnel_simulator_scenarios_table
+
+    _require_org(db, org_id)
+    try:
+        ensure_funnel_simulator_scenarios_table(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+    return (
+        db.query(FunnelSimulatorScenario)
+        .filter(FunnelSimulatorScenario.org_id == org_id)
+        .order_by(FunnelSimulatorScenario.updated_at.desc())
+        .all()
+    )
 
 
 @router.get("/organizations/{org_id}/kpi-snapshot", response_model=KpiSnapshotResponse)
@@ -2276,3 +2481,85 @@ def admin_get_kpi_snapshot(
         payments_available=has_payment_source(db, org_id),
         generated_at=utcnow(),
     )
+
+
+@router.get("/notices", response_model=List[OwnerOrgNoticeResponse])
+def list_owner_notices(
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Recent notices the system owner sent to orgs."""
+    from app.models.owner_org_notice import OwnerOrgNotice
+
+    rows = (
+        db.query(OwnerOrgNotice, Organization.name)
+        .join(Organization, Organization.id == OwnerOrgNotice.org_id)
+        .order_by(OwnerOrgNotice.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        OwnerOrgNoticeResponse(
+            id=n.id,
+            org_id=n.org_id,
+            organization_name=name,
+            title=n.title,
+            body=n.body,
+            created_at=n.created_at,
+        )
+        for n, name in rows
+    ]
+
+
+@router.post("/notices", response_model=List[OwnerOrgNoticeResponse], status_code=status.HTTP_201_CREATED)
+def create_owner_notices(
+    body: OwnerOrgNoticeCreate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Send a notice to selected orgs, or every consulting-tier org if org_ids is empty."""
+    from app.models.owner_org_notice import OwnerOrgNotice
+
+    title = (body.title or "").strip()
+    text_body = (body.body or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    if not text_body:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    if body.org_ids:
+        orgs = db.query(Organization).filter(Organization.id.in_(body.org_ids)).all()
+    else:
+        orgs = (
+            db.query(Organization)
+            .filter(Organization.consulting_tier.in_(["pro_consulting", "core_consulting"]))
+            .all()
+        )
+    if not orgs:
+        raise HTTPException(status_code=400, detail="No matching organizations to notify")
+
+    created = []
+    for org in orgs:
+        notice = OwnerOrgNotice(
+            org_id=org.id,
+            title=title[:200],
+            body=text_body,
+            created_by=admin_user.id,
+        )
+        db.add(notice)
+        created.append((notice, org.name))
+    db.commit()
+    for notice, _ in created:
+        db.refresh(notice)
+    return [
+        OwnerOrgNoticeResponse(
+            id=n.id,
+            org_id=n.org_id,
+            organization_name=name,
+            title=n.title,
+            body=n.body,
+            created_at=n.created_at,
+        )
+        for n, name in created
+    ]

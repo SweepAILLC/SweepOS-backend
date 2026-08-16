@@ -324,6 +324,8 @@ def _build_llm_payload(
             "client_management_philosophy",
             "target_audience",
             "unique_selling_proposition",
+            "personal_story",
+            "mission_statement",
             "business_description",
         ):
             v = ai_profile.get(k)

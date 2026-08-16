@@ -8,9 +8,10 @@ concept follows proven structure AND is anchored to the specific offer + real bu
 Blocks:
 - CONTENT_IDEATION_SOP  — hook & 3-layer-funnel concept framework (13 hook types).
 - OFFER_BUILDING_SOP    — positioning / value / offer-construction framework.
-- SHORTS_IDEATION_METHOD — sales-data-driven conversion ideation (the shorts skill logic, minus
-  the TokScript MCP: reference Fathom sales/check-in data to know which angles turn into buyers and
-  to pre-handle objections through content before the call).
+- SHORTS_IDEATION_METHOD — sales-data-driven conversion ideation (the shorts /sweep skill logic):
+  use Marketing Intel signals + Instagram performance (top/underperformers with permalinks + metrics)
+  via SweepOS MCP — not TokScript — to know which angles turn into buyers and to pre-handle
+  objections through content before the call.
 
 Keep SOP_VERSION in sync with meaningful edits so the content bundle regenerates.
 Human-readable copies live at frontend/public/resources/*.md.
@@ -23,7 +24,8 @@ SOP_VERSION = 2
 CONTENT_IDEATION_SOP = """HOOK & VIDEO CONCEPT IDEATION SOP (universal, niche-agnostic framework).
 This SOP governs the FIRST 3 SECONDS (the hook) and the IDEA a concept is built around.
 Apply it to every concept, then personalize using INTELLIGENCE_PROFILE (offer ladder,
-business_description, target_audience, unique_selling_proposition, pipeline_priorities).
+business_description, target_audience, unique_selling_proposition, personal_story,
+mission_statement, pipeline_priorities).
 
 CORE PRINCIPLE — THE 3-LAYER FUNNEL (never invert the order):
 - HOOK (0-3s): stop the scroll for the WIDEST relevant audience. ZERO niche-specific terms.

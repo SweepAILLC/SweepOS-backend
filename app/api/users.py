@@ -820,3 +820,17 @@ def delete_user_tab_permission(
     
     return None
 
+
+@router.post("/me/activity-heartbeat")
+def activity_heartbeat(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Record visible-tab time for the current user's selected org."""
+    from app.services.org_app_activity import record_heartbeat
+
+    org_id = UUID(str(getattr(current_user, "selected_org_id", None) or current_user.org_id))
+    record_heartbeat(db, org_id=org_id, user_id=current_user.id)
+    db.commit()
+    return {"ok": True}
+

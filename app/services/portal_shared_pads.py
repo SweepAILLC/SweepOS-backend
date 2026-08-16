@@ -13,6 +13,7 @@ from app.models.portal_shared_pad import (
     DEFAULT_SHARED_PAD_TITLE,
     MAX_SHARED_PADS_PER_ORG,
     PortalSharedPad,
+    PortalSharedPadDefault,
 )
 from app.models.user import User
 from app.schemas.portal import PortalSharedPadResponse, PortalSharedPadSummary
@@ -53,6 +54,57 @@ def pad_summary(pad: PortalSharedPad) -> PortalSharedPadSummary:
     )
 
 
+def get_or_create_pad_default(db: Session) -> PortalSharedPadDefault:
+    row = db.query(PortalSharedPadDefault).order_by(PortalSharedPadDefault.id.asc()).first()
+    if row:
+        return row
+    now = datetime.utcnow()
+    row = PortalSharedPadDefault(
+        id=1,
+        title=DEFAULT_SHARED_PAD_TITLE,
+        content=DEFAULT_SHARED_PAD_CONTENT,
+        updated_at=now,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def new_org_pad_defaults(db: Session) -> tuple[str, str]:
+    """Title/content copied into a brand-new org's first shared pad only."""
+    row = get_or_create_pad_default(db)
+    title = (row.title or "").strip() or DEFAULT_SHARED_PAD_TITLE
+    content = row.content if row.content is not None else DEFAULT_SHARED_PAD_CONTENT
+    return title, content
+
+
+def update_pad_default(
+    db: Session,
+    *,
+    title: Optional[str],
+    content: Optional[str],
+    user: User,
+) -> PortalSharedPadDefault:
+    row = get_or_create_pad_default(db)
+    if title is not None:
+        clean = title.strip() or DEFAULT_SHARED_PAD_TITLE
+        row.title = clean[:120]
+    if content is not None:
+        if len(content) > 200_000:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Content exceeds maximum length",
+            )
+        row.content = content
+    row.updated_by = user.id
+    row.updated_by_name = display_name(user)
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 def list_pads(db: Session, org_id: UUID) -> List[PortalSharedPad]:
     return (
         db.query(PortalSharedPad)
@@ -74,12 +126,13 @@ def ensure_default_pad(db: Session, org_id: UUID) -> PortalSharedPad:
             db.commit()
             db.refresh(first)
         return first
+    title, content = new_org_pad_defaults(db)
     now = datetime.utcnow()
     pad = PortalSharedPad(
         org_id=org_id,
-        title=DEFAULT_SHARED_PAD_TITLE,
+        title=title,
         sort_order=0,
-        content=DEFAULT_SHARED_PAD_CONTENT,
+        content=content,
         revision=1,
         created_at=now,
         updated_at=now,

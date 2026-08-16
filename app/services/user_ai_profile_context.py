@@ -196,13 +196,17 @@ def extract_ai_profile_for_llm(user: Any) -> Optional[Dict[str, Any]]:
         "business_description",
         "target_audience",
         "unique_selling_proposition",
+        "personal_story",
+        "mission_statement",
         "sales_framework",
         "sales_tactics",
+        # Legacy Marketing fields — still passed through if previously saved.
         "marketing_strategy",
         "marketing_channels",
         "pipeline_priorities",
         "asset_links",
     )
+    _longer_text = frozenset({"personal_story", "mission_statement", "client_management_philosophy"})
     out: Dict[str, Any] = {}
     for k in keys:
         v = raw.get(k)
@@ -216,7 +220,7 @@ def extract_ai_profile_for_llm(user: Any) -> Optional[Dict[str, Any]]:
             elif k == "pipeline_priorities" and isinstance(v, list):
                 out[k] = [str(x) for x in v if isinstance(x, str)][:10]
             elif isinstance(v, str) and v.strip():
-                out[k] = v.strip()[:1000]
+                out[k] = v.strip()[:2500 if k in _longer_text else 1000]
     ladder = offer_ladder_for_llm(extract_offer_ladder(raw))
     if ladder:
         out["offer_ladder"] = ladder
