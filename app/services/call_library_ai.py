@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,38 @@ from app.core.config import settings
 from app.services.llm_client import chat_json, llm_available, truncate_for_tokens
 
 logger = logging.getLogger(__name__)
+
+# Fathom markdown_formatted summaries wrap nearly every bullet in a timestamp deep-link.
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)]+)\)")
+_BARE_FATHOM_URL_RE = re.compile(r"https?://(?:www\.)?fathom\.video/\S+", re.IGNORECASE)
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+_ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+
+
+def clean_fathom_summary_text(text: str) -> str:
+    """
+    Turn Fathom's link-heavy markdown_formatted summary into readable plain text.
+
+    Keeps headings/bullets; unwraps [label](fathom timestamp url) → label and
+    strips leftover emphasis markers so the Call Library glance view is clean.
+    """
+    if not text:
+        return ""
+    out = str(text)
+    # Unwrap markdown links (repeat for rare nested cases).
+    for _ in range(3):
+        nxt = _MD_LINK_RE.sub(r"\1", out)
+        if nxt == out:
+            break
+        out = nxt
+    out = _BARE_FATHOM_URL_RE.sub("", out)
+    out = _BOLD_RE.sub(r"\1", out)
+    out = _ITALIC_RE.sub(r"\1", out)
+    # Tidy whitespace left by stripped URLs / empty link labels.
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out.strip()
 
 DISCOVERY_AUDIT_SOP = """\
 DISCOVERY AUDIT SOP — scoring framework (use this to score the discovery_audit section):
@@ -315,10 +348,10 @@ def generate_glance_call_report(
     org_id: Optional[uuid.UUID] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Minimal non-sales report: raw Fathom summary + one short LLM paragraph.
+    Minimal non-sales report: cleaned Fathom summary + one short LLM paragraph.
     No sales-audit framework, action items, or transcript-heavy prompts.
     """
-    fathom_summary = (summary or "").strip()
+    fathom_summary = clean_fathom_summary_text(summary or "")
     # Prefer Fathom summary only; tiny transcript assist if summary is missing.
     summary_part = truncate_for_tokens(fathom_summary, 3500) if fathom_summary else ""
     transcript_part = ""

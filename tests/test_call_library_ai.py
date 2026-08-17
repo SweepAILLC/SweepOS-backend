@@ -6,6 +6,7 @@ from app.services.call_library_ai import (
     OBJECTION_HANDLING_SOP,
     PITCHING_SOP,
     _build_library_user_payload,
+    clean_fathom_summary_text,
     generate_call_library_report,
     is_substantive_call_library_report,
 )
@@ -56,6 +57,27 @@ class TestSopBlocksPresent:
         # Keep SOP injection sizes reasonable for token budget (enforced again at runtime)
         assert len(PITCHING_SOP) < 6000
         assert len(OBJECTION_HANDLING_SOP) < 8000
+
+
+class TestCleanFathomSummaryText:
+    def test_unwraps_timestamp_markdown_links(self):
+        raw = (
+            "## Key Takeaways\n\n"
+            "  - [**Coaching Paused:** One-on-one coaching is paused until December.]"
+            "(https://fathom.video/share/abc?tab=summary&timestamp=591.0)\n"
+            "  - [Free Group Access: Landen retains free access.]"
+            "(https://fathom.video/share/abc?tab=summary&timestamp=762.0)\n"
+        )
+        cleaned = clean_fathom_summary_text(raw)
+        assert "https://fathom.video" not in cleaned
+        assert "[" not in cleaned
+        assert "]" not in cleaned
+        assert "Coaching Paused: One-on-one coaching is paused until December." in cleaned
+        assert "Free Group Access: Landen retains free access." in cleaned
+        assert "## Key Takeaways" in cleaned
+
+    def test_preserves_plain_text(self):
+        assert clean_fathom_summary_text("Simple summary.") == "Simple summary."
 
 
 class TestSubstantiveReportGuard:
