@@ -76,6 +76,8 @@ from app.schemas.portal import (
     PortalSharedPadDefaultUpdate,
     PortalSharedPadDefaultResponse,
     FunnelSimulatorScenarioResponse,
+    FunnelSimulatorScenarioCreate,
+    FunnelSimulatorScenarioUpdate,
 )
 from app.services import portal_shared_pads as pads_svc
 from app.core.config import settings
@@ -2421,6 +2423,159 @@ def admin_list_funnel_simulator_scenarios(
         .order_by(FunnelSimulatorScenario.updated_at.desc())
         .all()
     )
+
+
+def _ensure_funnel_simulator_table(db: Session) -> None:
+    from app.services.funnel_simulator import ensure_funnel_simulator_scenarios_table
+
+    try:
+        ensure_funnel_simulator_scenarios_table(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+@router.get("/organizations/{org_id}/funnel-simulator/baselines")
+def admin_get_funnel_simulator_baselines(
+    org_id: UUID,
+    days: int = Query(90, ge=1, le=365),
+    mtd: bool = Query(False),
+    funnel_id: Optional[UUID] = Query(None),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Historic rates for the simulator for any org (system owner)."""
+    from app.services.funnel_simulator import build_funnel_simulator_baselines
+
+    _require_org(db, org_id)
+    payload = build_funnel_simulator_baselines(
+        db, org_id, days=days, mtd=mtd, funnel_id=funnel_id
+    )
+    if payload.get("error"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=payload["error"])
+    return payload
+
+
+@router.post(
+    "/organizations/{org_id}/funnel-simulator/scenarios",
+    response_model=FunnelSimulatorScenarioResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def admin_create_funnel_simulator_scenario(
+    org_id: UUID,
+    body: FunnelSimulatorScenarioCreate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    from app.models.funnel_simulator_scenario import (
+        MAX_FUNNEL_SIMULATOR_SCENARIOS_PER_ORG,
+        FunnelSimulatorScenario,
+    )
+
+    _require_org(db, org_id)
+    _ensure_funnel_simulator_table(db)
+    count = (
+        db.query(FunnelSimulatorScenario)
+        .filter(FunnelSimulatorScenario.org_id == org_id)
+        .count()
+    )
+    if count >= MAX_FUNNEL_SIMULATOR_SCENARIOS_PER_ORG:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum {MAX_FUNNEL_SIMULATOR_SCENARIOS_PER_ORG} scenarios per organization.",
+        )
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    now = datetime.utcnow()
+    row = FunnelSimulatorScenario(
+        org_id=org_id,
+        name=name[:120],
+        mode=body.mode,
+        funnel_id=body.funnel_id,
+        lookback_days=str(body.lookback_days or "90")[:16],
+        inputs=body.inputs if isinstance(body.inputs, dict) else {},
+        created_by=admin_user.id,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.patch(
+    "/organizations/{org_id}/funnel-simulator/scenarios/{scenario_id}",
+    response_model=FunnelSimulatorScenarioResponse,
+)
+def admin_update_funnel_simulator_scenario(
+    org_id: UUID,
+    scenario_id: UUID,
+    body: FunnelSimulatorScenarioUpdate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    from app.models.funnel_simulator_scenario import FunnelSimulatorScenario
+
+    _require_org(db, org_id)
+    _ensure_funnel_simulator_table(db)
+    row = (
+        db.query(FunnelSimulatorScenario)
+        .filter(
+            FunnelSimulatorScenario.id == scenario_id,
+            FunnelSimulatorScenario.org_id == org_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Name is required")
+        row.name = name[:120]
+    if body.mode is not None:
+        row.mode = body.mode
+    if body.funnel_id is not None or (body.model_fields_set and "funnel_id" in body.model_fields_set):
+        row.funnel_id = body.funnel_id
+    if body.lookback_days is not None:
+        row.lookback_days = str(body.lookback_days)[:16]
+    if body.inputs is not None:
+        row.inputs = body.inputs if isinstance(body.inputs, dict) else {}
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@router.delete(
+    "/organizations/{org_id}/funnel-simulator/scenarios/{scenario_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def admin_delete_funnel_simulator_scenario(
+    org_id: UUID,
+    scenario_id: UUID,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    from app.models.funnel_simulator_scenario import FunnelSimulatorScenario
+
+    _require_org(db, org_id)
+    _ensure_funnel_simulator_table(db)
+    row = (
+        db.query(FunnelSimulatorScenario)
+        .filter(
+            FunnelSimulatorScenario.id == scenario_id,
+            FunnelSimulatorScenario.org_id == org_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scenario not found")
+    db.delete(row)
+    db.commit()
+    return None
 
 
 @router.get("/organizations/{org_id}/kpi-snapshot", response_model=KpiSnapshotResponse)
