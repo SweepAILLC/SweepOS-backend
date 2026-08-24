@@ -15,6 +15,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.llm_budget import consume_llm_budget
+from app.core.llm_exceptions import LLMBudgetExceededError, LLMSlotUnavailableError
 from app.core.prompt_security import sanitize_llm_user_payload
 
 logger = logging.getLogger(__name__)
@@ -69,8 +70,47 @@ def chat_json(
         raise RuntimeError("No LLM API key configured")
 
     if org_id is not None and not consume_llm_budget(org_id):
-        raise RuntimeError("llm_budget_exceeded")
+        raise LLMBudgetExceededError(str(org_id))
 
+    from app.core.llm_slot import acquire_llm_slot, release_llm_slot
+
+    if not acquire_llm_slot():
+        raise LLMSlotUnavailableError()
+
+    try:
+        return _chat_json_after_budget(
+            system_prompt,
+            user_prompt,
+            provider=provider,
+            api_key=api_key,
+            temperature=temperature,
+            timeout=timeout,
+            org_id=org_id,
+            model=model,
+            max_tokens=max_tokens,
+            max_input_chars=max_input_chars,
+            min_user_chars=min_user_chars,
+            feature=feature,
+        )
+    finally:
+        release_llm_slot()
+
+
+def _chat_json_after_budget(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    provider: str,
+    api_key: str,
+    temperature: float,
+    timeout: float,
+    org_id,
+    model,
+    max_tokens,
+    max_input_chars,
+    min_user_chars: int,
+    feature: str,
+) -> Dict[str, Any]:
     max_total = int(
         max_input_chars
         if max_input_chars is not None

@@ -45,7 +45,9 @@ class GlobalRateLimitMiddleware(BaseHTTPMiddleware):
         if not ok:
             return JSONResponse(
                 status_code=429,
-                content={"detail": "Too many requests. Please slow down."},
+                content={
+                    "detail": "Rate limit exceeded. You're making too many requests — please slow down and try again in a moment."
+                },
                 headers={"Retry-After": "60"},
             )
         return await call_next(request)

@@ -9,6 +9,18 @@ import threading
 
 app = FastAPI(title="Sweep Coach OS API", version="1.0.0")
 
+def _tune_api_threadpool() -> None:
+    """Sync routes (LLM drafts, Stripe) run in anyio's threadpool. Default 40 is tight at 50 users."""
+    n = int(getattr(app_settings, "API_THREADPOOL_SIZE", 64) or 64)
+    try:
+        import anyio.to_thread
+
+        anyio.to_thread.current_default_thread_limiter().total_tokens = n
+    except Exception:
+        logging.getLogger("app").warning("could not raise API threadpool to %s", n, exc_info=True)
+
+_tune_api_threadpool()
+
 # CORS: default localhost + ALLOWED_ORIGINS_EXTRA for production (Render/Vercel)
 _allowed_origins = app_settings.get_allowed_origins()
 app.add_middleware(
@@ -21,6 +33,12 @@ app.add_middleware(
 )
 # Global throttle (after CORS registration so this runs first on each request — see Starlette order)
 app.add_middleware(GlobalRateLimitMiddleware)
+
+# Add LLM-specific exception handlers first (more specific)
+from app.core.llm_exceptions import LLMException
+from app.api.llm_error_handler import llm_exception_handler
+
+app.add_exception_handler(LLMException, llm_exception_handler)
 
 # Add exception handler to ensure CORS headers are included even on errors
 from fastapi.responses import JSONResponse
