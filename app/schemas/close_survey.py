@@ -26,10 +26,27 @@ class CloseSurveyOfferOption(BaseModel):
     suggested_total_cents: Optional[int] = None
 
 
+class CloseSurveyCloserOption(BaseModel):
+    id: str
+    name: str
+    email: Optional[str] = None
+    role: str
+
+
+class CloseSurveyLeadSourceOption(BaseModel):
+    """key=organic or funnel UUID; funnel_id set only for funnel options."""
+
+    key: str
+    label: str
+    funnel_id: Optional[str] = None
+
+
 class CloseSurveyMetaResponse(BaseModel):
     org_name: str
     clients: List[CloseSurveyClientOption]
     offers: List[CloseSurveyOfferOption]
+    closers: List[CloseSurveyCloserOption] = []
+    lead_sources: List[CloseSurveyLeadSourceOption] = []
 
 
 PaymentSource = Literal["manual", "stripe", "whop", "none"]
@@ -48,6 +65,12 @@ class CloseSurveySubmitRequest(BaseModel):
     recording_url: Optional[str] = Field(None, max_length=2000)
     call_notes: Optional[str] = Field(None, max_length=8000)
     entry_date: Optional[date] = None
+    closer_user_id: Optional[UUID] = None
+    lead_source_key: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="organic or funnel UUID from meta.lead_sources",
+    )
 
 
 class CloseSurveySubmitResponse(BaseModel):
@@ -56,6 +79,8 @@ class CloseSurveySubmitResponse(BaseModel):
     closed: bool
     deal_outcome: DealOutcome
     payment_source: PaymentSource
+    closer_user_id: Optional[str] = None
+    lead_source: Optional[str] = None
     manual_payment_id: Optional[str] = None
     lifecycle_state: Optional[str] = None
     message: str = "Logged — pipeline / payments / KPI will refresh."

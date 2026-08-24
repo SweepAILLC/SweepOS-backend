@@ -79,17 +79,20 @@ def _manual_payment_stripe_responses(
 
     query = db.query(ManualPayment).filter(ManualPayment.org_id == org_id)
     if start_date is not None and end_date is not None:
+        # Compare calendar dates so tz-aware payment_date vs naive UTC windows
+        # don't drop a payment recorded "today" in the user's local timezone.
         query = query.filter(
             and_(
-                ManualPayment.payment_date >= start_date,
-                ManualPayment.payment_date <= end_date,
+                func.date(ManualPayment.payment_date) >= start_date.date(),
+                func.date(ManualPayment.payment_date) <= end_date.date(),
             )
         )
 
     rows = query.order_by(desc(ManualPayment.payment_date)).all()
+    client_map = _client_map_for_ids(db, [mp.client_id for mp in rows])
     result: List[StripePaymentResponse] = []
     for mp in rows:
-        client = db.query(Client).filter(Client.id == mp.client_id).first()
+        client = client_map.get(mp.client_id)
         disp_name, disp_email = _payment_display_client_info(client)
         pay_dt = mp.payment_date or mp.created_at
         created_ts = int(pay_dt.timestamp()) if pay_dt else 0
@@ -154,6 +157,64 @@ def _payment_display_client_info(client, transaction_email=None, payment_raw_eve
         email = extract_email_from_payment_raw(payment_raw_event)
     display_name = (name.strip() if name else "") or (email or "") or "Unknown"
     return display_name, email
+
+
+def _org_has_treasury_rows(db: Session, org_id: uuid.UUID) -> bool:
+    return (
+        db.query(StripeTreasuryTransaction.id)
+        .filter(StripeTreasuryTransaction.org_id == org_id)
+        .limit(1)
+        .first()
+        is not None
+    )
+
+
+def _client_map_for_ids(db: Session, client_ids) -> dict:
+    unique = []
+    seen = set()
+    for cid in client_ids:
+        if cid and cid not in seen:
+            seen.add(cid)
+            unique.append(cid)
+    if not unique:
+        return {}
+    rows = db.query(Client).filter(Client.id.in_(unique)).all()
+    return {row.id: row for row in rows}
+
+
+def _payment_recovery_indexes(db: Session, org_id: uuid.UUID):
+    """One org query instead of N+1 pending/rejected recovery lookups."""
+    recs = (
+        db.query(Recommendation)
+        .filter(
+            Recommendation.org_id == org_id,
+            Recommendation.type == "payment_recovery",
+        )
+        .all()
+    )
+    pending_by_client = {}
+    rejected_by_client = {}
+    rejected_by_payment_id = {}
+
+    def _matches(rec, wanted: str) -> bool:
+        st = rec.status
+        name = (getattr(st, "name", None) or "")
+        val = (getattr(st, "value", None) or "")
+        blob = f"{st} {name} {val}".upper()
+        return wanted.upper() in blob
+
+    for rec in recs:
+        if _matches(rec, "PENDING"):
+            if rec.client_id:
+                pending_by_client.setdefault(rec.client_id, rec)
+        elif _matches(rec, "REJECTED"):
+            if rec.client_id:
+                rejected_by_client.setdefault(rec.client_id, rec)
+            payload = rec.payload if isinstance(rec.payload, dict) else {}
+            pid = payload.get("payment_id") if payload else None
+            if pid:
+                rejected_by_payment_id[str(pid)] = rec
+    return pending_by_client, rejected_by_client, rejected_by_payment_id
 
 
 def check_stripe_connected(db: Session, org_id: uuid.UUID) -> bool:
@@ -1777,14 +1838,7 @@ def get_payments(
         from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
         
         # Check if Treasury Transactions table has any data for this org
-        from sqlalchemy import text
-        treasury_count = db.query(StripeTreasuryTransaction).filter(
-            StripeTreasuryTransaction.org_id == org_id
-        ).count()
-        
-        # If no Treasury Transactions exist, fall back to old payment system
-        if treasury_count == 0:
-            print(f"[PAYMENTS] No Treasury Transactions found for org {org_id}, falling back to StripePayment")
+        if not _org_has_treasury_rows(db, org_id):
             use_treasury = False
         else:
             newest_payment_at = db.query(func.max(StripePayment.created_at)).filter(
@@ -1804,13 +1858,7 @@ def get_payments(
                 and newest_treasury_at
                 and newest_payment_at > newest_treasury_at + timedelta(minutes=2)
             ):
-                print(
-                    f"[PAYMENTS] StripePayment ahead of Treasury for org {org_id}; "
-                    "using StripePayment for freshness"
-                )
                 use_treasury = False
-            else:
-                print(f"[PAYMENTS] Found {treasury_count} Treasury Transactions for org {org_id}, using Treasury Transactions")
         
     if use_treasury:
         # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
@@ -1834,12 +1882,8 @@ def get_payments(
         # Filter by date range if provided
         if scope == "mtd" or range_days is not None:
             start_date, end_date = _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
-            query = query.filter(
-                and_(
-                    (StripeTreasuryTransaction.posted_at or StripeTreasuryTransaction.created) >= start_date,
-                    (StripeTreasuryTransaction.posted_at or StripeTreasuryTransaction.created) <= end_date
-                )
-            )
+            txn_at = func.coalesce(StripeTreasuryTransaction.posted_at, StripeTreasuryTransaction.created)
+            query = query.filter(and_(txn_at >= start_date, txn_at <= end_date))
         
         # Get all transactions, then deduplicate
         all_transactions = query.order_by(desc(StripeTreasuryTransaction.posted_at or StripeTreasuryTransaction.created)).all()
@@ -1871,9 +1915,10 @@ def get_payments(
         deduplicated.sort(key=lambda t: (t.posted_at or t.created).timestamp() if (t.posted_at or t.created) else 0, reverse=True)
 
         start_date, end_date = _payments_window_from_params(scope, range_days)
+        client_map = _client_map_for_ids(db, [t.client_id for t in deduplicated])
         stripe_result = []
         for transaction in deduplicated:
-            client = db.query(Client).filter(Client.id == transaction.client_id).first() if transaction.client_id else None
+            client = client_map.get(transaction.client_id) if transaction.client_id else None
 
             display_id = transaction.flow_id or transaction.stripe_transaction_id
             if transaction.flow_type and transaction.flow_type.value in ['received_credit', 'inbound_transfer']:
@@ -1977,16 +2022,14 @@ def get_payments(
         if key not in payment_map:
             payment_map[key] = payment
             deduplicated.append(payment)
-        else:
-            existing_payment = payment_map[key]
-            print(f"[PAYMENTS] Skipping duplicate payment {payment.stripe_id} (type: {payment.type}) - keeping {existing_payment.stripe_id} (type: {existing_payment.type}) for {key[0]} {key[1]}")
     
     deduplicated.sort(key=lambda p: p.created_at.timestamp() if p.created_at else 0, reverse=True)
 
     start_date, end_date = _payments_window_from_params(scope, range_days)
+    client_map = _client_map_for_ids(db, [p.client_id for p in deduplicated])
     stripe_result = []
     for payment in deduplicated:
-        client = db.query(Client).filter(Client.id == payment.client_id).first() if payment.client_id else None
+        client = client_map.get(payment.client_id) if payment.client_id else None
 
         display_subscription_id = payment.subscription_id
         if not display_subscription_id:
@@ -2081,9 +2124,11 @@ def _build_failed_payments_from_stripe_payment_table(
     db: Session,
     org_id: uuid.UUID,
     exclude_resolved: bool,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
 ) -> List[StripeFailedPaymentResponse]:
     """Group failed/past_due StripePayment rows into failed queue response items (no pagination)."""
-    all_failed_payments = db.query(StripePayment).filter(
+    query = db.query(StripePayment).filter(
         and_(
             StripePayment.org_id == org_id,
             or_(
@@ -2091,17 +2136,13 @@ def _build_failed_payments_from_stripe_payment_table(
                 StripePayment.status == "past_due"
             )
         )
-    ).order_by(desc(StripePayment.created_at)).all()
-
-    print(f"[DEBUG] Total failed payments found: {len(all_failed_payments)}")
-    for p in all_failed_payments[:20]:
-        print(f"  - ID: {p.stripe_id}, Sub: {p.subscription_id}, Client: {p.client_id}, Invoice: {p.invoice_id}, Created: {p.created_at}, Status: {p.status}")
-
-    sub_counts = {}
-    for p in all_failed_payments:
-        if p.subscription_id:
-            sub_counts[p.subscription_id] = sub_counts.get(p.subscription_id, 0) + 1
-    print(f"[DEBUG] Subscription IDs with multiple failed payments: {[(sub, count) for sub, count in sub_counts.items() if count > 1]}")
+    )
+    if start_date is not None and end_date is not None:
+        query = query.filter(
+            StripePayment.created_at >= start_date,
+            StripePayment.created_at <= end_date,
+        )
+    all_failed_payments = query.order_by(desc(StripePayment.created_at)).all()
 
     grouped_payments = {}
 
@@ -2123,10 +2164,6 @@ def _build_failed_payments_from_stripe_payment_table(
                 'first_attempt': payment.created_at,
                 'latest_attempt': payment.created_at
             }
-            print(f"[DEBUG] New group created: key={group_key}, payment_id={payment.stripe_id}, sub={payment.subscription_id}, client={payment.client_id}, invoice={payment.invoice_id}")
-        else:
-            existing_count = len(grouped_payments[group_key]['payments'])
-            print(f"[DEBUG] Adding to existing group: key={group_key}, payment_id={payment.stripe_id}, existing_count={existing_count}, sub={payment.subscription_id}, client={payment.client_id}, invoice={payment.invoice_id}")
 
         grouped_payments[group_key]['payments'].append(payment)
 
@@ -2135,87 +2172,34 @@ def _build_failed_payments_from_stripe_payment_table(
         if payment.created_at > grouped_payments[group_key]['latest_attempt']:
             grouped_payments[group_key]['latest_attempt'] = payment.created_at
 
-    result = []
+    pending_by_client, rejected_by_client, rejected_by_payment_id = _payment_recovery_indexes(db, org_id)
     type_priority = {'charge': 0, 'payment_intent': 1, 'invoice': 2}
+    representatives = []
     for group_key, group_data in grouped_payments.items():
-        # Prefer charge > payment_intent > invoice, then earliest by created_at
         representative_payment = min(
             group_data['payments'],
             key=lambda p: (type_priority.get(p.type, 3), p.created_at or datetime.max)
         )
-        attempt_count = len(group_data['payments'])
-
-        subscription_id = None
-        client_id = None
-        invoice_id = None
-
-        if len(group_key) == 2 and group_key[0] == 'sub':
-            subscription_id = representative_payment.subscription_id
-        elif len(group_key) == 2 and group_key[0] == 'inv':
-            invoice_id = representative_payment.invoice_id
-            subscription_id = representative_payment.subscription_id
-        elif len(group_key) == 2 and group_key[0] == 'stripe':
-            # Standalone failed payments (pi_xxx, ch_xxx) with no sub/invoice/client - include them
-            subscription_id = representative_payment.subscription_id
-        elif len(group_key) == 2:
-            first, second = group_key
-            if first is None:
-                if isinstance(second, uuid.UUID):
-                    client_id = second
-                else:
-                    invoice_id = representative_payment.invoice_id
-
-        if not client_id:
-            client_id = representative_payment.client_id
-        if not subscription_id:
-            subscription_id = representative_payment.subscription_id
-
-        print(f"[DEBUG] Failed payment group: key={group_key}, attempt_count={attempt_count}, subscription_id={subscription_id}, client_id={client_id}")
-
-        client = db.query(Client).filter(Client.id == representative_payment.client_id).first() if representative_payment.client_id else None
-
-        recovery = None
-        rejected_recovery = None
-        if representative_payment.client_id:
-            recovery = db.query(Recommendation).filter(
-                and_(
-                    Recommendation.org_id == org_id,
-                    Recommendation.client_id == representative_payment.client_id,
-                    Recommendation.type == "payment_recovery",
-                    Recommendation.status == "PENDING"
-                )
-            ).first()
-
         if exclude_resolved:
-            from sqlalchemy import text
-            payment_id_str = str(representative_payment.id)
-
+            rejected_recovery = None
             if representative_payment.client_id:
-                rejected_recovery = db.query(Recommendation).filter(
-                    and_(
-                        Recommendation.org_id == org_id,
-                        Recommendation.client_id == representative_payment.client_id,
-                        Recommendation.type == "payment_recovery",
-                        Recommendation.status == "REJECTED"
-                    )
-                ).first()
-
+                rejected_recovery = rejected_by_client.get(representative_payment.client_id)
             if not rejected_recovery:
-                rejected_by_payment_id = db.query(Recommendation).filter(
-                    and_(
-                        Recommendation.org_id == org_id,
-                        Recommendation.type == "payment_recovery",
-                        Recommendation.status == "REJECTED",
-                        text("recommendations.payload->>'payment_id' = :payment_id")
-                    )
-                ).params(payment_id=payment_id_str).first()
+                rejected_recovery = rejected_by_payment_id.get(str(representative_payment.id))
+            if rejected_recovery:
+                continue
+        representatives.append((representative_payment, group_data))
 
-                if rejected_by_payment_id:
-                    rejected_recovery = rejected_by_payment_id
-
-        if exclude_resolved and rejected_recovery:
-            continue
-
+    client_map = _client_map_for_ids(db, [rp.client_id for rp, _ in representatives])
+    result = []
+    for representative_payment, group_data in representatives:
+        attempt_count = len(group_data['payments'])
+        client = client_map.get(representative_payment.client_id) if representative_payment.client_id else None
+        recovery = (
+            pending_by_client.get(representative_payment.client_id)
+            if representative_payment.client_id
+            else None
+        )
         tx_email = collect_email_from_raw_events([p.raw_event for p in group_data["payments"]])
         disp_name, disp_email = _payment_display_client_info(
             client,
@@ -2296,30 +2280,25 @@ def get_failed_payments(
     
     # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
     
+    window_start, window_end = _payments_window_from_params(scope, range_days)
+
     # Use Treasury Transactions if requested
-    if use_treasury:
-        # Check if Treasury Transactions table has any data for this org
-        from sqlalchemy import text
-        treasury_count = db.query(StripeTreasuryTransaction).filter(
-            StripeTreasuryTransaction.org_id == org_id
-        ).count()
-        
-        # If no Treasury Transactions exist, fall back to old payment system
-        if treasury_count == 0:
-            print(f"[FAILED PAYMENTS] No Treasury Transactions found for org {org_id}, falling back to StripePayment")
-            use_treasury = False
-        else:
-            print(f"[FAILED PAYMENTS] Found {treasury_count} Treasury Transactions for org {org_id}, using Treasury Transactions")
+    if use_treasury and not _org_has_treasury_rows(db, org_id):
+        use_treasury = False
     
     if use_treasury:
         # Get voided transactions (failed payments)
         # Use raw SQL to avoid SQLAlchemy enum name conversion
         from sqlalchemy import text
-        all_failed_transactions = db.query(StripeTreasuryTransaction).filter(
+        treasury_q = db.query(StripeTreasuryTransaction).filter(
             StripeTreasuryTransaction.org_id == org_id
         ).filter(
             text("stripe_treasury_transactions.status = 'void'::treasurytransactionstatus")
-        ).order_by(desc(StripeTreasuryTransaction.created)).all()
+        )
+        if window_start is not None and window_end is not None:
+            txn_at = func.coalesce(StripeTreasuryTransaction.posted_at, StripeTreasuryTransaction.created)
+            treasury_q = treasury_q.filter(and_(txn_at >= window_start, txn_at <= window_end))
+        all_failed_transactions = treasury_q.order_by(desc(StripeTreasuryTransaction.created)).all()
         
         # Group by flow_id to condense retry attempts
         grouped_transactions = {}
@@ -2347,62 +2326,26 @@ def get_failed_payments(
             if transaction.created > grouped_transactions[group_key]['latest_attempt']:
                 grouped_transactions[group_key]['latest_attempt'] = transaction.created
         
-        # Convert grouped transactions to result list
-        result = []
+        pending_by_client, rejected_by_client, rejected_by_payment_id = _payment_recovery_indexes(db, org_id)
+        representatives = []
         for group_key, group_data in grouped_transactions.items():
-            # Use the FIRST transaction (earliest) as the representative to show initial date
             representative = min(group_data['transactions'], key=lambda t: t.created)
-            attempt_count = len(group_data['transactions'])
-            
-            client = db.query(Client).filter(Client.id == representative.client_id).first() if representative.client_id else None
-            
-            # Check if recovery recommendation exists
-            recovery = None
-            rejected_recovery = None
-            if representative.client_id:
-                recovery = db.query(Recommendation).filter(
-                    and_(
-                        Recommendation.org_id == org_id,
-                        Recommendation.client_id == representative.client_id,
-                        Recommendation.type == "payment_recovery",
-                        Recommendation.status == "PENDING"
-                    )
-                ).first()
-            
-            # Check if payment is resolved (by payment_id in payload - works for all cases)
             if exclude_resolved:
-                from sqlalchemy import text
-                payment_id_str = str(representative.id)
-                
-                # First check by client_id if available
+                rejected_recovery = None
                 if representative.client_id:
-                    rejected_recovery = db.query(Recommendation).filter(
-                        and_(
-                            Recommendation.org_id == org_id,
-                            Recommendation.client_id == representative.client_id,
-                            Recommendation.type == "payment_recovery",
-                            Recommendation.status == "REJECTED"
-                        )
-                    ).first()
-                
-                # Also check by payment_id in payload (works for all cases, including no client_id)
+                    rejected_recovery = rejected_by_client.get(representative.client_id)
                 if not rejected_recovery:
-                    rejected_by_payment_id = db.query(Recommendation).filter(
-                        and_(
-                            Recommendation.org_id == org_id,
-                            Recommendation.type == "payment_recovery",
-                            Recommendation.status == "REJECTED",
-                            text("recommendations.payload->>'payment_id' = :payment_id")
-                        )
-                    ).params(payment_id=payment_id_str).first()
-                    
-                    if rejected_by_payment_id:
-                        rejected_recovery = rejected_by_payment_id
-            
-            # Skip resolved payments if exclude_resolved is True
-            if exclude_resolved and rejected_recovery:
-                continue
-            
+                    rejected_recovery = rejected_by_payment_id.get(str(representative.id))
+                if rejected_recovery:
+                    continue
+            representatives.append((representative, group_data))
+
+        client_map = _client_map_for_ids(db, [r.client_id for r, _ in representatives])
+        result = []
+        for representative, group_data in representatives:
+            attempt_count = len(group_data['transactions'])
+            client = client_map.get(representative.client_id) if representative.client_id else None
+            recovery = pending_by_client.get(representative.client_id) if representative.client_id else None
             disp_name, disp_email = _payment_display_client_info(
                 client,
                 transaction_email=representative.customer_email,
@@ -2432,17 +2375,20 @@ def get_failed_payments(
         # Sort by latest attempt (most recent first)
         result.sort(key=lambda r: r.latest_attempt_at, reverse=True)
         # Merge StripePayment failures not represented in Treasury (webhooks/sync)
-        stripe_only = _build_failed_payments_from_stripe_payment_table(db, org_id, exclude_resolved)
+        stripe_only = _build_failed_payments_from_stripe_payment_table(
+            db, org_id, exclude_resolved, window_start, window_end
+        )
         merged = _merge_treasury_and_stripe_failed_queues(result, stripe_only)
         merged.sort(key=lambda r: r.latest_attempt_at, reverse=True)
         merged = _filter_failed_payments_by_window(merged, scope, range_days)
         return merged[(page - 1) * page_size:page * page_size]
     
     # Fallback: StripePayment table only (no Treasury rows or use_treasury=False)
-    result = _build_failed_payments_from_stripe_payment_table(db, org_id, exclude_resolved)
+    result = _build_failed_payments_from_stripe_payment_table(
+        db, org_id, exclude_resolved, window_start, window_end
+    )
     result = _filter_failed_payments_by_window(result, scope, range_days)
     return result[(page - 1) * page_size:page * page_size]
-
 
 @router.get("/client/{client_id}/revenue", response_model=StripeClientRevenueResponse)
 def get_client_revenue(

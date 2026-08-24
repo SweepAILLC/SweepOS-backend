@@ -40,12 +40,17 @@ class BookingTriggerConfig(BaseModel):
     The engine reads this to decide whether a freshly created Calendly/Cal.com booking
     should fire the rule. ``event_type_ids`` is a list of provider-native ids
     (Cal.com eventType.id as string, Calendly event_type URI). Set ``match_all_events``
-    to True to fire on any booking from the chosen provider without picking specific
-    events (off by default to prevent accidental blast-emails).
+    to True to fire on any *sales* booking from the chosen provider without picking
+    specific events (off by default to prevent accidental blast-emails).
+
+    Regardless of selection, the engine only enqueues when the booking is marked as a
+    sales call (Calendar event-type sales toggle / per-booking override).
     """
     provider: Literal["calcom", "calendly", "any"] = "any"
     event_type_ids: Optional[List[str]] = None
     match_all_events: bool = False
+    # Documented for API clarity; backend always enforces sales-only today.
+    sales_calls_only: bool = True
 
 
 _AUTOMATION_AI_PROMPT_MAX_LEN = 8000
@@ -282,6 +287,65 @@ class AutomationPreviewResponse(BaseModel):
     chosen_opportunities: List[str] = []
     merge_tags_resolved: Dict[str, str] = {}
     notes: List[str] = []
+
+
+class AutomationFlowTestRequest(BaseModel):
+    """Send lightweight test emails for one flow's enabled action steps."""
+    email: str = Field(..., min_length=3, max_length=320)
+    client_id: Optional[uuid.UUID] = None
+    trigger_kind: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _normalize_email(cls, v: str) -> str:
+        t = (v or "").strip().lower()
+        if "@" not in t or "." not in t.split("@")[-1]:
+            raise ValueError("email must look like an address")
+        return t
+
+    @field_validator("trigger_kind")
+    @classmethod
+    def _validate_trigger_kind(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if v not in TRIGGER_KIND_VALUES:
+            raise ValueError(f"trigger_kind must be one of {TRIGGER_KIND_VALUES}")
+        return v
+
+
+class AutomationFlowTestStepResult(BaseModel):
+    playbook: str
+    node_kind: str
+    trigger_kind: Optional[str] = None
+    step_index: Optional[int] = None
+    enabled: bool = False
+    status: str
+    detail: Optional[str] = None
+    brevo_message_id: Optional[str] = None
+    job_id: Optional[str] = None
+
+
+class AutomationFlowTestResponse(BaseModel):
+    ok: bool
+    flow: str
+    to_email: str
+    client_id: Optional[str] = None
+    client_label: Optional[str] = None
+    sent_count: int = 0
+    results: List[AutomationFlowTestStepResult] = []
+    error: Optional[str] = None
+    # Diagnostics (also useful when ok=false)
+    dispatcher_healthy: bool = False
+    brevo_connected: bool = False
+    brevo_note: Optional[str] = None
+    enabled_action_count: int = 0
+    enabled_wait_count: int = 0
+    enabled_playbooks: List[str] = []
+    approval_gated_playbooks: List[str] = []
+    booking_trigger_ready: bool = True
+    booking_trigger_note: Optional[str] = None
+    blockers: List[str] = []
+    ready_for_live_sends: bool = False
 
 
 # -- Outreach inbox ------------------------------------------------------------

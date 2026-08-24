@@ -301,7 +301,7 @@ def generate_call_library_report(
             feature="call_library",
         )
     except RuntimeError as e:
-        if "llm_budget" in str(e).lower():
+        if "llm_budget" in str(e).lower() or "llm_slot" in str(e).lower():
             raise
         logger.warning("call_library LLM runtime error model=%s: %s", model_override, e)
         return None
@@ -388,7 +388,7 @@ def generate_glance_call_report(
                 raw.get("summary") or raw.get("analysis") or raw.get("ai_summary") or ""
             ).strip()[:1200]
     except RuntimeError as e:
-        if "llm_budget" in str(e).lower():
+        if "llm_budget" in str(e).lower() or "llm_slot" in str(e).lower():
             raise
         logger.warning("call_library glance LLM runtime error: %s", e)
     except Exception as e:

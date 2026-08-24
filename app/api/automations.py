@@ -33,6 +33,8 @@ from app.schemas.automation import (
     AutomationEmailJobListResponse,
     AutomationEmailJobRead,
     AutomationFlowStepCreate,
+    AutomationFlowTestRequest,
+    AutomationFlowTestResponse,
     AutomationPreviewRequest,
     AutomationPreviewResponse,
     AutomationRuleRead,
@@ -43,6 +45,7 @@ from app.schemas.automation import (
 from app.services.automation_dispatcher import read_dispatcher_health
 from app.services.automation_drafts import build_automation_email_draft
 from app.services.automation_engine import seed_default_rules
+from app.services.automation_flow_test import diagnose_flow, run_flow_test
 
 LOG = logging.getLogger(__name__)
 
@@ -367,3 +370,42 @@ def preview_draft(
         merge_tags_resolved=draft.merge_tags_resolved,
         notes=draft.notes,
     )
+
+
+@router.get("/flows/{flow}/diagnostics")
+def flow_diagnostics(
+    flow: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Readiness snapshot for one flow (worker / Brevo / enabled steps / booking config)."""
+    if flow not in FLOW_VALUES:
+        raise HTTPException(status_code=400, detail=f"unknown flow '{flow}'")
+    org_id = _resolve_org_id(current_user)
+    return diagnose_flow(db, org_id, flow)
+
+
+@router.post("/flows/{flow}/test", response_model=AutomationFlowTestResponse)
+def test_flow(
+    flow: str,
+    body: AutomationFlowTestRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """Send sync [TEST] emails for enabled action steps in a flow (bypasses worker/delays)."""
+    if flow not in FLOW_VALUES:
+        raise HTTPException(status_code=400, detail=f"unknown flow '{flow}'")
+    org_id = _resolve_org_id(current_user)
+    try:
+        out = run_flow_test(
+            db,
+            org_id=org_id,
+            flow=flow,
+            email=body.email,
+            client_id=body.client_id,
+            trigger_kind=body.trigger_kind,
+            user_id=current_user.id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return AutomationFlowTestResponse.model_validate(out)

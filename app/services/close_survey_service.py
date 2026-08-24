@@ -13,11 +13,16 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.models.client import Client, LifecycleState
 from app.models.client_checkin import ClientCheckIn
 from app.models.calendar_booking_sales import CalendarBookingSales
+from app.models.funnel import Funnel
 from app.models.manual_payment import ManualPayment
 from app.models.organization import Organization
+from app.models.user import User, role_to_api
+from app.models.user_organization import UserOrganization
 from app.schemas.client import ClientOfferEnrollmentPatch
 from app.schemas.close_survey import (
     CloseSurveyClientOption,
+    CloseSurveyCloserOption,
+    CloseSurveyLeadSourceOption,
     DealOutcome,
     CloseSurveyMetaResponse,
     CloseSurveyOfferOption,
@@ -26,6 +31,8 @@ from app.schemas.close_survey import (
 )
 from app.services.offer_ladder import resolve_org_offer_ladder
 from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+_ORGANIC_LEAD_KEY = "organic"
 
 LOG = logging.getLogger("app.close_survey")
 
@@ -63,6 +70,66 @@ def _lifecycle_str(state: Any) -> str:
     if hasattr(state, "value"):
         return str(state.value)
     return str(state)
+
+
+def _user_display_name(user: User) -> str:
+    email = (getattr(user, "email", None) or "").strip()
+    if email and "@" in email:
+        return email.split("@")[0]
+    return email or "Member"
+
+
+def _list_org_closers(db: Session, org_id: uuid.UUID) -> List[CloseSurveyCloserOption]:
+    """Union of users.home-org + UserOrganization members (owners/admins/system owners)."""
+    by_id: Dict[str, User] = {}
+    for u in db.query(User).filter(User.org_id == org_id).all():
+        by_id[str(u.id)] = u
+    for u in (
+        db.query(User)
+        .join(UserOrganization, UserOrganization.user_id == User.id)
+        .filter(UserOrganization.org_id == org_id)
+        .all()
+    ):
+        by_id[str(u.id)] = u
+
+    opts: List[CloseSurveyCloserOption] = []
+    for u in by_id.values():
+        try:
+            role = role_to_api(u.role) if u.role is not None else "member"
+        except Exception:
+            role = "member"
+        opts.append(
+            CloseSurveyCloserOption(
+                id=str(u.id),
+                name=_user_display_name(u),
+                email=(u.email or None),
+                role=role,
+            )
+        )
+    opts.sort(key=lambda c: (c.name or "").lower())
+    return opts
+
+
+def _list_lead_sources(db: Session, org_id: uuid.UUID) -> List[CloseSurveyLeadSourceOption]:
+    sources: List[CloseSurveyLeadSourceOption] = [
+        CloseSurveyLeadSourceOption(key=_ORGANIC_LEAD_KEY, label="Organic", funnel_id=None)
+    ]
+    funnels = (
+        db.query(Funnel)
+        .filter(Funnel.org_id == org_id)
+        .order_by(Funnel.name.asc())
+        .all()
+    )
+    for f in funnels:
+        name = (f.name or "").strip() or "Untitled funnel"
+        sources.append(
+            CloseSurveyLeadSourceOption(
+                key=str(f.id),
+                label=name,
+                funnel_id=str(f.id),
+            )
+        )
+    return sources
 
 
 def build_close_survey_meta(db: Session, org: Organization) -> CloseSurveyMetaResponse:
@@ -140,6 +207,8 @@ def build_close_survey_meta(db: Session, org: Organization) -> CloseSurveyMetaRe
         org_name=org.name or "Organization",
         clients=client_opts,
         offers=offers,
+        closers=_list_org_closers(db, org.id),
+        lead_sources=_list_lead_sources(db, org.id),
     )
 
 
@@ -206,6 +275,8 @@ def _append_notes(
     cash_cents: Optional[int],
     recording_url: Optional[str],
     call_notes: Optional[str],
+    closer_name: Optional[str] = None,
+    lead_source_label: Optional[str] = None,
 ) -> None:
     if payment_source == "manual" and cash_cents and cash_cents > 0:
         pay_line = f"manual|${cash_cents / 100:.2f}"
@@ -216,6 +287,10 @@ def _append_notes(
         f"### Post-sales {entry_day.isoformat()}",
         f"Outcome: {deal_outcome.replace('_', '-')} · Payment: {pay_line}",
     ]
+    if closer_name:
+        lines.append(f"Closer: {closer_name}")
+    if lead_source_label:
+        lines.append(f"Lead source: {lead_source_label}")
     if recording_url:
         lines.append(f"Recording: {recording_url.strip()}")
     notes_body = (call_notes or "").strip()
@@ -226,6 +301,38 @@ def _append_notes(
     existing = (client.notes or "").rstrip()
     client.notes = f"{existing}\n\n{block}".strip() + "\n" if existing else block + "\n"
     client.updated_at = datetime.utcnow()
+
+
+def _stamp_closer_and_lead_source(
+    client: Client,
+    *,
+    closer_user_id: Optional[str],
+    closer_name: Optional[str],
+    lead_source_key: str,
+    lead_source_label: str,
+    funnel_id: Optional[str],
+) -> None:
+    meta = client.meta if isinstance(client.meta, dict) else {}
+    prev_ps = meta.get("post_sales") if isinstance(meta.get("post_sales"), dict) else {}
+    post_sales = {
+        **prev_ps,
+        "closer_user_id": closer_user_id,
+        "closer_name": closer_name,
+        "lead_source_key": lead_source_key,
+        "lead_source": lead_source_label,
+        "funnel_id": funnel_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    meta = {**meta, "post_sales": post_sales}
+
+    prev_prospect = meta.get("prospect") if isinstance(meta.get("prospect"), dict) else {}
+    prospect = {**prev_prospect, "source": lead_source_label}
+    if funnel_id:
+        prospect["funnel_id"] = funnel_id
+    meta["prospect"] = prospect
+
+    client.meta = meta
+    flag_modified(client, "meta")
 
 
 def _apply_offer_enrollment(
@@ -365,6 +472,23 @@ def submit_close_survey(
     meta = build_close_survey_meta(db, org)
     offer_labels = {o.slot: o.label for o in meta.offers}
 
+    closer_user_id_str: Optional[str] = None
+    closer_name: Optional[str] = None
+    if body.closer_user_id is not None:
+        closer_key = str(body.closer_user_id)
+        closer_opt = next((c for c in meta.closers if c.id == closer_key), None)
+        if closer_opt is None:
+            raise HTTPException(status_code=400, detail="Invalid closer")
+        closer_user_id_str = closer_opt.id
+        closer_name = closer_opt.name or closer_opt.email or closer_opt.id
+
+    lead_key = (body.lead_source_key or _ORGANIC_LEAD_KEY).strip() or _ORGANIC_LEAD_KEY
+    lead_opt = next((ls for ls in meta.lead_sources if ls.key == lead_key), None)
+    if lead_opt is None:
+        raise HTTPException(status_code=400, detail="Invalid lead source")
+    lead_source_label = lead_opt.label
+    lead_funnel_id = lead_opt.funnel_id
+
     manual_payment_id: Optional[str] = None
 
     # 1) Manual payment
@@ -423,7 +547,17 @@ def submit_close_survey(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid offer enrollment: {e}") from e
 
-    # 4) Notes
+    # 4) Closer + lead source on client meta
+    _stamp_closer_and_lead_source(
+        client,
+        closer_user_id=closer_user_id_str,
+        closer_name=closer_name,
+        lead_source_key=lead_key,
+        lead_source_label=lead_source_label,
+        funnel_id=lead_funnel_id,
+    )
+
+    # 5) Notes
     _append_notes(
         client,
         entry_day=entry_day,
@@ -432,12 +566,14 @@ def submit_close_survey(
         cash_cents=cash_cents,
         recording_url=body.recording_url,
         call_notes=body.call_notes,
+        closer_name=closer_name,
+        lead_source_label=lead_source_label,
     )
 
     db.commit()
     db.refresh(client)
 
-    # 5) KPI live sync (cash / closes from check-ins + payments)
+    # 6) KPI live sync (cash / closes from check-ins + payments)
     try:
         from app.services.kpi_integration_sync import sync_kpi_for_datetime
 
@@ -445,7 +581,7 @@ def submit_close_survey(
     except Exception as e:
         LOG.warning("KPI sync after close survey failed: %s", e)
 
-    # 6) Optional KPI revenue add (contract / AOV) — delta vs previous enrollment.
+    # 7) Optional KPI revenue add (contract / AOV) — delta vs previous enrollment.
     # Only when the survey supplied a contract amount (or cleared via offer write).
     if contract_cents is not None or body.offer_slot:
         new_contract = int(contract_cents or 0)
@@ -475,6 +611,8 @@ def submit_close_survey(
         closed=is_closed,
         deal_outcome=outcome,
         payment_source=body.payment_source,
+        closer_user_id=closer_user_id_str,
+        lead_source=lead_source_label,
         manual_payment_id=manual_payment_id,
         lifecycle_state=_lifecycle_str(client.lifecycle_state),
         submitted_at=datetime.now(timezone.utc),

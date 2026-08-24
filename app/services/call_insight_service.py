@@ -5,8 +5,6 @@ import hashlib
 import json
 import logging
 from collections import defaultdict
-import threading
-import time
 import uuid
 from datetime import datetime, timezone, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,31 +37,13 @@ from app.services.health_score_cache_service import resolve_health_score
 
 logger = logging.getLogger(__name__)
 
-_org_hour_lock = threading.Lock()
-_org_hour_counts: Dict[str, int] = {}
-
-
-def _org_bucket_key(org_id: uuid.UUID) -> str:
-    hour = int(time.time() // 3600)
-    return f"{org_id}:{hour}"
-
 
 def check_org_insight_throttle(org_id: uuid.UUID) -> bool:
-    """Return True if allowed, False if over hourly cap."""
+    """Return True if allowed, False if over hourly cap. Redis-shared when REDIS_URL is set."""
     max_h = int(getattr(settings, "CALL_INSIGHT_ORG_MAX_PER_HOUR", 40) or 40)
-    key = _org_bucket_key(org_id)
-    with _org_hour_lock:
-        c = _org_hour_counts.get(key, 0)
-        if c >= max_h:
-            return False
-        _org_hour_counts[key] = c + 1
-    # prune old keys occasionally
-    if len(_org_hour_counts) > 5000:
-        cutoff = int(time.time() // 3600) - 2
-        stale = [k for k in _org_hour_counts if int(k.split(":")[-1]) < cutoff]
-        for k in stale[:1000]:
-            _org_hour_counts.pop(k, None)
-    return True
+    from app.core.rate_limit import sliding_window_try_acquire
+
+    return sliding_window_try_acquire(f"call_insight_hour:{org_id}", max_h, 3600)
 
 
 def hash_context_pack(pack: Dict[str, Any]) -> str:

@@ -894,6 +894,9 @@ def on_booking_created_pre_sale(
 
     Event matching uses the lowest step_index booking step that has trigger_config,
     preferring the canonical ``pre_sale_post_booking`` rule when present.
+
+    Sales-only: bookings that are not marked as sales calls (Calendar event-type
+    sales toggle or per-booking override) never enqueue.
     """
     steps = _list_trigger_steps(
         db,
@@ -921,6 +924,28 @@ def on_booking_created_pre_sale(
         event_type_id=event_type_id,
         trigger_config=trigger_config,
     ):
+        return []
+
+    # Hard gate: post-booking automations only fire for sales-designated calls
+    # (Calendar event-type sales toggle or per-booking override).
+    from app.services.checkin_sync import get_sales_call_flags
+
+    is_sales, _ = get_sales_call_flags(
+        db,
+        org_id,
+        str(provider).lower(),
+        str(external_booking_id),
+        event_type_id,
+    )
+    if not is_sales:
+        LOG.info(
+            "automation: skipping pre-sale booking emails for client %s -- "
+            "booking %s/%s is not a sales call (event_type_id=%s).",
+            client_id,
+            provider,
+            external_booking_id,
+            event_type_id,
+        )
         return []
 
     client = (
@@ -1043,6 +1068,7 @@ def seed_default_rules(db: Session, org_id: uuid.UUID) -> List[AutomationRule]:
                     "provider": "any",
                     "event_type_ids": [],
                     "match_all_events": False,
+                    "sales_calls_only": True,
                 },
                 "combine_top_n": 1,
                 "require_approval": False,

@@ -528,7 +528,7 @@ def generate_and_persist_report(
                 objection_handling_sop=objection_sop,
             )
     except RuntimeError as e:
-        if "llm_budget" in str(e).lower():
+        if "llm_budget" in str(e).lower() or "llm_slot" in str(e).lower():
             _upsert_report(
                 db,
                 org_id,

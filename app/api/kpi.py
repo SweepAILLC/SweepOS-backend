@@ -168,13 +168,16 @@ def _autopopulate_from_integrations(
     entry_day: date,
     payload: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Force-refresh live auto fields from integrations; never writes revenue (manual)."""
+    """Fill live auto fields from integrations without clobbering explicit edits.
+
+    Explicit payload keys (grid / CSV / survey writes) win. Live sync still
+    backfills any auto fields the caller did not set. Never writes revenue.
+    """
     out = dict(payload)
-    # Drop stale revenue keys from auto path — revenue is manual-only.
     live = compute_live_fields_for_day(db, org_id, entry_day)
-    # Always overwrite live auto fields from source of truth when available.
     for field, value in live.items():
-        out[field] = value
+        if field not in out:
+            out[field] = value
 
     # Through today: remaining auto defaults (new_followers) when unset
     if entry_day <= date.today():
