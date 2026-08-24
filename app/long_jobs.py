@@ -90,10 +90,10 @@ def schedule_background_work(
 
     Call Library batches pass a higher ``job_timeout`` — each report can take up to
     CALL_LIBRARY_LLM_TIMEOUT_SEC and batches run sequentially with stagger.
+
+    RQ wins when enabled so Fathom/LLM follow-ups never pile onto the API process
+    just because the caller passed FastAPI BackgroundTasks.
     """
-    if background_tasks is not None:
-        background_tasks.add_task(fn, *args)
-        return
     if prefer_rq:
         q = _get_queue(queue_name)
         if q is not None:
@@ -111,6 +111,9 @@ def schedule_background_work(
                     "RQ enqueue failed for %s; falling back",
                     getattr(fn, "__name__", fn),
                 )
+    if background_tasks is not None:
+        background_tasks.add_task(fn, *args)
+        return
     threading.Thread(target=fn, args=args, daemon=True).start()
 
 

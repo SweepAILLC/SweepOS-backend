@@ -1,27 +1,15 @@
 """
 Per-organization sliding-window budget for outbound LLM API calls (cost protection).
-In-memory; resets on process restart (acceptable for single-instance / small clusters).
+
+Uses Redis when REDIS_URL is set so web + worker processes share one cap.
+Falls back to in-memory (per process) when Redis is unavailable.
 """
 from __future__ import annotations
 
-import threading
-import time
 import uuid
-from collections import defaultdict
-from typing import Dict, List
 
 from app.core.config import settings
-
-_lock = threading.Lock()
-# org_id str -> list of unix timestamps (seconds) of consumed calls
-_org_windows: Dict[str, List[float]] = defaultdict(list)
-
-_WINDOW_SEC = 60.0
-
-
-def _prune(org_key: str, now: float) -> None:
-    cutoff = now - _WINDOW_SEC
-    _org_windows[org_key] = [t for t in _org_windows[org_key] if t > cutoff]
+from app.core.rate_limit import sliding_window_try_acquire
 
 
 def consume_llm_budget(org_id: uuid.UUID) -> bool:
@@ -34,23 +22,13 @@ def consume_llm_budget(org_id: uuid.UUID) -> bool:
     max_calls = getattr(settings, "LLM_MAX_CALLS_PER_MINUTE_PER_ORG", 45)
     if max_calls <= 0:
         return False
-    key = str(org_id)
-    now = time.time()
-    with _lock:
-        _prune(key, now)
-        if len(_org_windows[key]) >= max_calls:
-            return False
-        _org_windows[key].append(now)
-        return True
+    return sliding_window_try_acquire(f"llm_budget:{org_id}", int(max_calls), 60)
 
 
 def peek_llm_budget_remaining(org_id: uuid.UUID) -> int:
-    """Approximate remaining calls in current window (for debugging/metrics)."""
+    """Approximate remaining calls. Memory/Redis do not expose an exact remaining count cheaply."""
     if not getattr(settings, "LLM_BUDGET_ENABLED", True):
         return 999
-    max_calls = getattr(settings, "LLM_MAX_CALLS_PER_MINUTE_PER_ORG", 45)
-    key = str(org_id)
-    now = time.time()
-    with _lock:
-        _prune(key, now)
-        return max(0, max_calls - len(_org_windows[key]))
+    max_calls = int(getattr(settings, "LLM_MAX_CALLS_PER_MINUTE_PER_ORG", 45) or 45)
+    # Best-effort: try one dry peek is not available; report configured max.
+    return max_calls

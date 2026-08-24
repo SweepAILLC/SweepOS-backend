@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     DATABASE_MAX_OVERFLOW: int = 30
     DATABASE_POOL_TIMEOUT: int = 30
     DATABASE_POOL_RECYCLE: int = 1800
+    # Worker processes hold fewer connections so RQ_WORKER_COUNT * pool stays under Postgres max.
+    WORKER_DATABASE_POOL_SIZE: int = 4
+    WORKER_DATABASE_MAX_OVERFLOW: int = 6
 
     # Reverse proxy: set True when the API sits behind a load balancer that sets X-Forwarded-For
     TRUST_PROXY_HEADERS: bool = False
@@ -45,11 +48,14 @@ class Settings(BaseSettings):
     # When True with REDIS_URL, heavy jobs (Fathom follow-ups, bundle regen, etc.) use RQ
     # instead of FastAPI BackgroundTasks / in-process threads. Run `python -m app.worker`.
     USE_RQ_LONG_JOBS: bool = False
+    # Extra RQ processes inside `python -m app.worker` (parent also runs one + dispatcher).
+    RQ_WORKER_COUNT: int = 2
+    # Starlette/anyio threadpool for sync FastAPI routes (50 concurrent browsers).
+    API_THREADPOOL_SIZE: int = 64
 
     # Global API throttle (per client IP, sliding 60s window). 0 = disabled.
-    # SPAs (funnel analytics polling + terminal widgets) can burst >120/min from one user; too low causes
-    # 429 + Retry-After: 60 and looks like "network errors" for ~1 minute. Override on Render via env if needed.
-    GLOBAL_API_RATE_LIMIT_PER_MINUTE: int = 480
+    # 50 concurrent users on one office NAT × ~40 req/min ≈ 2000. Too low looks like "network errors".
+    GLOBAL_API_RATE_LIMIT_PER_MINUTE: int = 2400
 
     # Brute-force protection on POST /auth/login (per IP)
     LOGIN_RATE_LIMIT_MAX: int = 30
@@ -168,6 +174,9 @@ class Settings(BaseSettings):
     # LLM cost & safety (per-org in-memory budget; tune for your traffic)
     LLM_BUDGET_ENABLED: bool = True
     LLM_MAX_CALLS_PER_MINUTE_PER_ORG: int = 45
+    # Shared across web + worker when REDIS_URL is set. Caps provider + DB pressure.
+    LLM_MAX_INFLIGHT: int = 6
+    LLM_SLOT_WAIT_SEC: float = 45.0
     LLM_MAX_INPUT_CHARS_TOTAL: int = 48000  # Hard cap on system+user prompt size sent to providers
 
     # Fathom sentiment: skip LLM when combined input is too small (saves calls; default neutral locally)

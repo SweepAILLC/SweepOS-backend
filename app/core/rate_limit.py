@@ -34,6 +34,11 @@ _redis_client: object = None
 _redis_lock = threading.Lock()
 
 
+def get_shared_redis():
+    """Public Redis handle for budget / LLM slot / rate limits. None if unset or down."""
+    return _get_redis()
+
+
 def _get_redis():
     """Lazy singleton sync Redis client (thread-safe pool)."""
     global _redis_client

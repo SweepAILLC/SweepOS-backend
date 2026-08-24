@@ -20,7 +20,10 @@ import signal
 import sys
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
+
+# Must be set before first SessionLocal import in this process (and spawn children).
+os.environ.setdefault("SWEEP_PROCESS_ROLE", "worker")
 
 from app.core.config import settings
 from app.db.session import SessionLocal
@@ -214,17 +217,48 @@ def _dispatcher_loop() -> None:
             time.sleep(TICK_INTERVAL - elapsed)
 
 
+def _rq_child_entry() -> None:
+    """Spawned RQ process: one job at a time, no automation dispatcher."""
+    os.environ["SWEEP_PROCESS_ROLE"] = "worker"
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    _run_rq_worker_main()
+
+
+def _spawn_extra_rq_workers(extra: int) -> List[object]:
+    if extra <= 0:
+        return []
+    import multiprocessing
+
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+    procs: List[object] = []
+    for i in range(extra):
+        p = multiprocessing.Process(
+            target=_rq_child_entry,
+            name=f"rq-worker-{i + 2}",
+            daemon=True,
+        )
+        p.start()
+        procs.append(p)
+        LOG.info("spawned extra RQ worker pid=%s", p.pid)
+    return procs
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     rq_enabled = bool(settings.REDIS_URL and settings.USE_RQ_LONG_JOBS)
+    rq_count = max(1, int(getattr(settings, "RQ_WORKER_COUNT", 1) or 1))
     LOG.info(
-        "starting worker pid=%s redis=%s rq=%s",
+        "starting worker pid=%s redis=%s rq=%s rq_workers=%s",
         os.getpid(),
         bool(settings.REDIS_URL),
         rq_enabled,
+        rq_count if rq_enabled else 0,
     )
 
     dispatcher_thread = threading.Thread(
@@ -234,13 +268,20 @@ def main() -> None:
     )
     dispatcher_thread.start()
 
+    extra_procs: List[object] = []
     try:
         if rq_enabled:
+            extra_procs = _spawn_extra_rq_workers(rq_count - 1)
             _run_rq_worker_main()
         else:
             while not _SHUTDOWN:
                 time.sleep(1.0)
     finally:
+        for p in extra_procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
         LOG.info("worker shutting down")
 
 
