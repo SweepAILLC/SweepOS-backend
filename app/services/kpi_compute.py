@@ -152,6 +152,7 @@ def entry_to_dict(entry: Any) -> Dict[str, Any]:
         "inbound_bookings": getattr(entry, "inbound_bookings", None),
         "outbound_bookings": getattr(entry, "outbound_bookings", None),
         "calls_booked": entry.calls_booked,
+        "calls_booked_activity": getattr(entry, "calls_booked_activity", None),
         "calls_taken": entry.calls_taken,
         "offers_made": entry.offers_made,
         "no_shows": entry.no_shows,
@@ -170,6 +171,23 @@ def _mean(values: Sequence[float]) -> Optional[float]:
     return round(sum(values) / len(values), 2)
 
 
+def _group_by_date(rows: Sequence[Any]) -> Dict[date, List[Any]]:
+    """Group rows sharing an entry_date — orgs with per-rep entries can have >1 row/date."""
+    by_date: Dict[date, List[Any]] = {}
+    for e in rows:
+        by_date.setdefault(e.entry_date, []).append(e)
+    return by_date
+
+
+def _per_date_rate(rows_for_date: List[Any], numer_key: str, denom_key: str) -> Optional[float]:
+    """Sum numerator/denominator across all rows for one date, then compute one rate —
+    correct whether a date has one org-aggregate row or several per-rep rows."""
+    dicts = [entry_to_dict(e) for e in rows_for_date]
+    numer = sum(float(d.get(numer_key) or 0) for d in dicts)
+    denom = sum(float(d.get(denom_key) or 0) for d in dicts)
+    return safe_pct(numer, denom)
+
+
 def build_monthly_rollups(entries: Iterable[Any], months: int = 12) -> List[KpiMonthlyRollup]:
     """Group entries by calendar month; newest months first, capped at `months`."""
     by_month: Dict[str, List[Any]] = {}
@@ -182,6 +200,7 @@ def build_monthly_rollups(entries: Iterable[Any], months: int = 12) -> List[KpiM
 
     for key in keys:
         rows = by_month[key]
+        by_date = _group_by_date(rows)
         year, month = map(int, key.split("-"))
         period_start = date(year, month, 1)
         period_end = date(year, month, monthrange(year, month)[1])
@@ -198,6 +217,7 @@ def build_monthly_rollups(entries: Iterable[Any], months: int = 12) -> List[KpiM
             "inbound_bookings": 0,
             "outbound_bookings": 0,
             "calls_booked": 0,
+            "calls_booked_activity": 0,
             "calls_taken": 0,
             "offers_made": 0,
             "no_shows": 0,
@@ -225,6 +245,7 @@ def build_monthly_rollups(entries: Iterable[Any], months: int = 12) -> List[KpiM
                 "inbound_bookings",
                 "outbound_bookings",
                 "calls_booked",
+                "calls_booked_activity",
                 "calls_taken",
                 "offers_made",
                 "no_shows",
@@ -237,21 +258,30 @@ def build_monthly_rollups(entries: Iterable[Any], months: int = 12) -> List[KpiM
                 sums["revenue"] += float(d["revenue"])
             if d.get("content_posted"):
                 sums["content_posted_days"] += 1
-            if d.get("outreach_reply_pct") is not None:
-                reply_rates.append(float(d["outreach_reply_pct"]))
-            if d.get("convo_to_booking_pct") is not None:
-                booking_rates.append(float(d["convo_to_booking_pct"]))
-            if d.get("show_up_pct") is not None:
-                show_rates.append(float(d["show_up_pct"]))
-            if d.get("closing_rate_pct") is not None:
-                close_rates.append(float(d["closing_rate_pct"]))
+
+        # One rate per calendar date (summed across rows sharing that date first),
+        # not one rate per row — otherwise a date with several per-rep rows would
+        # count multiple times in the average instead of once.
+        for rows_for_date in by_date.values():
+            r = _per_date_rate(rows_for_date, "respondents", "outreach_sent")
+            if r is not None:
+                reply_rates.append(r)
+            r = _per_date_rate(rows_for_date, "calls_booked", "respondents")
+            if r is not None:
+                booking_rates.append(r)
+            r = _per_date_rate(rows_for_date, "calls_taken", "calls_booked")
+            if r is not None:
+                show_rates.append(r)
+            r = _per_date_rate(rows_for_date, "closes", "calls_taken")
+            if r is not None:
+                close_rates.append(r)
 
         rollups.append(
             KpiMonthlyRollup(
                 period_label=key,
                 period_start=period_start,
                 period_end=period_end,
-                days_with_data=len(rows),
+                days_with_data=len(by_date),
                 new_followers=sums["new_followers"],
                 outreach_sent=sums["outreach_sent"],
                 respondents=sums["respondents"],
@@ -263,6 +293,7 @@ def build_monthly_rollups(entries: Iterable[Any], months: int = 12) -> List[KpiM
                 inbound_bookings=sums["inbound_bookings"],
                 outbound_bookings=sums["outbound_bookings"],
                 calls_booked=sums["calls_booked"],
+                calls_booked_activity=sums["calls_booked_activity"],
                 calls_taken=sums["calls_taken"],
                 offers_made=sums["offers_made"],
                 no_shows=sums["no_shows"],
@@ -339,8 +370,9 @@ def overall_day_tier(
 
 
 SNAPSHOT_CARD_DEFS = (
-    {"key": "outreach_sent", "label": "Outreach Sent", "kind": "int", "aggregation": "sum", "tier_metric": "outreach_sent"},
+    {"key": "total_conversations", "label": "Total Conversations", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "calls_booked", "label": "Calls Booked", "kind": "int", "aggregation": "sum", "tier_metric": None},
+    {"key": "calls_booked_activity", "label": "Calls Booked (Activity)", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "calls_taken", "label": "Calls Taken", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "closes", "label": "Closes", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "convo_to_booking_pct", "label": "Convo→Book", "kind": "pct", "aggregation": "avg", "tier_metric": "convo_to_booking_pct"},
@@ -380,10 +412,23 @@ def build_kpi_snapshot(
     # Precompute rates onto dicts once
     dicts = [entry_to_dict(e) for e in scoped]
 
+    def _total_conversations(d: Dict[str, Any]) -> float:
+        return float(
+            (d.get("new_conversations") or 0)
+            + (d.get("followups_sent") or 0)
+            + (d.get("outreach_sent") or 0)
+            + (d.get("conversations_nurtured") or 0)
+        )
+
     cards: List[KpiSnapshotCard] = []
     for defn in SNAPSHOT_CARD_DEFS:
         key = defn["key"]
-        if defn["aggregation"] == "sum":
+        if key == "total_conversations":
+            total = sum(_total_conversations(d) for d in dicts)
+            any_val = bool(dicts)
+            value = round(total, 2) if any_val else None
+            tier_val = None
+        elif defn["aggregation"] == "sum":
             total = 0.0
             any_val = False
             for d in dicts:
@@ -417,17 +462,44 @@ def build_kpi_snapshot(
 
     series: List[KpiSnapshotSeriesPoint] = []
     if include_series:
-        for e, d in zip(scoped, dicts):
-            rates = compute_rates(d)
+        # One point per calendar date — sum across rows sharing a date first
+        # (an org with per-rep entries can have several rows for one date).
+        by_date = _group_by_date(scoped)
+        for entry_date in sorted(by_date.keys()):
+            rows_for_date = by_date[entry_date]
+            day_dicts = [entry_to_dict(e) for e in rows_for_date]
+            summed = {
+                k: sum(float(dd.get(k) or 0) for dd in day_dicts)
+                for k in (
+                    "outreach_sent",
+                    "followups_sent",
+                    "new_conversations",
+                    "conversations_nurtured",
+                    "respondents",
+                    "calls_booked",
+                    "calls_taken",
+                    "closes",
+                    "cash_collected",
+                    "revenue",
+                )
+            }
+            rates = compute_rates(summed)
+            total_convos = int(
+                summed["new_conversations"]
+                + summed["followups_sent"]
+                + summed["outreach_sent"]
+                + summed["conversations_nurtured"]
+            )
             series.append(
                 KpiSnapshotSeriesPoint(
-                    date=e.entry_date,
-                    outreach_sent=d.get("outreach_sent"),
-                    calls_booked=d.get("calls_booked"),
-                    calls_taken=d.get("calls_taken"),
-                    closes=d.get("closes"),
-                    cash_collected=d.get("cash_collected"),
-                    revenue=d.get("revenue"),
+                    date=entry_date,
+                    outreach_sent=int(summed["outreach_sent"]),
+                    total_conversations=total_convos,
+                    calls_booked=int(summed["calls_booked"]),
+                    calls_taken=int(summed["calls_taken"]),
+                    closes=int(summed["closes"]),
+                    cash_collected=summed["cash_collected"],
+                    revenue=summed["revenue"],
                     show_up_pct=rates.get("show_up_pct"),
                     closing_rate_pct=rates.get("closing_rate_pct"),
                     convo_to_booking_pct=rates.get("convo_to_booking_pct"),
@@ -442,7 +514,7 @@ def build_kpi_snapshot(
         range_end=range_end,
         days=days,
         generated_at=gen,
-        days_with_data=len(scoped),
+        days_with_data=len({e.entry_date for e in scoped}),
         cards=cards,
         current_month=current_month,
         flags=flag_list[:8],

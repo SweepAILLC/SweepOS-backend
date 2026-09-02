@@ -27,10 +27,15 @@ from app.schemas.kpi import (
     KpiDailyEntryUpdate,
     KpiFlagsResponse,
     KpiMonthlyRollup,
+    KpiRepOptionsResponse,
+    KpiRepPerformanceResponse,
+    KpiRevenueContributorsResponse,
     KpiSnapshotResponse,
     compute_rates,
 )
 from app.services.kpi_bottleneck_service import detect_bottlenecks, utcnow
+from app.services.kpi_rep_performance import build_rep_performance
+from app.services.org_members import list_org_member_options
 from app.services.kpi_compute import (
     build_kpi_snapshot,
     build_monthly_rollups,
@@ -39,6 +44,7 @@ from app.services.kpi_compute import (
 )
 from app.services.kpi_integration_sync import (
     compute_live_fields_for_day,
+    get_revenue_contributors_for_day,
     has_calendar_source as _has_calendar_source,
     has_payment_source as _has_payment_source,
     refresh_kpi_live_fields_for_range,
@@ -62,6 +68,7 @@ UPSERT_FIELDS = (
     "inbound_bookings",
     "outbound_bookings",
     "calls_booked",
+    "calls_booked_activity",
     "calls_taken",
     "offers_made",
     "no_shows",
@@ -86,6 +93,7 @@ ADDITIVE_INT_FIELDS = frozenset(
         "outbound_bookings",
         "offers_made",
         "calls_taken",
+        "calls_booked_activity",
         "no_shows",
         "closes",
         "new_followers",
@@ -96,6 +104,22 @@ ADDITIVE_DECIMAL_FIELDS = frozenset({"cash_collected", "revenue"})
 
 def _org_id(user: User) -> uuid.UUID:
     return getattr(user, "selected_org_id", user.org_id)
+
+
+def _validated_rep_user_id(
+    db: Session, org_id: uuid.UUID, raw: Optional[str]
+) -> Optional[uuid.UUID]:
+    """Parse + confirm rep_user_id belongs to this org — never trust a bare id from a
+    public/authenticated caller for a column that attributes data to another user."""
+    if not raw:
+        return None
+    try:
+        parsed = uuid.UUID(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid rep_user_id") from exc
+    if not any(str(parsed) == opt.id for opt in list_org_member_options(db, org_id)):
+        raise HTTPException(status_code=400, detail="rep_user_id is not a member of this org")
+    return parsed
 
 
 def _parse_date(value: str) -> date:
@@ -186,7 +210,7 @@ def _autopopulate_from_integrations(
         calendar_available = _has_calendar_source(db, org_id)
         payments_available = _has_payment_source(db, org_id)
         if calendar_available:
-            for field in ("calls_booked", "calls_taken", "closes", "no_shows"):
+            for field in ("calls_booked", "calls_booked_activity", "calls_taken", "closes", "no_shows"):
                 if field not in out:
                     out[field] = 0
         if payments_available and "cash_collected" not in out:
@@ -211,7 +235,7 @@ def _with_auto_zero_defaults(
         data["new_followers"] = 0
         changed = True
     if calendar_available:
-        for field in ("calls_booked", "calls_taken", "closes", "no_shows"):
+        for field in ("calls_booked", "calls_booked_activity", "calls_taken", "closes", "no_shows"):
             if data.get(field) is None:
                 data[field] = 0
                 changed = True
@@ -237,6 +261,9 @@ def list_kpi_entries(
         description="When true, refresh live calendar/payment fields before returning. "
         "Pass false for fast month navigation (cached rows only).",
     ),
+    rep_user_id: Optional[str] = Query(
+        None, description="Filter to one rep's own rows instead of the org aggregate"
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -257,9 +284,15 @@ def list_kpi_entries(
         except Exception:
             db.rollback()
 
+    rep_uuid = _validated_rep_user_id(db, org_id, rep_user_id)
     q = db.query(OrgKpiDailyEntry).filter(OrgKpiDailyEntry.org_id == org_id)
     q = q.filter(OrgKpiDailyEntry.entry_date >= range_start)
     q = q.filter(OrgKpiDailyEntry.entry_date <= range_end)
+    # Grid/Calendar render one row per date — stay on the org-aggregate row
+    # (rep_user_id NULL) by default so that assumption holds even for orgs
+    # using per-rep entry. Pass rep_user_id to instead scope to one rep's own
+    # rows (used by the By Rep view's calendar tab).
+    q = q.filter(OrgKpiDailyEntry.rep_user_id == rep_uuid)
     rows = q.order_by(OrgKpiDailyEntry.entry_date.asc()).all()
     calendar_available = _has_calendar_source(db, org_id)
     payments_available = _has_payment_source(db, org_id)
@@ -271,7 +304,7 @@ def list_kpi_entries(
             r.new_followers = 0
             dirty = True
         if calendar_available:
-            for field in ("calls_booked", "calls_taken", "closes", "no_shows"):
+            for field in ("calls_booked", "calls_booked_activity", "calls_taken", "closes", "no_shows"):
                 if getattr(r, field) is None:
                     setattr(r, field, 0)
                     dirty = True
@@ -297,17 +330,23 @@ def list_kpi_entries(
 def upsert_kpi_entry(
     entry_date: str,
     body: KpiDailyEntryUpdate,
+    rep_user_id: Optional[str] = Query(
+        None, description="Attribute this entry to a rep instead of the org aggregate"
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Upsert a single day's metrics (inline autosave)."""
+    """Upsert a single day's metrics (inline autosave). Omit rep_user_id for the
+    org-aggregate row (default); pass it to write/edit one rep's own row instead."""
     org_id = _org_id(current_user)
     d = _parse_date(entry_date)
+    rep_uuid = _validated_rep_user_id(db, org_id, rep_user_id)
     return _upsert_kpi_entry_for_org(
         db=db,
         org_id=org_id,
         entry_day=d,
         payload=body.model_dump(exclude_unset=True),
+        rep_user_id=rep_uuid,
     )
 
 
@@ -412,14 +451,19 @@ def _upsert_kpi_entry_for_org(
     payload: Dict[str, Any],
     *,
     additive: bool = False,
+    rep_user_id: Optional[uuid.UUID] = None,
 ) -> KpiDailyEntryRead:
     row = (
         db.query(OrgKpiDailyEntry)
-        .filter(OrgKpiDailyEntry.org_id == org_id, OrgKpiDailyEntry.entry_date == entry_day)
+        .filter(
+            OrgKpiDailyEntry.org_id == org_id,
+            OrgKpiDailyEntry.entry_date == entry_day,
+            OrgKpiDailyEntry.rep_user_id == rep_user_id,
+        )
         .first()
     )
     if row is None:
-        row = OrgKpiDailyEntry(org_id=org_id, entry_date=entry_day)
+        row = OrgKpiDailyEntry(org_id=org_id, entry_date=entry_day, rep_user_id=rep_user_id)
         db.add(row)
 
     payload = dict(payload)
@@ -470,14 +514,20 @@ def _upsert_kpi_entry_for_org(
 @router.delete("/entries/{entry_date}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_kpi_entry(
     entry_date: str,
+    rep_user_id: Optional[str] = Query(None, description="Delete a specific rep's row instead of the org aggregate"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     org_id = _org_id(current_user)
     d = _parse_date(entry_date)
+    rep_uuid = _validated_rep_user_id(db, org_id, rep_user_id)
     row = (
         db.query(OrgKpiDailyEntry)
-        .filter(OrgKpiDailyEntry.org_id == org_id, OrgKpiDailyEntry.entry_date == d)
+        .filter(
+            OrgKpiDailyEntry.org_id == org_id,
+            OrgKpiDailyEntry.entry_date == d,
+            OrgKpiDailyEntry.rep_user_id == rep_uuid,
+        )
         .first()
     )
     if not row:
@@ -581,7 +631,7 @@ def get_kpi_autopopulate_status(
     payments_available = _has_payment_source(db, org_id)
     cols = ["new_followers"]
     if calendar_available:
-        cols.extend(["calls_booked", "calls_taken", "closes", "no_shows"])
+        cols.extend(["calls_booked", "calls_booked_activity", "calls_taken", "closes", "no_shows"])
     if payments_available:
         cols.append("cash_collected")
     return KpiAutopopulateStatusResponse(
@@ -657,6 +707,46 @@ def get_kpi_snapshot(
 
 
 # ---------------------------------------------------------------------------
+# By-rep performance
+# ---------------------------------------------------------------------------
+
+@router.get("/rep-performance", response_model=KpiRepPerformanceResponse)
+def get_kpi_rep_performance(
+    days: int = Query(30, ge=1, le=365, description="Trailing window length in days"),
+    start: Optional[str] = Query(None, description="YYYY-MM-DD inclusive (overrides days)"),
+    end: Optional[str] = Query(None, description="YYYY-MM-DD inclusive"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Per-rep (setter/closer) funnel + close/cash totals: current period, the
+    equal-length previous period, and each metric's personal-best month."""
+    org_id = _org_id(current_user)
+    today = date.today()
+    range_end = _parse_date(end) if end else today
+    range_start = _parse_date(start) if start else range_end - timedelta(days=days - 1)
+    if range_end < range_start:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+    return build_rep_performance(db, org_id, range_start=range_start, range_end=range_end)
+
+
+@router.get("/entries/{entry_date}/revenue-contributors", response_model=KpiRevenueContributorsResponse)
+def get_kpi_revenue_contributors(
+    entry_date: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Which clients' payments made up this day's cash_collected (Stripe/Whop/manual)."""
+    org_id = _org_id(current_user)
+    day = _parse_date(entry_date)
+    contributors = get_revenue_contributors_for_day(db, org_id, day)
+    return KpiRevenueContributorsResponse(
+        entry_date=day,
+        total_cents=sum(c.amount_cents for c in contributors),
+        contributors=contributors,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
 
@@ -681,12 +771,7 @@ def get_kpi_flags(
     return KpiFlagsResponse(flags=flags, generated_at=utcnow())
 
 
-@router.get("/public/{token}/entries/{entry_date}", response_model=KpiDailyEntryRead)
-def get_public_kpi_entry(
-    token: str,
-    entry_date: str,
-    db: Session = Depends(get_db),
-):
+def _resolve_bench_by_token(db: Session, token: str) -> OrgKpiBenchmark:
     try:
         token_uuid = uuid.UUID(token)
     except ValueError as exc:
@@ -698,14 +783,47 @@ def get_public_kpi_entry(
     )
     if not bench:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid entry token")
+    return bench
+
+
+@router.get("/public/{token}/reps", response_model=KpiRepOptionsResponse)
+def get_public_kpi_reps(token: str, db: Session = Depends(get_db)):
+    """Rep options for the public entry form's 'who are you?' picker."""
+    bench = _resolve_bench_by_token(db, token)
+    return KpiRepOptionsResponse(reps=list_org_member_options(db, bench.org_id))
+
+
+@router.get("/reps", response_model=KpiRepOptionsResponse)
+def get_kpi_reps(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Rep options for the in-app entry rep picker."""
+    org_id = _org_id(current_user)
+    return KpiRepOptionsResponse(reps=list_org_member_options(db, org_id))
+
+
+@router.get("/public/{token}/entries/{entry_date}", response_model=KpiDailyEntryRead)
+def get_public_kpi_entry(
+    token: str,
+    entry_date: str,
+    rep_user_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    bench = _resolve_bench_by_token(db, token)
     day = _parse_date(entry_date)
+    rep_uuid = _validated_rep_user_id(db, bench.org_id, rep_user_id)
     row = (
         db.query(OrgKpiDailyEntry)
-        .filter(OrgKpiDailyEntry.org_id == bench.org_id, OrgKpiDailyEntry.entry_date == day)
+        .filter(
+            OrgKpiDailyEntry.org_id == bench.org_id,
+            OrgKpiDailyEntry.entry_date == day,
+            OrgKpiDailyEntry.rep_user_id == rep_uuid,
+        )
         .first()
     )
     if row is None:
-        row = OrgKpiDailyEntry(org_id=bench.org_id, entry_date=day)
+        row = OrgKpiDailyEntry(org_id=bench.org_id, entry_date=day, rep_user_id=rep_uuid)
         db.add(row)
         db.commit()
         db.refresh(row)
@@ -722,20 +840,14 @@ def upsert_public_kpi_entry(
     token: str,
     entry_date: str,
     body: KpiDailyEntryUpdate,
+    rep_user_id: Optional[str] = Query(
+        None, description="Attribute this entry to a rep instead of the org aggregate"
+    ),
     db: Session = Depends(get_db),
 ):
-    try:
-        token_uuid = uuid.UUID(token)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid entry token") from exc
-    bench = (
-        db.query(OrgKpiBenchmark)
-        .filter(OrgKpiBenchmark.entry_form_token == token_uuid)
-        .first()
-    )
-    if not bench:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invalid entry token")
+    bench = _resolve_bench_by_token(db, token)
     day = _parse_date(entry_date)
+    rep_uuid = _validated_rep_user_id(db, bench.org_id, rep_user_id)
     # Public survey submissions add to the day's existing totals; grid edits stay absolute.
     return _upsert_kpi_entry_for_org(
         db=db,
@@ -743,4 +855,5 @@ def upsert_public_kpi_entry(
         entry_day=day,
         payload=body.model_dump(exclude_unset=True),
         additive=True,
+        rep_user_id=rep_uuid,
     )

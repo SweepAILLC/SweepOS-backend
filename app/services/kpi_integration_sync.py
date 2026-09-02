@@ -11,15 +11,42 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.models.client import Client
 from app.models.client_checkin import ClientCheckIn
 from app.models.manual_payment import ManualPayment
 from app.models.oauth_token import OAuthProvider, OAuthToken
 from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.models.stripe_payment import StripePayment
 from app.models.whop_payment import WhopPayment
+from app.schemas.kpi import KpiRevenueContributor
 
-LIVE_CALENDAR_FIELDS = ("calls_booked", "calls_taken", "closes", "no_shows")
+LIVE_CALENDAR_FIELDS = ("calls_booked", "calls_booked_activity", "calls_taken", "closes", "no_shows")
 LIVE_PAYMENT_FIELDS = ("cash_collected",)
+
+def _sales_call_unique_key(ci: ClientCheckIn) -> str:
+    """Stable key so duplicate check-in rows for the same calendar event count once."""
+    event_id = (getattr(ci, "event_id", None) or "").strip()
+    if event_id:
+        provider = (getattr(ci, "provider", None) or "").strip()
+        return f"{provider}:{event_id}"
+    return f"id:{ci.id}"
+
+
+def _count_unique_sales_calls(rows: Iterable[ClientCheckIn], predicate) -> int:
+    seen: Set[str] = set()
+    n = 0
+    for ci in rows:
+        if not getattr(ci, "is_sales_call", False):
+            continue
+        if not predicate(ci):
+            continue
+        key = _sales_call_unique_key(ci)
+        if key in seen:
+            continue
+        seen.add(key)
+        n += 1
+    return n
+
 
 
 def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -97,6 +124,62 @@ def _payment_cash_by_day(
     return by_day
 
 
+def _client_display_name(client: Optional[Client]) -> str:
+    if client is None:
+        return "Unknown client"
+    name = " ".join(part for part in (client.first_name, client.last_name) if part).strip()
+    return name or (client.email or "Unknown client")
+
+
+def get_revenue_contributors_for_day(
+    db: Session,
+    org_id: uuid.UUID,
+    entry_day: date,
+) -> List[KpiRevenueContributor]:
+    """Which clients' payments made up this day's cash_collected — same three
+    sources _payment_cash_by_day sums, but itemized instead of totaled."""
+    range_start, range_end = day_bounds_utc(entry_day)
+    out: List[KpiRevenueContributor] = []
+
+    def add(payment_id: str, client_id: Optional[uuid.UUID], amount_cents: int, source: str) -> None:
+        if amount_cents == 0:
+            return
+        client = db.query(Client).filter(Client.id == client_id).first() if client_id else None
+        out.append(
+            KpiRevenueContributor(
+                client_id=client_id,
+                client_name=_client_display_name(client),
+                amount_cents=amount_cents,
+                source=source,
+                payment_id=payment_id,
+            )
+        )
+
+    for p in (
+        db.query(StripePayment)
+        .filter(StripePayment.org_id == org_id, StripePayment.status == "succeeded")
+        .all()
+    ):
+        ts = _ensure_utc(p.created_at)
+        if ts and range_start <= ts <= range_end:
+            add(str(p.id), p.client_id, int(p.amount_cents or 0), "stripe")
+
+    for p in db.query(WhopPayment).filter(WhopPayment.org_id == org_id).all():
+        if (p.status or "").lower() not in ("paid", "succeeded", "completed", "successful"):
+            continue
+        ts = _ensure_utc(p.created_at)
+        if ts and range_start <= ts <= range_end:
+            add(str(p.id), p.client_id, int(p.amount_cents or 0), "whop")
+
+    for p in db.query(ManualPayment).filter(ManualPayment.org_id == org_id).all():
+        ts = _ensure_utc(p.payment_date or p.created_at)
+        if ts and range_start <= ts <= range_end:
+            add(str(p.id), p.client_id, int(p.amount_cents or 0), "manual")
+
+    out.sort(key=lambda c: c.amount_cents, reverse=True)
+    return out
+
+
 def compute_live_fields_for_day(
     db: Session,
     org_id: uuid.UUID,
@@ -117,19 +200,37 @@ def compute_live_fields_for_day(
         if checkins is None:
             checkins = db.query(ClientCheckIn).filter(ClientCheckIn.org_id == org_id).all()
         scoped: List[ClientCheckIn] = []
+        booked_on_day: List[ClientCheckIn] = []
         for ci in checkins:
             st = _ensure_utc(ci.start_time)
-            if not st or st < start or st > end:
-                continue
-            scoped.append(ci)
-        out["calls_taken"] = sum(
-            1
-            for ci in scoped
-            if ci.is_sales_call and ci.completed and not ci.cancelled and not ci.no_show
+            if st and start <= st <= end:
+                scoped.append(ci)
+            created = _ensure_utc(ci.created_at)
+            if created and start <= created <= end:
+                booked_on_day.append(ci)
+        out["calls_taken"] = _count_unique_sales_calls(
+            scoped,
+            lambda ci: bool(ci.completed) and not ci.cancelled and not ci.no_show,
         )
-        out["calls_booked"] = sum(1 for ci in scoped if ci.is_sales_call and not ci.cancelled)
-        out["closes"] = sum(1 for ci in scoped if ci.is_sales_call and ci.sale_closed is True)
-        out["no_shows"] = sum(1 for ci in scoped if ci.is_sales_call and ci.no_show)
+        out["calls_booked"] = _count_unique_sales_calls(
+            scoped,
+            lambda ci: not ci.cancelled,
+        )
+        # Unique sales calls marked closed / no-show for this calendar day.
+        out["closes"] = _count_unique_sales_calls(
+            scoped,
+            lambda ci: ci.sale_closed is True,
+        )
+        out["no_shows"] = _count_unique_sales_calls(
+            scoped,
+            lambda ci: bool(ci.no_show),
+        )
+        # Booking *activity* — when the booking was made, not when the meeting is
+        # scheduled for. A call booked today for next week counts here today.
+        out["calls_booked_activity"] = _count_unique_sales_calls(
+            booked_on_day,
+            lambda ci: not ci.cancelled,
+        )
 
     if pay:
         if cash_by_day is None:
@@ -137,6 +238,76 @@ def compute_live_fields_for_day(
         out["cash_collected"] = round(cash_by_day.get(entry_day, 0) / 100.0, 2)
 
     return out
+
+
+def _compute_host_breakdown_for_day(
+    entry_day: date,
+    checkins: Iterable[ClientCheckIn],
+) -> Dict[uuid.UUID, Dict[str, int]]:
+    """Same calls_booked/calls_taken/closes/no_shows logic as compute_live_fields_for_day,
+    scoped per host_user_id — feeds the per-rep org_kpi_daily_entries rows the By Rep
+    view reads. Only meaningful for orgs whose calendar setup assigns different hosts;
+    checkins with no resolved host_user_id contribute nothing here (they still count
+    toward the org-aggregate row as before)."""
+    start, end = day_bounds_utc(entry_day)
+    by_host: Dict[uuid.UUID, List[ClientCheckIn]] = {}
+    booked_by_host: Dict[uuid.UUID, List[ClientCheckIn]] = {}
+    for ci in checkins:
+        host_id = getattr(ci, "host_user_id", None)
+        if not host_id:
+            continue
+        st = _ensure_utc(ci.start_time)
+        if st and start <= st <= end:
+            by_host.setdefault(host_id, []).append(ci)
+        created = _ensure_utc(ci.created_at)
+        if created and start <= created <= end:
+            booked_by_host.setdefault(host_id, []).append(ci)
+
+    out: Dict[uuid.UUID, Dict[str, int]] = {}
+    for host_id in set(by_host.keys()) | set(booked_by_host.keys()):
+        rows = by_host.get(host_id, [])
+        booked_rows = booked_by_host.get(host_id, [])
+        out[host_id] = {
+            "calls_taken": _count_unique_sales_calls(
+                rows,
+                lambda ci: bool(ci.completed) and not ci.cancelled and not ci.no_show,
+            ),
+            "calls_booked": _count_unique_sales_calls(rows, lambda ci: not ci.cancelled),
+            "calls_booked_activity": _count_unique_sales_calls(
+                booked_rows, lambda ci: not ci.cancelled
+            ),
+            "closes": _count_unique_sales_calls(rows, lambda ci: ci.sale_closed is True),
+            "no_shows": _count_unique_sales_calls(rows, lambda ci: bool(ci.no_show)),
+        }
+    return out
+
+
+def _sync_host_kpi_rows_for_day(
+    db: Session,
+    org_id: uuid.UUID,
+    entry_day: date,
+    checkins: Iterable[ClientCheckIn],
+) -> None:
+    """Upsert one org_kpi_daily_entries row per host_user_id with calendar-derived
+    metrics for entry_day. Never touches cash_collected/revenue/manual fields —
+    those come from close-survey attribution (sales_activity_events), not calendars."""
+    breakdown = _compute_host_breakdown_for_day(entry_day, checkins)
+    for host_id, values in breakdown.items():
+        row = (
+            db.query(OrgKpiDailyEntry)
+            .filter(
+                OrgKpiDailyEntry.org_id == org_id,
+                OrgKpiDailyEntry.entry_date == entry_day,
+                OrgKpiDailyEntry.rep_user_id == host_id,
+            )
+            .first()
+        )
+        if row is None:
+            row = OrgKpiDailyEntry(org_id=org_id, entry_date=entry_day, rep_user_id=host_id)
+            db.add(row)
+        for field, value in values.items():
+            setattr(row, field, value)
+        row.updated_at = datetime.utcnow()
 
 
 def sync_kpi_day_from_integrations(
@@ -161,6 +332,9 @@ def sync_kpi_day_from_integrations(
     if not cal and not pay:
         return None
 
+    if cal and checkins is None:
+        checkins = db.query(ClientCheckIn).filter(ClientCheckIn.org_id == org_id).all()
+
     values = compute_live_fields_for_day(
         db,
         org_id,
@@ -170,6 +344,10 @@ def sync_kpi_day_from_integrations(
         checkins=checkins,
         cash_by_day=cash_by_day,
     )
+
+    if cal and checkins is not None:
+        _sync_host_kpi_rows_for_day(db, org_id, entry_day, checkins)
+
     if not values:
         return None
 

@@ -64,7 +64,7 @@ router = APIRouter()
 
 SERVER_INFO = {
     "name": "sweepos",
-    "version": "1.7.0",
+    "version": "1.8.0",
     "protocolVersion": "2025-03-26",
 }
 
@@ -181,8 +181,10 @@ TOOLS = [
             "Org Intelligence bank: business context (business description, target audience/ICP, "
             "unique selling proposition, coaching style, marketing strategy/channels), sales approach "
             "(framework + tactics), pipeline priorities, brand voice, and the configured offer ladder "
-            "with pricing. Call this for insight into the org's offer and business context before "
-            "advising on positioning, pricing, or strategy."
+            "with pricing — plus call-derived signals (objections, wins, stories, themes), which are "
+            "always populated even when the org hasn't filled in the Intelligence tab. Call this for "
+            "insight into the org's offer and business context before advising on positioning, "
+            "pricing, or strategy; if intelligence_profile is empty, use signals instead of stopping."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -366,7 +368,10 @@ TOOLS = [
         "name": "get_instagram_top_posts",
         "description": (
             "Top Instagram posts by engagement rate, each with instagram_url and numerical metrics. "
-            "Optionally filter by format_bucket (reel|carousel|image|video) or theme_key."
+            "Identify posts by instagram_url (permalink) — captions are edited/truncated/duplicated "
+            "and are display-only, never a reliable identifier. Response includes last_synced_at so "
+            "you can tell the user how current the numbers are. Optionally filter by format_bucket "
+            "(reel|carousel|image|video) or theme_key."
         ),
         "inputSchema": {
             "type": "object",
@@ -382,7 +387,9 @@ TOOLS = [
         "name": "get_instagram_underperforming_posts",
         "description": (
             "Lowest-engagement Instagram posts in the window, each with instagram_url and numerical "
-            "metrics. Use with get_instagram_top_posts to contrast winners vs underperformers."
+            "metrics. Identify posts by instagram_url (permalink), not caption — captions are "
+            "display-only and can be edited/truncated/duplicated. Response includes last_synced_at. "
+            "Use with get_instagram_top_posts to contrast winners vs underperformers."
         ),
         "inputSchema": {
             "type": "object",
@@ -548,6 +555,102 @@ TOOLS = [
             "required": ["client_id", "sender_email", "sender_name", "subject", "confirm_send"],
         },
     },
+    {
+        "name": "owner_list_organizations",
+        "description": (
+            "SYSTEM OWNER ONLY. List every organization on the platform with headline stats: "
+            "user/client/funnel counts, cash collected (last 30d, previous 30d, all-time), MRR, "
+            "and activity (online now, active seconds last 7d/30d). Use to find which org_id to "
+            "drill into with the other owner_* tools. Returns a permission error for non-system-owner callers."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "owner_get_organization_dashboard",
+        "description": (
+            "SYSTEM OWNER ONLY. Full performance dashboard for one organization — the same data as "
+            "the internal owner org-dashboard view: client pipeline counts by lifecycle stage, funnel "
+            "conversion metrics, Stripe MRR/ARR/subscriptions, cash collected (since onboarding, "
+            "all-time, manual, combined), Terminal-style KPI summary (cash/MRR/AOV/close rate/show-up "
+            "rate for the given range), 30-day growth signals (show-up/close rate, calls booked, "
+            "active-client cohort), and this org's LLM API usage/cost for the last 30 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "org_id": {
+                    "type": "string",
+                    "description": "Organization UUID (get from owner_list_organizations)",
+                },
+                "range_days": {
+                    "type": "integer",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 3660,
+                    "description": "Rolling window for the Terminal-style KPI fields when scope is unset",
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "'mtd' for month-to-date, 'all' for all-time, omit for rolling range_days",
+                },
+            },
+            "required": ["org_id"],
+        },
+    },
+    {
+        "name": "owner_get_organization_kpi_snapshot",
+        "description": (
+            "SYSTEM OWNER ONLY. Detailed KPI Command Center snapshot for one organization: cards "
+            "(outreach, calls booked/taken, closes, cash collected, rates), daily series, and "
+            "bottleneck/decline flags, for a given date range."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "org_id": {"type": "string", "description": "Organization UUID"},
+                "days": {"type": "integer", "default": 30, "minimum": 1, "maximum": 365},
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive; overrides days"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive; overrides days"},
+                "include_flags": {"type": "boolean", "default": True},
+                "include_series": {"type": "boolean", "default": True},
+            },
+            "required": ["org_id"],
+        },
+    },
+    {
+        "name": "owner_get_organization_shared_space",
+        "description": (
+            "SYSTEM OWNER ONLY. Read the consulting-portal shared-space pad(s) for one organization "
+            "— the collaborative notes/doc shared between the coach and their client-facing portal. "
+            "Returns all pads (title + content + revision) unless pad_id narrows to one."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "org_id": {"type": "string", "description": "Organization UUID"},
+                "pad_id": {"type": "string", "description": "Optional: fetch one specific pad by UUID"},
+            },
+            "required": ["org_id"],
+        },
+    },
+    {
+        "name": "owner_get_llm_usage_timeseries",
+        "description": (
+            "SYSTEM OWNER ONLY. Daily estimated LLM API cost/usage over time — platform-wide (omit "
+            "org_id) or for one organization (pass org_id): calls, tokens, and estimated cost in USD."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "org_id": {
+                    "type": "string",
+                    "description": "Optional: scope to one organization; omit for platform total",
+                },
+                "days": {"type": "integer", "default": 30, "minimum": 1, "maximum": 1095},
+                "scope": {"type": "string", "description": "'mtd' or 'all'; overrides days"},
+            },
+        },
+    },
 ]
 
 
@@ -594,6 +697,40 @@ def _text_result(payload: Any) -> dict:
     if len(text) > 140_000:
         text = text[:140_000] + "\n…[truncated]"
     return {"content": [{"type": "text", "text": text}]}
+
+
+def _dump(value: Any) -> Any:
+    """Serialize Pydantic model instances (and lists of them) to plain JSON-able data."""
+    if isinstance(value, list):
+        return [_dump(v) for v in value]
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if hasattr(value, "dict"):
+        return value.dict()
+    return value
+
+
+def _require_system_owner(db: Session, user_id: Optional[uuid.UUID]):
+    """
+    Gate for owner_* tools (cross-org platform data). Returns (user, None) when the
+    caller is a system owner (sudo admin, or OWNER/ADMIN in the main Sweep org);
+    otherwise returns (None, error_result) to hand straight back to the caller.
+    """
+    from app.models.user import User
+    from app.api.deps import user_is_system_owner
+
+    user = db.query(User).filter(User.id == user_id).first() if user_id else None
+    if not user or not user_is_system_owner(user, db):
+        return None, _text_result(
+            {
+                "error": "forbidden",
+                "detail": (
+                    "System owner access required for this tool "
+                    "(sudo admin, or OWNER/ADMIN in the main Sweep org)."
+                ),
+            }
+        )
+    return user, None
 
 
 def _run_tool(
@@ -911,6 +1048,118 @@ def _run_tool(
                 confirm_send=bool(args.get("confirm_send")),
             )
         )
+    if name == "owner_list_organizations":
+        admin_user, denial = _require_system_owner(db, user_id)
+        if denial:
+            return denial
+        from app.api.admin import list_organizations as _admin_list_organizations
+
+        rows = _admin_list_organizations(db=db, admin_user=admin_user)
+        return _text_result({"organizations": _dump(rows)})
+    if name == "owner_get_organization_dashboard":
+        admin_user, denial = _require_system_owner(db, user_id)
+        if denial:
+            return denial
+        oid = args.get("org_id")
+        if not oid:
+            return _text_result({"error": "org_id required"})
+        try:
+            target_org_id = uuid.UUID(str(oid))
+        except ValueError:
+            return _text_result({"error": "invalid org_id"})
+        from app.api.admin import get_organization_dashboard as _admin_get_dashboard
+
+        try:
+            payload = _admin_get_dashboard(
+                org_id=target_org_id,
+                range_days=int(args.get("range_days") or 30),
+                scope=args.get("scope"),
+                db=db,
+                admin_user=admin_user,
+            )
+        except Exception as exc:
+            return _text_result({"error": getattr(exc, "detail", str(exc))})
+        return _text_result(_dump(payload))
+    if name == "owner_get_organization_kpi_snapshot":
+        admin_user, denial = _require_system_owner(db, user_id)
+        if denial:
+            return denial
+        oid = args.get("org_id")
+        if not oid:
+            return _text_result({"error": "org_id required"})
+        try:
+            target_org_id = uuid.UUID(str(oid))
+        except ValueError:
+            return _text_result({"error": "invalid org_id"})
+        from app.api.admin import admin_get_kpi_snapshot as _admin_kpi_snapshot
+
+        try:
+            payload = _admin_kpi_snapshot(
+                org_id=target_org_id,
+                days=int(args.get("days") or 30),
+                start=args.get("start"),
+                end=args.get("end"),
+                include_flags=bool(args.get("include_flags", True)),
+                include_series=bool(args.get("include_series", True)),
+                db=db,
+                admin_user=admin_user,
+            )
+        except Exception as exc:
+            return _text_result({"error": getattr(exc, "detail", str(exc))})
+        return _text_result(_dump(payload))
+    if name == "owner_get_organization_shared_space":
+        admin_user, denial = _require_system_owner(db, user_id)
+        if denial:
+            return denial
+        oid = args.get("org_id")
+        if not oid:
+            return _text_result({"error": "org_id required"})
+        try:
+            target_org_id = uuid.UUID(str(oid))
+        except ValueError:
+            return _text_result({"error": "invalid org_id"})
+        from app.api.admin import (
+            admin_list_portal_shared_pads as _admin_list_pads,
+            admin_get_portal_shared_pad_by_id as _admin_get_pad,
+        )
+
+        pad_id = args.get("pad_id")
+        try:
+            if pad_id:
+                payload = _admin_get_pad(
+                    org_id=target_org_id,
+                    pad_id=uuid.UUID(str(pad_id)),
+                    since_revision=None,
+                    db=db,
+                    admin_user=admin_user,
+                )
+                return _text_result(_dump(payload))
+            payload = _admin_list_pads(org_id=target_org_id, db=db, admin_user=admin_user)
+        except Exception as exc:
+            return _text_result({"error": getattr(exc, "detail", str(exc))})
+        return _text_result({"pads": _dump(payload)})
+    if name == "owner_get_llm_usage_timeseries":
+        admin_user, denial = _require_system_owner(db, user_id)
+        if denial:
+            return denial
+        raw_org_id = args.get("org_id")
+        try:
+            target_org_id = uuid.UUID(str(raw_org_id)) if raw_org_id else None
+        except ValueError:
+            return _text_result({"error": "invalid org_id"})
+        from app.api.admin import get_llm_usage_timeseries as _admin_llm_usage
+
+        try:
+            payload = _admin_llm_usage(
+                days=int(args.get("days") or 30),
+                scope=args.get("scope"),
+                org_id=target_org_id,
+                db=db,
+                admin_user=admin_user,
+            )
+        except Exception as exc:
+            return _text_result({"error": getattr(exc, "detail", str(exc))})
+        return _text_result(_dump(payload))
     return _text_result({"error": f"Unknown tool: {name}"})
 
 

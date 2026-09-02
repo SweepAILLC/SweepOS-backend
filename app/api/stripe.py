@@ -758,94 +758,149 @@ def reconcile_stripe_data(
 @router.delete("/payments/{payment_id}")
 def delete_payment(
     payment_id: str,
-    use_treasury: bool = Query(True, description="Delete from Treasury Transactions if True, otherwise from StripePayment"),
+    use_treasury: bool = Query(True, description="Ignored; both Treasury and StripePayment rows are removed when found."),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Delete a payment that is known to be false/incorrect.
-    
-    This endpoint allows deletion of payments from either:
-    - Treasury Transactions (if use_treasury=True)
-    - StripePayment table (if use_treasury=False)
-    
-    After deletion, triggers reconciliation to recalculate derived metrics.
+    Remove a Stripe/Treasury payment from Sweep (refunds, false positives).
+    Looks up by UUID in either table, then deletes related copies so the
+    amount does not reappear when the other source is used.
     """
-    if not check_stripe_connected(db, current_user.org_id):
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    if not check_stripe_connected(db, org_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Stripe not connected."
         )
-    
-    org_id = current_user.org_id
-    
+
+    pid: Optional[uuid.UUID] = None
     try:
-        if use_treasury:
-            # Delete from Treasury Transactions
-            transaction = db.query(StripeTreasuryTransaction).filter(
-                and_(
-                    StripeTreasuryTransaction.id == uuid.UUID(payment_id),
-                    StripeTreasuryTransaction.org_id == org_id
+        pid = uuid.UUID(payment_id)
+    except ValueError:
+        pid = None
+
+    treasury = None
+    stripe_pay = None
+    if pid is not None:
+        treasury = (
+            db.query(StripeTreasuryTransaction)
+            .filter(
+                StripeTreasuryTransaction.id == pid,
+                StripeTreasuryTransaction.org_id == org_id,
+            )
+            .first()
+        )
+        stripe_pay = (
+            db.query(StripePayment)
+            .filter(StripePayment.id == pid, StripePayment.org_id == org_id)
+            .first()
+        )
+
+    if treasury is None and stripe_pay is None:
+        treasury = (
+            db.query(StripeTreasuryTransaction)
+            .filter(
+                StripeTreasuryTransaction.org_id == org_id,
+                or_(
+                    StripeTreasuryTransaction.stripe_transaction_id == payment_id,
+                    StripeTreasuryTransaction.flow_id == payment_id,
+                ),
+            )
+            .first()
+        )
+        stripe_pay = (
+            db.query(StripePayment)
+            .filter(StripePayment.org_id == org_id, StripePayment.stripe_id == payment_id)
+            .first()
+        )
+
+    if treasury is None and stripe_pay is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Payment not found.",
+        )
+
+    match_ids: List[str] = []
+    if treasury is not None:
+        if treasury.stripe_transaction_id:
+            match_ids.append(treasury.stripe_transaction_id)
+        if treasury.flow_id:
+            match_ids.append(treasury.flow_id)
+    if stripe_pay is not None and stripe_pay.stripe_id:
+        match_ids.append(stripe_pay.stripe_id)
+    match_ids = list({m for m in match_ids if m})
+
+    try:
+        deleted_from: List[str] = []
+        skip_treasury_ids = set()
+        skip_payment_ids = set()
+        if treasury is not None:
+            skip_treasury_ids.add(treasury.id)
+            db.delete(treasury)
+            deleted_from.append("treasury")
+        if stripe_pay is not None:
+            skip_payment_ids.add(stripe_pay.id)
+            db.delete(stripe_pay)
+            deleted_from.append("stripe_payment")
+
+        if match_ids:
+            related_treasury = (
+                db.query(StripeTreasuryTransaction)
+                .filter(
+                    StripeTreasuryTransaction.org_id == org_id,
+                    or_(
+                        StripeTreasuryTransaction.stripe_transaction_id.in_(match_ids),
+                        StripeTreasuryTransaction.flow_id.in_(match_ids),
+                    ),
                 )
-            ).first()
-            
-            if not transaction:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Treasury transaction with ID {payment_id} not found."
+                .all()
+            )
+            for row in related_treasury:
+                if row.id in skip_treasury_ids:
+                    continue
+                db.delete(row)
+                deleted_from.append("treasury_related")
+            related_payments = (
+                db.query(StripePayment)
+                .filter(
+                    StripePayment.org_id == org_id,
+                    StripePayment.stripe_id.in_(match_ids),
                 )
-            
-            transaction_id = transaction.stripe_transaction_id
-            db.delete(transaction)
-            db.commit()
-            
-            print(f"[DELETE] Deleted Treasury transaction {transaction_id} (ID: {payment_id}) for org {org_id}")
-            
-        else:
-            # Delete from StripePayment table
-            payment = db.query(StripePayment).filter(
-                and_(
-                    StripePayment.id == uuid.UUID(payment_id),
-                    StripePayment.org_id == org_id
-                )
-            ).first()
-            
-            if not payment:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Payment with ID {payment_id} not found."
-                )
-            
-            stripe_id = payment.stripe_id
-            db.delete(payment)
-            db.commit()
-            
-            print(f"[DELETE] Deleted StripePayment {stripe_id} (ID: {payment_id}) for org {org_id}")
-        
-        # Trigger reconciliation to recalculate derived metrics
+                .all()
+            )
+            for row in related_payments:
+                if row.id in skip_payment_ids:
+                    continue
+                db.delete(row)
+                deleted_from.append("stripe_payment_related")
+
+        db.commit()
+
         from app.services.stripe_sync_v2 import reconcile_stripe_data
+        from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+        reconcile_result = {}
         try:
-            reconcile_result = reconcile_stripe_data(db, org_id=org_id)
-            print(f"[DELETE] Reconciliation complete: {reconcile_result.get('clients_reconciled', 0)} clients reconciled")
+            reconcile_result = reconcile_stripe_data(db, org_id=org_id) or {}
         except Exception as reconcile_error:
             print(f"[DELETE] Warning: Reconciliation failed after deletion: {str(reconcile_error)}")
-            # Don't fail the deletion if reconciliation fails
-        
+        try:
+            invalidate_terminal_monthly_trends_cache(org_id)
+        except Exception:
+            pass
+
+        print(f"[DELETE] Removed payment {payment_id} for org {org_id} from {deleted_from}")
         return {
             "success": True,
-            "message": f"Payment deleted successfully. Reconciliation triggered.",
+            "message": "Payment deleted. Reconciliation triggered.",
             "payment_id": payment_id,
+            "deleted_from": deleted_from,
             "reconciliation": {
-                "clients_reconciled": reconcile_result.get("clients_reconciled", 0) if 'reconcile_result' in locals() else 0,
-                "revenue_recalculated": reconcile_result.get("revenue_recalculated", 0) if 'reconcile_result' in locals() else 0
-            }
+                "clients_reconciled": reconcile_result.get("clients_reconciled", 0),
+                "revenue_recalculated": reconcile_result.get("revenue_recalculated", 0),
+            },
         }
-        
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid payment ID format: {payment_id}"
-        )
     except HTTPException:
         raise
     except Exception as e:

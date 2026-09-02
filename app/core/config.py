@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "supersecret_jwt_key_change_in_production"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440  # 24 hours; reduce logout frequency
 
+    # Sentry (optional — leave blank to disable)
+    SENTRY_DSN: Optional[str] = None
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.0
+    SENTRY_SEND_DEFAULT_PII: bool = True
+    ENVIRONMENT: str = "development"
+
     # Google OAuth (user sign-in / invite signup / account linking)
     GOOGLE_OAUTH_CLIENT_ID: Optional[str] = None
     GOOGLE_OAUTH_CLIENT_SECRET: Optional[str] = None

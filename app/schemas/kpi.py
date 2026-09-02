@@ -77,6 +77,7 @@ class KpiDailyEntryBase(BaseModel):
     inbound_bookings: Optional[int] = None
     outbound_bookings: Optional[int] = None
     calls_booked: Optional[int] = None
+    calls_booked_activity: Optional[int] = None
     calls_taken: Optional[int] = None
     offers_made: Optional[int] = None
     no_shows: Optional[int] = None
@@ -109,6 +110,7 @@ class KpiDailyEntryRead(KpiDailyEntryBase):
     id: UUID
     org_id: UUID
     entry_date: date
+    rep_user_id: Optional[UUID] = None
     created_at: datetime
     updated_at: datetime
 
@@ -125,6 +127,7 @@ class KpiDailyEntryRead(KpiDailyEntryBase):
             "id": row.id,
             "org_id": row.org_id,
             "entry_date": row.entry_date,
+            "rep_user_id": getattr(row, "rep_user_id", None),
             "total_followers": row.total_followers,
             "new_followers": row.new_followers,
             "content_posted": row.content_posted,
@@ -140,6 +143,7 @@ class KpiDailyEntryRead(KpiDailyEntryBase):
             "inbound_bookings": getattr(row, "inbound_bookings", None),
             "outbound_bookings": getattr(row, "outbound_bookings", None),
             "calls_booked": row.calls_booked,
+            "calls_booked_activity": getattr(row, "calls_booked_activity", None),
             "calls_taken": row.calls_taken,
             "offers_made": row.offers_made,
             "no_shows": row.no_shows,
@@ -181,6 +185,7 @@ class KpiMonthlyRollup(BaseModel):
     inbound_bookings: int = 0
     outbound_bookings: int = 0
     calls_booked: int = 0
+    calls_booked_activity: int = 0
     calls_taken: int = 0
     offers_made: int = 0
     no_shows: int = 0
@@ -285,6 +290,19 @@ class KpiEntryLinkResponse(BaseModel):
     url: str
 
 
+class KpiRepOption(BaseModel):
+    """One org member selectable as a rep (setter or closer) for attribution."""
+
+    id: str
+    name: str
+    email: Optional[str] = None
+    role: Optional[str] = None
+
+
+class KpiRepOptionsResponse(BaseModel):
+    reps: List[KpiRepOption] = Field(default_factory=list)
+
+
 class KpiAutopopulateStatusResponse(BaseModel):
     calendar_available: bool = False
     payments_available: bool = False
@@ -310,6 +328,7 @@ class KpiSnapshotCard(BaseModel):
 class KpiSnapshotSeriesPoint(BaseModel):
     date: date
     outreach_sent: Optional[int] = None
+    total_conversations: Optional[int] = None
     calls_booked: Optional[int] = None
     calls_taken: Optional[int] = None
     closes: Optional[int] = None
@@ -336,3 +355,65 @@ class KpiSnapshotResponse(BaseModel):
     series: List[KpiSnapshotSeriesPoint] = Field(default_factory=list)
     calendar_available: bool = False
     payments_available: bool = False
+
+
+# ---------------------------------------------------------------------------
+# By-rep performance (setter/closer attribution)
+# ---------------------------------------------------------------------------
+
+
+class KpiRepPerformanceMetrics(BaseModel):
+    """One period's totals for one rep. Funnel fields come from that rep's
+    org_kpi_daily_entries rows; closes/cash come from sales_activity_events
+    (the closer log) — a rep may have either, both, or neither populated."""
+
+    outreach_sent: int = 0
+    calls_booked: int = 0
+    calls_booked_activity: int = 0
+    calls_taken: int = 0
+    no_shows: int = 0
+    closes: int = 0
+    cash_collected_cents: int = 0
+    show_up_pct: Optional[float] = None
+    closing_rate_pct: Optional[float] = None
+
+
+class KpiRepPerformanceRow(BaseModel):
+    rep_user_id: UUID
+    rep_name: str
+    rep_email: Optional[str] = None
+    current: KpiRepPerformanceMetrics
+    previous: KpiRepPerformanceMetrics
+    # Each metric's own best calendar month over the trailing lookback window —
+    # not necessarily all from the same month.
+    personal_best: KpiRepPerformanceMetrics
+    personal_best_month: Dict[str, Optional[str]] = Field(default_factory=dict)
+
+
+class KpiRepPerformanceResponse(BaseModel):
+    org_id: UUID
+    range_start: date
+    range_end: date
+    previous_range_start: date
+    previous_range_end: date
+    generated_at: datetime
+    reps: List[KpiRepPerformanceRow] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Revenue contributors (which clients' payments made up a day's cash_collected)
+# ---------------------------------------------------------------------------
+
+
+class KpiRevenueContributor(BaseModel):
+    client_id: Optional[UUID] = None
+    client_name: str
+    amount_cents: int
+    source: Literal["stripe", "whop", "manual"]
+    payment_id: str
+
+
+class KpiRevenueContributorsResponse(BaseModel):
+    entry_date: date
+    total_cents: int
+    contributors: List[KpiRevenueContributor] = Field(default_factory=list)

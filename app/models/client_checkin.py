@@ -36,6 +36,13 @@ class ClientCheckIn(Base):
     # (e.g. "Discovery Call") without re-parsing raw_event_data on every trigger.
     event_type_id = Column(String, nullable=True, index=True)
     event_type_label = Column(String, nullable=True)
+
+    # Assigned host/organizer for this booking, extracted from raw_event_data at webhook
+    # time (Cal.com organizer.email / Calendly event_memberships[].user_email). Only
+    # meaningful for orgs whose calendar setup round-robins bookings across team members —
+    # null when the org has one shared calendar identity or extraction/resolution misses.
+    host_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    host_email = Column(String, nullable=True)
     
     # Status
     completed = Column(Boolean, default=False, nullable=False)  # True if meeting has passed

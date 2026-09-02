@@ -105,6 +105,28 @@ def _booking_completed(start_time: datetime, end_time: Optional[datetime], *, no
     return ensure_utc(boundary) < now_utc
 
 
+def _resolve_host_user_id(db: Session, org_id: uuid.UUID, host_email: Optional[str]) -> Optional[uuid.UUID]:
+    """Best-effort match of a booking's host/organizer email to an org User — never
+    raises; a miss just means this checkin stays unattributed to a specific rep."""
+    if not host_email:
+        return None
+    try:
+        from app.models.user import User
+
+        email = str(host_email).strip().lower()
+        if not email:
+            return None
+        row = (
+            db.query(User)
+            .filter(User.org_id == org_id, User.email.ilike(email))
+            .first()
+        )
+        return row.id if row else None
+    except Exception:
+        LOG.exception("calendar webhook: host_user_id resolution failed for %s", host_email)
+        return None
+
+
 def _upsert_check_in(
     db: Session,
     *,
@@ -124,8 +146,10 @@ def _upsert_check_in(
     event_type_label: Optional[str],
     cancelled: bool,
     raw_payload: Dict[str, Any],
+    host_email: Optional[str] = None,
 ) -> Tuple[ClientCheckIn, bool]:
     """Insert or refresh a ClientCheckIn row. Returns (row, is_new)."""
+    host_user_id = _resolve_host_user_id(db, org_id, host_email)
     is_sales_call, sale_closed = get_sales_call_flags(
         db, org_id, provider, event_id, event_type_id
     )
@@ -162,6 +186,10 @@ def _upsert_check_in(
             existing.is_sales_call = True
         if getattr(existing, "sale_closed", None) is None and sale_closed is not None:
             existing.sale_closed = sale_closed
+        if host_email and not existing.host_email:
+            existing.host_email = host_email
+        if host_user_id and not existing.host_user_id:
+            existing.host_user_id = host_user_id
         existing.updated_at = datetime.now(timezone.utc)
         existing.raw_event_data = json.dumps(raw_payload)
         return existing, False
@@ -187,6 +215,8 @@ def _upsert_check_in(
         is_sales_call=is_sales_call,
         sale_closed=sale_closed,
         raw_event_data=json.dumps(raw_payload),
+        host_email=host_email,
+        host_user_id=host_user_id,
     )
     db.add(row)
     return row, True
@@ -289,6 +319,15 @@ async def calendly_webhook(
 
     cancelled = kind == "invitee.canceled" or str(invitee.get("status") or "").lower() in ("canceled", "cancelled")
 
+    # Team/round-robin event types carry the assigned host(s) in event_memberships.
+    # Single-host event types typically omit it — host stays unattributed, which is fine.
+    host_email: Optional[str] = None
+    memberships = scheduled.get("event_memberships")
+    if isinstance(memberships, list) and memberships:
+        first = memberships[0]
+        if isinstance(first, dict):
+            host_email = first.get("user_email") or None
+
     try:
         if use_placeholder:
             client = get_or_create_calendar_placeholder_client(db, org_uuid)
@@ -318,6 +357,7 @@ async def calendly_webhook(
         event_type_label=event_type_label,
         cancelled=cancelled,
         raw_payload=body,
+        host_email=host_email,
     )
     db.commit()
     invalidate_terminal_monthly_trends_cache(org_uuid)
@@ -428,6 +468,11 @@ async def calcom_webhook(
 
     cancelled = trigger == "BOOKING_CANCELLED"
 
+    # Team/round-robin bookings carry the assigned host in `organizer`. Single-host
+    # setups typically still populate this with the one connected account.
+    organizer = payload.get("organizer")
+    host_email = organizer.get("email") if isinstance(organizer, dict) else None
+
     try:
         if use_placeholder:
             client = get_or_create_calendar_placeholder_client(db, org_uuid)
@@ -457,6 +502,7 @@ async def calcom_webhook(
         event_type_label=event_type_label,
         cancelled=cancelled,
         raw_payload=body,
+        host_email=host_email,
     )
     db.commit()
     invalidate_terminal_monthly_trends_cache(org_uuid)

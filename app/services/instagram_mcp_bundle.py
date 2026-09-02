@@ -93,10 +93,13 @@ def get_instagram_performance_for_mcp(
         "usage": (
             "Marketing Intel Instagram read model. Use period_comparison for how metrics moved "
             "vs the prior equal window. Use weekly_trend for pattern trends over time. "
-            "Cite top_posts / underperformers by instagram_url (permalink) and their metrics "
-            "(reach, views, saved, engagement_rate_pct). Prefer observed numbers and links over "
-            "invented advice. If connected=false, ask the user to connect Instagram in "
-            "SweepOS → Integrations."
+            "Identify and cite top_posts / underperformers by instagram_url (permalink) — the "
+            "stable identifier — and their metrics (reach, views, saved, engagement_rate_pct). "
+            "caption_excerpt is display-only; never use it to match, dedupe, or refer to a post "
+            "(captions get edited/truncated/duplicated). last_synced_at shows how current this "
+            "data is (syncs run roughly every 24h) — surface it if the user asks. Prefer "
+            "observed numbers and links over invented advice. If connected=false, ask the user "
+            "to connect Instagram in SweepOS → Integrations."
         ),
     }
 
@@ -125,9 +128,14 @@ def get_instagram_top_posts_for_mcp(
         "count": len(posts),
         "posts": posts,
         "capabilities": raw.get("capabilities"),
+        "last_synced_at": raw.get("last_synced_at"),
         "usage": (
-            "Top Instagram posts by engagement rate. Each post includes instagram_url and "
-            "numerical metrics for citation."
+            "Top Instagram posts by engagement rate. Identify each post by instagram_url "
+            "(permalink) — it is the stable identifier; caption_excerpt is display-only and "
+            "can be edited/truncated, do not use it to match or dedupe posts. Each post "
+            "includes numerical metrics for citation. last_synced_at shows when this org's "
+            "Instagram data was last refreshed (syncs run roughly every 24h) — surface it if "
+            "the user asks how current the numbers are."
         ),
     }
 
@@ -154,9 +162,13 @@ def get_instagram_underperforming_posts_for_mcp(
         "count": len(posts),
         "posts": posts,
         "capabilities": raw.get("capabilities"),
+        "last_synced_at": raw.get("last_synced_at"),
         "usage": (
-            "Lowest-engagement Instagram posts in the window. Cite instagram_url + metrics when "
-            "contrasting against top performers; do not invent reasons not present in the data."
+            "Lowest-engagement Instagram posts in the window. Identify each post by "
+            "instagram_url (permalink), not caption_excerpt (display-only, can be edited/"
+            "truncated). Cite instagram_url + metrics when contrasting against top performers; "
+            "do not invent reasons not present in the data. last_synced_at shows when this "
+            "org's Instagram data was last refreshed (syncs run roughly every 24h)."
         ),
     }
 

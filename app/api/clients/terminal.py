@@ -370,10 +370,21 @@ def get_terminal_summary(
     top_30 = _build_top(rev_30)
     top_90 = _build_top(rev_90)
 
+    active_clients_count = (
+        db.query(func.count(Client.id))
+        .filter(
+            Client.org_id == org_id,
+            Client.lifecycle_state.in_([LifecycleState.ACTIVE, LifecycleState.OFFBOARDING]),
+        )
+        .scalar()
+        or 0
+    )
+
     return TerminalSummaryResponse(
         cash_collected=cash_collected,
         mrr=mrr,
         top_contributors_30d=top_30,
         top_contributors_90d=top_90,
         cash_by_source=cash_by_source,
+        active_clients_count=int(active_clients_count),
     )

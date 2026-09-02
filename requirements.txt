@@ -20,3 +20,4 @@ httpx==0.25.2
 composio>=0.18.0,<0.19
 dnspython>=2.4.0
 gunicorn==21.2.0
+sentry-sdk[fastapi]>=2.0.0,<3

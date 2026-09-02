@@ -6,7 +6,7 @@ payment → active, and program progress → offboarding → dead.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 import uuid
@@ -549,6 +549,210 @@ def process_client_automation(
         "state_changes": pipeline_changes,
         "pipeline_changes": pipeline_changes,
     }
+
+
+
+
+def mark_latest_sales_call_closed(db: Session, org_id: uuid.UUID, client: Client) -> Optional[datetime]:
+    """Mark the most recent open sales call closed (payment or close form).
+
+    Returns the call start_time when a row was updated, else None.
+    Does not commit — caller owns the transaction.
+    """
+    from app.models.client_checkin import ClientCheckIn
+    from app.models.calendar_booking_sales import CalendarBookingSales
+
+    check_in = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.client_id == client.id,
+            ClientCheckIn.is_sales_call == True,
+            (ClientCheckIn.sale_closed == False) | (ClientCheckIn.sale_closed.is_(None)),
+        )
+        .order_by(ClientCheckIn.start_time.desc())
+        .limit(1)
+        .first()
+    )
+    if not check_in:
+        return None
+
+    check_in.sale_closed = True
+    check_in.no_show = False
+    check_in.updated_at = datetime.utcnow()
+
+    if getattr(check_in, "provider", None) in ("calcom", "calendly") and check_in.event_id:
+        sales_row = (
+            db.query(CalendarBookingSales)
+            .filter(
+                CalendarBookingSales.org_id == org_id,
+                CalendarBookingSales.provider == check_in.provider,
+                CalendarBookingSales.event_id == check_in.event_id,
+            )
+            .first()
+        )
+        if sales_row:
+            sales_row.is_sales_call = True
+            sales_row.sale_closed = True
+            sales_row.updated_at = datetime.utcnow()
+        else:
+            db.add(
+                CalendarBookingSales(
+                    org_id=org_id,
+                    provider=check_in.provider,
+                    event_id=check_in.event_id,
+                    event_uri=check_in.event_uri,
+                    is_sales_call=True,
+                    sale_closed=True,
+                )
+            )
+    print(
+        f"[SALES_CLOSE] Marked sales call {check_in.event_id} closed for client {client.id}"
+    )
+    return check_in.start_time
+
+
+def apply_payment_pipeline_effects(db: Session, client: Client) -> Optional[datetime]:
+    """After a payment is recorded: Active (if needed) + close latest sales call.
+
+    Returns sales-call start_time when a call was closed. Does not commit.
+    """
+    move_client_to_active_on_payment(db, client)
+    return mark_latest_sales_call_closed(db, client.org_id, client)
+
+
+def run_payment_pipeline_effects_job(org_id: str, client_id: str, when_iso: str | None = None) -> None:
+    """RQ/thread-safe: close last sales call, Active, KPI sync. Works without a logged-in user."""
+    from app.db.session import SessionLocal
+    from app.services.kpi_integration_sync import sync_kpi_for_datetime
+    from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+    db = SessionLocal()
+    try:
+        oid = uuid.UUID(str(org_id))
+        cid = uuid.UUID(str(client_id))
+        client = db.query(Client).filter(Client.id == cid, Client.org_id == oid).first()
+        if not client:
+            return
+        call_when = apply_payment_pipeline_effects(db, client)
+        db.commit()
+        sync_when = call_when
+        if sync_when is None and when_iso:
+            try:
+                sync_when = datetime.fromisoformat(when_iso.replace("Z", "+00:00"))
+            except Exception:
+                sync_when = datetime.utcnow()
+        try:
+            sync_kpi_for_datetime(db, oid, sync_when or datetime.utcnow(), commit=True)
+        except Exception as kpi_err:
+            print(f"[PAYMENT_PIPELINE] KPI sync failed: {kpi_err}")
+        try:
+            invalidate_terminal_monthly_trends_cache(oid)
+        except Exception:
+            pass
+    except Exception as e:
+        db.rollback()
+        print(f"[PAYMENT_PIPELINE] job failed org={org_id} client={client_id}: {e}")
+    finally:
+        db.close()
+
+
+def enqueue_payment_pipeline_effects(
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+    *,
+    when: Optional[datetime] = None,
+) -> None:
+    """Fire-and-forget payment → close + Active + KPI (RQ when enabled)."""
+    from app.long_jobs import schedule_background_work
+
+    when_iso = None
+    if when is not None:
+        when_iso = when.isoformat()
+    schedule_background_work(
+        run_payment_pipeline_effects_job,
+        None,
+        str(org_id),
+        str(client_id),
+        when_iso,
+        prefer_rq=True,
+        job_timeout=120,
+    )
+
+
+def run_close_survey_kpi_sync_job(
+    org_id: str,
+    when_iso: str | None,
+    entry_day: str,
+    revenue_delta_usd: float = 0.0,
+) -> None:
+    """Async KPI + terminal cache refresh after public close-survey submit."""
+    from app.db.session import SessionLocal
+    from app.services.kpi_integration_sync import sync_kpi_for_datetime
+    from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+    db = SessionLocal()
+    try:
+        oid = uuid.UUID(str(org_id))
+        when = None
+        if when_iso:
+            try:
+                when = datetime.fromisoformat(when_iso.replace("Z", "+00:00"))
+            except Exception:
+                when = None
+        if when is None:
+            try:
+                d = date.fromisoformat(entry_day)
+                when = datetime(d.year, d.month, d.day, 12, 0, 0, tzinfo=timezone.utc)
+            except Exception:
+                when = datetime.now(timezone.utc)
+        sync_kpi_for_datetime(db, oid, when, commit=True)
+        if revenue_delta_usd:
+            try:
+                from app.api.kpi import _upsert_kpi_entry_for_org
+                from datetime import date as date_cls
+
+                _upsert_kpi_entry_for_org(
+                    db,
+                    oid,
+                    date_cls.fromisoformat(entry_day),
+                    {"revenue": float(revenue_delta_usd)},
+                    additive=True,
+                )
+            except Exception as rev_err:
+                print(f"[CLOSE_SURVEY_KPI] revenue add failed: {rev_err}")
+        try:
+            invalidate_terminal_monthly_trends_cache(oid)
+        except Exception:
+            pass
+    except Exception as e:
+        db.rollback()
+        print(f"[CLOSE_SURVEY_KPI] job failed: {e}")
+    finally:
+        db.close()
+
+
+def enqueue_close_survey_kpi_sync(
+    org_id: uuid.UUID,
+    *,
+    when: Optional[datetime],
+    entry_day,
+    revenue_delta_usd: float = 0.0,
+) -> None:
+    from app.long_jobs import schedule_background_work
+
+    when_iso = when.isoformat() if when is not None else None
+    day_str = entry_day.isoformat() if hasattr(entry_day, "isoformat") else str(entry_day)
+    schedule_background_work(
+        run_close_survey_kpi_sync_job,
+        None,
+        str(org_id),
+        when_iso,
+        day_str,
+        float(revenue_delta_usd or 0),
+        prefer_rq=True,
+        job_timeout=120,
+    )
 
 
 def move_client_to_active_on_payment(db: Session, client: Client) -> bool:

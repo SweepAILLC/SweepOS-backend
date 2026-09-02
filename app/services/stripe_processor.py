@@ -367,7 +367,10 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         # Move client back to active if they received a payment (automation rule)
         if client:
             try:
-                from app.services.client_automation import move_client_to_active_on_payment
+                from app.services.client_automation import (
+                    mark_latest_sales_call_closed,
+                    move_client_to_active_on_payment,
+                )
                 if move_client_to_active_on_payment(db, client):
                     db.commit()
                     print(f"[CLIENT_AUTOMATION] ✅ Moved client {client.id} back to ACTIVE after payment")
@@ -376,7 +379,14 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
                 print(f"[CLIENT_AUTOMATION] ⚠️  Error in automation: {str(automation_error)}")
             # Mark most recent sales call as closed when this client pays (close-rate automation)
             try:
-                _mark_latest_sales_call_closed(db, org_id, client)
+                call_when = mark_latest_sales_call_closed(db, org_id, client)
+                db.commit()
+                if call_when is not None:
+                    try:
+                        from app.services.kpi_integration_sync import sync_kpi_for_datetime
+                        sync_kpi_for_datetime(db, org_id, call_when, commit=True)
+                    except Exception as kpi_err:
+                        print(f"[KPI_SYNC] ⚠️ Error syncing closes after sale_closed: {kpi_err}")
             except Exception as sales_err:
                 print(f"[SALES_CLOSE] ⚠️  Error marking sales call closed: {str(sales_err)}")
 
@@ -413,65 +423,6 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         db.rollback()
         raise
 
-
-def _mark_latest_sales_call_closed(db: Session, org_id: uuid.UUID, client: Client) -> None:
-    """
-    Mark the single most recent open sales call for this client as closed (payment succeeded).
-    Uses only client_id (client card) so 'paid' is tied to the associated client, not email.
-    Clients can have multiple emails; we do not match by email for closing.
-    """
-    from app.models.client_checkin import ClientCheckIn
-    from app.models.calendar_booking_sales import CalendarBookingSales
-
-    # Only mark by client_id (associated client card) - not by email
-    check_in = (
-        db.query(ClientCheckIn)
-        .filter(
-            ClientCheckIn.org_id == org_id,
-            ClientCheckIn.client_id == client.id,
-            ClientCheckIn.is_sales_call == True,
-            (ClientCheckIn.sale_closed == False) | (ClientCheckIn.sale_closed.is_(None)),
-        )
-        .order_by(ClientCheckIn.start_time.desc())
-        .limit(1)
-        .first()
-    )
-    if not check_in:
-        return
-
-    check_in.sale_closed = True
-    check_in.updated_at = datetime.utcnow()
-    meta = (
-        db.query(CalendarBookingSales)
-        .filter(
-            CalendarBookingSales.org_id == org_id,
-            CalendarBookingSales.provider == check_in.provider,
-            CalendarBookingSales.event_id == check_in.event_id,
-        )
-        .first()
-    )
-    if meta:
-        meta.sale_closed = True
-        meta.updated_at = datetime.utcnow()
-    else:
-        db.add(
-            CalendarBookingSales(
-                org_id=org_id,
-                provider=check_in.provider,
-                event_id=check_in.event_id,
-                event_uri=check_in.event_uri,
-                is_sales_call=True,
-                sale_closed=True,
-            )
-        )
-    db.commit()
-    print(f"[SALES_CLOSE] Marked sales call {check_in.event_id} as closed for client {client.id} after payment")
-    try:
-        from app.services.kpi_integration_sync import sync_kpi_for_datetime
-
-        sync_kpi_for_datetime(db, org_id, getattr(check_in, "start_time", None), commit=True)
-    except Exception as kpi_err:
-        print(f"[KPI_SYNC] ⚠️ Error syncing closes after sale_closed: {kpi_err}")
 
 
 def _unclose_sales_call_for_client(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> None:

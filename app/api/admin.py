@@ -57,9 +57,10 @@ from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.portal_todo import PortalTodo
 from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.models.org_kpi_benchmark import OrgKpiBenchmark
-from app.schemas.kpi import KpiSnapshotResponse
+from app.schemas.kpi import KpiRepPerformanceResponse, KpiSnapshotResponse
 from app.services.kpi_bottleneck_service import detect_bottlenecks, utcnow
 from app.services.kpi_compute import build_kpi_snapshot
+from app.services.kpi_rep_performance import build_rep_performance
 from app.services.kpi_integration_sync import (
     has_calendar_source,
     has_payment_source,
@@ -570,8 +571,11 @@ def invite_organization(
         raise HTTPException(status_code=400, detail="Organization name is required")
     if not admin_email:
         raise HTTPException(status_code=400, detail="Admin email is required")
+    consulting_tier = (body.consulting_tier or "").strip() or None
+    if consulting_tier is not None and consulting_tier not in ("pro_consulting", "core_consulting"):
+        raise HTTPException(status_code=400, detail="Invalid consulting tier")
 
-    org = Organization(name=name)
+    org = Organization(name=name, consulting_tier=consulting_tier)
     db.add(org)
     db.flush()
 
@@ -2636,6 +2640,34 @@ def admin_get_kpi_snapshot(
         payments_available=has_payment_source(db, org_id),
         generated_at=utcnow(),
     )
+
+
+@router.get("/organizations/{org_id}/kpi/rep-performance", response_model=KpiRepPerformanceResponse)
+def admin_get_kpi_rep_performance(
+    org_id: UUID,
+    days: int = Query(30, ge=1, le=365),
+    start: Optional[str] = Query(None, description="YYYY-MM-DD inclusive"),
+    end: Optional[str] = Query(None, description="YYYY-MM-DD inclusive"),
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Per-rep (setter/closer) performance for any org (system owner)."""
+    _require_org(db, org_id)
+
+    def _parse_qdate(raw: Optional[str]) -> Optional[date]:
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid date: {raw}") from exc
+
+    today = date.today()
+    range_end = _parse_qdate(end) or today
+    range_start = _parse_qdate(start) or (range_end - timedelta(days=days - 1))
+    if range_end < range_start:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+    return build_rep_performance(db, org_id, range_start=range_start, range_end=range_end)
 
 
 @router.get("/notices", response_model=List[OwnerOrgNoticeResponse])

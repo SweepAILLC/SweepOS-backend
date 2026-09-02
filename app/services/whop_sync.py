@@ -204,12 +204,16 @@ def sync_whop_incremental(db: Session, org_id: uuid.UUID, force_full: bool = Fal
         try:
             from app.models.client import Client
             from app.services.automation_engine import on_payment_received
-            from app.services.client_automation import apply_automatic_lifecycle_for_client
+            from app.services.client_automation import (
+                apply_automatic_lifecycle_for_client,
+                enqueue_payment_pipeline_effects,
+            )
 
             for cid in {sig["client_id"] for sig in new_first_payment_signals}:
                 client_row = db.query(Client).filter(Client.id == cid).first()
                 if client_row:
                     apply_automatic_lifecycle_for_client(db, client_row)
+                    enqueue_payment_pipeline_effects(org_id, client_row.id)
             db.flush()
 
             for sig in new_first_payment_signals:

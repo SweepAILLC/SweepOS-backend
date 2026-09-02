@@ -167,8 +167,14 @@ def get_org_intelligence_for_mcp(
     org_id: uuid.UUID,
     *,
     user_id: Optional[uuid.UUID] = None,
+    signals: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Full Intelligence bank + offer ladder: ICP, business context, sales approach."""
+    """
+    Full Intelligence bank + offer ladder: ICP, business context, sales approach.
+    Always also carries call-derived `signals` so the response is never a dead end
+    just because the org hasn't filled in the Intelligence tab. Pass `signals` when
+    the caller already computed it (e.g. the bootstrap function) to skip a redundant query.
+    """
     profile: Optional[Dict[str, Any]] = None
     if user_id:
         user = db.query(User).filter(User.id == user_id).first()
@@ -192,24 +198,37 @@ def get_org_intelligence_for_mcp(
             profile = row.ai_profile
 
     ladder = resolve_org_offer_ladder(db, org_id)
+    if signals is None:
+        signals = get_org_sales_signals_for_mcp(db, org_id)
     out = {
         "org_id": str(org_id),
         "ai_profile": _trim_profile_for_marketing(profile),
         "intelligence_profile": _full_intelligence_for_mcp(profile),
         "offer_ladder": offer_ladder_for_llm(ladder),
+        "signals": signals,
         "usage": (
             "intelligence_profile carries the org's business context (description, USP, "
             "target audience, coaching style, marketing strategy), sales_approach "
             "(framework + tactics), pipeline_priorities, and brand_voice. offer_ladder is "
             "the configured offer/pricing ladder. Ground offer positioning and business "
             "advice in these fields; ai_profile is a marketing-trimmed subset kept for "
-            "backward compatibility."
+            "backward compatibility. signals is always populated from call-derived data "
+            "(objections, wins, stories, themes) independent of whether the Intelligence "
+            "tab has been filled in — use it even when intelligence_profile is empty."
         ),
     }
-    if not out["intelligence_profile"] and not out["offer_ladder"]:
+    intelligence_empty = not out["intelligence_profile"] and not out["offer_ladder"]
+    if intelligence_empty and not signals.get("has_any"):
         out["hint"] = (
-            "No Intelligence profile configured for this org yet. Fill in the Intelligence "
-            "tab in SweepOS (business description, offers, ICP) to unlock business context."
+            "No Intelligence profile configured for this org yet, and no call-derived "
+            "signals are available either. Fill in the Intelligence tab in SweepOS "
+            "(business description, offers, ICP) to unlock business context."
+        )
+    elif intelligence_empty:
+        out["hint"] = (
+            "No Intelligence-tab profile configured for this org yet, but call-derived "
+            "sales signals are available below (signals) — use those for grounding "
+            "instead of waiting on the ICP form."
         )
     return out
 
@@ -304,7 +323,7 @@ def get_marketing_intel_bootstrap_for_mcp(
     knowledge = css.load_knowledge_grouped(db, org_id)
     sp_source, sp_paragraphs = build_sales_playbook_for_studio(db, org_id, use_llm_synthesis=False)
     signals = get_org_sales_signals_for_mcp(db, org_id)
-    intel = get_org_intelligence_for_mcp(db, org_id, user_id=user_id)
+    intel = get_org_intelligence_for_mcp(db, org_id, user_id=user_id, signals=signals)
 
     content_bundle: Optional[Dict[str, Any]] = None
     batch_id: Optional[str] = None

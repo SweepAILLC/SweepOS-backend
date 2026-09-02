@@ -49,6 +49,7 @@ from app.models.funnel_lead_notification import FunnelLeadNotification
 from app.models.funnel_simulator_scenario import FunnelSimulatorScenario
 from app.models.org_app_session import OrgAppSession
 from app.models.owner_org_notice import OwnerOrgNotice, OwnerOrgNoticeRead
+from app.models.sales_activity_event import SalesActivityEvent
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -85,5 +86,6 @@ __all__ = [
     "OrgAppSession",
     "OwnerOrgNotice",
     "OwnerOrgNoticeRead",
+    "SalesActivityEvent",
 ]
 

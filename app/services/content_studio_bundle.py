@@ -156,6 +156,8 @@ def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, A
         },
         "top_posts": [
             {
+                "permalink": p.get("permalink"),
+                "ig_media_id": p.get("ig_media_id"),
                 "hook_text": p.get("hook_text"),
                 "format_bucket": p.get("format_bucket"),
                 "engagement_rate_pct": p.get("engagement_rate_pct"),
@@ -167,6 +169,8 @@ def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, A
         ],
         "underperformers": [
             {
+                "permalink": p.get("permalink"),
+                "ig_media_id": p.get("ig_media_id"),
                 "hook_text": p.get("hook_text"),
                 "format_bucket": p.get("format_bucket"),
                 "engagement_rate_pct": p.get("engagement_rate_pct"),
@@ -180,10 +184,12 @@ def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, A
 
 
 def _instagram_anchor_for_stage(stage_id: str, ig: Dict[str, Any]) -> str:
-    """Cite observed top-post performance (not funnel/format/hook advice labels)."""
+    """Cite observed top-post performance by permalink (not caption/hook text alone) —
+    captions get edited/truncated/duplicated, the permalink is the stable identifier."""
     top = ig.get("top_posts") if isinstance(ig, dict) else None
     hooks: List[str] = []
     formats: List[str] = []
+    links: List[str] = []
     if isinstance(top, list):
         for row in top[:3]:
             if not isinstance(row, dict):
@@ -194,6 +200,9 @@ def _instagram_anchor_for_stage(stage_id: str, ig: Dict[str, Any]) -> str:
             fb = str(row.get("format_bucket") or "").strip()
             if fb and fb not in formats:
                 formats.append(fb)
+            link = str(row.get("permalink") or "").strip()
+            if link:
+                links.append(link)
 
     summary = ig.get("summary") if isinstance(ig, dict) else None
     delta_bits: List[str] = []
@@ -215,13 +224,18 @@ def _instagram_anchor_for_stage(stage_id: str, ig: Dict[str, Any]) -> str:
     if hooks:
         quoted = "; ".join(f"“{h}”" for h in hooks[:2])
         parts.append(f"Reuse the shape of winning hooks (do not copy verbatim): {quoted}.")
+    if links:
+        parts.append("Source post(s): " + "; ".join(links[:2]) + ".")
     if delta_bits:
         parts.append("Period movement: " + "; ".join(delta_bits[:2]) + ".")
     under = ig.get("underperformers") if isinstance(ig, dict) else None
     if isinstance(under, list) and under:
-        weak = str((under[0] or {}).get("hook_text") or "").strip()
+        weak_row = under[0] or {}
+        weak = str(weak_row.get("hook_text") or "").strip()
+        weak_link = str(weak_row.get("permalink") or "").strip()
         if weak:
-            parts.append(f"Avoid weak opening patterns like “{weak[:80]}”.")
+            suffix = f" ({weak_link})" if weak_link else ""
+            parts.append(f"Avoid weak opening patterns like “{weak[:80]}”{suffix}.")
     return " ".join(parts)
 
 
@@ -486,11 +500,14 @@ HARD RULES:
   - 3-layer funnel: the `hook` behaves as the HOOK (widest relevant audience, ZERO niche terms, one universal driver, passes the swap test); niche/ICP specificity only enters in the amplifier beats (context → symptom → system); the final beat is the CTA (one ask tied to the amplifier's specific promise). Pick hook types from the SOP's 13 that fit each stage's goal.
   - Reinforce the OFFER: where relevant, echo the operator's positioning levers (owned category, named enemy/wrong-cause, named mechanism, proof) and move the value equation (raise believable outcome/likelihood, lower perceived time/effort).
   - The frameworks are the STRUCTURE; INTELLIGENCE_PROFILE + Fathom SIGNALS are the SUBSTANCE.
-- When INSTAGRAM_PERFORMANCE is connected: ground concepts in observed top_posts (hooks, formats, captions)
-  and period deltas in summary; avoid patterns from underperformers. Do not invent funnel/format/hook
-  "advice labels" — only cite values that appear in the Instagram payload.
+- When INSTAGRAM_PERFORMANCE is connected: ground concepts in observed top_posts (hooks, formats, permalinks)
+  and period deltas in summary; avoid patterns from underperformers. Identify each cited post by its
+  `permalink` (stable, unique) rather than by its caption or hook text alone — captions get edited,
+  truncated, or duplicated across posts, so they are not reliable identifiers. Do not invent
+  funnel/format/hook "advice labels" — only cite values that appear in the Instagram payload.
 - If INSTAGRAM_PERFORMANCE.connected=true, every concept's why_for_icp MUST include one explicit line that starts
-  with "Instagram performance signal" and references a real top-post hook/format or a period delta from summary.
+  with "Instagram performance signal", references a real top-post hook/format or a period delta from summary,
+  AND includes that post's `permalink` so the citation is verifiable, not just a caption echo.
 - No PII (no full names). Paraphrase any quotes."""
 
     ig_perf = _instagram_perf_block_for_llm(db, org_id)

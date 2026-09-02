@@ -274,6 +274,8 @@ class TerminalSummaryResponse(BaseModel):
     top_contributors_30d: List[TerminalTopContributor]
     top_contributors_90d: List[TerminalTopContributor]
     cash_by_source: Optional[TerminalCashBySourceBreakdown] = None
+    # Active + offboarding clients (pipeline "Active Clients" metric).
+    active_clients_count: int = 0
 
 
 # Client health score (logic-based; AI-ready factors for future referral/testimonial/retention/upsell)

@@ -66,6 +66,17 @@ class SyncResponse(BaseModel):
     last_sync_at: Optional[str] = None
 
 
+def _status_for_composio_connect_error(message: str) -> int:
+    lowered = (message or "").lower()
+    if "invalid api key" in lowered or "apikey_invalidapikey" in lowered:
+        return status.HTTP_400_BAD_REQUEST
+    if "lacks permission" in lowered or "permission" in lowered or "insufficient" in lowered:
+        return status.HTTP_403_FORBIDDEN
+    if "timed out" in lowered or "timeout" in lowered:
+        return status.HTTP_504_GATEWAY_TIMEOUT
+    return status.HTTP_502_BAD_GATEWAY
+
+
 def _org_id(user: User) -> uuid.UUID:
     raw = getattr(user, "selected_org_id", None) or user.org_id
     return raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
@@ -188,7 +199,10 @@ def connect_instagram(
         raise HTTPException(status_code=code, detail=msg) from e
     except ComposioToolError as e:
         logger.warning("instagram connect tool error org=%s: %s", org_id, e)
-        raise HTTPException(status_code=502, detail=str(e)) from e
+        raise HTTPException(
+            status_code=_status_for_composio_connect_error(str(e)),
+            detail=str(e),
+        ) from e
     except Exception as e:
         logger.exception("instagram connect unexpected error org=%s", org_id)
         raise HTTPException(

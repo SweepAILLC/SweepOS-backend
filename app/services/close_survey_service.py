@@ -16,6 +16,7 @@ from app.models.calendar_booking_sales import CalendarBookingSales
 from app.models.funnel import Funnel
 from app.models.manual_payment import ManualPayment
 from app.models.organization import Organization
+from app.models.sales_activity_event import SalesActivityEvent
 from app.models.user import User, role_to_api
 from app.models.user_organization import UserOrganization
 from app.schemas.client import ClientOfferEnrollmentPatch
@@ -383,7 +384,7 @@ def _apply_latest_sales_call_outcome(
     client: Client,
     outcome: DealOutcome,
 ) -> Optional[datetime]:
-    """Apply yes/no/no-show to latest sales call and mirror close state row."""
+    """Apply Close / No show to latest sales call. No Close leaves flags empty."""
     check_in = (
         db.query(ClientCheckIn)
         .filter(
@@ -398,15 +399,16 @@ def _apply_latest_sales_call_outcome(
     if not check_in:
         return None
 
+    # "no" (No Close): leave sale_closed / no_show empty — do not stamp the call.
+    if outcome == "no":
+        return check_in.start_time
+
     if outcome == "yes":
         check_in.sale_closed = True
         check_in.no_show = False
     elif outcome == "no_show":
         check_in.sale_closed = False
         check_in.no_show = True
-    else:
-        check_in.sale_closed = False
-        check_in.no_show = False
     check_in.updated_at = datetime.utcnow()
 
     if getattr(check_in, "provider", None) in ("calcom", "calendly") and check_in.event_id:
@@ -525,8 +527,15 @@ def submit_close_survey(
     except Exception as e:
         LOG.warning("apply sales outcome failed for %s: %s", client.id, e)
 
-    if is_closed:
+    if outcome == "yes":
         _force_active(client)
+    elif outcome == "no_show":
+        client.lifecycle_state = LifecycleState.QUALIFIED
+        client.last_activity_at = datetime.utcnow()
+    else:
+        # No Close → nurturing; call flags left empty above.
+        client.lifecycle_state = LifecycleState.NURTURING
+        client.last_activity_at = datetime.utcnow()
 
     # 3) Offer enrollment — capture prior contract so KPI revenue uses a delta
     # (avoids double-counting when drawer already synced the same amount).
@@ -557,6 +566,22 @@ def submit_close_survey(
         funnel_id=lead_funnel_id,
     )
 
+    # 4b) Immutable per-rep log entry (independent of the client-meta stamp
+    # above, which gets overwritten on the client's next survey) — this is
+    # what the by-rep KPI performance dashboard reads from.
+    db.add(
+        SalesActivityEvent(
+            org_id=org.id,
+            entry_date=entry_day,
+            rep_user_id=uuid.UUID(closer_user_id_str) if closer_user_id_str else None,
+            rep_role="closer",
+            client_id=client.id,
+            cash_collected_cents=cash_cents,
+            is_closed=is_closed,
+            source="close_survey",
+        )
+    )
+
     # 5) Notes
     _append_notes(
         client,
@@ -573,37 +598,23 @@ def submit_close_survey(
     db.commit()
     db.refresh(client)
 
-    # 6) KPI live sync (cash / closes from check-ins + payments)
-    try:
-        from app.services.kpi_integration_sync import sync_kpi_for_datetime
-
-        sync_kpi_for_datetime(db, org.id, sales_event_when or when, commit=True)
-    except Exception as e:
-        LOG.warning("KPI sync after close survey failed: %s", e)
-
-    # 7) Optional KPI revenue add (contract / AOV) — delta vs previous enrollment.
-    # Only when the survey supplied a contract amount (or cleared via offer write).
+    # 6) KPI + terminal refresh async (public form stays fast; works offline for users)
+    revenue_delta_usd = 0.0
     if contract_cents is not None or body.offer_slot:
         new_contract = int(contract_cents or 0)
         revenue_delta_usd = (new_contract - prev_contract_cents) / 100.0
-        if revenue_delta_usd != 0:
-            try:
-                from app.api.kpi import _upsert_kpi_entry_for_org
-
-                _upsert_kpi_entry_for_org(
-                    db,
-                    org.id,
-                    entry_day,
-                    {"revenue": revenue_delta_usd},
-                    additive=True,
-                )
-            except Exception as e:
-                LOG.warning("KPI revenue add after close survey failed: %s", e)
 
     try:
-        invalidate_terminal_monthly_trends_cache(org.id)
-    except Exception:
-        pass
+        from app.services.client_automation import enqueue_close_survey_kpi_sync
+
+        enqueue_close_survey_kpi_sync(
+            org.id,
+            when=sales_event_when or when,
+            entry_day=entry_day,
+            revenue_delta_usd=revenue_delta_usd if revenue_delta_usd != 0 else 0.0,
+        )
+    except Exception as e:
+        LOG.warning("enqueue close-survey KPI sync failed: %s", e)
 
     return CloseSurveySubmitResponse(
         ok=True,

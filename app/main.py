@@ -7,6 +7,18 @@ from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
 import logging
 import threading
 
+import sentry_sdk
+
+_sentry_dsn = (app_settings.SENTRY_DSN or "").strip()
+if _sentry_dsn:
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        # Request headers / IP — see https://docs.sentry.io/platforms/python/data-management/data-collected/
+        send_default_pii=app_settings.SENTRY_SEND_DEFAULT_PII,
+        traces_sample_rate=app_settings.SENTRY_TRACES_SAMPLE_RATE,
+        environment=app_settings.ENVIRONMENT,
+    )
+
 app = FastAPI(title="Sweep Coach OS API", version="1.0.0")
 
 def _tune_api_threadpool() -> None:
@@ -49,6 +61,11 @@ async def global_exception_handler(request: Request, exc: Exception):
     """Ensure CORS headers are included even on unhandled exceptions"""
     import logging
     logging.getLogger("app").exception("Unhandled exception on %s %s", request.method, request.url.path)
+    if _sentry_dsn:
+        sentry_sdk.capture_exception(exc)
+        # Ensure verify hits (and short-lived workers) flush before response returns
+        if request.url.path == "/sentry-debug":
+            sentry_sdk.flush(timeout=5)
 
     response = JSONResponse(
         status_code=500,
@@ -377,4 +394,9 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/sentry-debug")
+async def trigger_error():
+    division_by_zero = 1 / 0
 

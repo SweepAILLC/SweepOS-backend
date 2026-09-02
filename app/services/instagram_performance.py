@@ -741,6 +741,7 @@ def top_posts_for_mcp(
         "count": len(posts[:limit]),
         "posts": posts[:limit],
         "capabilities": perf.get("capabilities"),
+        "last_synced_at": perf.get("last_synced_at"),
     }
 
 
@@ -765,4 +766,5 @@ def bottom_posts_for_mcp(
         "count": len(posts[:lim]),
         "posts": posts[:lim],
         "capabilities": perf.get("capabilities"),
+        "last_synced_at": perf.get("last_synced_at"),
     }

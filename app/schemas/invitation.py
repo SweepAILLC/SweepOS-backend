@@ -8,6 +8,8 @@ class InviteOrgAdminRequest(BaseModel):
     """System owner: create org and invite admin."""
     name: str
     admin_email: str
+    # "pro_consulting" | "core_consulting" | None (not a consulting org)
+    consulting_tier: Optional[str] = None
 
 
 class InviteUserRequest(BaseModel):

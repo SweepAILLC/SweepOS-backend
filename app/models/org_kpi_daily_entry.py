@@ -10,11 +10,12 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
-    UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -22,9 +23,36 @@ from app.db.session import Base
 
 
 class OrgKpiDailyEntry(Base):
+    """
+    One row per (org_id, entry_date) when rep_user_id is NULL — the org-wide
+    aggregate, unchanged from the original single-row-per-day design. One row
+    per (org_id, entry_date, rep_user_id) when set — a single rep's entry for
+    that day. Both shapes coexist; org-level reads must SUM/merge across rows
+    for a date instead of assuming exactly one (see kpi_compute.py).
+    """
+
     __tablename__ = "org_kpi_daily_entries"
     __table_args__ = (
-        UniqueConstraint("org_id", "entry_date", name="uq_org_kpi_daily_entries_org_date"),
+        # At most one aggregate row per org/date (rep_user_id NULL).
+        Index(
+            "uq_org_kpi_daily_entries_org_date_agg",
+            "org_id",
+            "entry_date",
+            unique=True,
+            postgresql_where=text("rep_user_id IS NULL"),
+        ),
+        # At most one row per org/date/rep (rep_user_id set). A plain
+        # UniqueConstraint on (org_id, entry_date, rep_user_id) would NOT
+        # enforce the aggregate case above, since SQL treats NULL <> NULL —
+        # hence two partial indexes instead of one constraint.
+        Index(
+            "uq_org_kpi_daily_entries_org_date_rep",
+            "org_id",
+            "entry_date",
+            "rep_user_id",
+            unique=True,
+            postgresql_where=text("rep_user_id IS NOT NULL"),
+        ),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -35,6 +63,11 @@ class OrgKpiDailyEntry(Base):
         index=True,
     )
     entry_date = Column(Date, nullable=False, index=True)
+    rep_user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     total_followers = Column(Integer, nullable=True)
     new_followers = Column(Integer, nullable=True)
@@ -52,6 +85,11 @@ class OrgKpiDailyEntry(Base):
     inbound_bookings = Column(Integer, nullable=True)
     outbound_bookings = Column(Integer, nullable=True)
     calls_booked = Column(Integer, nullable=True)
+    # Calls whose *booking action* (ClientCheckIn.created_at) happened on this
+    # entry_date — distinct from calls_booked, which counts calls whose meeting
+    # start_time falls on this date. A call booked today for next week counts
+    # here today, and toward calls_booked on the meeting's actual date.
+    calls_booked_activity = Column(Integer, nullable=True)
     calls_taken = Column(Integer, nullable=True)
     offers_made = Column(Integer, nullable=True)
     no_shows = Column(Integer, nullable=True)

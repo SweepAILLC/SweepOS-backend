@@ -478,13 +478,20 @@ def create_manual_payment(
     db.refresh(manual_payment)
 
     try:
-        from app.services.client_automation import apply_automatic_lifecycle_for_client
+        from app.services.client_automation import (
+            apply_automatic_lifecycle_for_client,
+            enqueue_payment_pipeline_effects,
+        )
 
         apply_automatic_lifecycle_for_client(db, client)
         db.commit()
         db.refresh(client)
+        # Async: ensure latest sales call closes + Active + KPI even if lifecycle no-op.
+        enqueue_payment_pipeline_effects(
+            org_id, client.id, when=manual_payment.payment_date
+        )
     except Exception as lc_err:
-        print(f"[MANUAL PAYMENT] lifecycle update skipped for {client.id}: {lc_err}")
+        print(f"[MANUAL PAYMENT] lifecycle/close enqueue skipped for {client.id}: {lc_err}")
 
     invalidate_terminal_monthly_trends_cache(org_id)
 
