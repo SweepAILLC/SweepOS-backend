@@ -13,6 +13,8 @@ from app.db.session import get_db
 from app.models.organization import Organization
 from app.models.user import User
 from app.schemas.close_survey import (
+    CloseSurveyClientOption,
+    CloseSurveyCreateClientRequest,
     CloseSurveyEntryLinkResponse,
     CloseSurveyMetaResponse,
     CloseSurveySubmitRequest,
@@ -20,6 +22,7 @@ from app.schemas.close_survey import (
 )
 from app.services.close_survey_service import (
     build_close_survey_meta,
+    create_close_survey_client,
     resolve_org_by_close_token,
     submit_close_survey,
 )
@@ -58,6 +61,16 @@ def get_close_survey_entry_link(
 def get_close_survey_meta(token: str, db: Session = Depends(get_db)):
     org = resolve_org_by_close_token(db, token)
     return build_close_survey_meta(db, org)
+
+
+@router.post("/public/{token}/clients", response_model=CloseSurveyClientOption)
+def post_close_survey_create_client(
+    token: str,
+    body: CloseSurveyCreateClientRequest,
+    db: Session = Depends(get_db),
+):
+    org = resolve_org_by_close_token(db, token)
+    return create_close_survey_client(db, org, body)
 
 
 @router.post("/public/{token}/submit", response_model=CloseSurveySubmitResponse)

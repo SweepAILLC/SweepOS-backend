@@ -34,11 +34,21 @@ class CloseSurveyCloserOption(BaseModel):
 
 
 class CloseSurveyLeadSourceOption(BaseModel):
-    """key=organic or funnel UUID; funnel_id set only for funnel options."""
+    """key=organic|dms|referral or funnel UUID; funnel_id set only for funnel options."""
 
     key: str
     label: str
     funnel_id: Optional[str] = None
+
+
+class CloseSurveyCreateClientRequest(BaseModel):
+    first_name: Optional[str] = Field(None, max_length=120)
+    last_name: Optional[str] = Field(None, max_length=120)
+    email: Optional[str] = Field(None, max_length=320)
+    phone: Optional[str] = Field(None, max_length=40)
+    instagram: Optional[str] = Field(None, max_length=120)
+    notes: Optional[str] = Field(None, max_length=8000)
+    lifecycle_state: Optional[str] = Field(None, max_length=40)
 
 
 class CloseSurveyMetaResponse(BaseModel):
@@ -69,7 +79,7 @@ class CloseSurveySubmitRequest(BaseModel):
     lead_source_key: Optional[str] = Field(
         None,
         max_length=64,
-        description="organic or funnel UUID from meta.lead_sources",
+        description="organic|dms|referral or funnel UUID from meta.lead_sources",
     )
 
 

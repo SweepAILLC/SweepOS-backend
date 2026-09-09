@@ -7,10 +7,12 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models.client import Client, LifecycleState
+from app.models.client import Client, LifecycleState, parse_lifecycle_state_from_db
 from app.models.client_checkin import ClientCheckIn
 from app.models.calendar_booking_sales import CalendarBookingSales
 from app.models.funnel import Funnel
@@ -23,6 +25,7 @@ from app.schemas.client import ClientOfferEnrollmentPatch
 from app.schemas.close_survey import (
     CloseSurveyClientOption,
     CloseSurveyCloserOption,
+    CloseSurveyCreateClientRequest,
     CloseSurveyLeadSourceOption,
     DealOutcome,
     CloseSurveyMetaResponse,
@@ -34,6 +37,11 @@ from app.services.offer_ladder import resolve_org_offer_ladder
 from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
 _ORGANIC_LEAD_KEY = "organic"
+_DEFAULT_LEAD_SOURCES = (
+    (_ORGANIC_LEAD_KEY, "Organic"),
+    ("dms", "DMs"),
+    ("referral", "Referral"),
+)
 
 LOG = logging.getLogger("app.close_survey")
 
@@ -113,7 +121,8 @@ def _list_org_closers(db: Session, org_id: uuid.UUID) -> List[CloseSurveyCloserO
 
 def _list_lead_sources(db: Session, org_id: uuid.UUID) -> List[CloseSurveyLeadSourceOption]:
     sources: List[CloseSurveyLeadSourceOption] = [
-        CloseSurveyLeadSourceOption(key=_ORGANIC_LEAD_KEY, label="Organic", funnel_id=None)
+        CloseSurveyLeadSourceOption(key=key, label=label, funnel_id=None)
+        for key, label in _DEFAULT_LEAD_SOURCES
     ]
     funnels = (
         db.query(Funnel)
@@ -133,6 +142,72 @@ def _list_lead_sources(db: Session, org_id: uuid.UUID) -> List[CloseSurveyLeadSo
     return sources
 
 
+def _client_option(client: Client) -> CloseSurveyClientOption:
+    return CloseSurveyClientOption(
+        id=str(client.id),
+        name=_client_display_name(client),
+        email=(client.email or None),
+        lifecycle_state=_lifecycle_str(client.lifecycle_state),
+    )
+
+
+def create_close_survey_client(
+    db: Session,
+    org: Organization,
+    body: CloseSurveyCreateClientRequest,
+) -> CloseSurveyClientOption:
+    first = (body.first_name or "").strip() or None
+    last = (body.last_name or "").strip() or None
+    email = (body.email or "").strip() or None
+    if not first and not last and not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide at least a name or email",
+        )
+    if email:
+        existing = (
+            db.query(Client)
+            .filter(
+                Client.org_id == org.id,
+                func.lower(Client.email) == email.lower(),
+            )
+            .first()
+        )
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Client with email {email} already exists",
+            )
+
+    client = Client(
+        org_id=org.id,
+        first_name=first,
+        last_name=last,
+        email=email,
+        phone=(body.phone or "").strip() or None,
+        instagram=(body.instagram or "").strip() or None,
+        notes=(body.notes or "").strip() or None,
+        lifecycle_state=parse_lifecycle_state_from_db(body.lifecycle_state),
+    )
+    db.add(client)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Could not create client due to a conflict with existing data (e.g. duplicate email).",
+        )
+    db.refresh(client)
+    try:
+        from app.services.fathom_client_link import relink_fathom_for_client_and_queue
+
+        relink_fathom_for_client_and_queue(db, org.id, client)
+    except Exception as relink_err:
+        LOG.warning("fathom relink after close-survey create skipped for %s: %s", client.id, relink_err)
+    return _client_option(client)
+
+
 def build_close_survey_meta(db: Session, org: Organization) -> CloseSurveyMetaResponse:
     clients = (
         db.query(Client)
@@ -141,15 +216,7 @@ def build_close_survey_meta(db: Session, org: Organization) -> CloseSurveyMetaRe
         .limit(_CLIENT_CAP)
         .all()
     )
-    client_opts = [
-        CloseSurveyClientOption(
-            id=str(c.id),
-            name=_client_display_name(c),
-            email=(c.email or None),
-            lifecycle_state=_lifecycle_str(c.lifecycle_state),
-        )
-        for c in clients
-    ]
+    client_opts = [_client_option(c) for c in clients]
     client_opts.sort(key=lambda c: (c.name or "").lower())
 
     offers: List[CloseSurveyOfferOption] = []
