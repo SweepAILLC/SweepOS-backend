@@ -50,6 +50,8 @@ from app.models.funnel_simulator_scenario import FunnelSimulatorScenario
 from app.models.org_app_session import OrgAppSession
 from app.models.owner_org_notice import OwnerOrgNotice, OwnerOrgNoticeRead
 from app.models.sales_activity_event import SalesActivityEvent
+from app.models.content_angle_map import ContentAngleMap
+from app.models.discord_channel_mapping import DiscordChannelMapping
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -87,5 +89,7 @@ __all__ = [
     "OwnerOrgNotice",
     "OwnerOrgNoticeRead",
     "SalesActivityEvent",
+    "ContentAngleMap",
+    "DiscordChannelMapping",
 ]
 

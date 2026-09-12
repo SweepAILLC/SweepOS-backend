@@ -298,10 +298,12 @@ def ensure_stripe_webhook_for_org(
         }
     except Exception as exc:
         logger.exception("stripe_webhook_onboard: ensure failed org=%s", org_id)
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        # Never roll back a caller-owned session — connect already committed the API key.
+        if owns_db:
+            try:
+                db.rollback()
+            except Exception:
+                pass
         return {
             "success": False,
             "webhook_active": False,

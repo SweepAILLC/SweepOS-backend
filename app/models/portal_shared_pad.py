@@ -9,8 +9,7 @@ MAX_SHARED_PADS_PER_ORG = 10
 # Default body for the first org pad (Markdown — headings + task checkboxes).
 DEFAULT_SHARED_PAD_CONTENT = """## Onboarding Checklist
 
-- [ ] Complete Tally Forms Client Service Agreement (https://tally.so/r/mJyDAX)
-- [ ] Fill out Tally Forms Onboarding Form (https://tally.so/r/KY0yqg)
+- [ ] Book your Sweep onboarding call
 - [ ] Join Discord — Join the Sweep Team Discord Server! (https://discord.gg/7BAPM45R7y)
 """
 

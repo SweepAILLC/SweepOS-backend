@@ -237,3 +237,114 @@ async def stripe_webhook(
         print(f"[WEBHOOK] Full traceback:")
         print(traceback.format_exc())
         return _json_response(500, "Webhook processing failed")
+
+
+@router.post("/whop/org/{org_id}")
+async def whop_webhook_per_org(
+    org_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Verify Whop Standard Webhooks signature and upsert payments into whop_payments."""
+    try:
+        org_uuid = uuid.UUID(org_id)
+    except ValueError:
+        return _json_response(400, "Invalid org")
+
+    oauth_token = (
+        db.query(OAuthToken)
+        .filter(
+            OAuthToken.provider == OAuthProvider.WHOP,
+            OAuthToken.org_id == org_uuid,
+            OAuthToken.webhook_secret.isnot(None),
+        )
+        .first()
+    )
+    if not oauth_token or not oauth_token.webhook_secret:
+        return _json_response(500, "Webhook not configured for org")
+
+    from app.core.encryption import decrypt_token
+    from app.services.whop_webhook import payment_item_from_webhook_payload, verify_whop_webhook_signature
+
+    webhook_secret = decrypt_token(oauth_token.webhook_secret)
+    body = await request.body()
+    header_map = {k: v for k, v in request.headers.items()}
+    if not verify_whop_webhook_signature(webhook_secret, header_map, body):
+        return _json_response(400, "Invalid signature")
+
+    try:
+        import json
+
+        payload = json.loads(body.decode("utf-8") or "{}")
+        if not isinstance(payload, dict):
+            return _json_response(400, "Invalid payload")
+
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        account = payload.get("account_id") or payload.get("company_id") or data.get("company_id")
+        expected_company = (oauth_token.account_id or "").strip()
+        if expected_company and account and str(account).strip() != expected_company:
+            return _json_response(400, "Company mismatch")
+
+        item = payment_item_from_webhook_payload(payload)
+        if item is None:
+            oauth_token.last_webhook_processed_at = datetime.utcnow()
+            db.commit()
+            return _json_response(200, "Ignored")
+
+        from app.services.whop_sync import (
+            apply_whop_first_payment_signals,
+            hydrate_whop_payment_item,
+            upsert_whop_payment_item,
+        )
+
+        item = hydrate_whop_payment_item(decrypt_token(oauth_token.access_token), item)
+
+        sig = upsert_whop_payment_item(db, org_uuid, item)
+        oauth_token.last_webhook_processed_at = datetime.utcnow()
+        db.commit()
+        if sig:
+            apply_whop_first_payment_signals(db, org_uuid, [sig])
+            try:
+                from app.models.client import Client
+                from app.models.whop_payment import WhopPayment
+                from app.services import discord_notify
+
+                payment_row = (
+                    db.query(WhopPayment)
+                    .filter(WhopPayment.org_id == org_uuid, WhopPayment.whop_id == sig.get("whop_id"))
+                    .first()
+                )
+                client_row = (
+                    db.query(Client)
+                    .filter(Client.id == sig.get("client_id"), Client.org_id == org_uuid)
+                    .first()
+                )
+                client_name = None
+                if client_row:
+                    client_name = " ".join(
+                        p for p in (client_row.first_name, client_row.last_name) if p
+                    ) or None
+                amount_cents = int(sig.get("amount_cents") or 0)
+                currency = (payment_row.currency if payment_row else None) or "usd"
+                discord_notify.send_discord_event_background(
+                    org_uuid,
+                    "new_transaction",
+                    title=f"New transaction: ${amount_cents / 100:.2f} {currency.upper()}",
+                    description=client_name or "Unknown client",
+                    fields=[("Source", "Whop"), ("Payment ID", str(sig.get("whop_id")))],
+                )
+            except Exception as discord_err:
+                print(f"[DISCORD_NOTIFY] new_transaction (whop) skipped: {discord_err}")
+        else:
+            try:
+                from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+                invalidate_terminal_monthly_trends_cache(org_uuid)
+            except Exception:
+                pass
+        return _json_response(200, "Webhook received")
+    except Exception:
+        import traceback
+
+        print(traceback.format_exc())
+        return _json_response(500, "Webhook processing failed")

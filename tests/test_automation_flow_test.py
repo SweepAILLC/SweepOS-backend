@@ -105,10 +105,11 @@ def test_diagnose_post_booking_flags_empty_trigger(mock_brevo, mock_health, _see
 @patch("app.services.automation_flow_test.read_dispatcher_health")
 @patch("app.services.automation_flow_test.get_brevo_auth_headers")
 @patch("app.services.automation_flow_test.resolve_sender_for_org")
+@patch("app.services.automation_flow_test.build_automation_email_draft")
 @patch("app.services.automation_flow_test.send_email")
 @patch("app.services.automation_flow_test.diagnose_flow")
 def test_run_flow_test_sends_enabled_actions_only(
-    mock_diag, mock_send, mock_sender, mock_headers, mock_health, _seed
+    mock_diag, mock_send, mock_build_draft, mock_sender, mock_headers, mock_health, _seed
 ):
     mock_diag.return_value = {
         "flow": "onboarding",
@@ -128,6 +129,11 @@ def test_run_flow_test_sends_enabled_actions_only(
     }
     mock_headers.return_value = {"api-key": "x"}
     mock_sender.return_value = {"email": "coach@example.com", "name": "Coach"}
+    mock_build_draft.return_value = SimpleNamespace(
+        subject="Welcome to the program — your first steps",
+        html="<p>Real workflow html</p>",
+        body_plain="Real workflow plain text",
+    )
     mock_send.return_value = {"messageId": "msg-1"}
 
     wait = SimpleNamespace(
@@ -190,9 +196,9 @@ def test_run_flow_test_sends_enabled_actions_only(
     assert out["ok"] is True
     assert out["sent_count"] == 1
     assert mock_send.call_count == 1
+    assert mock_build_draft.call_count == 1
     subject = mock_send.call_args.kwargs["subject"]
-    assert subject.startswith("[TEST]")
-    assert "Alex" in subject
+    assert subject == "Welcome to the program — your first steps"
     statuses = {r["playbook"]: r["status"] for r in out["results"]}
     assert statuses["w1"] == "skipped"
     assert statuses["first_payment_onboarding"] == "sent"

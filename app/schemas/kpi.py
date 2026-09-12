@@ -306,6 +306,9 @@ class KpiRepOptionsResponse(BaseModel):
 class KpiAutopopulateStatusResponse(BaseModel):
     calendar_available: bool = False
     payments_available: bool = False
+    # True once an Instagram DM read has succeeded for the org (messaging scope
+    # granted), which is what turns new_conversations / respondents into AUTO.
+    instagram_dm_available: bool = False
     # Column keys that should be presented as AUTO in UI.
     autopopulated_columns: List[str] = Field(default_factory=list)
 

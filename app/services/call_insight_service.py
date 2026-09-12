@@ -479,12 +479,20 @@ def run_call_insight_for_fathom_record(
         fathom_call_record_id,
         row.id,
     )
+
     try:
         from app.services.org_sales_theme_service import record_from_completed_insight
 
         record_from_completed_insight(db, row)
     except Exception as e:
         logger.warning("org_sales_theme record_from_completed_insight skipped: %s", e)
+
+    try:
+        from app.services.content_angle_map import maybe_queue_fathom_refresh
+
+        maybe_queue_fathom_refresh(org_id)
+    except Exception as e:
+        logger.warning("content_angle_map fathom refresh skipped: %s", e)
 
     # Enqueue win_combined_ask automation jobs (worker handles draft+send asynchronously
     # so the call-insight handler stays fast and survives API restarts).

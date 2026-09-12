@@ -369,6 +369,23 @@ async def calendly_webhook(
         LOG.exception("calendly webhook: KPI live sync failed")
     _run_pipeline_after_webhook(db, org_uuid, client.id)
 
+    if is_new and not cancelled:
+        try:
+            from app.services import discord_notify
+
+            discord_notify.send_discord_event_background(
+                org_uuid,
+                "new_booking",
+                title=f"New booking: {' '.join(p for p in (client.first_name or invitee_name, client.last_name) if p) or 'Unknown'}",
+                description=event_type_label or "Calendly booking",
+                fields=[
+                    ("Provider", "Calendly"),
+                    ("When", discord_notify.format_org_local_datetime(db, org_uuid, start_time)),
+                ] + ([("Email", invitee_email)] if invitee_email else []),
+            )
+        except Exception as e:
+            LOG.warning("discord_notify new_booking (calendly) skipped: %s", e)
+
     fired_jobs: list[str] = []
     if is_new and not cancelled and not use_placeholder:
         try:
@@ -513,6 +530,23 @@ async def calcom_webhook(
     except Exception:
         LOG.exception("calendly webhook: KPI live sync failed")
     _run_pipeline_after_webhook(db, org_uuid, client.id)
+
+    if is_new and not cancelled:
+        try:
+            from app.services import discord_notify
+
+            discord_notify.send_discord_event_background(
+                org_uuid,
+                "new_booking",
+                title=f"New booking: {' '.join(p for p in (client.first_name or attendee_name, client.last_name) if p) or 'Unknown'}",
+                description=event_type_label or "Cal.com booking",
+                fields=[
+                    ("Provider", "Cal.com"),
+                    ("When", discord_notify.format_org_local_datetime(db, org_uuid, start_time)),
+                ] + ([("Email", attendee_email)] if attendee_email else []),
+            )
+        except Exception as e:
+            LOG.warning("discord_notify new_booking (calcom) skipped: %s", e)
 
     fired_jobs: list[str] = []
     if is_new and not cancelled and not use_placeholder:

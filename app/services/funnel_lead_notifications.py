@@ -250,10 +250,36 @@ def enqueue_funnel_lead_notification(
             is_new_client=bool(is_new_client),
         )
 
+    def _notify_discord_new_lead(row: FunnelLeadNotification) -> None:
+        try:
+            from app.services import discord_notify
+
+            fields = [
+                (label, value)
+                for label, value in [
+                    ("Email", row.lead_email),
+                    ("Phone", row.lead_phone),
+                    ("Instagram", row.lead_instagram),
+                    ("Funnel", row.funnel_name),
+                    ("Source", row.source),
+                ]
+                if value
+            ]
+            discord_notify.send_discord_event_background(
+                org_id,
+                "new_lead",
+                title=f"New lead: {row.lead_name or 'Unnamed lead'}",
+                description="Returning lead" if not row.is_new_client else "New client",
+                fields=fields,
+            )
+        except Exception:
+            LOG.warning("discord_notify new_lead skipped", exc_info=True)
+
     row = _build_row()
     try:
         db.add(row)
         db.commit()
+        _notify_discord_new_lead(row)
         return row.id
     except Exception:
         LOG.exception("enqueue_funnel_lead_notification commit failed")
@@ -267,6 +293,7 @@ def enqueue_funnel_lead_notification(
                 row = _build_row()
                 db.add(row)
                 db.commit()
+                _notify_discord_new_lead(row)
                 return row.id
             except Exception:
                 LOG.exception("enqueue retry failed")
@@ -344,7 +371,7 @@ def render_digest(
     else:
         subject = f"{n} new leads from your funnels — {org_name}"
 
-    frontend = (getattr(settings, "FRONTEND_URL", None) or "http://localhost:3002").rstrip("/")
+    frontend = (getattr(settings, "FRONTEND_URL", None) or "http://localhost:3003").rstrip("/")
     pipeline_url = f"{frontend}/?tab=pipeline"
 
     shown = list(rows[:DIGEST_ROW_CAP])

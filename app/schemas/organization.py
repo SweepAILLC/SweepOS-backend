@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 
@@ -19,6 +19,8 @@ class OrganizationUpdate(BaseModel):
     # Empty string clears tier; omit field to leave unchanged
     consulting_tier: Optional[str] = None  # pro_consulting | core_consulting | ""
     booking_url: Optional[str] = None
+    program_start_date: Optional[date] = None
+    program_end_date: Optional[date] = None
 
 
 class Organization(OrganizationBase):
@@ -26,6 +28,8 @@ class Organization(OrganizationBase):
     max_user_seats: Optional[int] = None
     consulting_tier: Optional[str] = None
     booking_url: Optional[str] = None
+    program_start_date: Optional[date] = None
+    program_end_date: Optional[date] = None
     created_at: datetime
     updated_at: datetime
 

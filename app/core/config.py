@@ -122,6 +122,14 @@ class Settings(BaseSettings):
     INSTAGRAM_MANUAL_SYNC_COOLDOWN_SEC: int = 900
     # Manual Sync sliding-window rate limit.
     INSTAGRAM_MANUAL_SYNC_MAX_PER_HOUR: int = 3
+
+    # Instagram DM -> KPI autopilot (new_conversations / respondents).
+    # Composio has no Instagram triggers, so DM state is polled.
+    INSTAGRAM_DM_SYNC_ENABLED: bool = True
+    # How often the worker polls DM threads for every connected org.
+    INSTAGRAM_DM_SYNC_INTERVAL_SEC: int = 3600
+    # Per-run cap on threads inspected so one huge inbox cannot stall the worker.
+    INSTAGRAM_DM_MAX_THREADS_PER_SYNC: int = 200
     
     # Stripe
     STRIPE_CLIENT_ID: Optional[str] = None
@@ -138,14 +146,21 @@ class Settings(BaseSettings):
     # Brevo
     BREVO_CLIENT_ID: Optional[str] = None
     BREVO_CLIENT_SECRET: Optional[str] = None
-    BREVO_REDIRECT_URI: str = "http://localhost:3002/oauth/brevo/callback"
+    BREVO_REDIRECT_URI: str = "http://localhost:3003/oauth/brevo/callback"
     BREVO_LOGIN_URL: Optional[str] = None  # Optional custom login URL, defaults to standard Brevo auth URL
     BREVO_API_KEY: Optional[str] = None  # Global API key for onboarding emails (invitations); does not affect per-org Brevo OAuth/API
     # Default fixed window for batched funnel-lead digest emails (overridable per org).
     FUNNEL_LEAD_DIGEST_WINDOW_MINUTES: int = 15
-    
+
+    # Discord (per-org OAuth to install one shared bot into an org's own server,
+    # plus a single bot token owned by this app used to actually send messages).
+    DISCORD_CLIENT_ID: Optional[str] = None
+    DISCORD_CLIENT_SECRET: Optional[str] = None
+    DISCORD_BOT_TOKEN: Optional[str] = None  # From the Bot tab of your Discord application
+    DISCORD_REDIRECT_URI: str = "http://localhost:3003/api/oauth/discord/callback"
+
     # Frontend
-    FRONTEND_URL: str = "http://localhost:3002"  # Frontend URL for OAuth redirects
+    FRONTEND_URL: str = "http://localhost:3003"  # Frontend URL for OAuth redirects
 
     # Backend public URL for webhook endpoints (required for per-org Stripe webhooks)
     # e.g. https://api.sweepai.site or http://localhost:8000 for local dev

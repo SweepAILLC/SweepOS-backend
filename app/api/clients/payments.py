@@ -262,6 +262,51 @@ def get_client_payments(
     
     for manual_payment in manual_payments:
         all_payments.append(ManualPaymentWrapper(manual_payment))
+
+    # 5. Whop payments linked to merged clients (or email match)
+    whop_rows = (
+        db.query(WhopPayment)
+        .filter(WhopPayment.org_id == org_id, WhopPayment.client_id.in_(client_uuids))
+        .order_by(desc(WhopPayment.created_at))
+        .all()
+    )
+    added_whop_ids = {p.id for p in whop_rows}
+
+    class WhopPaymentWrapper:
+        def __init__(self, row):
+            raw_status = (row.status or "").lower()
+            self.id = row.id
+            self.stripe_id = f"whop:{row.whop_id}"
+            self.client_id = row.client_id
+            from app.services.whop_sync import stored_or_raw_amount_cents
+
+            self.amount_cents = stored_or_raw_amount_cents(row)
+            self.currency = row.currency or "usd"
+            self.status = "succeeded" if raw_status in WHOP_PAID_STATUSES else raw_status
+            self.type = "whop"
+            self.subscription_id = None
+            self.invoice_id = None
+            self.receipt_url = None
+            self.created_at = row.created_at
+            self.description = None
+            self.payment_method = "whop"
+
+    for row in whop_rows:
+        all_payments.append(WhopPaymentWrapper(row))
+
+    if all_merged_emails:
+        from app.services.whop_sync import _payer_email
+
+        for row in db.query(WhopPayment).filter(WhopPayment.org_id == org_id).all():
+            if row.id in added_whop_ids:
+                continue
+            raw = row.raw if isinstance(row.raw, dict) else {}
+            email = _payer_email(raw) if raw else None
+            if not email:
+                continue
+            if normalize_email(email) in all_merged_emails:
+                all_payments.append(WhopPaymentWrapper(row))
+                added_whop_ids.add(row.id)
     
     # Apply the EXACT same deduplication logic as the recent payments table
     def deduplicate_payments(payments_list):
@@ -273,7 +318,7 @@ def get_client_payments(
         # Sort: prefer charge over payment_intent over invoice, then by created_at (most recent first)
         # This matches the recent payments table sorting exactly
         payments_list.sort(key=lambda p: (
-            {'charge': 0, 'payment_intent': 1, 'invoice': 2, 'manual_payment': 3}.get(getattr(p, 'type', None), 4),
+            {'charge': 0, 'payment_intent': 1, 'invoice': 2, 'manual_payment': 3, 'whop': 3}.get(getattr(p, 'type', None), 4),
             -(getattr(p, 'created_at', None).timestamp() if getattr(p, 'created_at', None) else 0)
         ))
         
@@ -284,7 +329,7 @@ def get_client_payments(
             payment_status = getattr(payment, 'status', None)
             
             # For manual payments (no stripe_id), use payment id
-            if payment_type == 'manual_payment':
+            if payment_type in ('manual_payment', 'whop'):
                 if payment_id and str(payment_id) not in seen_stripe_ids:
                     seen_stripe_ids.add(str(payment_id))
                     deduplicated.append(payment)

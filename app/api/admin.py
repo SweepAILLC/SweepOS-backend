@@ -25,7 +25,12 @@ from app.schemas.organization import (
     OrganizationUpdate,
     OrganizationWithStats,
 )
-from app.schemas.invitation import InviteOrgAdminRequest, InvitationResponse
+from app.schemas.invitation import (
+    InviteOrgAdminRequest,
+    InviteUserRequest,
+    InvitationExpiryUpdate,
+    InvitationResponse,
+)
 from app.models.organization_invitation import OrganizationInvitation
 from app.models.client_checkin import ClientCheckIn
 from app.models.manual_payment import ManualPayment
@@ -80,9 +85,16 @@ from app.schemas.portal import (
     FunnelSimulatorScenarioCreate,
     FunnelSimulatorScenarioUpdate,
 )
+from app.schemas.content_angle_map import (
+    ContentAngleDeleteBody,
+    ContentAngleMapOut,
+    ContentAnglePatchBody,
+    ContentAnglePillsPutBody,
+    ContentAngleRegenerateBody,
+)
 from app.services import portal_shared_pads as pads_svc
 from app.core.config import settings
-from app.core.rate_limit import rate_limit
+from app.core.rate_limit import rate_limit, check_sliding_window
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
@@ -200,6 +212,25 @@ def _org_performance_maps(db: Session, now: datetime):
 
 def _utc_naive(dt_aware: datetime) -> datetime:
     return dt_aware.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _sales_calls_booked_count(
+    db: Session,
+    *,
+    start: datetime,
+    end: datetime,
+    org_id: Optional[UUID] = None,
+) -> int:
+    """Booked-call KPIs count sales calls only (non-cancelled), matching Sales KPIs live fields."""
+    q = db.query(func.count(ClientCheckIn.id)).filter(
+        ClientCheckIn.is_sales_call == True,  # noqa: E712
+        ClientCheckIn.cancelled == False,  # noqa: E712
+        ClientCheckIn.start_time >= start,
+        ClientCheckIn.start_time < end,
+    )
+    if org_id is not None:
+        q = q.filter(ClientCheckIn.org_id == org_id)
+    return q.scalar() or 0
 
 
 def _global_show_up_rate_pct(
@@ -548,69 +579,59 @@ def list_organizations(
     return result
 
 
-# Invitation-based org onboarding (only way to create new orgs; uses BREVO_API_KEY)
+# Signup-link org onboarding (recipient names the org and creates their account)
 @router.post("/organizations/invite", response_model=dict, status_code=status.HTTP_201_CREATED)
-@rate_limit(max_requests=10, window_seconds=900)  # 10 org invites per 15 min per admin
+@rate_limit(max_requests=10, window_seconds=900)  # 10 org invite links per 15 min per admin
 def invite_organization(
     body: InviteOrgAdminRequest,
     request: Request,
     db: Session = Depends(get_db),
     admin_user: User = Depends(require_admin),
 ):
-    """
-    Create a new organization and send an invitation email to the org admin.
-    They set their own password via the invitation link. No user is created until they accept.
-    """
+    """Mint a signup link. No email is sent. Recipient creates the org and account on accept."""
     import secrets
-    from datetime import datetime, timedelta
-    from app.services.onboarding_email import send_org_admin_invitation_email, INVITATION_EXPIRES_DAYS
 
-    name = (body.name or "").strip()
-    admin_email = (body.admin_email or "").strip().lower()
-    if not name:
-        raise HTTPException(status_code=400, detail="Organization name is required")
-    if not admin_email:
-        raise HTTPException(status_code=400, detail="Admin email is required")
+    name = (body.name or "").strip() or None
     consulting_tier = (body.consulting_tier or "").strip() or None
     if consulting_tier is not None and consulting_tier not in ("pro_consulting", "core_consulting"):
         raise HTTPException(status_code=400, detail="Invalid consulting tier")
 
-    org = Organization(name=name, consulting_tier=consulting_tier)
-    db.add(org)
-    db.flush()
+    org = None
+    if name:
+        org = Organization(name=name, consulting_tier=consulting_tier)
+        db.add(org)
+        db.flush()
+
+    from app.services.organization_invitations import (
+        invitation_response,
+        resolve_invitation_expires_at,
+    )
 
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(days=INVITATION_EXPIRES_DAYS)
+    expires_at = resolve_invitation_expires_at(
+        never_expires=body.never_expires,
+        expires_at=body.expires_at,
+        expires_in_days=body.expires_in_days,
+    )
     inv = OrganizationInvitation(
-        org_id=org.id,
-        invitee_email=admin_email,
+        org_id=org.id if org else None,
+        invitee_email=None,
         invitation_type="ORG_ADMIN",
         role="admin",
         token=token,
         expires_at=expires_at,
         created_by=admin_user.id,
+        multi_use=bool(body.multi_use),
     )
     db.add(inv)
     db.commit()
-    db.refresh(org)
+    if org:
+        db.refresh(org)
     db.refresh(inv)
 
-    frontend_url = getattr(settings, "FRONTEND_URL", "") or "http://localhost:3002"
-    link = f"{frontend_url.rstrip('/')}/invite/accept?token={token}"
-    send_org_admin_invitation_email(to_email=admin_email, org_name=org.name, invitation_link=link)
-
     return {
-        "organization": OrganizationSchema.model_validate(org),
-        "invitation": InvitationResponse(
-            id=inv.id,
-            org_id=inv.org_id,
-            invitee_email=inv.invitee_email,
-            invitation_type=inv.invitation_type,
-            role=inv.role,
-            expires_at=inv.expires_at,
-            used_at=inv.used_at,
-            created_at=inv.created_at,
-        ),
+        "organization": OrganizationSchema.model_validate(org) if org else None,
+        "invitation": invitation_response(inv),
     }
 
 
@@ -620,28 +641,123 @@ def list_all_invitations(
     admin_user: User = Depends(require_admin),
 ):
     """List all pending invitations across all organizations (system owner only)."""
+    from app.services.organization_invitations import (
+        invitation_response,
+        pending_invitation_filters,
+    )
+
     invs = (
         db.query(OrganizationInvitation)
-        .filter(
-            OrganizationInvitation.used_at.is_(None),
-            OrganizationInvitation.expires_at > datetime.utcnow(),
-        )
+        .filter(*pending_invitation_filters())
         .order_by(OrganizationInvitation.created_at.desc())
         .all()
     )
-    return [
-        InvitationResponse(
-            id=i.id,
-            org_id=i.org_id,
-            invitee_email=i.invitee_email,
-            invitation_type=i.invitation_type,
-            role=i.role,
-            expires_at=i.expires_at,
-            used_at=i.used_at,
-            created_at=i.created_at,
+    return [invitation_response(i) for i in invs]
+
+
+@router.patch(
+    "/organizations/invitations/{invitation_id}",
+    response_model=InvitationResponse,
+)
+def admin_update_invitation_expiry(
+    invitation_id: UUID,
+    body: InvitationExpiryUpdate,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    from app.schemas.invitation import InvitationExpiryUpdate as _Expiry  # noqa: F401
+    from app.services.organization_invitations import (
+        invitation_response,
+        resolve_invitation_expires_at,
+    )
+
+    inv = (
+        db.query(OrganizationInvitation)
+        .filter(
+            OrganizationInvitation.id == invitation_id,
+            OrganizationInvitation.used_at.is_(None),
         )
-        for i in invs
-    ]
+        .first()
+    )
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invitation not found or already used")
+    inv.expires_at = resolve_invitation_expires_at(
+        never_expires=body.never_expires,
+        expires_at=body.expires_at,
+        expires_in_days=body.expires_in_days,
+    )
+    inv.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(inv)
+    return invitation_response(inv)
+
+
+@router.delete(
+    "/organizations/invitations/{invitation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def admin_cancel_invitation(
+    invitation_id: UUID,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    inv = (
+        db.query(OrganizationInvitation)
+        .filter(
+            OrganizationInvitation.id == invitation_id,
+            OrganizationInvitation.used_at.is_(None),
+        )
+        .first()
+    )
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invitation not found or already used")
+    db.delete(inv)
+    db.commit()
+    return None
+
+
+@router.post(
+    "/organizations/{org_id}/invite-user",
+    response_model=InvitationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+@rate_limit(max_requests=20, window_seconds=900)
+def admin_invite_user_to_org(
+    org_id: UUID,
+    body: InviteUserRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Create a single-use user invite for any org. Returns the accept link; email is optional."""
+    from app.services.organization_invitations import (
+        create_user_invitation,
+        invitation_accept_link,
+        invitation_response,
+    )
+    from app.services.onboarding_email import send_user_invitation_email
+
+    org = _require_org(db, org_id)
+    inv = create_user_invitation(
+        db,
+        org=org,
+        email=body.email,
+        role=body.role or "member",
+        created_by=admin_user.id,
+    )
+    email_sent = False
+    if body.send_email:
+        email_sent = bool(
+            send_user_invitation_email(
+                to_email=inv.invitee_email,
+                org_name=org.name,
+                invitation_link=invitation_accept_link(inv.token),
+                role=inv.role,
+                inviter_name=admin_user.email,
+                existing_user=False,
+            )
+        )
+    return invitation_response(inv, email_sent=email_sent)
 
 
 @router.get("/organizations/{org_id}", response_model=OrganizationWithStats)
@@ -710,6 +826,18 @@ def update_organization(
         org.consulting_tier = org_data.consulting_tier or None
     if org_data.booking_url is not None:
         org.booking_url = (org_data.booking_url or "").strip() or None
+    updates = org_data.model_dump(exclude_unset=True)
+    if "program_start_date" in updates:
+        org.program_start_date = updates["program_start_date"]
+    if "program_end_date" in updates:
+        org.program_end_date = updates["program_end_date"]
+    start = getattr(org, "program_start_date", None)
+    end = getattr(org, "program_end_date", None)
+    if start and end and end < start:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="program_end_date must be on or after program_start_date",
+        )
 
     db.commit()
     db.refresh(org)
@@ -1005,9 +1133,10 @@ def get_global_health(
         OAuthToken.provider == OAuthProvider.BREVO
     ).scalar() or 0
 
+    from app.services.organization_invitations import pending_invitation_filters
+
     pending_inv = db.query(func.count(OrganizationInvitation.id)).filter(
-        OrganizationInvitation.used_at.is_(None),
-        OrganizationInvitation.expires_at > now,
+        *pending_invitation_filters()
     ).scalar() or 0
 
     sixty_days_ago = now - timedelta(days=30) * 2
@@ -1046,23 +1175,11 @@ def get_global_health(
     thirty_utc = now_utc - timedelta(days=30)
     sixty_utc = now_utc - timedelta(days=60)
 
-    calls_booked_last_30d = (
-        db.query(func.count(ClientCheckIn.id))
-        .filter(
-            ClientCheckIn.start_time >= thirty_utc,
-            ClientCheckIn.start_time < now_utc,
-        )
-        .scalar()
-        or 0
+    calls_booked_last_30d = _sales_calls_booked_count(
+        db, start=thirty_utc, end=now_utc
     )
-    calls_booked_previous_30d = (
-        db.query(func.count(ClientCheckIn.id))
-        .filter(
-            ClientCheckIn.start_time >= sixty_utc,
-            ClientCheckIn.start_time < thirty_utc,
-        )
-        .scalar()
-        or 0
+    calls_booked_previous_30d = _sales_calls_booked_count(
+        db, start=sixty_utc, end=thirty_utc
     )
 
     lifecycle_active_clients_current = (
@@ -1098,14 +1215,8 @@ def get_global_health(
 
         stripe_rev = _global_stripe_rev_month_post_onboarding(db, ps_naive, pe_naive_exclusive)
 
-        calls_ct = (
-            db.query(func.count(ClientCheckIn.id))
-            .filter(
-                ClientCheckIn.start_time >= month_cursor,
-                ClientCheckIn.start_time < month_end_exclusive,
-            )
-            .scalar()
-            or 0
+        calls_ct = _sales_calls_booked_count(
+            db, start=month_cursor, end=month_end_exclusive
         )
 
         cum_clients = (
@@ -1538,15 +1649,8 @@ def get_organization_dashboard(
             now_naive,
         )
 
-        calls_ct = (
-            db.query(func.count(ClientCheckIn.id))
-            .filter(
-                ClientCheckIn.org_id == org_id,
-                ClientCheckIn.start_time >= month_cursor,
-                ClientCheckIn.start_time < month_end_exclusive,
-            )
-            .scalar()
-            or 0
+        calls_ct = _sales_calls_booked_count(
+            db, start=month_cursor, end=month_end_exclusive, org_id=org_id
         )
 
         cum_clients = (
@@ -1668,25 +1772,11 @@ def get_organization_dashboard(
     close_rate_last_30d_pct = _org_close_rate_pct(
         db, org_id, thirty_utc, now_utc_dash, now_utc_dash
     )
-    calls_booked_last_30d = (
-        db.query(func.count(ClientCheckIn.id))
-        .filter(
-            ClientCheckIn.org_id == org_id,
-            ClientCheckIn.start_time >= thirty_utc,
-            ClientCheckIn.start_time < now_utc_dash,
-        )
-        .scalar()
-        or 0
+    calls_booked_last_30d = _sales_calls_booked_count(
+        db, start=thirty_utc, end=now_utc_dash, org_id=org_id
     )
-    calls_booked_previous_30d = (
-        db.query(func.count(ClientCheckIn.id))
-        .filter(
-            ClientCheckIn.org_id == org_id,
-            ClientCheckIn.start_time >= sixty_utc,
-            ClientCheckIn.start_time < thirty_utc,
-        )
-        .scalar()
-        or 0
+    calls_booked_previous_30d = _sales_calls_booked_count(
+        db, start=sixty_utc, end=thirty_utc, org_id=org_id
     )
     lifecycle_active_clients_current = clients_by_status.get(LifecycleState.ACTIVE.value, 0)
     thirty_naive = now_naive - timedelta(days=30)
@@ -1704,6 +1794,8 @@ def get_organization_dashboard(
     return OrganizationDashboardSummary(
         organization_id=org_id,
         organization_name=org.name,
+        program_start_date=org.program_start_date.isoformat() if getattr(org, "program_start_date", None) else None,
+        program_end_date=org.program_end_date.isoformat() if getattr(org, "program_end_date", None) else None,
         total_users=total_users,
         max_user_seats=getattr(org, "max_user_seats", None),
         total_clients=total_clients,
@@ -2360,6 +2452,99 @@ def admin_put_portal_shared_pad_default(
     )
 
 
+@router.get("/organizations/{org_id}/content-angle-map", response_model=ContentAngleMapOut)
+def admin_get_content_angle_map(
+    org_id: UUID,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    """Content Angle Map for any organization (system owner)."""
+    from app.services import content_angle_map as cam
+
+    _require_org(db, org_id)
+    payload = cam.load_map_out(db, org_id)
+    if (payload.can_generate_icp and not payload.icp_angles) or (
+        payload.can_generate_brand and not payload.personal_brand_angles
+    ):
+        cam.maybe_queue_initial_generation(org_id)
+    return payload
+
+
+@router.patch("/organizations/{org_id}/content-angle-map/angles", response_model=ContentAngleMapOut)
+def admin_patch_content_angle_map_angle(
+    org_id: UUID,
+    body: ContentAnglePatchBody,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    from app.services import content_angle_map as cam
+
+    _require_org(db, org_id)
+    try:
+        return cam.patch_angle(db, org_id, body.card, body.id, body.text)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.delete("/organizations/{org_id}/content-angle-map/angles", response_model=ContentAngleMapOut)
+def admin_delete_content_angle_map_angle(
+    org_id: UUID,
+    body: ContentAngleDeleteBody,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    from app.services import content_angle_map as cam
+
+    _require_org(db, org_id)
+    return cam.delete_angle(db, org_id, body.card, body.id)
+
+
+@router.put("/organizations/{org_id}/content-angle-map/pills", response_model=ContentAngleMapOut)
+def admin_put_content_angle_map_pills(
+    org_id: UUID,
+    body: ContentAnglePillsPutBody,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    from app.services import content_angle_map as cam
+
+    _require_org(db, org_id)
+    try:
+        return cam.replace_pills(db, org_id, body.stage, body.pills)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post("/organizations/{org_id}/content-angle-map/regenerate", response_model=ContentAngleMapOut)
+def admin_regenerate_content_angle_map(
+    org_id: UUID,
+    body: ContentAngleRegenerateBody,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_admin),
+):
+    from app.services import content_angle_map as cam
+    from app.services.llm_client import llm_available
+
+    _require_org(db, org_id)
+    check_sliding_window(
+        f"cam_regen_admin_{org_id}_{admin_user.id}",
+        max_requests=6,
+        window_seconds=3600,
+        endpoint_name="content_angle_map_regenerate",
+    )
+    if not llm_available():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI generation is not configured",
+        )
+    try:
+        return cam.generate_card(db, org_id, body.card, full=body.full)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e) or "Generation failed") from e
+
+
 @router.get("/organizations/{org_id}/kpi-entries")
 def admin_get_kpi_entries(
     org_id: UUID,
@@ -2616,6 +2801,7 @@ def admin_get_kpi_snapshot(
             OrgKpiDailyEntry.org_id == org_id,
             OrgKpiDailyEntry.entry_date >= range_start,
             OrgKpiDailyEntry.entry_date <= range_end,
+            OrgKpiDailyEntry.rep_user_id.is_(None),
         )
         .order_by(OrgKpiDailyEntry.entry_date.asc())
         .all()

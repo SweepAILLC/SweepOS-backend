@@ -113,6 +113,7 @@ def _dispatcher_loop() -> None:
     last_call_library_drain = 0.0
     last_stripe_catchup = 0.0
     last_instagram_sync = 0.0
+    last_instagram_dm_sync = 0.0
     call_library_drain_interval = float(
         getattr(settings, "CALL_LIBRARY_WORKER_DRAIN_INTERVAL_SEC", 180) or 180
     )
@@ -127,6 +128,11 @@ def _dispatcher_loop() -> None:
         instagram_sync_check_interval = float(
             getattr(settings, "INSTAGRAM_SYNC_INTERVAL_SEC", 86400) or 86400
         )
+    # NOT SHIPPED: Instagram DM data via Composio is still in progress and its
+    # module isn't part of this deploy — force-disabled (0 = never) regardless
+    # of settings so the block below is never reached (it would ImportError
+    # since app.services.instagram_dm_sync isn't present in this build).
+    instagram_dm_sync_interval = 0.0
     while not _SHUTDOWN:
         loop_started = time.time()
         try:
@@ -205,6 +211,29 @@ def _dispatcher_loop() -> None:
                     except Exception:
                         LOG.exception("instagram sync enqueue failed")
                     last_instagram_sync = now
+                if (
+                    instagram_dm_sync_interval > 0
+                    and now - last_instagram_dm_sync >= instagram_dm_sync_interval
+                ):
+                    try:
+                        from app.long_jobs import schedule_background_work
+                        from app.services.instagram_dm_sync import (
+                            sync_instagram_dms_all_orgs_job,
+                        )
+
+                        schedule_background_work(
+                            sync_instagram_dms_all_orgs_job,
+                            None,
+                            prefer_rq=True,
+                            job_timeout=1800,
+                        )
+                        LOG.info(
+                            "instagram dm sync enqueued (interval=%ss)",
+                            int(instagram_dm_sync_interval),
+                        )
+                    except Exception:
+                        LOG.exception("instagram dm sync enqueue failed")
+                    last_instagram_dm_sync = now
                 if attempted:
                     LOG.info("dispatcher: processed %d job(s)", attempted)
         except Exception:

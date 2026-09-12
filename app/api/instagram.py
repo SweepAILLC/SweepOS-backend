@@ -98,7 +98,7 @@ def _callback_url() -> str:
 
 
 def _frontend_integrations_url(*, connected: bool = False, error: Optional[str] = None) -> str:
-    front = (settings.FRONTEND_URL or "http://localhost:3002").rstrip("/")
+    front = (settings.FRONTEND_URL or "http://localhost:3003").rstrip("/")
     qs = "tab=integrations&instagram="
     qs += "connected" if connected else "error"
     if error:

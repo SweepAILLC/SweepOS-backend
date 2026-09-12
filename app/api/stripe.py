@@ -21,6 +21,7 @@ from app.models.stripe_subscription import StripeSubscription
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction, TreasuryTransactionStatus
 from app.models.client import Client
 from app.models.manual_payment import ManualPayment
+from app.models.whop_payment import WhopPayment
 from app.models.recommendation import Recommendation, RecommendationStatus
 from app.utils.stripe_ids import normalize_stripe_id, normalize_stripe_id_for_dedup
 from app.utils.stripe_helpers import collect_email_from_raw_events, extract_email_from_payment_raw
@@ -117,13 +118,291 @@ def _manual_payment_stripe_responses(
     return result
 
 
+def _whop_payment_stripe_responses(
+    db: Session,
+    org_id: uuid.UUID,
+    start_date: Optional[datetime],
+    end_date: Optional[datetime],
+    status_filter: Optional[str],
+) -> List[StripePaymentResponse]:
+    """Org Whop payments as StripePaymentResponse rows (Terminal recent transactions)."""
+    from app.services.whop_sync import (
+        WHOP_PAID_STATUSES,
+        _payer_email,
+        _payer_name,
+        stored_or_raw_amount_cents,
+    )
+
+    query = db.query(WhopPayment).filter(WhopPayment.org_id == org_id)
+    if start_date is not None and end_date is not None:
+        query = query.filter(
+            and_(WhopPayment.created_at >= start_date, WhopPayment.created_at <= end_date)
+        )
+    rows = query.order_by(desc(WhopPayment.created_at)).all()
+    client_map = _client_map_for_ids(db, [wp.client_id for wp in rows])
+    result: List[StripePaymentResponse] = []
+    for wp in rows:
+        raw_status = (wp.status or "").lower()
+        is_paid = raw_status in WHOP_PAID_STATUSES
+        display_status = "succeeded" if is_paid else raw_status
+        if status_filter == "succeeded" and not is_paid:
+            continue
+        if status_filter and status_filter != "succeeded" and display_status != status_filter:
+            continue
+        client = client_map.get(wp.client_id) if wp.client_id else None
+        raw = wp.raw if isinstance(wp.raw, dict) else {}
+        email = _payer_email(raw) if raw else None
+        payer_name = _payer_name(raw) if raw else None
+        disp_name, disp_email = _payment_display_client_info(client, transaction_email=email)
+        client_has_name = bool(
+            client and f"{client.first_name or ''} {client.last_name or ''}".strip()
+        )
+        if payer_name and not client_has_name:
+            disp_name = payer_name
+        created_ts = int(wp.created_at.timestamp()) if wp.created_at else 0
+        result.append(
+            StripePaymentResponse(
+                id=str(wp.id),
+                stripe_id=f"whop:{wp.whop_id}",
+                client_id=str(wp.client_id) if wp.client_id else None,
+                client_name=disp_name,
+                client_email=disp_email,
+                amount_cents=stored_or_raw_amount_cents(wp),
+                currency=wp.currency or "usd",
+                status=display_status,
+                subscription_id="Whop",
+                receipt_url=None,
+                created_at=created_ts,
+                payment_method="whop",
+            )
+        )
+    return result
+
+
+def _lookup_whop_payment(db: Session, org_id: uuid.UUID, payment_id: str) -> Optional[WhopPayment]:
+    pid: Optional[uuid.UUID] = None
+    try:
+        pid = uuid.UUID(payment_id)
+    except ValueError:
+        pid = None
+    if pid is not None:
+        row = (
+            db.query(WhopPayment)
+            .filter(WhopPayment.id == pid, WhopPayment.org_id == org_id)
+            .first()
+        )
+        if row:
+            return row
+    whop_id = payment_id[5:] if payment_id.startswith("whop:") else payment_id
+    return (
+        db.query(WhopPayment)
+        .filter(WhopPayment.org_id == org_id, WhopPayment.whop_id == whop_id)
+        .first()
+    )
+
+
+def _fold_payment_min_ts(dest: dict, cid, ts) -> None:
+    if cid and ts:
+        dest[cid] = min(dest[cid], ts) if cid in dest else ts
+
+
+def _fold_payment_max_ts(dest: dict, cid, ts) -> None:
+    if cid and ts:
+        dest[cid] = max(dest[cid], ts) if cid in dest else ts
+
+
+def _merge_whop_first_paid_by_client(db: Session, org_id: uuid.UUID, dest: dict) -> None:
+    from app.services.whop_sync import WHOP_PAID_STATUSES
+
+    rows = (
+        db.query(WhopPayment.client_id, func.min(WhopPayment.created_at))
+        .filter(
+            WhopPayment.org_id == org_id,
+            WhopPayment.client_id.isnot(None),
+            WhopPayment.status.in_(tuple(WHOP_PAID_STATUSES)),
+        )
+        .group_by(WhopPayment.client_id)
+        .all()
+    )
+    for cid, ts in rows:
+        _fold_payment_min_ts(dest, cid, ts)
+
+
+def _whop_last_paid_by_client(db: Session, org_id: uuid.UUID) -> dict:
+    from app.services.whop_sync import WHOP_PAID_STATUSES
+
+    dest = {}
+    rows = (
+        db.query(WhopPayment.client_id, func.max(WhopPayment.created_at))
+        .filter(
+            WhopPayment.org_id == org_id,
+            WhopPayment.client_id.isnot(None),
+            WhopPayment.status.in_(tuple(WHOP_PAID_STATUSES)),
+        )
+        .group_by(WhopPayment.client_id)
+        .all()
+    )
+    for cid, ts in rows:
+        _fold_payment_max_ts(dest, cid, ts)
+    return dest
+
+
+def _has_processor_payment_in_range(
+    db: Session,
+    org_id: uuid.UUID,
+    client_id,
+    after: datetime,
+    until: datetime,
+) -> bool:
+    from app.services.whop_sync import WHOP_PAID_STATUSES
+
+    stripe_hit = (
+        db.query(StripePayment.id)
+        .filter(
+            and_(
+                StripePayment.org_id == org_id,
+                StripePayment.client_id == client_id,
+                StripePayment.status == "succeeded",
+                StripePayment.created_at > after,
+                StripePayment.created_at <= until,
+            )
+        )
+        .first()
+    )
+    if stripe_hit:
+        return True
+    whop_hit = (
+        db.query(WhopPayment.id)
+        .filter(
+            and_(
+                WhopPayment.org_id == org_id,
+                WhopPayment.client_id == client_id,
+                WhopPayment.status.in_(tuple(WHOP_PAID_STATUSES)),
+                WhopPayment.created_at > after,
+                WhopPayment.created_at <= until,
+            )
+        )
+        .first()
+    )
+    return whop_hit is not None
+
+
+def _count_whop_failed_in_range(
+    db: Session, org_id: uuid.UUID, start_date: datetime, end_date: datetime
+) -> int:
+    from app.services.whop_sync import WHOP_FAILED_STATUSES
+
+    return (
+        db.query(func.count(func.distinct(WhopPayment.whop_id)))
+        .filter(
+            WhopPayment.org_id == org_id,
+            WhopPayment.status.in_(tuple(WHOP_FAILED_STATUSES)),
+            WhopPayment.created_at >= start_date,
+            WhopPayment.created_at <= end_date,
+        )
+        .scalar()
+        or 0
+    )
+
+
+def _build_failed_payments_from_whop(
+    db: Session,
+    org_id: uuid.UUID,
+    exclude_resolved: bool,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+) -> List["StripeFailedPaymentResponse"]:
+    from app.services.whop_sync import (
+        WHOP_FAILED_STATUSES,
+        _payer_email,
+        _payer_name,
+        stored_or_raw_amount_cents,
+    )
+
+    query = db.query(WhopPayment).filter(
+        WhopPayment.org_id == org_id,
+        WhopPayment.status.in_(tuple(WHOP_FAILED_STATUSES)),
+    )
+    if start_date is not None and end_date is not None:
+        query = query.filter(
+            and_(WhopPayment.created_at >= start_date, WhopPayment.created_at <= end_date)
+        )
+    rows = query.order_by(desc(WhopPayment.created_at)).all()
+    pending_by_client, rejected_by_client, rejected_by_payment_id = _payment_recovery_indexes(
+        db, org_id
+    )
+    client_map = _client_map_for_ids(db, [wp.client_id for wp in rows])
+    result = []
+    for wp in rows:
+        if exclude_resolved:
+            rejected_recovery = None
+            if wp.client_id:
+                rejected_recovery = rejected_by_client.get(wp.client_id)
+            if not rejected_recovery:
+                rejected_recovery = rejected_by_payment_id.get(str(wp.id))
+            if rejected_recovery:
+                continue
+        client = client_map.get(wp.client_id) if wp.client_id else None
+        raw = wp.raw if isinstance(wp.raw, dict) else {}
+        tx_email = _payer_email(raw) if raw else None
+        payer_name = _payer_name(raw) if raw else None
+        disp_name, disp_email = _payment_display_client_info(client, transaction_email=tx_email)
+        client_has_name = bool(
+            client and f"{client.first_name or ''} {client.last_name or ''}".strip()
+        )
+        if payer_name and not client_has_name:
+            disp_name = payer_name
+        ts = int(wp.created_at.timestamp()) if wp.created_at else 0
+        recovery = pending_by_client.get(wp.client_id) if wp.client_id else None
+        result.append(
+            StripeFailedPaymentResponse(
+                id=str(wp.id),
+                stripe_id=f"whop:{wp.whop_id}",
+                client_id=str(wp.client_id) if wp.client_id else None,
+                client_name=disp_name,
+                client_email=disp_email,
+                amount_cents=stored_or_raw_amount_cents(wp),
+                currency=wp.currency or "usd",
+                status="failed",
+                subscription_id="Whop",
+                receipt_url=None,
+                created_at=ts,
+                has_recovery_recommendation=recovery is not None,
+                recovery_recommendation_id=str(recovery.id) if recovery else None,
+                attempt_count=1,
+                first_attempt_at=ts,
+                latest_attempt_at=ts,
+                invoice_id=None,
+            )
+        )
+    return result
+
+
+def _merge_failed_with_whop(
+    existing: List["StripeFailedPaymentResponse"],
+    whop_rows: List["StripeFailedPaymentResponse"],
+) -> List["StripeFailedPaymentResponse"]:
+    seen = {r.stripe_id for r in existing if r.stripe_id}
+    seen.update(r.id for r in existing)
+    merged = list(existing)
+    for row in whop_rows:
+        if row.stripe_id in seen or row.id in seen:
+            continue
+        merged.append(row)
+        seen.add(row.stripe_id)
+        seen.add(row.id)
+    merged.sort(key=lambda r: r.latest_attempt_at, reverse=True)
+    return merged
+
+
 def _paginate_merged_payment_responses(
     stripe_rows: List[StripePaymentResponse],
     manual_rows: List[StripePaymentResponse],
     page: int,
     page_size: int,
+    extra_rows: Optional[List[StripePaymentResponse]] = None,
 ) -> List[StripePaymentResponse]:
-    merged = stripe_rows + manual_rows
+    merged = stripe_rows + manual_rows + (extra_rows or [])
     merged.sort(key=lambda p: p.created_at or 0, reverse=True)
     start = (page - 1) * page_size
     return merged[start : start + page_size]
@@ -478,15 +757,23 @@ def get_stripe_last_updated(
     Terminal tab uses this to refetch only when a webhook has fired (faster tab switch).
     """
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    token = db.query(OAuthToken).filter(
-        OAuthToken.provider == OAuthProvider.STRIPE,
+    tokens = db.query(OAuthToken).filter(
         OAuthToken.org_id == org_id,
-    ).first()
-    if not token:
+        or_(
+            OAuthToken.provider == OAuthProvider.STRIPE,
+            OAuthToken.provider == OAuthProvider.WHOP,
+        ),
+    ).all()
+    if not tokens:
         return {"last_updated": None, "last_updated_ms": None}
 
     # Webhooks are ideal, but manual sync should also advance this marker so Terminal refreshes.
-    candidates = [dt for dt in [token.last_webhook_processed_at, token.last_sync_at] if dt is not None]
+    # Include Whop so payment.succeeded ingest refreshes Recent transactions without a Stripe token.
+    candidates = []
+    for token in tokens:
+        candidates.extend(
+            [dt for dt in [token.last_webhook_processed_at, token.last_sync_at] if dt is not None]
+        )
     if not candidates:
         return {"last_updated": None, "last_updated_ms": None}
 
@@ -768,17 +1055,50 @@ def delete_payment(
     amount does not reappear when the other source is used.
     """
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    if not check_stripe_connected(db, org_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
-        )
+    stripe_connected = check_stripe_connected(db, org_id)
 
     pid: Optional[uuid.UUID] = None
     try:
         pid = uuid.UUID(payment_id)
     except ValueError:
         pid = None
+
+    whop_pay = _lookup_whop_payment(db, org_id, payment_id)
+    if whop_pay is not None:
+        try:
+            linked_client_id = whop_pay.client_id
+            db.delete(whop_pay)
+            db.flush()
+            if linked_client_id:
+                from app.api.clients.helpers import recompute_client_lifetime_revenue
+
+                linked = db.query(Client).filter(Client.id == linked_client_id, Client.org_id == org_id).first()
+                if linked:
+                    recompute_client_lifetime_revenue(db, org_id, linked)
+            db.commit()
+            from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+            invalidate_terminal_monthly_trends_cache(org_id)
+            return {
+                "success": True,
+                "message": "Whop payment deleted.",
+                "payment_id": payment_id,
+                "deleted_from": ["whop_payment"],
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to delete payment: {str(e)}",
+            )
+
+    if not stripe_connected:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Stripe not connected.",
+        )
 
     treasury = None
     stripe_pay = None
@@ -1082,6 +1402,7 @@ def get_stripe_summary(
                 first_by_client[cid] = min(first_by_client.get(cid, ts), ts) if cid in first_by_client else ts
     except Exception:
         pass
+    _merge_whop_first_paid_by_client(db, org_id, first_by_client)
     new_customers = sum(
         1 for _, first_ts in first_by_client.items()
         if start_date <= first_ts <= end_date
@@ -1130,7 +1451,8 @@ def get_stripe_summary(
     # and they haven't made a new payment since
     grace_period_cutoff = end_date - timedelta(days=30)
     
-    # Get clients with one-off payments
+    # Get clients with one-off payments (Stripe one-off + any Whop paid)
+    last_paid_by_client = {}
     clients_with_payments = db.query(
         StripePayment.client_id,
         func.max(StripePayment.created_at).label('last_payment_date')
@@ -1142,8 +1464,12 @@ def get_stripe_summary(
             StripePayment.subscription_id.is_(None)  # One-off payments only
         )
     ).group_by(StripePayment.client_id).all()
-    
     for client_id, last_payment_date in clients_with_payments:
+        _fold_payment_max_ts(last_paid_by_client, client_id, last_payment_date)
+    for client_id, last_payment_date in _whop_last_paid_by_client(db, org_id).items():
+        _fold_payment_max_ts(last_paid_by_client, client_id, last_payment_date)
+    
+    for client_id, last_payment_date in last_paid_by_client.items():
         if not client_id or not last_payment_date:
             continue
         
@@ -1153,16 +1479,9 @@ def get_stripe_summary(
         
         # Check if last payment was before grace period cutoff
         if last_payment_date < grace_period_cutoff:
-            # Check if client made any payment after last_payment_date but before end_date
-            has_renewal = db.query(StripePayment).filter(
-                and_(
-                    StripePayment.org_id == org_id,
-                    StripePayment.client_id == client_id,
-                    StripePayment.status == 'succeeded',
-                    StripePayment.created_at > last_payment_date,
-                    StripePayment.created_at <= end_date
-                )
-            ).first()
+            has_renewal = _has_processor_payment_in_range(
+                db, org_id, client_id, last_payment_date, end_date
+            )
             
             if not has_renewal:
                 # Churn date is last_payment_date + 30 days
@@ -1247,6 +1566,8 @@ def get_stripe_summary(
         except Exception as e2:
             print(f"[FAILED PAYMENTS COUNT] Error with fallback: {str(e2)}")
             failed_payments = 0
+
+    failed_payments += _count_whop_failed_in_range(db, org_id, start_date, end_date)
     
     # Define deduplication function - used by both revenue calculation and recent payments
     # This ensures revenue matches exactly what users see in the recent payments table
@@ -1880,13 +2201,20 @@ def get_payments(
     """
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
-    if not check_stripe_connected(db, org_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
+    stripe_connected = check_stripe_connected(db, org_id)
+
+    if not stripe_connected:
+        start_date, end_date = _payments_window_from_params(scope, range_days)
+        return _paginate_merged_payment_responses(
+            [],
+            _manual_payment_stripe_responses(db, org_id, start_date, end_date, status_filter),
+            page,
+            page_size,
+            extra_rows=_whop_payment_stripe_responses(
+                db, org_id, start_date, end_date, status_filter
+            ),
         )
-    
+
     # Use Treasury Transactions if requested — but prefer StripePayment when webhooks
     # have newer succeeded rows than Treasury (avoids ~hour lag on Finances/Stripe UI).
     if use_treasury:
@@ -1999,7 +2327,12 @@ def get_payments(
         manual_result = _manual_payment_stripe_responses(
             db, org_id, start_date, end_date, status_filter
         )
-        return _paginate_merged_payment_responses(stripe_result, manual_result, page, page_size)
+        whop_result = _whop_payment_stripe_responses(
+            db, org_id, start_date, end_date, status_filter
+        )
+        return _paginate_merged_payment_responses(
+            stripe_result, manual_result, page, page_size, extra_rows=whop_result
+        )
     
     # Fallback to old payment system (when use_treasury=False)
     # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
@@ -2111,7 +2444,12 @@ def get_payments(
     manual_result = _manual_payment_stripe_responses(
         db, org_id, start_date, end_date, status_filter
     )
-    return _paginate_merged_payment_responses(stripe_result, manual_result, page, page_size)
+    whop_result = _whop_payment_stripe_responses(
+        db, org_id, start_date, end_date, status_filter
+    )
+    return _paginate_merged_payment_responses(
+        stripe_result, manual_result, page, page_size, extra_rows=whop_result
+    )
 
 
 def _merge_treasury_and_stripe_failed_queues(
@@ -2326,16 +2664,24 @@ def get_failed_payments(
     """
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
-    if not check_stripe_connected(db, org_id):
+    from app.api.whop import check_whop_connected
+
+    stripe_connected = check_stripe_connected(db, org_id)
+    if not stripe_connected and not check_whop_connected(db, org_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
+            detail="No payment processor connected."
         )
     
     # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
     
     window_start, window_end = _payments_window_from_params(scope, range_days)
+    if not stripe_connected:
+        result = _build_failed_payments_from_whop(
+            db, org_id, exclude_resolved, window_start, window_end
+        )
+        result = _filter_failed_payments_by_window(result, scope, range_days)
+        return result[(page - 1) * page_size:page * page_size]
 
     # Use Treasury Transactions if requested
     if use_treasury and not _org_has_treasury_rows(db, org_id):
@@ -2434,6 +2780,10 @@ def get_failed_payments(
             db, org_id, exclude_resolved, window_start, window_end
         )
         merged = _merge_treasury_and_stripe_failed_queues(result, stripe_only)
+        merged = _merge_failed_with_whop(
+            merged,
+            _build_failed_payments_from_whop(db, org_id, exclude_resolved, window_start, window_end),
+        )
         merged.sort(key=lambda r: r.latest_attempt_at, reverse=True)
         merged = _filter_failed_payments_by_window(merged, scope, range_days)
         return merged[(page - 1) * page_size:page * page_size]
@@ -2441,6 +2791,10 @@ def get_failed_payments(
     # Fallback: StripePayment table only (no Treasury rows or use_treasury=False)
     result = _build_failed_payments_from_stripe_payment_table(
         db, org_id, exclude_resolved, window_start, window_end
+    )
+    result = _merge_failed_with_whop(
+        result,
+        _build_failed_payments_from_whop(db, org_id, exclude_resolved, window_start, window_end),
     )
     result = _filter_failed_payments_by_window(result, scope, range_days)
     return result[(page - 1) * page_size:page * page_size]
@@ -2454,11 +2808,12 @@ def get_client_revenue(
     """Get single-client revenue panel"""
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
-    if not check_stripe_connected(db, org_id):
+    from app.api.whop import check_whop_connected
+
+    if not check_stripe_connected(db, org_id) and not check_whop_connected(db, org_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
+            detail="No payment processor connected."
         )
     
     from uuid import UUID
@@ -2492,7 +2847,9 @@ def get_client_revenue(
         )
     ).first()
     
-    # Get payment history
+    # Get payment history (Stripe + Whop)
+    from app.services.whop_sync import WHOP_PAID_STATUSES, stored_or_raw_amount_cents
+
     payments = db.query(StripePayment).filter(
         StripePayment.client_id == client_uuid
     ).order_by(desc(StripePayment.created_at)).limit(20).all()
@@ -2507,6 +2864,26 @@ def get_client_revenue(
         }
         for p in payments
     ]
+    whop_rows = (
+        db.query(WhopPayment)
+        .filter(WhopPayment.client_id == client_uuid, WhopPayment.org_id == org_id)
+        .order_by(desc(WhopPayment.created_at))
+        .limit(20)
+        .all()
+    )
+    for wp in whop_rows:
+        raw_status = (wp.status or "").lower()
+        payment_history.append(
+            {
+                "id": str(wp.id),
+                "amount_cents": stored_or_raw_amount_cents(wp),
+                "status": "succeeded" if raw_status in WHOP_PAID_STATUSES else raw_status,
+                "created_at": wp.created_at,
+                "receipt_url": None,
+            }
+        )
+    payment_history.sort(key=lambda row: row["created_at"] or datetime.min, reverse=True)
+    payment_history = payment_history[:20]
     
     disp_name, disp_email = _payment_display_client_info(client)
     return StripeClientRevenueResponse(
@@ -2583,6 +2960,7 @@ def get_churn_analytics(
                 first_by_client_churn[cid] = min(first_by_client_churn.get(cid, ts), ts) if cid in first_by_client_churn else ts
     except Exception:
         pass
+    _merge_whop_first_paid_by_client(db, org_id, first_by_client_churn)
     
     # Track clients who have churned (to prevent double-counting in same lifecycle)
     # Key: client_id, Value: (churn_date, lifecycle_start_date)
@@ -2645,8 +3023,7 @@ def get_churn_analytics(
         # Calculate the cutoff date: 30 days before month_end
         grace_period_cutoff = month_end - timedelta(days=30)
         
-        # Get all clients who have made one-off payments (no subscription)
-        # Group by client and get their last payment date
+        last_paid_by_client = {}
         clients_with_payments = db.query(
             StripePayment.client_id,
             func.max(StripePayment.created_at).label('last_payment_date')
@@ -2659,8 +3036,12 @@ def get_churn_analytics(
                 StripePayment.subscription_id.is_(None)
             )
         ).group_by(StripePayment.client_id).all()
-        
         for client_id, last_payment_date in clients_with_payments:
+            _fold_payment_max_ts(last_paid_by_client, client_id, last_payment_date)
+        for client_id, last_payment_date in _whop_last_paid_by_client(db, org_id).items():
+            _fold_payment_max_ts(last_paid_by_client, client_id, last_payment_date)
+        
+        for client_id, last_payment_date in last_paid_by_client.items():
             if not client_id or not last_payment_date:
                 continue
             
@@ -2670,17 +3051,9 @@ def get_churn_analytics(
             
             # Check if last payment was before the grace period cutoff
             if last_payment_date < grace_period_cutoff:
-                # Check if client made any payment after last_payment_date but before month_end
-                # If they did, they didn't churn (they renewed within grace period)
-                has_renewal = db.query(StripePayment).filter(
-                    and_(
-                        StripePayment.org_id == org_id,
-                        StripePayment.client_id == client_id,
-                        StripePayment.status == 'succeeded',
-                        StripePayment.created_at > last_payment_date,
-                        StripePayment.created_at <= month_end
-                    )
-                ).first()
+                has_renewal = _has_processor_payment_in_range(
+                    db, org_id, client_id, last_payment_date, month_end
+                )
                 
                 if not has_renewal:
                     # Client churned: last payment was 30+ days ago and no renewal
@@ -2697,15 +3070,9 @@ def get_churn_analytics(
                             if last_churn_info:
                                 last_churn_date = last_churn_info[0]
                                 # Check if client made any payment after last churn but before this churn
-                                has_payment_after_churn = db.query(StripePayment).filter(
-                                    and_(
-                                        StripePayment.org_id == org_id,
-                                        StripePayment.client_id == client_id,
-                                        StripePayment.status == 'succeeded',
-                                        StripePayment.created_at > last_churn_date,
-                                        StripePayment.created_at <= churn_date
-                                    )
-                                ).first()
+                                has_payment_after_churn = _has_processor_payment_in_range(
+                                    db, org_id, client_id, last_churn_date, churn_date
+                                )
                                 
                                 has_sub_after_churn = db.query(StripeSubscription).filter(
                                     and_(
@@ -3259,14 +3626,72 @@ def assign_payment_to_client(
     """
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
-    if not check_stripe_connected(db, org_id):
+    from app.api.whop import check_whop_connected
+
+    stripe_connected = check_stripe_connected(db, org_id)
+    whop_connected = check_whop_connected(db, org_id)
+    if not stripe_connected and not whop_connected:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
+            detail="No payment processor connected."
         )
     
     try:
+        whop_pay = _lookup_whop_payment(db, org_id, payment_id)
+        if whop_pay is not None:
+            client_uuid = uuid.UUID(client_id)
+            client = db.query(Client).filter(
+                Client.id == client_uuid,
+                Client.org_id == org_id
+            ).first()
+            if not client:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Client with ID {client_id} not found or doesn't belong to your organization."
+                )
+            previous_client_id = whop_pay.client_id
+            whop_pay.client_id = client_uuid
+            whop_pay.updated_at = datetime.utcnow()
+            db.flush()
+            from app.api.clients.helpers import recompute_client_lifetime_revenue
+
+            recompute_client_lifetime_revenue(db, org_id, client)
+            if previous_client_id and previous_client_id != client_uuid:
+                previous = db.query(Client).filter(
+                    Client.id == previous_client_id, Client.org_id == org_id
+                ).first()
+                if previous:
+                    recompute_client_lifetime_revenue(db, org_id, previous)
+            try:
+                from app.services.client_automation import (
+                    apply_automatic_lifecycle_for_client,
+                    move_client_to_active_on_payment,
+                )
+
+                apply_automatic_lifecycle_for_client(db, client)
+                move_client_to_active_on_payment(db, client)
+            except Exception:
+                pass
+            db.commit()
+            from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
+
+            invalidate_terminal_monthly_trends_cache(org_id)
+            disp_name, _ = _payment_display_client_info(client)
+            return {
+                "success": True,
+                "message": f"Payment assigned to {disp_name}",
+                "payment_id": payment_id,
+                "client_id": client_id,
+                "client_name": disp_name,
+                "reconciliation": None,
+            }
+
+        if not stripe_connected:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Payment with ID {payment_id} not found or doesn't belong to your organization."
+            )
+
         payment_uuid = uuid.UUID(payment_id)
         payment = db.query(StripePayment).filter(
             StripePayment.id == payment_uuid,
@@ -3365,46 +3790,49 @@ def resolve_failed_payment_alert(
     """
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
-    
-    if not check_stripe_connected(db, org_id):
+    from app.api.whop import check_whop_connected
+
+    if not check_stripe_connected(db, org_id) and not check_whop_connected(db, org_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Stripe not connected."
+            detail="No payment processor connected."
         )
     
     try:
         # Find the payment to get client_id for recommendation lookup
-        payment_uuid = uuid.UUID(payment_id)
         client_id_for_recommendation = None
-        
-        # Try StripePayment table first
-        payment = db.query(StripePayment).filter(
-            StripePayment.id == payment_uuid,
-            StripePayment.org_id == org_id
-        ).first()
-        
-        if payment:
-            client_id_for_recommendation = payment.client_id
-            stripe_id = payment.stripe_id
-            print(f"[RESOLVE] Resolving failed payment alert for StripePayment {stripe_id} (ID: {payment_id})")
+        whop_pay = _lookup_whop_payment(db, org_id, payment_id)
+        if whop_pay is not None:
+            client_id_for_recommendation = whop_pay.client_id
+            print(f"[RESOLVE] Resolving failed payment alert for Whop {whop_pay.whop_id} (ID: {payment_id})")
         else:
-            # Try Treasury Transactions table
-            transaction = db.query(StripeTreasuryTransaction).filter(
-                and_(
-                    StripeTreasuryTransaction.id == payment_uuid,
-                    StripeTreasuryTransaction.org_id == org_id
-                )
+            payment_uuid = uuid.UUID(payment_id)
+            payment = db.query(StripePayment).filter(
+                StripePayment.id == payment_uuid,
+                StripePayment.org_id == org_id
             ).first()
             
-            if transaction:
-                client_id_for_recommendation = transaction.client_id
-                transaction_id = transaction.stripe_transaction_id
-                print(f"[RESOLVE] Resolving failed payment alert for Treasury transaction {transaction_id} (ID: {payment_id})")
+            if payment:
+                client_id_for_recommendation = payment.client_id
+                stripe_id = payment.stripe_id
+                print(f"[RESOLVE] Resolving failed payment alert for StripePayment {stripe_id} (ID: {payment_id})")
             else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Payment with ID {payment_id} not found or doesn't belong to your organization."
-                )
+                transaction = db.query(StripeTreasuryTransaction).filter(
+                    and_(
+                        StripeTreasuryTransaction.id == payment_uuid,
+                        StripeTreasuryTransaction.org_id == org_id
+                    )
+                ).first()
+                
+                if transaction:
+                    client_id_for_recommendation = transaction.client_id
+                    transaction_id = transaction.stripe_transaction_id
+                    print(f"[RESOLVE] Resolving failed payment alert for Treasury transaction {transaction_id} (ID: {payment_id})")
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Payment with ID {payment_id} not found or doesn't belong to your organization."
+                    )
         
         # Mark any associated recovery recommendations as rejected, or create one if it doesn't exist
         if client_id_for_recommendation:

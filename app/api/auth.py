@@ -16,7 +16,7 @@ from app.models.user import (
 )
 from app.models.user_organization import UserOrganization
 from app.models.organization import Organization
-from app.schemas.user import UserLogin, Token, User as UserSchema, UserSettingsUpdate, LoginResponse
+from app.schemas.user import UserLogin, Token, User as UserSchema, UserSettingsUpdate, LoginResponse, OnboardingFormCompleteRequest
 from app.schemas.organization import UserOrganizationResponse, OrganizationSwitchRequest
 from app.schemas.invitation import InviteValidateResponse, InviteAcceptRequest, InviteAcceptResponse
 from app.core.security import verify_password, create_access_token, get_password_hash
@@ -24,7 +24,7 @@ from app.core.config import settings
 from app.core.rate_limit import rate_limit, check_sliding_window
 from app.core.request_ip import get_client_ip
 from app.api.deps import get_current_user, user_is_system_owner, is_sudo_admin
-from app.services.fathom_client import normalize_fathom_api_key
+from app.services.fathom_client import normalize_fathom_api_key, encrypt_fathom_api_key, decrypt_fathom_api_key
 
 router = APIRouter()
 _logger = logging.getLogger(__name__)
@@ -257,21 +257,38 @@ def _organization_name(db: Session, org_id: UUID) -> Optional[str]:
 
 
 def _organization_portal_fields(db: Session, org_id: UUID) -> tuple:
-    """Return (org_name, consulting_tier, booking_url) for the given org."""
+    """Return (org_name, consulting_tier, booking_url, program_start, program_end)."""
     row = db.query(Organization).filter(Organization.id == org_id).first()
     if not row:
-        return None, None, None
+        return None, None, None, None, None
     return (
         row.name,
         getattr(row, "consulting_tier", None),
         getattr(row, "booking_url", None),
+        getattr(row, "program_start_date", None),
+        getattr(row, "program_end_date", None),
+    )
+
+
+def _onboarding_form_flags(db: Session, user_id: UUID) -> tuple[bool, bool, bool, bool]:
+    row = db.query(User).filter(User.id == user_id).first()
+    if not row:
+        return False, False, False, False
+    return (
+        getattr(row, "onboarding_csa_completed_at", None) is not None,
+        getattr(row, "onboarding_intake_completed_at", None) is not None,
+        getattr(row, "onboarding_call_booked_at", None) is not None,
+        getattr(row, "onboarding_tour_completed_at", None) is not None,
     )
 
 
 def _user_schema_response(current_user: User, db: Session) -> UserSchema:
     role_value = role_to_api(current_user.role)
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    org_name, consulting_tier, booking_url = _organization_portal_fields(db, org_id)
+    org_name, consulting_tier, booking_url, program_start_date, program_end_date = (
+        _organization_portal_fields(db, org_id)
+    )
+    csa_done, intake_done, call_booked, tour_done = _onboarding_form_flags(db, current_user.id)
     return UserSchema(
         id=current_user.id,
         org_id=org_id,
@@ -283,8 +300,52 @@ def _user_schema_response(current_user: User, db: Session) -> UserSchema:
         is_sudo_admin=is_sudo_admin(current_user),
         consulting_tier=consulting_tier,
         booking_url=booking_url,
+        program_start_date=program_start_date,
+        program_end_date=program_end_date,
         created_at=current_user.created_at,
+        onboarding_csa_completed=csa_done,
+        onboarding_intake_completed=intake_done,
+        onboarding_call_booked=call_booked,
+        onboarding_tour_completed=tour_done,
     )
+
+
+
+@router.post("/me/onboarding-forms", response_model=UserSchema)
+def complete_onboarding_form(
+    body: OnboardingFormCompleteRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Record Tally first-login form submit (CSA or intake) or Cal.com booking. Idempotent."""
+    check_sliding_window(
+        f"onboarding_forms:{current_user.id}",
+        max_requests=20,
+        window_seconds=300,
+        db=db,
+        audit_user=current_user,
+        audit_request=request,
+        endpoint_name="complete_onboarding_form",
+    )
+    form_id = (body.form_id or "").strip()
+    if form_id not in ("mJyDAX", "KY0yqg", "cal_onboarding", "product_tour"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown onboarding form")
+    user_row = db.query(User).filter(User.id == current_user.id).first()
+    if not user_row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    now = datetime.utcnow()
+    if form_id == "mJyDAX" and user_row.onboarding_csa_completed_at is None:
+        user_row.onboarding_csa_completed_at = now
+    if form_id == "KY0yqg" and user_row.onboarding_intake_completed_at is None:
+        user_row.onboarding_intake_completed_at = now
+    if form_id == "cal_onboarding" and getattr(user_row, "onboarding_call_booked_at", None) is None:
+        user_row.onboarding_call_booked_at = now
+    if form_id == "product_tour" and getattr(user_row, "onboarding_tour_completed_at", None) is None:
+        user_row.onboarding_tour_completed_at = now
+    db.commit()
+    db.refresh(user_row)
+    return _user_schema_response(current_user, db)
 
 
 @router.get("/me", response_model=UserSchema)
@@ -373,7 +434,13 @@ def update_user_settings(
         if not org:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
         new_key = normalize_fathom_api_key(settings_data.fathom_api_key)
-        org.fathom_api_key = new_key
+        try:
+            org.fathom_api_key = encrypt_fathom_api_key(new_key)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Server encryption is not configured (set ENCRYPTION_KEY). Cannot store API keys.",
+            ) from e
 
     if settings_data.ai_profile is not None:
         from app.services.org_intelligence_profile import set_org_ai_profile
@@ -382,23 +449,15 @@ def update_user_settings(
 
     db.commit()
     db.refresh(user_row)
+    if settings_data.ai_profile is not None:
+        try:
+            from app.services.content_angle_map import maybe_queue_initial_generation
 
-    role_value = role_to_api(user_row.role)
-    org_id = getattr(current_user, "selected_org_id", user_row.org_id)
-    org_name, consulting_tier, booking_url = _organization_portal_fields(db, org_id)
-    return UserSchema(
-        id=user_row.id,
-        org_id=org_id,
-        org_name=org_name,
-        email=user_row.email,
-        role=role_value,
-        is_admin=user_row.is_admin,
-        is_system_owner=user_is_system_owner(current_user, db),
-        is_sudo_admin=is_sudo_admin(current_user),
-        consulting_tier=consulting_tier,
-        booking_url=booking_url,
-        created_at=user_row.created_at,
-    )
+            org_id_cam = getattr(current_user, "selected_org_id", None) or current_user.org_id
+            maybe_queue_initial_generation(org_id_cam)
+        except Exception:
+            _logger.warning("content_angle_map initial generation queue skipped", exc_info=True)
+    return _user_schema_response(current_user, db)
 
 
 @router.get("/me/settings")
@@ -419,9 +478,9 @@ def get_user_settings(
     org_row = db.query(Organization).filter(Organization.id == org_id_settings).first()
     fathom_key = None
     if org_row is not None:
-        fathom_key = getattr(org_row, "fathom_api_key", None)
+        fathom_key = decrypt_fathom_api_key(getattr(org_row, "fathom_api_key", None))
     if not fathom_key and user_row:
-        fathom_key = getattr(user_row, "fathom_api_key", None)
+        fathom_key = decrypt_fathom_api_key(getattr(user_row, "fathom_api_key", None))
 
     google_connected = bool(user_row and user_row.google_id)
     google_email = (user_row.google_email if user_row else None) or None
@@ -665,17 +724,62 @@ def validate_invitation_token(
     ).first()
     if not inv:
         return InviteValidateResponse(valid=False, message="Invalid or expired invitation")
-    if inv.expires_at <= datetime.utcnow():
+    from app.services.organization_invitations import invitation_is_expired
+
+    if invitation_is_expired(inv):
         return InviteValidateResponse(valid=False, message="Invitation has expired")
-    org = db.query(Organization).filter(Organization.id == inv.org_id).first()
+    org = (
+        db.query(Organization).filter(Organization.id == inv.org_id).first()
+        if inv.org_id
+        else None
+    )
     org_name = org.name if org else None
+    from app.services.organization_invitations import bound_invitee_email
+
+    bound_email = bound_invitee_email(inv)
     return InviteValidateResponse(
         valid=True,
         org_name=org_name,
         invitation_type=inv.invitation_type,
         role=inv.role,
         expires_at=inv.expires_at,
+        needs_email=bound_email is None,
+        needs_org_name=inv.org_id is None,
+        invitee_email=bound_email,
     )
+
+
+def _require_password_proof_for_open_invite(
+    was_open_invite: bool,
+    existing_user: User,
+    provided_password: Optional[str],
+) -> None:
+    """
+    SECURITY: on an open/unbound invite (invitee_email unset — e.g. the
+    platform-admin-minted org signup link), the email used to look up
+    existing_user was typed by whoever holds the link — not vetted by any
+    admin. Without this check, anyone with the link could type in a KNOWN
+    existing user's email and walk away with a fully valid access_token for
+    that account — a password-free account takeover, since org access
+    elsewhere (see switch_organization) is resolved by email. Require proof
+    of ownership. Bound invites (admin explicitly typed this exact email) are
+    trusted input and skip this — see accept_invitation for was_open_invite.
+    """
+    if not was_open_invite:
+        return
+    if not existing_user.hashed_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "An account with this email already exists and uses Google sign-in. "
+                "Log in with Google first, then ask an org admin to add you instead."
+            ),
+        )
+    if not provided_password or not verify_password(provided_password, existing_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="An account with this email already exists. Enter its password to join this organization.",
+        )
 
 
 @router.post("/invite/accept", response_model=InviteAcceptResponse)
@@ -701,14 +805,31 @@ def accept_invitation(
     ).first()
     if not inv:
         raise HTTPException(status_code=400, detail="Invalid or already used invitation")
-    if inv.expires_at <= datetime.utcnow():
+    from app.services.organization_invitations import invitation_is_expired as _invite_expired
+
+    if _invite_expired(inv):
         raise HTTPException(status_code=400, detail="Invitation has expired")
 
-    org = db.query(Organization).filter(Organization.id == inv.org_id).first()
-    if not org:
-        raise HTTPException(status_code=400, detail="Organization not found")
+    from app.services.organization_invitations import (
+        bound_invitee_email,
+        consume_invitation,
+        ensure_invite_organization,
+        is_multi_use,
+        resolve_invitation_email,
+    )
 
-    email_normalized = inv.invitee_email.strip().lower()
+    # Captured before any mutation below: an "open" link (invitee_email unset,
+    # e.g. the platform-admin-minted org signup link) lets the ACCEPTOR choose
+    # any email — untrusted input. A "bound" link had a specific email chosen
+    # by the admin who created it — trusted input. See the existing_user branch
+    # below for why this distinction is security-critical, not just bookkeeping.
+    was_open_invite = bound_invitee_email(inv) is None
+
+    org = ensure_invite_organization(db, inv, body.org_name)
+
+    email_normalized = resolve_invitation_email(inv, body.email)
+    if not is_multi_use(inv):
+        inv.invitee_email = email_normalized
     role_normalized = (inv.role or "member").strip().lower()
     if role_normalized not in ("owner", "admin", "member"):
         role_normalized = "member"
@@ -718,20 +839,22 @@ def accept_invitation(
     if existing_user:
         in_org_user = db.query(User).filter(
             func.lower(User.email) == email_normalized,
-            User.org_id == inv.org_id,
+            User.org_id == org.id,
         ).first()
         if in_org_user:
             raise HTTPException(status_code=400, detail="You are already in this organization")
 
         already_linked = db.query(UserOrganization).filter(
-            UserOrganization.org_id == inv.org_id,
+            UserOrganization.org_id == org.id,
             UserOrganization.user_id == existing_user.id,
         ).first()
         if already_linked:
             raise HTTPException(status_code=400, detail="You are already in this organization")
 
+        _require_password_proof_for_open_invite(was_open_invite, existing_user, body.password)
+
         if org.max_user_seats is not None:
-            current_count = db.query(func.count(User.id)).filter(User.org_id == inv.org_id).scalar() or 0
+            current_count = db.query(func.count(User.id)).filter(User.org_id == org.id).scalar() or 0
             if current_count >= org.max_user_seats:
                 raise HTTPException(
                     status_code=403,
@@ -747,7 +870,7 @@ def accept_invitation(
             """),
             {
                 "id": org_user_id,
-                "org_id": inv.org_id,
+                "org_id": org.id,
                 "email": email_normalized,
                 "hashed_password": existing_user.hashed_password,
                 "role": userrole_bind_value(user_role),
@@ -757,17 +880,17 @@ def accept_invitation(
         db.add(
             UserOrganization(
                 user_id=org_user_id,
-                org_id=inv.org_id,
+                org_id=org.id,
                 is_primary=False,
             )
         )
-        inv.used_at = datetime.utcnow()
+        consume_invitation(inv)
         db.commit()
         access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             data={
                 "sub": email_normalized,
-                "org_id": str(inv.org_id),
+                "org_id": str(org.id),
                 "user_id": str(org_user_id),
                 "role": role_to_api(user_role),
             },
@@ -776,7 +899,7 @@ def accept_invitation(
         return InviteAcceptResponse(
             access_token=access_token,
             token_type="bearer",
-            org_id=inv.org_id,
+            org_id=org.id,
             user_id=org_user_id,
             existing_user=True,
             message="You have been added to this organization.",
@@ -795,13 +918,13 @@ def accept_invitation(
     # Check email not already in this org (shouldn't be, but safety)
     in_org = db.query(User).filter(
         func.lower(User.email) == email_normalized,
-        User.org_id == inv.org_id,
+        User.org_id == org.id,
     ).first()
     if in_org:
         raise HTTPException(status_code=400, detail="A user with this email already exists in this organization")
 
     if org.max_user_seats is not None:
-        current_count = db.query(func.count(User.id)).filter(User.org_id == inv.org_id).scalar() or 0
+        current_count = db.query(func.count(User.id)).filter(User.org_id == org.id).scalar() or 0
         if current_count >= org.max_user_seats:
             raise HTTPException(
                 status_code=403,
@@ -818,7 +941,7 @@ def accept_invitation(
         """),
         {
             "id": new_user_id,
-            "org_id": inv.org_id,
+            "org_id": org.id,
             "email": email_normalized,
             "hashed_password": get_password_hash(password),
             "role": userrole_bind_value(user_role),
@@ -827,18 +950,18 @@ def accept_invitation(
     )
     uo = UserOrganization(
         user_id=new_user_id,
-        org_id=inv.org_id,
+        org_id=org.id,
         is_primary=True,
     )
     db.add(uo)
-    inv.used_at = datetime.utcnow()
+    consume_invitation(inv)
     db.commit()
 
     access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={
             "sub": email_normalized,
-            "org_id": str(inv.org_id),
+            "org_id": str(org.id),
             "user_id": str(new_user_id),
             "role": role_to_api(user_role),
         },
@@ -847,7 +970,7 @@ def accept_invitation(
     return InviteAcceptResponse(
         access_token=access_token,
         token_type="bearer",
-        org_id=inv.org_id,
+        org_id=org.id,
         user_id=new_user_id,
         existing_user=False,
         message="Account created. You are now signed in.",

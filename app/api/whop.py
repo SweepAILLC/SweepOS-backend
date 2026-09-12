@@ -56,10 +56,11 @@ def whop_status(db: Session = Depends(get_db), current_user: User = Depends(get_
         .first()
     )
     if not t:
-        return WhopConnectionStatus(connected=False, message="Whop is not connected.")
+        return WhopConnectionStatus(connected=False, webhook_active=False, message="Whop is not connected.")
     return WhopConnectionStatus(
         connected=True,
         company_id=t.account_id,
+        webhook_active=bool(t.webhook_endpoint_id and t.webhook_secret),
         message="Whop is connected.",
     )
 
@@ -71,6 +72,27 @@ def whop_connect(
     current_user: User = Depends(require_admin_or_owner),
 ):
     org_id = _org_id(current_user)
+
+    # Same 3-attempts/15-minute guard as the Stripe/Brevo direct-API-key-connect
+    # endpoints — this one was missing it, letting an authenticated admin hammer
+    # Whop's credential-validation API (and this endpoint) without limit.
+    from app.core.rate_limit import _rate_limit_store, _rate_limit_lock, _cleanup_old_entries
+
+    _cleanup_old_entries()
+    identifier = f"whop_connect_{current_user.id}_{org_id}"
+    now = datetime.utcnow()
+    window_start = now - timedelta(seconds=900)
+    with _rate_limit_lock:
+        if identifier not in _rate_limit_store:
+            _rate_limit_store[identifier] = []
+        recent_requests = [ts for ts, _ in _rate_limit_store[identifier] if ts > window_start]
+        if len(recent_requests) >= 3:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded: 3 Whop connection attempts per 15 minutes. Please try again later.",
+            )
+        _rate_limit_store[identifier].append((now, 1))
+
     try:
         whop_client.validate_credentials(body.api_key.strip(), body.company_id.strip())
     except ValueError as e:
@@ -121,6 +143,10 @@ def whop_connect(
         )
         raise HTTPException(status_code=503, detail=f"{hint}({e.__class__.__name__})") from e
 
+    from app.services.whop_webhook_onboard import ensure_whop_webhook_for_org
+
+    webhook_result = ensure_whop_webhook_for_org(org_id, db=db, force=True)
+
     import threading
 
     def bg():
@@ -133,18 +159,49 @@ def whop_connect(
             bg_db.close()
 
     threading.Thread(target=bg, daemon=True).start()
-    return {"success": True, "message": "Whop connected. Initial sync started in the background."}
+    message = "Whop connected. Initial sync started in the background."
+    if webhook_result.get("webhook_active"):
+        message = "Whop connected. Webhook registered; new payments ingest automatically. Initial sync started."
+    elif webhook_result.get("message"):
+        message = f"Whop connected. {webhook_result.get('message')} Initial sync started."
+    elif webhook_result.get("error"):
+        message = f"Whop connected. Webhook not registered ({webhook_result.get('error')}). Use Sync payments as fallback. Initial sync started."
+    return {
+        "success": True,
+        "message": message,
+        "webhook_active": bool(webhook_result.get("webhook_active")),
+        "webhook": webhook_result,
+    }
 
 
 @router.post("/disconnect", status_code=status.HTTP_200_OK)
 def whop_disconnect(db: Session = Depends(get_db), current_user: User = Depends(require_admin_or_owner)):
     org_id = _org_id(current_user)
+    from app.services.whop_webhook_onboard import delete_whop_webhook_for_org
+
+    delete_whop_webhook_for_org(org_id, db=db)
     db.query(OAuthToken).filter(
         OAuthToken.org_id == org_id,
         OAuthToken.provider == OAuthProvider.WHOP,
     ).delete()
     db.commit()
     return {"success": True}
+
+
+@router.post("/repair-webhook", status_code=status.HTTP_200_OK)
+def whop_repair_webhook(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    org_id = _org_id(current_user)
+    if not check_whop_connected(db, org_id):
+        raise HTTPException(status_code=404, detail="Whop not connected.")
+    from app.services.whop_webhook_onboard import ensure_whop_webhook_for_org
+
+    result = ensure_whop_webhook_for_org(org_id, db=db, force=True)
+    if not result.get("success") and result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @router.post("/sync", status_code=status.HTTP_200_OK)
@@ -156,6 +213,15 @@ def whop_sync(
     org_id = _org_id(current_user)
     if not check_whop_connected(db, org_id):
         raise HTTPException(status_code=404, detail="Whop not connected.")
+    from app.services.whop_webhook_onboard import ensure_whop_webhook_for_org
+
+    token = (
+        db.query(OAuthToken)
+        .filter(OAuthToken.org_id == org_id, OAuthToken.provider == OAuthProvider.WHOP)
+        .first()
+    )
+    if token and not (token.webhook_endpoint_id and token.webhook_secret):
+        ensure_whop_webhook_for_org(org_id, db=db, force=False)
     out = sync_whop_incremental(db, org_id=org_id, force_full=force_full)
     if out.get("error"):
         raise HTTPException(status_code=400, detail=out["error"])
@@ -163,7 +229,9 @@ def whop_sync(
 
 
 def _whop_succeeded(p: WhopPayment) -> bool:
-    return (p.status or "").lower() == "paid"
+    from app.services.whop_sync import WHOP_PAID_STATUSES
+
+    return (p.status or "").lower() in WHOP_PAID_STATUSES
 
 
 @router.get("/summary", response_model=WhopSummaryOut)

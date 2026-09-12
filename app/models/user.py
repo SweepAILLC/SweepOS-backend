@@ -97,6 +97,13 @@ class User(Base):
     ai_profile = Column(JSON, nullable=True)
     google_id = Column(String, nullable=True, index=True)
     google_email = Column(String, nullable=True)
+    # First-login Tally embeds (CSA mJyDAX, intake KY0yqg). Null = still required.
+    onboarding_csa_completed_at = Column(DateTime, nullable=True)
+    onboarding_intake_completed_at = Column(DateTime, nullable=True)
+    # Cal.com onboarding call booking. Null = still required.
+    onboarding_call_booked_at = Column(DateTime, nullable=True)
+    # Driver.js first-run product tour. Null = still required. Org-scoped user row.
+    onboarding_tour_completed_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         {"schema": None},

@@ -665,6 +665,37 @@ def submit_close_survey(
     db.commit()
     db.refresh(client)
 
+    try:
+        from app.services import discord_notify
+
+        client_name = " ".join(
+            p for p in (getattr(client, "first_name", None), getattr(client, "last_name", None)) if p
+        ) or "Unknown client"
+        outcome_label = {"yes": "Closed", "no": "No close", "no_show": "No-show"}.get(outcome, outcome)
+        notify_fields: List[tuple] = [("Outcome", outcome_label)]
+        if body.payment_source != "none":
+            notify_fields.append(("Payment source", body.payment_source))
+        if cash_cents:
+            notify_fields.append(("Cash collected", f"${cash_cents / 100:.2f}"))
+        if body.offer_name:
+            notify_fields.append(("Offer", body.offer_name))
+        if contract_cents:
+            notify_fields.append(("Contract amount", f"${contract_cents / 100:.2f}"))
+        if closer_name:
+            notify_fields.append(("Closer", closer_name))
+        if lead_source_label:
+            notify_fields.append(("Lead source", lead_source_label))
+
+        discord_notify.send_discord_event_background(
+            org.id,
+            "post_call",
+            title=f"Post-call form submitted — {client_name}",
+            description=(body.call_notes or "").strip()[:300] or None,
+            fields=notify_fields,
+        )
+    except Exception as e:
+        LOG.warning("discord_notify post_call (close survey) skipped: %s", e)
+
     # 6) KPI + terminal refresh async (public form stays fast; works offline for users)
     revenue_delta_usd = 0.0
     if contract_cents is not None or body.offer_slot:

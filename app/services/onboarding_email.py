@@ -59,19 +59,6 @@ def send_onboarding_email(
 INVITATION_EXPIRES_DAYS = 7
 
 
-def send_org_admin_invitation_email(to_email: str, org_name: str, invitation_link: str) -> bool:
-    """Send email inviting someone to set up an organization as org admin."""
-    subject = f"You've been invited to set up {org_name} on Sweep OS"
-    html = f"""
-    <p>You've been invited to set up <strong>{org_name}</strong> on Sweep OS.</p>
-    <p>Click the link below to create your account and set your password. This link expires in {INVITATION_EXPIRES_DAYS} days.</p>
-    <p><a href="{invitation_link}">{invitation_link}</a></p>
-    <p>After you sign in, you can add the system owner to your organization from the Owner tab.</p>
-    <p>If you didn't expect this email, you can ignore it.</p>
-    """
-    return send_onboarding_email(to_email, subject, html)
-
-
 def send_user_invitation_email(
     to_email: str,
     org_name: str,

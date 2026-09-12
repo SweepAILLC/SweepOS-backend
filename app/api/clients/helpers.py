@@ -312,6 +312,79 @@ def client_created_sort_key(client: Client) -> tuple:
         return (1, str(client.id))
 
 
+def stripe_succeeded_cents_for_client(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> int:
+    """Deduped succeeded Stripe cash for one client (same keys as Stripe reconcile)."""
+    from app.models.stripe_payment import StripePayment
+    from app.utils.stripe_ids import normalize_stripe_id_for_dedup
+
+    all_payments = (
+        db.query(StripePayment)
+        .filter(
+            StripePayment.client_id == client_id,
+            StripePayment.status == "succeeded",
+            StripePayment.org_id == org_id,
+        )
+        .all()
+    )
+    seen = set()
+    total = 0
+    all_payments.sort(
+        key=lambda p: (
+            0 if p.type == "charge" else 1,
+            -(p.updated_at.timestamp() if p.updated_at else 0),
+        )
+    )
+    for payment in all_payments:
+        if payment.subscription_id and payment.invoice_id:
+            key = (
+                normalize_stripe_id_for_dedup(payment.subscription_id),
+                normalize_stripe_id_for_dedup(payment.invoice_id),
+            )
+        elif payment.invoice_id:
+            key = (None, normalize_stripe_id_for_dedup(payment.invoice_id))
+        else:
+            key = (
+                normalize_stripe_id_for_dedup(payment.stripe_id)
+                if payment.stripe_id
+                else payment.stripe_id
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        total += int(payment.amount_cents or 0)
+    return total
+
+
+def recompute_client_lifetime_revenue(db: Session, org_id: uuid.UUID, client: Client) -> int:
+    """Set lifetime_revenue_cents from Stripe + Whop + manual. Returns new total."""
+    from app.models.manual_payment import ManualPayment
+
+    stripe_cents = stripe_succeeded_cents_for_client(db, org_id, client.id)
+    manual_cents = (
+        db.query(ManualPayment)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.client_id == client.id)
+        .all()
+    )
+    manual_total = sum(int(p.amount_cents or 0) for p in manual_cents)
+    whop_cents = (
+        db.query(WhopPayment)
+        .filter(
+            WhopPayment.org_id == org_id,
+            WhopPayment.client_id == client.id,
+            WhopPayment.status.in_(tuple(WHOP_PAID_STATUSES)),
+        )
+        .all()
+    )
+    from app.services.whop_sync import stored_or_raw_amount_cents
+
+    whop_total = sum(stored_or_raw_amount_cents(p) for p in whop_cents)
+    total = stripe_cents + manual_total + whop_total
+    if int(client.lifetime_revenue_cents or 0) != total:
+        client.lifetime_revenue_cents = total
+        client.updated_at = datetime.utcnow()
+    return total
+
+
 def load_whop_payments(db: Session, org_id: uuid.UUID) -> list:
     """Return Whop payments for org; empty list if table missing or query fails."""
     try:

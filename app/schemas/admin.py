@@ -226,6 +226,8 @@ class OrganizationDashboardSummary(BaseModel):
     """Summary of an organization's dashboard data"""
     organization_id: UUID
     organization_name: str
+    program_start_date: Optional[str] = None
+    program_end_date: Optional[str] = None
 
     # User seats (for system owner to limit org)
     total_users: int = 0

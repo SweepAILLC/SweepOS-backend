@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 
@@ -31,6 +31,12 @@ class UserPasswordChange(BaseModel):
     new_password: str
 
 
+class OnboardingFormCompleteRequest(BaseModel):
+    """Mark one first-login Tally form complete after embed FormSubmitted."""
+
+    form_id: str  # mJyDAX | KY0yqg | cal_onboarding | product_tour
+
+
 class UserSettingsUpdate(BaseModel):
     """User settings including privacy and data preferences"""
     email: Optional[str] = None
@@ -52,7 +58,13 @@ class User(UserBase):
     is_sudo_admin: bool = False
     consulting_tier: Optional[str] = None
     booking_url: Optional[str] = None
+    program_start_date: Optional[date] = None
+    program_end_date: Optional[date] = None
     created_at: datetime
+    onboarding_csa_completed: bool = True
+    onboarding_intake_completed: bool = True
+    onboarding_call_booked: bool = True
+    onboarding_tour_completed: bool = True
 
     class Config:
         from_attributes = True

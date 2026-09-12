@@ -158,6 +158,39 @@ def client_has_recorded_payment(
     return manual is not None
 
 
+def _succeeded_payment_count(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> int:
+    """Succeeded Stripe + paid-like Whop + manual rows for this client."""
+    from app.models.manual_payment import ManualPayment
+    from app.models.stripe_payment import StripePayment
+    from app.models.whop_payment import WhopPayment
+
+    stripe_n = (
+        db.query(StripePayment.id)
+        .filter(
+            StripePayment.org_id == org_id,
+            StripePayment.client_id == client_id,
+            StripePayment.status == "succeeded",
+            StripePayment.amount_cents > 0,
+        )
+        .count()
+    )
+    whop_n = (
+        db.query(WhopPayment.id)
+        .filter(
+            WhopPayment.org_id == org_id,
+            WhopPayment.client_id == client_id,
+            WhopPayment.status.in_(("paid", "succeeded", "completed", "successful")),
+        )
+        .count()
+    )
+    manual_n = (
+        db.query(ManualPayment.id)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.client_id == client_id)
+        .count()
+    )
+    return int(stripe_n or 0) + int(whop_n or 0) + int(manual_n or 0)
+
+
 def _has_upcoming_sales_call(
     db: Session,
     org_id: uuid.UUID,
@@ -615,9 +648,12 @@ def mark_latest_sales_call_closed(db: Session, org_id: uuid.UUID, client: Client
 def apply_payment_pipeline_effects(db: Session, client: Client) -> Optional[datetime]:
     """After a payment is recorded: Active (if needed) + close latest sales call.
 
-    Returns sales-call start_time when a call was closed. Does not commit.
+    Only the client's first succeeded payment stamps sale_closed. Repeat charges
+    stay Active without adding another KPI close. Does not commit.
     """
     move_client_to_active_on_payment(db, client)
+    if _succeeded_payment_count(db, client.org_id, client.id) > 1:
+        return None
     return mark_latest_sales_call_closed(db, client.org_id, client)
 
 

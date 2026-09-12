@@ -6,10 +6,11 @@ import uuid
 import httpx
 from app.db.session import get_db
 from app.core.config import settings
-from app.schemas.oauth import OAuthStartResponse, OAuthTokenResponse, DirectApiKeyRequest
+from app.schemas.oauth import OAuthStartResponse, OAuthTokenResponse, DirectApiKeyRequest, DiscordChannelMappingRequest
 from app.api.deps import get_current_user, require_admin, require_admin_or_owner
 from app.models.user import User
 from app.models.oauth_token import OAuthToken, OAuthProvider
+from app.models.discord_channel_mapping import DiscordChannelMapping
 from app.models.organization import Organization
 from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
@@ -573,8 +574,13 @@ def connect_stripe_direct(
             }
         )
         
-        # Encrypt the API key before storing
-        encrypted_token = encrypt_token(api_key)
+        try:
+            encrypted_token = encrypt_token(api_key)
+        except ValueError as enc_err:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Server encryption is not configured (set ENCRYPTION_KEY). Cannot store API keys.",
+            ) from enc_err
         
         # Check if token exists for this provider AND org
         existing = db.query(OAuthToken).filter(
@@ -2252,3 +2258,371 @@ def disconnect_calcom(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error disconnecting Cal.com: {str(e)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Discord
+#
+# One shared bot (owned by this app, DISCORD_BOT_TOKEN) is installed into each
+# org's own Discord server via OAuth. The install grants the bot permission to
+# view + send messages in channels the org's admin selects; the org then maps
+# Sweep event types (EOD form, post-call insight, general) to a channel each.
+# Sending always goes out through the shared bot token, never a per-user token.
+# ---------------------------------------------------------------------------
+
+# View Channel (1024) + Send Messages (2048) + Embed Links (16384) + Read Message History (65536)
+DISCORD_BOT_PERMISSIONS = 84992
+
+
+def _discord_org_id(current_user: User) -> uuid.UUID:
+    return getattr(current_user, "selected_org_id", None) or current_user.org_id
+
+
+DISCORD_STATE_MAX_AGE_SEC = 600  # 10 minutes to complete the Discord consent flow
+
+
+def _sign_discord_state(state_data: dict) -> str:
+    """
+    HMAC-sign the OAuth state so /discord/callback (which is unauthenticated —
+    Discord hits it directly) can trust the org_id embedded in it. Without this,
+    anyone could run their own OAuth flow, swap in an arbitrary org_id, and hit
+    the callback directly to hijack another org's Discord connection.
+    """
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    payload = json.dumps(state_data, separators=(",", ":"), sort_keys=True).encode()
+    sig = hmac.new(settings.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
+    envelope = {"d": state_data, "sig": sig}
+    return base64.urlsafe_b64encode(json.dumps(envelope, separators=(",", ":")).encode()).decode()
+
+
+def _verify_discord_state(state: str) -> uuid.UUID:
+    """Decode + verify a signed Discord OAuth state. Raises ValueError if invalid/expired/tampered."""
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import time
+
+    envelope = json.loads(base64.urlsafe_b64decode(state.encode()).decode())
+    data = envelope.get("d")
+    sig = envelope.get("sig")
+    if not isinstance(data, dict) or not isinstance(sig, str):
+        raise ValueError("malformed state")
+
+    payload = json.dumps(data, separators=(",", ":"), sort_keys=True).encode()
+    expected_sig = hmac.new(settings.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected_sig):
+        raise ValueError("state signature mismatch")
+
+    ts = int(data.get("ts", 0))
+    if ts <= 0 or (time.time() - ts) > DISCORD_STATE_MAX_AGE_SEC:
+        raise ValueError("state expired")
+
+    return uuid.UUID(data["org_id"])
+
+
+@router.post("/discord/start", response_model=OAuthStartResponse)
+def start_discord_oauth(
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """
+    Build the Discord authorization URL. Visiting it lets the org's admin pick
+    which of their own Discord servers to install the Sweep bot into.
+    """
+    if not settings.DISCORD_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Discord OAuth not configured. Set DISCORD_CLIENT_ID (and DISCORD_CLIENT_SECRET, DISCORD_BOT_TOKEN) in .env.",
+        )
+
+    import secrets
+    import time
+
+    org_id = _discord_org_id(current_user)
+    state_data = {
+        "org_id": str(org_id),
+        "nonce": secrets.token_urlsafe(8),
+        "ts": int(time.time()),
+    }
+    state = _sign_discord_state(state_data)
+
+    params = {
+        "client_id": settings.DISCORD_CLIENT_ID,
+        "redirect_uri": settings.DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "bot identify guilds",
+        "permissions": str(DISCORD_BOT_PERMISSIONS),
+        "state": state,
+    }
+    redirect_url = f"https://discord.com/oauth2/authorize?{urlencode(params)}"
+    return {"redirect_url": redirect_url}
+
+
+@router.get("/discord/callback")
+def discord_oauth_callback(
+    code: str = Query(None),
+    state: str = Query(None),
+    guild_id: str = Query(None),
+    error: str = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Handle Discord's redirect after the admin picks a server and approves the
+    bot install. Discord appends guild_id directly to this redirect (since we
+    requested the "bot" scope), so the server is known even before token exchange.
+    """
+    from fastapi.responses import RedirectResponse
+
+    frontend_url = settings.FRONTEND_URL
+
+    if error:
+        return RedirectResponse(
+            url=f"{frontend_url}/?discord_error={error}&tab=settings&section=integrations",
+            status_code=302,
+        )
+    if not code:
+        return RedirectResponse(
+            url=f"{frontend_url}/?discord_error=no_code&tab=settings&section=integrations",
+            status_code=302,
+        )
+    if not settings.DISCORD_CLIENT_ID or not settings.DISCORD_CLIENT_SECRET:
+        return RedirectResponse(
+            url=f"{frontend_url}/?discord_error=configuration_error&tab=settings&section=integrations",
+            status_code=302,
+        )
+
+    if not state:
+        return RedirectResponse(
+            url=f"{frontend_url}/?discord_error=missing_state&tab=settings&section=integrations",
+            status_code=302,
+        )
+    try:
+        org_id = _verify_discord_state(state)
+    except Exception as e:
+        # Do NOT fall back to a default org here — trusting an unverifiable org_id
+        # is exactly the cross-tenant hijack this signature check exists to prevent.
+        print(f"[DISCORD OAUTH] Rejected callback: invalid state ({e})")
+        return RedirectResponse(
+            url=f"{frontend_url}/?discord_error=invalid_state&tab=settings&section=integrations",
+            status_code=302,
+        )
+
+    try:
+        response = httpx.post(
+            "https://discord.com/api/v10/oauth2/token",
+            data={
+                "client_id": settings.DISCORD_CLIENT_ID,
+                "client_secret": settings.DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": settings.DISCORD_REDIRECT_URI,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30.0,
+        )
+        if response.status_code != 200:
+            error_msg = response.text[:300]
+            return RedirectResponse(
+                url=f"{frontend_url}/?discord_error=token_exchange_failed&error_description={error_msg}&tab=settings&section=integrations",
+                status_code=302,
+            )
+
+        token_data = response.json()
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        expires_in = token_data.get("expires_in", 604800)
+        scope = token_data.get("scope", "bot identify guilds")
+        resolved_guild_id = guild_id or (token_data.get("guild") or {}).get("id")
+
+        if not access_token or not resolved_guild_id:
+            return RedirectResponse(
+                url=f"{frontend_url}/?discord_error=incomplete_response&tab=settings&section=integrations",
+                status_code=302,
+            )
+
+        encrypted_token = encrypt_token(access_token)
+        encrypted_refresh = encrypt_token(refresh_token) if refresh_token else None
+        expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+
+        existing = db.query(OAuthToken).filter(
+            OAuthToken.provider == OAuthProvider.DISCORD,
+            OAuthToken.org_id == org_id,
+        ).first()
+
+        if existing:
+            existing.access_token = encrypted_token
+            existing.refresh_token = encrypted_refresh
+            existing.account_id = resolved_guild_id
+            existing.expires_at = expires_at
+            existing.scope = scope
+        else:
+            db.add(OAuthToken(
+                org_id=org_id,
+                provider=OAuthProvider.DISCORD,
+                account_id=resolved_guild_id,
+                access_token=encrypted_token,
+                refresh_token=encrypted_refresh,
+                expires_at=expires_at,
+                scope=scope,
+            ))
+        db.commit()
+
+        return RedirectResponse(
+            url=f"{frontend_url}/?discord_connected=true&tab=settings&section=integrations",
+            status_code=302,
+        )
+    except httpx.HTTPError as e:
+        db.rollback()
+        return RedirectResponse(
+            url=f"{frontend_url}/?discord_error=network_error&error_description={str(e)}&tab=settings&section=integrations",
+            status_code=302,
+        )
+    except Exception as e:
+        db.rollback()
+        return RedirectResponse(
+            url=f"{frontend_url}/?discord_error=unknown_error&error_description={str(e)}&tab=settings&section=integrations",
+            status_code=302,
+        )
+
+
+@router.get("/discord/status")
+def discord_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services import discord_notify
+
+    org_id = _discord_org_id(current_user)
+    row = discord_notify.get_discord_token_row(db, org_id)
+    if not row:
+        return {
+            "connected": False,
+            "bot_configured": discord_notify.bot_configured(),
+            "oauth_configured": discord_notify.oauth_configured(),
+        }
+    guild_name = discord_notify.fetch_guild_name(row.account_id) if row.account_id else None
+    return {
+        "connected": True,
+        "guild_id": row.account_id,
+        "guild_name": guild_name,
+        "bot_configured": discord_notify.bot_configured(),
+        "oauth_configured": discord_notify.oauth_configured(),
+    }
+
+
+@router.delete("/discord/disconnect", status_code=status.HTTP_204_NO_CONTENT)
+def disconnect_discord(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """
+    Forget this org's Discord connection. Does NOT remove the bot from the
+    Discord server — an org admin removes it from Discord's own Server Settings
+    → Integrations if they want that too.
+    """
+    org_id = _discord_org_id(current_user)
+    token_row = db.query(OAuthToken).filter(
+        OAuthToken.provider == OAuthProvider.DISCORD,
+        OAuthToken.org_id == org_id,
+    ).first()
+    if token_row:
+        db.delete(token_row)
+    db.query(DiscordChannelMapping).filter(DiscordChannelMapping.org_id == org_id).delete()
+    db.commit()
+    return None
+
+
+@router.get("/discord/channels")
+def list_discord_channels(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    from app.services import discord_notify
+
+    org_id = _discord_org_id(current_user)
+    guild_id = discord_notify.get_guild_id_for_org(db, org_id)
+    if not guild_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Discord is not connected for this organization")
+
+    ok, channels, error = discord_notify.list_guild_channels(guild_id)
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=error)
+    return {"guild_id": guild_id, "channels": channels}
+
+
+@router.get("/discord/channel-mappings")
+def get_discord_channel_mappings(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services import discord_notify
+
+    org_id = _discord_org_id(current_user)
+    rows = discord_notify.list_channel_mappings(db, org_id)
+    return {
+        "event_types": discord_notify.EVENT_TYPES,
+        "mappings": [
+            {"event_type": r.event_type, "channel_id": r.channel_id, "channel_name": r.channel_name}
+            for r in rows
+        ],
+    }
+
+
+@router.put("/discord/channel-mappings/{event_type}")
+def set_discord_channel_mapping(
+    event_type: str,
+    body: DiscordChannelMappingRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    from app.services import discord_notify
+
+    if not discord_notify.is_event_type_known(event_type):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown event_type: {event_type}")
+
+    org_id = _discord_org_id(current_user)
+    if not discord_notify.get_guild_id_for_org(db, org_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Discord is not connected for this organization")
+
+    row = discord_notify.set_channel_mapping(db, org_id, event_type, body.channel_id, body.channel_name)
+    return {"event_type": row.event_type, "channel_id": row.channel_id, "channel_name": row.channel_name}
+
+
+@router.delete("/discord/channel-mappings/{event_type}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_discord_channel_mapping(
+    event_type: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    from app.services import discord_notify
+
+    org_id = _discord_org_id(current_user)
+    discord_notify.delete_channel_mapping(db, org_id, event_type)
+    return None
+
+
+@router.post("/discord/test/{event_type}")
+def send_discord_test_message(
+    event_type: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    from app.services import discord_notify
+
+    org_id = _discord_org_id(current_user)
+    sample = discord_notify.build_sample_event(event_type, db=db, org_id=org_id)
+    sent, reason = discord_notify.send_discord_event(
+        db,
+        org_id,
+        event_type,
+        title=sample["title"],
+        description=sample["description"],
+        fields=sample["fields"],
+    )
+    if not sent:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Test send failed: {reason}")
+    return {"success": True}

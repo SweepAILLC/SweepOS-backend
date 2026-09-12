@@ -1495,34 +1495,12 @@ def reconcile_stripe_data(db: Session, org_id: uuid.UUID) -> dict:
     batch_dirty = 0
     for client in clients:
         try:
-            all_payments = db.query(StripePayment).filter(
-                StripePayment.client_id == client.id,
-                StripePayment.status == 'succeeded',
-                StripePayment.org_id == org_id
-            ).all()
+            from app.api.clients.helpers import recompute_client_lifetime_revenue
 
-            seen = set()
-            deduplicated_payments = []
-            all_payments.sort(key=lambda p: (
-                0 if p.type == 'charge' else 1,
-                -(p.updated_at.timestamp() if p.updated_at else 0)
-            ))
+            prior = int(client.lifetime_revenue_cents or 0)
+            total_revenue = recompute_client_lifetime_revenue(db, org_id, client)
 
-            for payment in all_payments:
-                if payment.subscription_id and payment.invoice_id:
-                    key = (normalize_stripe_id_for_dedup(payment.subscription_id), normalize_stripe_id_for_dedup(payment.invoice_id))
-                elif payment.invoice_id:
-                    key = (None, normalize_stripe_id_for_dedup(payment.invoice_id))
-                else:
-                    key = normalize_stripe_id_for_dedup(payment.stripe_id) if payment.stripe_id else payment.stripe_id
-                if key not in seen:
-                    seen.add(key)
-                    deduplicated_payments.append(payment)
-
-            total_revenue = sum(p.amount_cents for p in deduplicated_payments)
-
-            if client.lifetime_revenue_cents != total_revenue:
-                client.lifetime_revenue_cents = total_revenue
+            if prior != total_revenue:
                 results["revenue_recalculated"] += 1
                 batch_dirty += 1
                 if total_revenue > 0:

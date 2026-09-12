@@ -5,10 +5,9 @@ Requires current user to have access to the org and be admin/owner.
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List
 from uuid import UUID
-import secrets
 from app.db.session import get_db
 from app.api.deps import get_current_user
 from app.models.user import User, UserRole
@@ -33,9 +32,6 @@ from app.services.funnel_lead_notifications import (
 )
 
 router = APIRouter()
-
-# Default expiration for invitation links (days)
-INVITATION_EXPIRES_DAYS = 7
 
 
 def _user_has_org_access(db: Session, user: User, org_id: UUID) -> bool:
@@ -88,84 +84,37 @@ def invite_user_to_org(
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
 
-    if org.max_user_seats is not None:
-        current_count = db.query(func.count(User.id)).filter(User.org_id == org_id).scalar() or 0
-        if current_count >= org.max_user_seats:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Organization user limit reached ({org.max_user_seats} seats). Contact your system owner to increase the limit.",
-            )
-
-    email = body.email.strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required")
     role = _normalize_role(body.role or "member")
     if role == "owner" and current_user.role != UserRole.OWNER:
         raise HTTPException(status_code=403, detail="Only owners can invite as owner")
 
-    # Already in org?
-    existing_in_org = db.query(User).filter(
-        func.lower(User.email) == email,
-        User.org_id == org_id,
-    ).first()
-    if existing_in_org:
-        raise HTTPException(
-            status_code=400,
-            detail="A user with this email is already in this organization",
-        )
+    from app.services.organization_invitations import (
+        create_user_invitation,
+        invitation_accept_link,
+        invitation_response,
+    )
+    from app.services.onboarding_email import send_user_invitation_email
 
-    # Pending invitation for same email+org?
-    existing_inv = db.query(OrganizationInvitation).filter(
-        OrganizationInvitation.org_id == org_id,
-        func.lower(OrganizationInvitation.invitee_email) == email,
-        OrganizationInvitation.used_at.is_(None),
-        OrganizationInvitation.expires_at > datetime.utcnow(),
-    ).first()
-    if existing_inv:
-        raise HTTPException(
-            status_code=400,
-            detail="An invitation for this email is already pending",
-        )
-
-    token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(days=INVITATION_EXPIRES_DAYS)
-    inv = OrganizationInvitation(
-        org_id=org_id,
-        invitee_email=email,
-        invitation_type="USER",
+    inv = create_user_invitation(
+        db,
+        org=org,
+        email=body.email,
         role=role,
-        token=token,
-        expires_at=expires_at,
         created_by=current_user.id,
     )
-    db.add(inv)
-    db.commit()
-    db.refresh(inv)
-
-    # Send email via BREVO_API_KEY (onboarding only)
-    from app.services.onboarding_email import send_user_invitation_email
-    frontend_url = getattr(settings, "FRONTEND_URL", "") or "http://localhost:3002"
-    link = f"{frontend_url.rstrip('/')}/invite/accept?token={token}"
-    inviter_name = current_user.email
-    send_user_invitation_email(
-        to_email=email,
-        org_name=org.name,
-        invitation_link=link,
-        role=role,
-        inviter_name=inviter_name,
-        existing_user=False,  # We don't know yet; email text works for both
-    )
-
-    return InvitationResponse(
-        id=inv.id,
-        org_id=inv.org_id,
-        invitee_email=inv.invitee_email,
-        invitation_type=inv.invitation_type,
-        role=inv.role,
-        expires_at=inv.expires_at,
-        used_at=inv.used_at,
-        created_at=inv.created_at,
-    )
+    email_sent = False
+    if body.send_email:
+        email_sent = bool(
+            send_user_invitation_email(
+                to_email=inv.invitee_email,
+                org_name=org.name,
+                invitation_link=invitation_accept_link(inv.token),
+                role=inv.role,
+                inviter_name=current_user.email,
+                existing_user=False,
+            )
+        )
+    return invitation_response(inv, email_sent=email_sent)
 
 
 @router.get("/{org_id}/invitations", response_model=List[InvitationResponse])
@@ -175,33 +124,23 @@ def list_org_invitations(
     current_user: User = Depends(get_current_user),
 ):
     """List pending invitations for this organization."""
+    from app.services.organization_invitations import invitation_response, pending_invitation_filters
+
     _require_org_admin(db, current_user, org_id)
     invs = (
         db.query(OrganizationInvitation)
         .filter(
             OrganizationInvitation.org_id == org_id,
-            OrganizationInvitation.used_at.is_(None),
-            OrganizationInvitation.expires_at > datetime.utcnow(),
+            *pending_invitation_filters(),
         )
         .order_by(OrganizationInvitation.created_at.desc())
         .all()
     )
-    return [
-        InvitationResponse(
-            id=i.id,
-            org_id=i.org_id,
-            invitee_email=i.invitee_email,
-            invitation_type=i.invitation_type,
-            role=i.role,
-            expires_at=i.expires_at,
-            used_at=i.used_at,
-            created_at=i.created_at,
-        )
-        for i in invs
-    ]
+    return [invitation_response(i) for i in invs]
 
 
 @router.post("/{org_id}/invitations/{invitation_id}/resend", response_model=InvitationResponse)
+@rate_limit(max_requests=10, window_seconds=900)  # 10 resends per 15 min per user — avoid inbox-bombing an invitee
 def resend_org_invitation(
     org_id: UUID,
     invitation_id: UUID,
@@ -222,29 +161,20 @@ def resend_org_invitation(
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
-    frontend_url = getattr(settings, "FRONTEND_URL", "") or "http://localhost:3002"
-    link = f"{frontend_url.rstrip('/')}/invite/accept?token={inv.token}"
+    from app.services.organization_invitations import invitation_accept_link, invitation_response
     from app.services.onboarding_email import send_user_invitation_email
+
     send_user_invitation_email(
         to_email=inv.invitee_email,
         org_name=org.name,
-        invitation_link=link,
+        invitation_link=invitation_accept_link(inv.token),
         role=inv.role,
         existing_user=False,
     )
     inv.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(inv)
-    return InvitationResponse(
-        id=inv.id,
-        org_id=inv.org_id,
-        invitee_email=inv.invitee_email,
-        invitation_type=inv.invitation_type,
-        role=inv.role,
-        expires_at=inv.expires_at,
-        used_at=inv.used_at,
-        created_at=inv.created_at,
-    )
+    return invitation_response(inv, email_sent=True)
 
 
 @router.delete("/{org_id}/invitations/{invitation_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -386,3 +316,45 @@ def send_notification_settings_test(
         raise HTTPException(status_code=404, detail="Organization not found")
     result = send_test_digest(db, org)
     return NotificationTestResponse(**result)
+
+
+@router.get("/{org_id}/timezone")
+def get_org_timezone(
+    org_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """IANA timezone used to localize notification timestamps (e.g. Discord bookings)."""
+    if not _user_has_org_access(db, current_user, org_id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this organization")
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return {"timezone": org.timezone or "UTC"}
+
+
+@router.patch("/{org_id}/timezone")
+def set_org_timezone(
+    org_id: UUID,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Set the org's IANA timezone (admin/owner only). Body: {"timezone": "America/New_York"}."""
+    _require_org_admin(db, current_user, org_id)
+    tz_name = str(body.get("timezone") or "").strip()
+    if not tz_name:
+        raise HTTPException(status_code=400, detail="timezone is required")
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        raise HTTPException(status_code=400, detail=f"Unknown timezone: {tz_name}")
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    org.timezone = tz_name
+    org.updated_at = datetime.utcnow()
+    db.commit()
+    return {"timezone": org.timezone}

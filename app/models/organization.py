@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Integer, Text
+from sqlalchemy import Column, Date, String, DateTime, Integer, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 import uuid
 from datetime import datetime
@@ -21,10 +21,16 @@ class Organization(Base):
     consulting_tier = Column(String, nullable=True)
     # External booking link (Cal.com / Calendly) shown in the org portal
     booking_url = Column(Text, nullable=True)
+    # Consulting / coaching program window (owner-set; shown on pipeline)
+    program_start_date = Column(Date, nullable=True)
+    program_end_date = Column(Date, nullable=True)
     # Public post-sales close survey link token (no login)
     close_form_token = Column(UUID(as_uuid=True), unique=True, nullable=True, index=True)
     # Extensible notification prefs, e.g. {"funnel_leads": {...}}
     notification_settings = Column(JSONB, nullable=True)
+    # IANA tz name (e.g. "America/New_York") used to localize notification timestamps
+    # (currently: Discord new_booking "When" field). Defaults to UTC when unset.
+    timezone = Column(String(64), nullable=False, default="UTC", server_default="UTC")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

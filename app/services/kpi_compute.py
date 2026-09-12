@@ -371,9 +371,9 @@ def overall_day_tier(
 
 SNAPSHOT_CARD_DEFS = (
     {"key": "total_conversations", "label": "Total Conversations", "kind": "int", "aggregation": "sum", "tier_metric": None},
-    {"key": "calls_booked", "label": "Calls Booked", "kind": "int", "aggregation": "sum", "tier_metric": None},
+    {"key": "calls_booked", "label": "Sales Calls Booked", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "calls_booked_activity", "label": "Calls Booked (Activity)", "kind": "int", "aggregation": "sum", "tier_metric": None},
-    {"key": "calls_taken", "label": "Calls Taken", "kind": "int", "aggregation": "sum", "tier_metric": None},
+    {"key": "calls_taken", "label": "Sales Calls Taken", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "closes", "label": "Closes", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "convo_to_booking_pct", "label": "Convo→Book", "kind": "pct", "aggregation": "avg", "tier_metric": "convo_to_booking_pct"},
     {"key": "outreach_reply_pct", "label": "Reply %", "kind": "pct", "aggregation": "avg", "tier_metric": "outreach_reply_pct"},

@@ -167,14 +167,23 @@ def build_client_profile_bundle(
                     .limit(payment_limit)
                     .all()
                 )
+                from app.services.whop_sync import stored_or_raw_amount_cents
+
                 for p in whop_rows:
-                    if (getattr(p, "status", None) or "") in ("succeeded", "paid", "complete"):
-                        total += int(p.amount_cents or 0)
+                    cents = stored_or_raw_amount_cents(p)
+                    if (getattr(p, "status", None) or "") in (
+                        "succeeded",
+                        "paid",
+                        "complete",
+                        "completed",
+                        "successful",
+                    ):
+                        total += cents
                     payments_out.append(
                         {
                             "source": "whop",
                             "id": str(p.id),
-                            "amount_cents": p.amount_cents,
+                            "amount_cents": cents,
                             "status": getattr(p, "status", None),
                             "created_at": p.created_at.isoformat() if p.created_at else None,
                         }

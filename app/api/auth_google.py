@@ -86,7 +86,7 @@ def _decode_state(state: str) -> Dict[str, Any]:
 
 
 def _frontend_redirect(path: str, **params: Any) -> RedirectResponse:
-    base = (settings.FRONTEND_URL or "http://localhost:3002").rstrip("/")
+    base = (settings.FRONTEND_URL or "http://localhost:3003").rstrip("/")
     qs = urlencode({k: v for k, v in params.items() if v is not None})
     url = f"{base}{path}" + (f"?{qs}" if qs else "")
     return RedirectResponse(url=url, status_code=302)
@@ -129,11 +129,19 @@ def _create_user_from_invite(
     google_id: str,
     google_email: str,
     hashed_password: Optional[str] = None,
+    org: Optional[Organization] = None,
+    email: Optional[str] = None,
 ) -> User:
     """Create a users row for an invitation (Google-only or copy of existing password)."""
     from app.models.user import parse_user_role_from_api as _parse
+    from app.services.organization_invitations import consume_invitation
 
-    email_normalized = inv.invitee_email.strip().lower()
+    email_normalized = (email or inv.invitee_email or "").strip().lower()
+    org_id = org.id if org is not None else inv.org_id
+    if not email_normalized:
+        raise HTTPException(status_code=400, detail="Email is required to create your account")
+    if not org_id:
+        raise HTTPException(status_code=400, detail="Organization name is required")
     role_normalized = (inv.role or "member").strip().lower()
     if role_normalized not in ("owner", "admin", "member"):
         role_normalized = "member"
@@ -149,7 +157,7 @@ def _create_user_from_invite(
         ),
         {
             "id": new_user_id,
-            "org_id": inv.org_id,
+            "org_id": org_id,
             "email": email_normalized,
             "hashed_password": hashed_password,
             "role": userrole_bind_value(user_role),
@@ -161,11 +169,11 @@ def _create_user_from_invite(
     db.add(
         UserOrganization(
             user_id=new_user_id,
-            org_id=inv.org_id,
+            org_id=org_id,
             is_primary=True,
         )
     )
-    inv.used_at = datetime.utcnow()
+    consume_invitation(inv)
     db.commit()
     user = db.query(User).filter(User.id == new_user_id).first()
     if not user:
@@ -180,6 +188,7 @@ def _accept_invite_with_google(
     google_id: str,
     google_email: str,
     email: str,
+    org_name: Optional[str] = None,
 ) -> tuple[User, uuid.UUID]:
     inv = (
         db.query(OrganizationInvitation)
@@ -191,34 +200,37 @@ def _accept_invite_with_google(
     )
     if not inv:
         raise HTTPException(status_code=400, detail="Invalid or already used invitation")
-    if inv.expires_at <= datetime.utcnow():
+    from app.services.organization_invitations import invitation_is_expired as _accept_expired
+
+    if _accept_expired(inv):
         raise HTTPException(status_code=400, detail="Invitation has expired")
 
-    invite_email = inv.invitee_email.strip().lower()
-    if email.strip().lower() != invite_email:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Google account email ({email}) does not match the invitation ({invite_email}).",
-        )
+    from app.services.organization_invitations import (
+        consume_invitation,
+        ensure_invite_organization,
+        is_multi_use,
+        resolve_invitation_email,
+    )
 
-    org = db.query(Organization).filter(Organization.id == inv.org_id).first()
-    if not org:
-        raise HTTPException(status_code=400, detail="Organization not found")
+    invite_email = resolve_invitation_email(inv, email)
+    if not is_multi_use(inv):
+        inv.invitee_email = invite_email
+    org = ensure_invite_organization(db, inv, org_name)
 
     # Already linked via google_id?
     by_gid = _find_user_by_google_id(db, google_id)
-    if by_gid and by_gid.org_id == inv.org_id:
+    if by_gid and by_gid.org_id == org.id:
         raise HTTPException(status_code=400, detail="You are already in this organization")
 
     existing_users = _find_users_by_email(db, invite_email)
     if existing_users:
         existing = existing_users[0]
-        in_org = next((u for u in existing_users if u.org_id == inv.org_id), None)
+        in_org = next((u for u in existing_users if u.org_id == org.id), None)
         if in_org:
             raise HTTPException(status_code=400, detail="You are already in this organization")
 
         if org.max_user_seats is not None:
-            current_count = db.query(func.count(User.id)).filter(User.org_id == inv.org_id).scalar() or 0
+            current_count = db.query(func.count(User.id)).filter(User.org_id == org.id).scalar() or 0
             if current_count >= org.max_user_seats:
                 raise HTTPException(
                     status_code=403,
@@ -232,15 +244,17 @@ def _accept_invite_with_google(
             google_id=google_id,
             google_email=google_email,
             hashed_password=existing.hashed_password,
+            org=org,
+            email=invite_email,
         )
         for u in existing_users:
             if not u.google_id:
                 _link_google(u, google_id, google_email)
         db.commit()
-        return user, inv.org_id
+        return user, org.id
 
     if org.max_user_seats is not None:
-        current_count = db.query(func.count(User.id)).filter(User.org_id == inv.org_id).scalar() or 0
+        current_count = db.query(func.count(User.id)).filter(User.org_id == org.id).scalar() or 0
         if current_count >= org.max_user_seats:
             raise HTTPException(
                 status_code=403,
@@ -253,8 +267,10 @@ def _accept_invite_with_google(
         google_id=google_id,
         google_email=google_email,
         hashed_password=None,
+        org=org,
+        email=invite_email,
     )
-    return user, inv.org_id
+    return user, org.id
 
 
 async def _exchange_code(code: str) -> Dict[str, Any]:
@@ -291,6 +307,7 @@ def google_oauth_start(
     request: Request,
     mode: str = Query("login", pattern="^(login|signup|invite|connect|mcp)$"),
     invite_token: Optional[str] = Query(None),
+    org_name: Optional[str] = Query(None),
     mcp_nonce: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -311,8 +328,12 @@ def google_oauth_start(
             )
             .first()
         )
-        if not inv or inv.expires_at <= datetime.utcnow():
+        from app.services.organization_invitations import invitation_is_expired as _g_expired
+
+        if not inv or _g_expired(inv):
             raise HTTPException(status_code=400, detail="Invalid or expired invitation")
+        if inv.org_id is None and not (org_name or "").strip():
+            raise HTTPException(status_code=400, detail="Organization name is required")
         mode_norm = "invite"
 
     connect_user_id: Optional[str] = None
@@ -335,6 +356,7 @@ def google_oauth_start(
         {
             "mode": mode_norm,
             "invite_token": invite_token.strip() if invite_token else None,
+            "org_name": (org_name or "").strip() or None,
             "mcp_nonce": mcp_nonce,
             "user_id": connect_user_id,
         }
@@ -429,6 +451,7 @@ async def google_oauth_callback(
                 google_id=google_id,
                 google_email=email,
                 email=email,
+                org_name=state_data.get("org_name"),
             )
         except HTTPException as e:
             return _frontend_redirect(

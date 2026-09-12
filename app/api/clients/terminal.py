@@ -180,7 +180,9 @@ def get_terminal_summary(
         ts = p.created_at
         if not ts:
             continue
-        amount = (p.amount_cents or 0) / 100.0
+        from app.services.whop_sync import stored_or_raw_amount_cents
+
+        amount = stored_or_raw_amount_cents(p) / 100.0
         _add_amount(whop_tot, ts, amount)
 
     today_cash = stripe_tot["today"] + manual_tot["today"] + whop_tot["today"]

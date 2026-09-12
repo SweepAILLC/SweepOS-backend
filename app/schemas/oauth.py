@@ -13,3 +13,8 @@ class OAuthTokenResponse(BaseModel):
 class DirectApiKeyRequest(BaseModel):
     api_key: str
 
+
+class DiscordChannelMappingRequest(BaseModel):
+    channel_id: str
+    channel_name: str | None = None
+

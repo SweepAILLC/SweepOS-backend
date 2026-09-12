@@ -159,7 +159,7 @@ def reconcile_fathom_webhooks_for_existing_orgs() -> dict[str, int]:
     the Fathom webhook destination so future Fathom-ready recordings flow in.
     """
     from app.models.organization import Organization
-    from app.services.fathom_client import normalize_fathom_api_key
+    from app.services.fathom_client import normalize_fathom_api_key, decrypt_fathom_api_key
 
     destination_missing = fathom_webhook_destination_for_org(
         uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -180,7 +180,7 @@ def reconcile_fathom_webhooks_for_existing_orgs() -> dict[str, int]:
 
     checked = registered = failed = skipped = 0
     for org_id, fathom_api_key in org_rows:
-        api_key = normalize_fathom_api_key(fathom_api_key)
+        api_key = normalize_fathom_api_key(decrypt_fathom_api_key(fathom_api_key))
         if not api_key:
             skipped += 1
             continue

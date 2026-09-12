@@ -358,6 +358,24 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         print(f"✅ Successfully processed {event_type} event - payment {payment_id} committed to database")
 
         try:
+            from app.services import discord_notify
+
+            client_name = None
+            if client:
+                client_name = " ".join(
+                    p for p in (getattr(client, "first_name", None), getattr(client, "last_name", None)) if p
+                ) or None
+            discord_notify.send_discord_event_background(
+                org_id,
+                "new_transaction",
+                title=f"New transaction: ${amount_cents / 100:.2f} {currency.upper()}",
+                description=client_name or "Unknown client",
+                fields=[("Event", event_type), ("Payment ID", payment_id)],
+            )
+        except Exception as discord_err:
+            print(f"[DISCORD_NOTIFY] new_transaction skipped: {discord_err}")
+
+        try:
             from app.services.kpi_integration_sync import sync_kpi_for_datetime
 
             sync_kpi_for_datetime(db, org_id, created_at, commit=True)
@@ -377,18 +395,26 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
             except Exception as automation_error:
                 # Don't fail payment processing if automation fails
                 print(f"[CLIENT_AUTOMATION] ⚠️  Error in automation: {str(automation_error)}")
-            # Mark most recent sales call as closed when this client pays (close-rate automation)
-            try:
-                call_when = mark_latest_sales_call_closed(db, org_id, client)
-                db.commit()
-                if call_when is not None:
-                    try:
-                        from app.services.kpi_integration_sync import sync_kpi_for_datetime
-                        sync_kpi_for_datetime(db, org_id, call_when, commit=True)
-                    except Exception as kpi_err:
-                        print(f"[KPI_SYNC] ⚠️ Error syncing closes after sale_closed: {kpi_err}")
-            except Exception as sales_err:
-                print(f"[SALES_CLOSE] ⚠️  Error marking sales call closed: {str(sales_err)}")
+            # Mark most recent sales call as closed on FIRST payment only.
+            # Later charges (retainers, upsells) must not add another KPI close.
+            if first_payment_signal:
+                try:
+                    call_when = mark_latest_sales_call_closed(db, org_id, client)
+                    db.commit()
+                    if call_when is not None:
+                        try:
+                            from app.services.kpi_integration_sync import sync_kpi_for_datetime
+                            sync_kpi_for_datetime(db, org_id, call_when, commit=True)
+                        except Exception as kpi_err:
+                            print(f"[KPI_SYNC] ⚠️ Error syncing closes after sale_closed: {kpi_err}")
+                except Exception as sales_err:
+                    print(f"[SALES_CLOSE] ⚠️  Error marking sales call closed: {str(sales_err)}")
+            else:
+                try:
+                    from app.services.kpi_integration_sync import sync_kpi_for_datetime
+                    sync_kpi_for_datetime(db, org_id, created_at, commit=True)
+                except Exception:
+                    pass
 
             # Enqueue first-payment automation jobs (worker handles draft+send asynchronously
             # so the webhook handler stays fast and survives API restarts).

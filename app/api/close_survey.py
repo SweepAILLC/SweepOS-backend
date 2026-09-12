@@ -49,7 +49,7 @@ def get_close_survey_entry_link(
         org.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(org)
-    base = str(getattr(settings, "FRONTEND_URL", "") or "http://localhost:3002").rstrip("/")
+    base = str(getattr(settings, "FRONTEND_URL", "") or "http://localhost:3003").rstrip("/")
     token = str(org.close_form_token)
     return CloseSurveyEntryLinkResponse(
         token=token,

@@ -23,7 +23,7 @@ from app.models.automation import (
 )
 from app.models.client import Client
 from app.services.automation_dispatcher import read_dispatcher_health
-from app.services.automation_drafts import resolve_sender_for_org
+from app.services.automation_drafts import build_automation_email_draft, resolve_sender_for_org
 from app.services.automation_engine import seed_default_rules
 from app.services.brevo_client import (
     BrevoNotConnectedError,
@@ -137,7 +137,7 @@ def run_flow_test(
     trigger_kind: Optional[str] = None,
     user_id: Optional[uuid.UUID] = None,
 ) -> Dict[str, Any]:
-    """Send lightweight [TEST] emails for enabled action steps in a flow (sync, no worker)."""
+    """Send real drafted flow emails to a chosen address (sync, no worker)."""
     if flow not in FLOW_VALUES:
         raise ValueError(f"unknown flow '{flow}'")
 
@@ -163,6 +163,21 @@ def run_flow_test(
             .order_by(Client.updated_at.desc().nullslast())
             .first()
         )
+
+    if client is None:
+        return {
+            **diagnostics,
+            "ok": False,
+            "to_email": to_email,
+            "client_id": None,
+            "client_label": None,
+            "sent_count": 0,
+            "results": [],
+            "error": (
+                "No preview client found. Select a client (or pass client_id) so test "
+                "send can render the real workflow content."
+            ),
+        }
 
     first_name = (client.first_name if client else None) or "there"
     client_label = None
@@ -231,36 +246,15 @@ def run_flow_test(
             results.append(entry)
             continue
 
-        subject_base = (rule.subject_template or rule.playbook or "Automation step").strip()
-        subject_base = subject_base.replace("{{first_name}}", first_name).replace(
-            "{{ first_name }}", first_name
-        )
-        subject = f"[TEST] {subject_base}"[:200]
-        schedule = rule.schedule_mode or ScheduleMode.AFTER_TRIGGER.value
-        html = (
-            "<div style='font-family:system-ui,sans-serif;line-height:1.5'>"
-            "<p><strong>Sweep automation test</strong></p>"
-            f"<p>Flow: <code>{flow}</code><br/>"
-            f"Step: <code>{rule.playbook}</code> "
-            f"(trigger={rule.trigger_kind or '—'}, schedule={schedule})</p>"
-            "<p>This confirms Brevo delivery for your org. Live sends still need an enabled "
-            "worker and a real trigger (booking / payment / win / offboarding).</p>"
-            f"<p style='color:#666;font-size:12px'>Sent at {now.isoformat()}Z</p>"
-            "</div>"
-        )
-        text = (
-            f"Sweep automation test\nFlow: {flow}\nStep: {rule.playbook}\n"
-            "Live sends still require the worker + a real trigger.\n"
-        )
-
         try:
+            draft = build_automation_email_draft(db, rule=rule, client=client)
             resp = send_email(
                 headers=headers,
                 sender=sender,
                 to=[{"email": to_email, "name": first_name}],
-                subject=subject,
-                html_content=html,
-                text_content=text,
+                subject=draft.subject,
+                html_content=draft.html,
+                text_content=draft.body_plain,
                 tags=["sweep-automation-test", flow, (rule.playbook or "")[:40]],
             )
             message_id = None
@@ -298,7 +292,7 @@ def run_flow_test(
                 job_id = str(job.id)
 
             entry["status"] = "sent"
-            entry["detail"] = subject
+            entry["detail"] = draft.subject
             entry["brevo_message_id"] = str(message_id) if message_id else None
             entry["job_id"] = job_id
             sent += 1

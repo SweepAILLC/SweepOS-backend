@@ -10,6 +10,7 @@ class WhopConnectRequest(BaseModel):
 class WhopConnectionStatus(BaseModel):
     connected: bool
     company_id: Optional[str] = None
+    webhook_active: bool = False
     message: str = ""
 
 

@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, kpi, instagram, close_survey
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -8,6 +8,36 @@ import logging
 import threading
 
 import sentry_sdk
+
+_INSECURE_DEFAULT_SECRET_KEY = "supersecret_jwt_key_change_in_production"
+
+
+def _validate_production_secrets() -> None:
+    """
+    Fail fast on boot rather than silently running with a publicly-known JWT
+    signing key. SECRET_KEY backs every session token AND (as of the Discord
+    integration) OAuth state signing — a deploy that forgot to set it would
+    let anyone forge valid auth tokens or hijack another org's OAuth callback.
+    Local dev (ENVIRONMENT=development, the default) is never affected.
+    """
+    if (app_settings.ENVIRONMENT or "development").strip().lower() == "development":
+        return
+    problems = []
+    if not app_settings.SECRET_KEY or app_settings.SECRET_KEY == _INSECURE_DEFAULT_SECRET_KEY:
+        problems.append("SECRET_KEY is unset or still the default placeholder value")
+    elif len(app_settings.SECRET_KEY) < 32:
+        problems.append("SECRET_KEY is shorter than 32 characters (too weak for HS256 JWT signing)")
+    if not (getattr(app_settings, "ENCRYPTION_KEY", None) or "").strip():
+        problems.append("ENCRYPTION_KEY is unset (OAuth tokens/API keys would be stored unencrypted)")
+    if problems:
+        raise RuntimeError(
+            "Refusing to start with ENVIRONMENT=%r and insecure config: %s. "
+            "Generate real values (see .env.example) before deploying."
+            % (app_settings.ENVIRONMENT, "; ".join(problems))
+        )
+
+
+_validate_production_secrets()
 
 _sentry_dsn = (app_settings.SENTRY_DSN or "").strip()
 if _sentry_dsn:
@@ -114,6 +144,7 @@ app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webh
 app.include_router(resources.router, prefix="/resources", tags=["resources"])
 app.include_router(portal.router, prefix="/portal", tags=["portal"])
 app.include_router(portal_funnel_simulator.router, prefix="/portal", tags=["portal"])
+app.include_router(content_angle_map.router, prefix="/portal", tags=["portal"])
 app.include_router(kpi.router, prefix="/kpi", tags=["kpi"])
 app.include_router(close_survey.router, prefix="/close-survey", tags=["close-survey"])
 app.include_router(instagram.router, prefix="/instagram", tags=["instagram"])
@@ -176,6 +207,10 @@ def _ensure_schema_columns_on_startup() -> None:
 
         McpOAuthClient.__table__.create(db.bind, checkfirst=True)
         McpOAuthGrant.__table__.create(db.bind, checkfirst=True)
+
+        from app.models.content_angle_map import ContentAngleMap
+
+        ContentAngleMap.__table__.create(db.bind, checkfirst=True)
 
         # user_organizations: per-org Intelligence bank
         _add_column_if_missing("user_organizations", "ai_profile", "JSONB")

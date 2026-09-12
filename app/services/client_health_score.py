@@ -50,13 +50,25 @@ def _factor_show_rate(db: Session, client_id: uuid.UUID, org_id: uuid.UUID) -> D
 
 
 def _factor_failed_payments(db: Session, client_id: uuid.UUID, org_id: uuid.UUID) -> Dict[str, Any]:
-    """Count of failed Stripe payments for this client (by client_id or by email match)."""
+    """Count of failed Stripe/Whop payments for this client (by client_id or by email match)."""
+    from app.models.whop_payment import WhopPayment
+    from app.services.whop_sync import WHOP_FAILED_STATUSES, _payer_email
+
     # Directly linked
     count = db.query(StripePayment).filter(
         StripePayment.client_id == client_id,
         StripePayment.org_id == org_id,
         StripePayment.status == "failed",
     ).count()
+    count += (
+        db.query(WhopPayment)
+        .filter(
+            WhopPayment.client_id == client_id,
+            WhopPayment.org_id == org_id,
+            WhopPayment.status.in_(tuple(WHOP_FAILED_STATUSES)),
+        )
+        .count()
+    )
 
     # Include unlinked payments that match client email (primary or additional)
     client = db.query(Client).filter(Client.id == client_id, Client.org_id == org_id).first()
@@ -73,6 +85,16 @@ def _factor_failed_payments(db: Session, client_id: uuid.UUID, org_id: uuid.UUID
                     email = extract_email_from_payment_raw(p.raw_event)
                     if email and re.sub(r'\s+', '', email.lower().strip()) in all_emails:
                         count += 1
+            unlinked_whop = db.query(WhopPayment).filter(
+                WhopPayment.client_id.is_(None),
+                WhopPayment.org_id == org_id,
+                WhopPayment.status.in_(tuple(WHOP_FAILED_STATUSES)),
+            ).all()
+            for wp in unlinked_whop:
+                raw = wp.raw if isinstance(wp.raw, dict) else {}
+                email = _payer_email(raw) if raw else None
+                if email and re.sub(r'\s+', '', email.lower().strip()) in all_emails:
+                    count += 1
 
             # Include Treasury void transactions (failed payments) by customer_email
             try:

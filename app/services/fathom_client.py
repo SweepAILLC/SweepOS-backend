@@ -8,9 +8,11 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import httpx
+from cryptography.fernet import InvalidToken
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.encryption import decrypt_token, encrypt_token
 from app.models.organization import Organization
 from app.models.user import User
 
@@ -21,6 +23,32 @@ BASE = "https://api.fathom.ai/external/v1"
 # Fathom docs: heavy /meetings (include_summary|include_transcript) ≈ 30/min (can drop to 5/min).
 # Global authenticated limit ≈ 60/min. Wait full window on 429 when header missing.
 _RATE_LIMIT_DEFAULT_WAIT_SEC = 62.0
+
+
+def encrypt_fathom_api_key(raw: Optional[str]) -> Optional[str]:
+    """Encrypt a normalized Fathom API key before storing on organizations/users."""
+    if not raw:
+        return None
+    return encrypt_token(raw)
+
+
+def decrypt_fathom_api_key(stored: Optional[str]) -> Optional[str]:
+    """
+    Decrypt a stored Fathom API key. Tolerates legacy rows written before this
+    column was encrypted (org/user API keys were previously stored in plaintext) —
+    falls back to the raw value when it isn't a valid Fernet token, so existing
+    orgs keep working until they re-save the key (which re-encrypts it going forward).
+
+    Catches both InvalidToken (legacy encryption.py Fernet path) and ValueError
+    (encryption_v2's decrypt_token wraps every failure, including a bad token,
+    as ValueError) since either backend may be active depending on deployment.
+    """
+    if not stored:
+        return None
+    try:
+        return decrypt_token(stored)
+    except (InvalidToken, ValueError):
+        return stored
 
 
 def normalize_fathom_api_key(raw: Optional[str]) -> Optional[str]:
@@ -67,11 +95,11 @@ def resolve_fathom_api_key(
     if db is not None and org_id is not None:
         org = db.query(Organization).filter(Organization.id == org_id).first()
         if org and getattr(org, "fathom_api_key", None):
-            k = normalize_fathom_api_key(org.fathom_api_key)
+            k = normalize_fathom_api_key(decrypt_fathom_api_key(org.fathom_api_key))
             if k:
                 return k
     if user is not None:
-        k = normalize_fathom_api_key(getattr(user, "fathom_api_key", None))
+        k = normalize_fathom_api_key(decrypt_fathom_api_key(getattr(user, "fathom_api_key", None)))
         if k:
             return k
     if db is not None and org_id is not None:
@@ -81,7 +109,7 @@ def resolve_fathom_api_key(
             .first()
         )
         if row and row.fathom_api_key:
-            k = normalize_fathom_api_key(row.fathom_api_key)
+            k = normalize_fathom_api_key(decrypt_fathom_api_key(row.fathom_api_key))
             if k:
                 return k
     env_k = normalize_fathom_api_key(getattr(settings, "FATHOM_API_KEY", None))
