@@ -1,7 +1,7 @@
 """Content Angle Map per consulting org.
 
 Revision ID: 082
-Revises: 081
+Revises: 080
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "082"
-down_revision = "081"
+down_revision = "080"
 branch_labels = None
 depends_on = None
 
