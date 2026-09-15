@@ -22,6 +22,7 @@ from app.models.instagram_media import InstagramMedia
 from app.models.oauth_token import OAuthProvider, OAuthToken
 from app.services import composio_client as cc
 from app.services.composio_client import (
+    ComposioAuthError,
     ComposioConfigError,
     ComposioNotConnectedError,
     ComposioToolError,
@@ -491,7 +492,12 @@ def sync_instagram_for_org(
             .scalar()
         )
 
-    user_info = fetch_user_info(db, org_id)
+    try:
+        user_info = fetch_user_info(db, org_id)
+    except ComposioAuthError:
+        cc.set_instagram_auth_invalid(db, org_id, True, commit=True)
+        raise
+    cc.set_instagram_auth_invalid(db, org_id, False, commit=False)
     ig_user_id = str(user_info.get("id") or user_info.get("ig_id") or token.account_id or "")
     username = str(user_info.get("username") or "")
     followers = _as_int(user_info.get("followers_count"))
@@ -878,6 +884,7 @@ def sync_instagram_all_orgs(db: Session) -> Dict[str, Any]:
     failed = 0
     skipped_fresh = 0
     skipped_no_creds = 0
+    skipped_auth_invalid = 0
     for tok in tokens:
         if tok.last_sync_at and tok.last_sync_at > cutoff:
             skipped_fresh += 1
@@ -885,9 +892,15 @@ def sync_instagram_all_orgs(db: Session) -> Dict[str, Any]:
         if not cc.composio_configured(db, tok.org_id):
             skipped_no_creds += 1
             continue
+        if cc.instagram_auth_invalid_from_scope(tok.scope):
+            skipped_auth_invalid += 1
+            continue
         try:
             sync_instagram_for_org(db, tok.org_id, full=False)
             synced += 1
+        except ComposioAuthError as e:
+            skipped_auth_invalid += 1
+            logger.warning("instagram sync needs reconnect org=%s: %s", tok.org_id, e)
         except (ComposioNotConnectedError, ComposioConfigError) as e:
             logger.info("instagram sync skip org=%s: %s", tok.org_id, e)
         except Exception:
@@ -902,6 +915,7 @@ def sync_instagram_all_orgs(db: Session) -> Dict[str, Any]:
         "failed": failed,
         "skipped_fresh": skipped_fresh,
         "skipped_no_creds": skipped_no_creds,
+        "skipped_auth_invalid": skipped_auth_invalid,
         "candidates": len(tokens),
     }
 

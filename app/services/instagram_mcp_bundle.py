@@ -62,6 +62,7 @@ def get_instagram_performance_for_mcp(
         "range_start": payload.get("range_start"),
         "range_end": payload.get("range_end"),
         "last_synced_at": payload.get("last_synced_at"),
+        "needs_reconnect": bool(payload.get("needs_reconnect")),
         "username": payload.get("username"),
         "capabilities": payload.get("capabilities"),
         "unsettled_post_count": payload.get("unsettled_post_count"),
@@ -99,7 +100,8 @@ def get_instagram_performance_for_mcp(
             "(captions get edited/truncated/duplicated). last_synced_at shows how current this "
             "data is (syncs run roughly every 24h) — surface it if the user asks. Prefer "
             "observed numbers and links over invented advice. If connected=false, ask the user "
-            "to connect Instagram in SweepOS → Integrations."
+            "to connect Instagram in SweepOS → Integrations. If needs_reconnect=true, the Meta "
+            "session is dead: ask them to Reconnect Instagram; cached posts are last-known, not live."
         ),
     }
 

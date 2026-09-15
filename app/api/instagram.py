@@ -23,6 +23,7 @@ from app.models.oauth_token import OAuthProvider, OAuthToken
 from app.models.user import User
 from app.services import composio_client as cc
 from app.services.composio_client import (
+    ComposioAuthError,
     ComposioConfigError,
     ComposioNotConnectedError,
     ComposioToolError,
@@ -54,6 +55,7 @@ class StatusResponse(BaseModel):
     followers_count: Optional[int] = None
     capabilities: Dict[str, Any] = Field(default_factory=dict)
     last_sync_at: Optional[str] = None
+    needs_reconnect: bool = False
     message: Optional[str] = None
 
 
@@ -154,7 +156,9 @@ def connect_instagram(
             detail="Add your Composio API key and Instagram auth config ID in Integrations first.",
         )
     # If Composio already has an ACTIVE Instagram account for this org, bind it
-    # and skip a fresh OAuth round-trip (avoids "multiple connected accounts" dead-ends).
+    # and skip a fresh OAuth round-trip — but only when that account can still
+    # read user info. A dead Meta session (OAuthException 190) must start a new
+    # link; claiming connected=true here is why reconnect could not recover.
     try:
         existing = cc.list_connected_account_ids(db, org_id)
     except Exception:
@@ -165,6 +169,8 @@ def connect_instagram(
         cc.upsert_instagram_connection(db, org_id, connected_account_id=ca_id)
         try:
             info = cc.execute(db, org_id, "INSTAGRAM_GET_USER_INFO", {"ig_user_id": "me"})
+            ig_user_id = None
+            username = None
             if isinstance(info, dict):
                 data = info.get("data") if isinstance(info.get("data"), dict) else info
                 if isinstance(data, list) and data:
@@ -172,18 +178,27 @@ def connect_instagram(
                 if isinstance(data, dict):
                     ig_user_id = str(data.get("id") or "") or None
                     username = str(data.get("username") or "") or None
-                    if ig_user_id:
-                        cc.upsert_instagram_connection(
-                            db,
-                            org_id,
-                            connected_account_id=ca_id,
-                            ig_user_id=ig_user_id,
-                            scope=f"instagram:{username}" if username else "composio_instagram",
-                        )
+            if ig_user_id:
+                cc.upsert_instagram_connection(
+                    db,
+                    org_id,
+                    connected_account_id=ca_id,
+                    ig_user_id=ig_user_id,
+                    scope=f"instagram:{username}" if username else "composio_instagram",
+                )
+            cc.set_instagram_auth_invalid(db, org_id, False)
+            schedule_background_work(_sync_org_outside_session, None, org_id, True)
+            return ConnectResponse(redirect_url=_frontend_integrations_url(connected=True))
+        except ComposioAuthError:
+            logger.info(
+                "instagram connect: existing account session invalidated, starting OAuth org=%s",
+                org_id,
+            )
+            cc.set_instagram_auth_invalid(db, org_id, True)
         except Exception:
-            logger.exception("instagram connect: reuse existing account user info failed org=%s", org_id)
-        schedule_background_work(_sync_org_outside_session, None, org_id, True)
-        return ConnectResponse(redirect_url=_frontend_integrations_url(connected=True))
+            logger.exception(
+                "instagram connect: reuse existing account user info failed org=%s", org_id
+            )
 
     try:
         result = cc.start_instagram_link(db, org_id, callback_url=_callback_url())
@@ -354,9 +369,8 @@ def instagram_status(
     except Exception:
         pass
 
-    username = None
-    if token.scope and token.scope.startswith("instagram:"):
-        username = token.scope.split(":", 1)[1] or None
+    username = cc.instagram_username_from_scope(token.scope)
+    needs_reconnect = cc.instagram_auth_invalid_from_scope(token.scope)
 
     # Infer capabilities from recent media
     from app.models.instagram_media import InstagramMedia
@@ -387,10 +401,15 @@ def instagram_status(
         followers_count=followers,
         capabilities=caps,
         last_sync_at=token.last_sync_at.isoformat() if token.last_sync_at else None,
+        needs_reconnect=needs_reconnect,
         message=(
-            None
-            if configured
-            else "Composio credentials missing — sync will fail until you re-save them in Integrations."
+            "Instagram session expired. Reconnect Instagram in Integrations to resume sync."
+            if needs_reconnect
+            else (
+                None
+                if configured
+                else "Composio credentials missing — sync will fail until you re-save them in Integrations."
+            )
         ),
     )
 
@@ -482,8 +501,8 @@ def get_performance(
     payload = build_instagram_performance(db, org_id, days=days)
     # Attach username from token scope when available
     token = cc.get_instagram_token(db, org_id)
-    if token and token.scope and token.scope.startswith("instagram:"):
-        payload["username"] = token.scope.split(":", 1)[1] or None
+    if token:
+        payload["username"] = cc.instagram_username_from_scope(token.scope)
     return payload
 
 

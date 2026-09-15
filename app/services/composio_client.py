@@ -42,6 +42,24 @@ class ComposioToolError(RuntimeError):
         self.raw = raw
 
 
+class ComposioAuthError(ComposioToolError):
+    """Meta access token is dead (OAuthException 190). User must reconnect."""
+
+
+# Stamped onto oauth_tokens.scope when GET_USER_INFO fails with an invalidated
+# session. Worker skips hourly retries; status/MCP tell the user to reconnect.
+# Cache is left intact so Marketing Intel still has last-known posts.
+AUTH_INVALID_MARKER = "auth:invalid"
+
+_AUTH_INVALID_MARKERS = (
+    "session has been invalidated",
+    "error validating access token",
+    "(#190)",
+    '"code":190',
+    "code: 190",
+)
+
+
 def get_composio_token(db: Session, org_id: uuid.UUID) -> Optional[OAuthToken]:
     return (
         db.query(OAuthToken)
@@ -356,9 +374,66 @@ def list_connected_account_ids(db: Session, org_id: uuid.UUID) -> list[str]:
     return out
 
 
+def _is_auth_invalid_message(message: str) -> bool:
+    lowered = (message or "").lower()
+    return any(marker in lowered for marker in _AUTH_INVALID_MARKERS)
+
+
+def _tool_error(message: str, *, slug: Optional[str] = None, raw: Any = None) -> ComposioToolError:
+    cls = ComposioAuthError if _is_auth_invalid_message(message) else ComposioToolError
+    return cls(message, slug=slug, raw=raw)
+
+
+def _scope_tokens(scope: Optional[str]) -> list[str]:
+    return [t for t in (scope or "").split() if t]
+
+
+def instagram_username_from_scope(scope: Optional[str]) -> Optional[str]:
+    """Username stored as instagram:<handle>, ignoring capability markers."""
+    if not scope:
+        return None
+    rest = scope.split(":", 1)[1] if scope.startswith("instagram:") else scope
+    for token in rest.split():
+        if token and ":" not in token:
+            return token
+    return None
+
+
+def instagram_auth_invalid_from_scope(scope: Optional[str]) -> bool:
+    return AUTH_INVALID_MARKER in _scope_tokens(scope)
+
+
+def instagram_auth_invalid(db: Session, org_id: uuid.UUID) -> bool:
+    row = get_instagram_token(db, org_id)
+    if row is None:
+        return False
+    return instagram_auth_invalid_from_scope(row.scope)
+
+
+def set_instagram_auth_invalid(
+    db: Session,
+    org_id: uuid.UUID,
+    invalid: bool,
+    *,
+    commit: bool = True,
+) -> None:
+    row = get_instagram_token(db, org_id)
+    if row is None:
+        return
+    tokens = [t for t in _scope_tokens(row.scope) if t != AUTH_INVALID_MARKER]
+    if invalid:
+        tokens.append(AUTH_INVALID_MARKER)
+    new_scope = " ".join(tokens)
+    if new_scope == (row.scope or ""):
+        return
+    row.scope = new_scope
+    if commit:
+        db.commit()
+
+
 def _unwrap_tool_result(result: Any, *, slug: str) -> Any:
     if result is None:
-        raise ComposioToolError("Empty tool response", slug=slug)
+        raise _tool_error("Empty tool response", slug=slug)
 
     # Object-style response
     if hasattr(result, "successful") or hasattr(result, "data"):
@@ -366,7 +441,7 @@ def _unwrap_tool_result(result: Any, *, slug: str) -> Any:
         error = getattr(result, "error", None)
         data = getattr(result, "data", result)
         if successful is False:
-            raise ComposioToolError(
+            raise _tool_error(
                 str(error or f"{slug} failed"),
                 slug=slug,
                 raw=result,
@@ -375,7 +450,7 @@ def _unwrap_tool_result(result: Any, *, slug: str) -> Any:
 
     if isinstance(result, dict):
         if result.get("successful") is False:
-            raise ComposioToolError(
+            raise _tool_error(
                 str(result.get("error") or f"{slug} failed"),
                 slug=slug,
                 raw=result,
@@ -431,6 +506,6 @@ def execute(
         raise
     except Exception as e:
         logger.exception("composio tools.execute failed slug=%s org=%s", slug, org_id)
-        raise ComposioToolError(str(e), slug=slug) from e
+        raise _tool_error(str(e), slug=slug, raw=e) from e
 
     return _unwrap_tool_result(result, slug=slug)

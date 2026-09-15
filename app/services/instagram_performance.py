@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.models.instagram_account_snapshot import InstagramAccountSnapshot
 from app.models.instagram_media import InstagramMedia
 from app.models.oauth_token import OAuthProvider, OAuthToken
+from app.services.composio_client import instagram_auth_invalid_from_scope
 from app.services.instagram_sync_service import (
     caption_len_bucket,
     resolve_capabilities,
@@ -539,6 +540,7 @@ def build_instagram_performance(
             "capabilities": {"insights": False, "reason": "Instagram is not connected."},
             "unsettled_post_count": 0,
             "last_synced_at": None,
+            "needs_reconnect": False,
             "usage": "Connect Instagram in Integrations to pull content performance.",
         }
 
@@ -667,6 +669,8 @@ def build_instagram_performance(
         insights_attempted=len(posts),
     )
 
+    needs_reconnect = instagram_auth_invalid_from_scope(token.scope)
+
     return {
         "connected": True,
         "org_id": str(org_id),
@@ -683,12 +687,18 @@ def build_instagram_performance(
         "capabilities": caps,
         "unsettled_post_count": unsettled,
         "last_synced_at": token.last_sync_at.isoformat() if token.last_sync_at else None,
+        "needs_reconnect": needs_reconnect,
         "username": None,  # filled by API from user_info cache / token scope if needed
         "usage": (
-            "summary.*_delta_pct and prev_* compare the selected window to the immediately "
-            "preceding window of equal length. top_posts/bottom_posts are ranked by engagement "
-            "rate with a reach floor. Prefer top_posts hooks and period deltas for ideation; "
-            "what_works/verdicts are secondary analytics, not primary UI advice."
+            "Instagram session expired — ask the user to Reconnect Instagram in SweepOS → Integrations. "
+            "Cached posts below are last-known, not live."
+            if needs_reconnect
+            else (
+                "summary.*_delta_pct and prev_* compare the selected window to the immediately "
+                "preceding window of equal length. top_posts/bottom_posts are ranked by engagement "
+                "rate with a reach floor. Prefer top_posts hooks and period deltas for ideation; "
+                "what_works/verdicts are secondary analytics, not primary UI advice."
+            )
         ),
     }
 
