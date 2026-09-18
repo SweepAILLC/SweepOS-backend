@@ -565,6 +565,7 @@ def sync_instagram_for_org(
     collected: List[Dict[str, Any]] = []
     after: Optional[str] = None
     budget_hit = False
+    page_index = 0
     while len(collected) < max_posts and _budget_ok(10.0):
         page_limit = min(50, max_posts - len(collected))
         try:
@@ -581,17 +582,26 @@ def sync_instagram_for_org(
         if not items:
             break
         stop_incremental = False
+        hit_watermark = False
         for item in items:
             posted = _parse_posted_at(item.get("timestamp") or item.get("posted_at"))
-            # Incremental: only keep posts newer than the watermark.
+            # Incremental: stop paging once we reach already-cached posts, but keep
+            # the first page so CDN cover URLs (they expire) get rewritten.
             if not full and newest_existing and posted and posted <= newest_existing:
+                hit_watermark = True
+                if page_index == 0:
+                    collected.append(item)
+                    if len(collected) >= max_posts:
+                        break
+                    continue
                 stop_incremental = True
                 break
             collected.append(item)
             if len(collected) >= max_posts:
                 break
-        if stop_incremental or not after:
+        if stop_incremental or hit_watermark or not after:
             break
+        page_index += 1
         time.sleep(0.2)
 
     if not _budget_ok(8.0):
