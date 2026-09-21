@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 import uuid
 from typing import Any, Optional
@@ -227,14 +228,32 @@ def _unwrap_calcom(payload: Any) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+_CALENDLY_API = "https://api.calendly.com"
+_CALENDLY_SUBSCRIPTIONS = f"{_CALENDLY_API}/webhook_subscriptions"
+_CALENDLY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _calendly_subscription_uri(existing_id: Optional[str]) -> Optional[str]:
+    """Subscription URI on Calendly's own API host, or None if the stored id looks wrong.
+
+    The id comes from our DB and is requested with the org's Bearer token, so anything
+    other than a bare id or a URI under api.calendly.com is refused instead of fetched.
+    """
+    raw = (existing_id or "").strip()
+    if raw.startswith(f"{_CALENDLY_SUBSCRIPTIONS}/"):
+        raw = raw[len(_CALENDLY_SUBSCRIPTIONS) + 1 :].rstrip("/")
+    return f"{_CALENDLY_SUBSCRIPTIONS}/{raw}" if _CALENDLY_ID_RE.match(raw) else None
+
+
 def _register_calendly(access_token: str, destination: str, existing_id: Optional[str]) -> dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
     }
     secret = secrets.token_urlsafe(32)
+    old_uri = _calendly_subscription_uri(existing_id)
     with httpx.Client(timeout=15.0) as client:
-        me = client.get("https://api.calendly.com/users/me", headers=headers)
+        me = client.get(f"{_CALENDLY_API}/users/me", headers=headers)
         if me.status_code != 200:
             return {
                 "success": False,
@@ -246,54 +265,58 @@ def _register_calendly(access_token: str, destination: str, existing_id: Optiona
         org_uri = resource.get("current_organization")
         if not user_uri:
             return {"success": False, "webhook_active": False, "error": "Calendly user URI missing"}
+        if not org_uri:
+            # Calendly requires `organization` on every subscription, whatever the scope.
+            return {"success": False, "webhook_active": False, "error": "Calendly organization URI missing"}
 
-        if existing_id:
-            uri = (
-                existing_id
-                if existing_id.startswith("http")
-                else f"https://api.calendly.com/webhook_subscriptions/{existing_id}"
-            )
+        def _delete_old() -> None:
+            if not old_uri:
+                return
             try:
-                client.delete(uri, headers=headers)
+                client.delete(old_uri, headers=headers)
             except Exception:
-                pass
+                LOG.warning("calendar_webhook_onboard: could not delete previous Calendly webhook")
 
-        payload: dict[str, Any] = {
-            "url": destination,
-            "events": CALENDLY_EVENTS,
-            "user": user_uri,
-            "scope": "user",
-            "signing_key": secret,
-        }
-        if org_uri:
-            payload["organization"] = org_uri
-            payload["scope"] = "organization"
-            payload.pop("user", None)
+        def _post(scope: str) -> httpx.Response:
+            payload: dict[str, Any] = {
+                "url": destination,
+                "events": CALENDLY_EVENTS,
+                "organization": org_uri,
+                "scope": scope,
+                "signing_key": secret,
+            }
+            if scope == "user":
+                payload["user"] = user_uri
+            return client.post(_CALENDLY_SUBSCRIPTIONS, headers=headers, json=payload)
 
-        resp = client.post("https://api.calendly.com/webhook_subscriptions", headers=headers, json=payload)
-        if resp.status_code not in (200, 201):
-            if payload.get("scope") == "organization":
-                payload = {
-                    "url": destination,
-                    "events": CALENDLY_EVENTS,
-                    "user": user_uri,
-                    "scope": "user",
-                    "signing_key": secret,
-                }
-                resp = client.post(
-                    "https://api.calendly.com/webhook_subscriptions",
-                    headers=headers,
-                    json=payload,
-                )
-        if resp.status_code not in (200, 201):
+        # Create first and only remove the previous webhook once a new one exists, so a
+        # failed registration never leaves the org without a working webhook. The one
+        # exception is Calendly's 409 for a duplicate url/scope, where our own previous
+        # subscription has to go before the replacement can be created.
+        deleted_old = False
+        errors: list[str] = []
+        resp: Optional[httpx.Response] = None
+        for scope in ("organization", "user"):
+            resp = _post(scope)
+            if resp.status_code == 409 and old_uri and not deleted_old:
+                deleted_old = True
+                _delete_old()
+                resp = _post(scope)
+            if resp.status_code in (200, 201):
+                break
+            errors.append(f"{scope} scope HTTP {resp.status_code}: {resp.text[:200]}")
+        else:
             return {
                 "success": False,
                 "webhook_active": False,
-                "error": f"Calendly webhook register HTTP {resp.status_code}: {resp.text[:300]}",
+                "error": "Calendly webhook register failed: " + "; ".join(errors),
             }
+
         created = (resp.json() or {}).get("resource") or {}
         hook_uri = str(created.get("uri") or created.get("id") or "")
         hook_id = hook_uri.rstrip("/").rsplit("/", 1)[-1][:64]
+        if old_uri and not deleted_old and old_uri.rsplit("/", 1)[-1] != hook_id:
+            _delete_old()
         return {"success": True, "webhook_id": hook_id, "secret": secret}
 
 
