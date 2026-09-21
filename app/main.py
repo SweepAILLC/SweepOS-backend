@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey, ghl, ghl_webhooks
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -135,9 +135,11 @@ app.include_router(integrations.router, prefix="/integrations", tags=["integrati
 app.include_router(finances.router, prefix="/integrations/finances", tags=["finances"])
 app.include_router(whop.router, prefix="/integrations/whop", tags=["whop"])
 app.include_router(stripe.router, prefix="/integrations/stripe", tags=["stripe"])
+app.include_router(ghl.router, prefix="/integrations/ghl", tags=["ghl"])
 app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 app.include_router(fathom_webhooks.router, prefix="/webhooks", tags=["fathom"])
 app.include_router(calendar_webhooks.router, prefix="/webhooks", tags=["calendar-webhooks"])
+app.include_router(ghl_webhooks.router, prefix="/webhooks", tags=["ghl-webhooks"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])
@@ -301,6 +303,11 @@ def _ensure_schema_columns_on_startup() -> None:
         from app.models.funnel_lead_notification import FunnelLeadNotification
 
         FunnelLeadNotification.__table__.create(db.bind, checkfirst=True)
+        from app.models.inbound_webhook_event import InboundWebhookEvent
+        from app.models.integration_event_dispatch import IntegrationEventDispatch
+
+        InboundWebhookEvent.__table__.create(db.bind, checkfirst=True)
+        IntegrationEventDispatch.__table__.create(db.bind, checkfirst=True)
         try:
             db.execute(text("SET LOCAL lock_timeout = '3s'"))
             db.execute(
@@ -413,6 +420,15 @@ def _ensure_schema_columns_on_startup() -> None:
                 target=reconcile_stripe_webhooks_for_existing_orgs,
                 daemon=True,
                 name="stripe-webhook-reconcile",
+            ).start()
+
+        if getattr(app_settings, "CALENDAR_RECONCILE_WEBHOOKS_ON_STARTUP", True):
+            from app.services.calendar_webhook_onboard import reconcile_calendar_webhooks_for_existing_orgs
+
+            threading.Thread(
+                target=reconcile_calendar_webhooks_for_existing_orgs,
+                daemon=True,
+                name="calendar-webhook-reconcile",
             ).start()
     except Exception as e:
         db.rollback()

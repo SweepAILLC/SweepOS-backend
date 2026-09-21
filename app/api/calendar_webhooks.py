@@ -29,7 +29,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.db.session import get_db
 from app.models.client import Client
 from app.models.client_checkin import ClientCheckIn
@@ -61,18 +60,56 @@ def _parse_org(org_id: str) -> uuid.UUID:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid org_id") from exc
 
 
-def _verify_hmac_sha256(secret: Optional[str], header_value: str, raw_body: bytes) -> None:
-    """If a secret is configured, verify the header matches HMAC-SHA256 of the raw body."""
+def verify_calcom_signature(secret: Optional[str], header_value: str, raw_body: bytes) -> bool:
+    """Cal.com X-Cal-Signature-256 is HMAC-SHA256 hex of the raw body."""
     if not secret:
-        # Match Fathom webhook posture: warn-but-accept when unset so local dev / first-time
-        # connections work; production should set the env var to lock this down.
-        return
+        return True
     expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
     candidates = [
         header_value.strip(),
         header_value.strip().split("=", 1)[-1].strip() if "=" in header_value else "",
     ]
-    if not any(hmac.compare_digest(c, expected) for c in candidates if c):
+    return any(hmac.compare_digest(c, expected) for c in candidates if c)
+
+
+def verify_calendly_signature(secret: Optional[str], header_value: str, raw_body: bytes) -> bool:
+    """Calendly-Webhook-Signature is ``t=<unix>,v1=<hex>`` over ``{t}.{body}``."""
+    if not secret:
+        return True
+    parts: Dict[str, str] = {}
+    for chunk in (header_value or "").split(","):
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+            parts[k.strip()] = v.strip()
+    ts = parts.get("t")
+    sig = parts.get("v1")
+    if not ts or not sig:
+        expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(header_value.strip(), expected) if header_value.strip() else False
+    signed = f"{ts}.".encode("utf-8") + raw_body
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
+def _verify_calendar_signature(
+    db: Session,
+    org_id: uuid.UUID,
+    provider: str,
+    header_value: str,
+    raw_body: bytes,
+) -> None:
+    from app.services.calendar_webhook_onboard import resolve_calendar_webhook_secret
+
+    secret = resolve_calendar_webhook_secret(db, org_id, provider)
+    if not secret:
+        LOG.warning("calendar webhook: no signing secret for org=%s provider=%s; accepting", org_id, provider)
+        return
+    ok = (
+        verify_calcom_signature(secret, header_value, raw_body)
+        if provider == "calcom"
+        else verify_calendly_signature(secret, header_value, raw_body)
+    )
+    if not ok:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid webhook signature")
 
 
@@ -268,13 +305,12 @@ async def calendly_webhook(
     org_uuid = _parse_org(org_id)
     raw_body = await _read_body_async(request)
 
-    secret = getattr(settings, "CALENDLY_WEBHOOK_SECRET", None) or None
     sig_header = (
         request.headers.get("calendly-webhook-signature")
         or request.headers.get("x-calendly-signature")
         or ""
     )
-    _verify_hmac_sha256(secret, sig_header, raw_body)
+    _verify_calendar_signature(db, org_uuid, "calendly", sig_header, raw_body)
 
     try:
         body = json.loads(raw_body)
@@ -283,6 +319,43 @@ async def calendly_webhook(
     if not isinstance(body, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Expected JSON object")
 
+    return _ingest_and_process_calendly(db, org_uuid, body)
+
+
+def _ingest_and_process_calendly(db: Session, org_uuid: uuid.UUID, body: Dict[str, Any]) -> Dict[str, Any]:
+    from app.services.inbound_webhook_inbox import (
+        mark_inbound_done,
+        mark_inbound_retry,
+        record_inbound_event,
+    )
+
+    kind, invitee, scheduled = _extract_calendly_invitee(body)
+    event_uri = str(scheduled.get("uri") or "")
+    event_uuid = event_uri.rsplit("/", 1)[-1] if event_uri else (str(invitee.get("uri") or "").rsplit("/", 1)[-1])
+    inbox_id = event_uuid or f"calendly-{kind or 'unknown'}"
+    row, _ = record_inbound_event(
+        db,
+        org_id=org_uuid,
+        provider="calendly",
+        event_id=inbox_id,
+        event_type=kind,
+        payload=body,
+    )
+    if row.status == "done":
+        return {"ok": True, "is_new": False, "fired_jobs": [], "deduped": True}
+    try:
+        result = process_calendly_webhook_payload(db, org_uuid, body)
+        mark_inbound_done(db, row)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        mark_inbound_retry(db, row, str(exc))
+        raise
+
+
+def process_calendly_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Process a verified Calendly payload. Used by the HTTP handler and inbox retries."""
     kind, invitee, scheduled = _extract_calendly_invitee(body)
     if kind not in ("invitee.created", "invitee.canceled"):
         # Acknowledge so Calendly doesn't keep retrying, but skip work.
@@ -371,17 +444,18 @@ async def calendly_webhook(
 
     if is_new and not cancelled:
         try:
-            from app.services import discord_notify
+            from app.services.integration_side_effects import emit_new_booking_discord
 
-            discord_notify.send_discord_event_background(
-                org_uuid,
-                "new_booking",
-                title=f"New booking: {' '.join(p for p in (client.first_name or invitee_name, client.last_name) if p) or 'Unknown'}",
-                description=event_type_label or "Calendly booking",
-                fields=[
-                    ("Provider", "Calendly"),
-                    ("When", discord_notify.format_org_local_datetime(db, org_uuid, start_time)),
-                ] + ([("Email", invitee_email)] if invitee_email else []),
+            emit_new_booking_discord(
+                db,
+                org_id=org_uuid,
+                provider="calendly",
+                event_id=event_uuid,
+                client=client,
+                attendee_name=invitee_name,
+                attendee_email=invitee_email,
+                event_type_label=event_type_label,
+                start_time=start_time,
             )
         except Exception as e:
             LOG.warning("discord_notify new_booking (calendly) skipped: %s", e)
@@ -430,13 +504,12 @@ async def calcom_webhook(
     org_uuid = _parse_org(org_id)
     raw_body = await _read_body_async(request)
 
-    secret = getattr(settings, "CALCOM_WEBHOOK_SECRET", None) or None
     sig_header = (
         request.headers.get("x-cal-signature-256")
         or request.headers.get("x-cal-signature")
         or ""
     )
-    _verify_hmac_sha256(secret, sig_header, raw_body)
+    _verify_calendar_signature(db, org_uuid, "calcom", sig_header, raw_body)
 
     try:
         body = json.loads(raw_body)
@@ -445,6 +518,42 @@ async def calcom_webhook(
     if not isinstance(body, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Expected JSON object")
 
+    return _ingest_and_process_calcom(db, org_uuid, body)
+
+
+def _ingest_and_process_calcom(db: Session, org_uuid: uuid.UUID, body: Dict[str, Any]) -> Dict[str, Any]:
+    from app.services.inbound_webhook_inbox import (
+        mark_inbound_done,
+        mark_inbound_retry,
+        record_inbound_event,
+    )
+
+    payload = body.get("payload") if isinstance(body.get("payload"), dict) else body
+    event_id = str(payload.get("uid") or payload.get("id") or "")
+    trigger = str(body.get("triggerEvent") or body.get("type") or "").upper()
+    inbox_id = event_id or f"calcom-{trigger or 'unknown'}"
+    row, _ = record_inbound_event(
+        db,
+        org_id=org_uuid,
+        provider="calcom",
+        event_id=inbox_id,
+        event_type=trigger,
+        payload=body,
+    )
+    if row.status == "done":
+        return {"ok": True, "is_new": False, "fired_jobs": [], "deduped": True}
+    try:
+        result = process_calcom_webhook_payload(db, org_uuid, body)
+        mark_inbound_done(db, row)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        mark_inbound_retry(db, row, str(exc))
+        raise
+
+
+def process_calcom_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dict[str, Any]) -> Dict[str, Any]:
     trigger = str(body.get("triggerEvent") or body.get("type") or "").upper()
     if trigger not in ("BOOKING_CREATED", "BOOKING_CANCELLED", "BOOKING_RESCHEDULED"):
         return {"ok": True, "skipped": True, "reason": f"unsupported_event:{trigger or 'unknown'}"}
@@ -533,17 +642,18 @@ async def calcom_webhook(
 
     if is_new and not cancelled:
         try:
-            from app.services import discord_notify
+            from app.services.integration_side_effects import emit_new_booking_discord
 
-            discord_notify.send_discord_event_background(
-                org_uuid,
-                "new_booking",
-                title=f"New booking: {' '.join(p for p in (client.first_name or attendee_name, client.last_name) if p) or 'Unknown'}",
-                description=event_type_label or "Cal.com booking",
-                fields=[
-                    ("Provider", "Cal.com"),
-                    ("When", discord_notify.format_org_local_datetime(db, org_uuid, start_time)),
-                ] + ([("Email", attendee_email)] if attendee_email else []),
+            emit_new_booking_discord(
+                db,
+                org_id=org_uuid,
+                provider="calcom",
+                event_id=event_id,
+                client=client,
+                attendee_name=attendee_name,
+                attendee_email=attendee_email,
+                event_type_label=event_type_label,
+                start_time=start_time,
             )
         except Exception as e:
             LOG.warning("discord_notify new_booking (calcom) skipped: %s", e)

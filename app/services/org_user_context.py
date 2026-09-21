@@ -287,14 +287,22 @@ def apply_selected_org_user_context(user: Any, db: Session, selected_org_id: uui
 
 def user_can_manage_org_integrations(user: Any, db: Session) -> bool:
     """True when the user is admin/owner for their currently selected org."""
+    from app.api.deps import user_is_system_owner
     from app.core.config import settings
 
-    if user.email == settings.SUDO_ADMIN_EMAIL:
+    email = (getattr(user, "email", None) or "").strip().lower()
+    sudo = (getattr(settings, "SUDO_ADMIN_EMAIL", None) or "").strip().lower()
+    if email and sudo and email == sudo:
         return True
 
     selected_org_id = getattr(user, "selected_org_id", None) or user.org_id
     if not isinstance(selected_org_id, uuid.UUID):
         selected_org_id = uuid.UUID(str(selected_org_id))
+
+    if user_is_system_owner(user, db) and user_has_email_org_access(
+        db, getattr(user, "email", "") or "", selected_org_id
+    ):
+        return True
 
     if str(getattr(user, "org_id", None)) == str(selected_org_id):
         role = user.role

@@ -52,6 +52,9 @@ from app.models.owner_org_notice import OwnerOrgNotice, OwnerOrgNoticeRead
 from app.models.sales_activity_event import SalesActivityEvent
 from app.models.content_angle_map import ContentAngleMap
 from app.models.discord_channel_mapping import DiscordChannelMapping
+from app.models.ghl_calendar_sync_setting import GhlCalendarSyncSetting
+from app.models.inbound_webhook_event import InboundWebhookEvent
+from app.models.integration_event_dispatch import IntegrationEventDispatch
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -91,5 +94,8 @@ __all__ = [
     "SalesActivityEvent",
     "ContentAngleMap",
     "DiscordChannelMapping",
+    "GhlCalendarSyncSetting",
+    "InboundWebhookEvent",
+    "IntegrationEventDispatch",
 ]
 

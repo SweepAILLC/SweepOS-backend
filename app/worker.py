@@ -152,6 +152,24 @@ def _dispatcher_loop() -> None:
                         db.rollback()
                     except Exception:
                         pass
+                try:
+                    from app.services.inbound_webhook_inbox import (
+                        flush_due_inbound_webhooks,
+                        retry_unprocessed_stripe_events,
+                    )
+
+                    inbound_n = flush_due_inbound_webhooks(db)
+                    if inbound_n:
+                        LOG.info("inbound webhook retries: processed %d row(s)", inbound_n)
+                    stripe_n = retry_unprocessed_stripe_events(db)
+                    if stripe_n:
+                        LOG.info("stripe event retries: processed %d row(s)", stripe_n)
+                except Exception:
+                    LOG.exception("inbound webhook retry flush failed")
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
                 now = time.time()
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     try:

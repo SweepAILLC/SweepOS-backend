@@ -16,6 +16,7 @@ class OAuthProvider(str, enum.Enum):
     INSTAGRAM = "instagram"
     COMPOSIO = "composio"
     DISCORD = "discord"
+    GHL = "ghl"
 
 
 class OAuthToken(Base):

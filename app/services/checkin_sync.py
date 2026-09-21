@@ -1106,8 +1106,27 @@ def sync_all_checkins(
             from app.services.automation_engine import on_booking_created_pre_sale
 
             def _fire(provider: str, rows: List[Dict[str, Any]]) -> None:
+                from app.models.client import Client
+                from app.services.integration_side_effects import emit_new_booking_discord
+
                 for row in rows:
                     try:
+                        client_row = (
+                            db.query(Client)
+                            .filter(Client.id == row["client_id"], Client.org_id == org_id)
+                            .first()
+                        )
+                        emit_new_booking_discord(
+                            db,
+                            org_id=org_id,
+                            provider=provider,
+                            event_id=str(row["external_booking_id"]),
+                            client=client_row,
+                            attendee_email=row.get("attendee_email"),
+                            event_type_label=row.get("event_type_label"),
+                            start_time=row.get("start_time"),
+                            require_recent=True,
+                        )
                         on_booking_created_pre_sale(
                             db,
                             org_id=org_id,

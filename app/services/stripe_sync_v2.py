@@ -285,7 +285,13 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
     Prevents duplicates by using unique constraint on (stripe_id, org_id).
     """
     payment_id = payment_data.id
-    
+    preexisting_sync_row = (
+        db.query(StripePayment.id)
+        .filter(StripePayment.stripe_id == payment_id, StripePayment.org_id == org_id)
+        .first()
+    )
+    was_new_payment = preexisting_sync_row is None
+
     # Determine payment status
     if payment_type == 'charge':
         status = getattr(payment_data, 'status', 'succeeded' if getattr(payment_data, 'paid', False) else 'failed')
@@ -628,6 +634,41 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
     
     if not payment:
         raise Exception(f"Failed to retrieve payment {payment_id} after upsert")
+
+    # Catch-up path: if the live webhook missed this charge, fire Discord + first-payment
+    # automations only for newly seen, recent succeeded payments (skip historical backfill).
+    try:
+        if (
+            was_new_payment
+            and (payment.status or status) == "succeeded"
+            and created_at
+            and (datetime.utcnow() - created_at) < timedelta(hours=36)
+        ):
+            from app.services.integration_side_effects import emit_new_payment_discord
+            from app.services.automation_engine import on_payment_received
+
+            emit_new_payment_discord(
+                db,
+                org_id=org_id,
+                source="stripe",
+                payment_id=str(payment.stripe_id),
+                amount_cents=int(payment.amount_cents or 0),
+                currency=payment.currency or "usd",
+                client=client,
+                event_type="stripe.sync",
+            )
+            if client:
+                on_payment_received(
+                    db,
+                    org_id=org_id,
+                    client_id=client.id,
+                    payment_source="stripe",
+                    payment_external_id=str(payment.stripe_id),
+                    amount_cents=int(payment.amount_cents or 0),
+                    paid_at=created_at,
+                )
+    except Exception as side_err:
+        print(f"[SYNC] payment side-effects skipped for {payment_id}: {side_err}")
     
     # Note: Client lifetime revenue is recalculated during reconciliation
     # to avoid double-counting during sync

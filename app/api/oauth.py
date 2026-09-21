@@ -1843,6 +1843,14 @@ def connect_calcom_direct(
             print(f"[CALCOM DIRECT] Created new connection for org {org_id}")
         
         db.commit()
+
+        webhook_result: dict = {}
+        try:
+            from app.services.calendar_webhook_onboard import ensure_calendar_webhook_for_org
+
+            webhook_result = ensure_calendar_webhook_for_org(org_id, "calcom", db=db, force=True)
+        except Exception as wh_err:
+            print(f"[CALCOM DIRECT] webhook register skipped: {wh_err}")
         
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -1852,7 +1860,9 @@ def connect_calcom_direct(
                 "account_email": account_email,
                 "account_name": account_name,
                 "org_id": str(org_id),
-                "method": "api_key"
+                "method": "api_key",
+                "webhook_active": bool(webhook_result.get("webhook_active")),
+                "webhook_url": webhook_result.get("destination_url"),
             }
         )
         
@@ -2120,6 +2130,14 @@ def connect_calendly_direct(
         print(f"[CALENDLY DIRECT] Created new connection for org {org_id}")
     
     db.commit()
+
+    webhook_result: dict = {}
+    try:
+        from app.services.calendar_webhook_onboard import ensure_calendar_webhook_for_org
+
+        webhook_result = ensure_calendar_webhook_for_org(org_id, "calendly", db=db, force=True)
+    except Exception as wh_err:
+        print(f"[CALENDLY DIRECT] webhook register skipped: {wh_err}")
     
     return JSONResponse(
         status_code=status.HTTP_200_OK,
@@ -2129,7 +2147,9 @@ def connect_calendly_direct(
             "account_email": account_email,
             "account_name": account_name,
             "org_id": str(org_id),
-            "method": "api_key"
+            "method": "api_key",
+            "webhook_active": bool(webhook_result.get("webhook_active")),
+            "webhook_url": webhook_result.get("destination_url"),
         }
     )
 

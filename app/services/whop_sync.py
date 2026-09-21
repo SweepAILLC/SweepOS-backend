@@ -451,6 +451,27 @@ def apply_whop_first_payment_signals(db: Session, org_id: uuid.UUID, signals: Li
         db.flush()
 
         first_signals = [sig for sig in paid_signals if sig.get("first")]
+        try:
+            from app.services.integration_side_effects import emit_new_payment_discord
+
+            for sig in paid_signals:
+                paid_at = sig.get("paid_at")
+                if paid_at is not None:
+                    naive = paid_at.replace(tzinfo=None) if getattr(paid_at, "tzinfo", None) else paid_at
+                    if (datetime.utcnow() - naive).total_seconds() > 36 * 3600:
+                        continue
+                client_for_notify = db.query(Client).filter(Client.id == sig["client_id"]).first()
+                emit_new_payment_discord(
+                    db,
+                    org_id=org_id,
+                    source="whop",
+                    payment_id=str(sig.get("whop_id")),
+                    amount_cents=int(sig.get("amount_cents") or 0),
+                    client=client_for_notify,
+                    event_type="whop.sync",
+                )
+        except Exception:
+            pass
         for sig in first_signals:
             client_row = db.query(Client).filter(Client.id == sig["client_id"]).first()
             if client_row:

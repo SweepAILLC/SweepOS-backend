@@ -358,19 +358,17 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         print(f"✅ Successfully processed {event_type} event - payment {payment_id} committed to database")
 
         try:
-            from app.services import discord_notify
+            from app.services.integration_side_effects import emit_new_payment_discord
 
-            client_name = None
-            if client:
-                client_name = " ".join(
-                    p for p in (getattr(client, "first_name", None), getattr(client, "last_name", None)) if p
-                ) or None
-            discord_notify.send_discord_event_background(
-                org_id,
-                "new_transaction",
-                title=f"New transaction: ${amount_cents / 100:.2f} {currency.upper()}",
-                description=client_name or "Unknown client",
-                fields=[("Event", event_type), ("Payment ID", payment_id)],
+            emit_new_payment_discord(
+                db,
+                org_id=org_id,
+                source="stripe",
+                payment_id=str(payment_id),
+                amount_cents=int(amount_cents or 0),
+                currency=currency,
+                client=client,
+                event_type=event_type,
             )
         except Exception as discord_err:
             print(f"[DISCORD_NOTIFY] new_transaction skipped: {discord_err}")

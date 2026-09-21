@@ -438,6 +438,25 @@ def get_calcom_status(
         )
 
 
+@router.post("/calcom/webhook/setup")
+def setup_calcom_webhook(
+    force: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """Register or repair the live Cal.com booking webhook for this org."""
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    from app.services.calendar_webhook_onboard import ensure_calendar_webhook_for_org
+
+    result = ensure_calendar_webhook_for_org(org_id, "calcom", db=db, force=force)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.get("error") or "Cal.com webhook registration failed",
+        )
+    return result
+
+
 def get_calcom_auth_headers(
     db: Session,
     org_id: uuid.UUID,
@@ -1173,6 +1192,25 @@ def get_calendly_status(
             connected=True,
             message="Calendly is connected and ready to use."
         )
+
+
+@router.post("/calendly/webhook/setup")
+def setup_calendly_webhook(
+    force: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """Register or repair the live Calendly booking webhook for this org."""
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    from app.services.calendar_webhook_onboard import ensure_calendar_webhook_for_org
+
+    result = ensure_calendar_webhook_for_org(org_id, "calendly", db=db, force=force)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.get("error") or "Calendly webhook registration failed",
+        )
+    return result
 
 
 def get_calendly_auth_headers(

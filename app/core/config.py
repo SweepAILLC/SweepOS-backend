@@ -178,6 +178,12 @@ class Settings(BaseSettings):
     # Fathom posture: warn-and-accept, fine for local dev, lock down in prod).
     CALENDLY_WEBHOOK_SECRET: Optional[str] = None
     CALCOM_WEBHOOK_SECRET: Optional[str] = None
+    # GHL Workflow "Webhook" actions can't HMAC-sign the body, only send a static
+    # custom header — the org pastes a shared secret into that header and Sweep
+    # compares it directly. Per-org secret (oauth_tokens.webhook_secret) wins over
+    # this env fallback; see app.services.ghl_client.resolve_ghl_webhook_secret.
+    GHL_WEBHOOK_SECRET: Optional[str] = None
+    CALENDAR_RECONCILE_WEBHOOKS_ON_STARTUP: bool = True
     # Optional Cal.com platform API key for **local dev testing only** (ENVIRONMENT=development).
     # Production uses OAuth tokens stored via Integrations.
     CALCOM_API_KEY: Optional[str] = None
