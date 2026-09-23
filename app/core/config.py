@@ -219,18 +219,6 @@ class Settings(BaseSettings):
     HEALTH_SCORE_RATE_LIMIT_MAX: int = 120  # logic-only path
     HEALTH_SCORE_AI_RATE_LIMIT_MAX: int = 25  # use_ai=true (more expensive)
 
-    # Fathom sync: optional pause between meetings to respect provider rate limits (ms)
-    FATHOM_SYNC_DELAY_MS: int = 0
-    # Pause between paginated /meetings list calls during bulk sync (ms). Light lists ≈ 60/min global limit.
-    FATHOM_SYNC_PAGE_DELAY_MS: int = 1100
-    # Max pages per sync request (cost / time bound)
-    FATHOM_SYNC_MAX_PAGES: int = 5
-    # Hard wall-clock cap per sync (seconds) to avoid very long requests on huge accounts
-    FATHOM_SYNC_MAX_SECONDS: int = 90
-    # Background sync (integrations button) may run longer than the HTTP request
-    FATHOM_SYNC_BACKGROUND_MAX_SECONDS: int = 300
-    # Stagger background /recordings enrichment after bulk sync (seconds between jobs)
-    FATHOM_ENRICHMENT_STAGGER_SEC: float = 3.0
     # Gap between /recordings/summary and /recordings/transcript (heavy rate limit)
     FATHOM_RECORDINGS_CALL_GAP_SEC: float = 2.5
 

@@ -236,28 +236,6 @@ def list_meetings(
     )
 
 
-def list_meetings_for_bulk_sync(
-    *,
-    cursor: Optional[str] = None,
-    api_key: str,
-    timeout: float = 60.0,
-) -> Dict[str, Any]:
-    """
-    Light /meetings pagination for bulk import.
-
-    Per Fathom rate limits, include_summary/include_transcript count as *heavy*
-    requests (~30/min). Bulk sync lists metadata + calendar_invitees only (60/min),
-    then background jobs pull summary/transcript via /recordings/*.
-    """
-    return list_meetings(
-        cursor=cursor,
-        include_summary=False,
-        include_transcript=False,
-        api_key=api_key,
-        timeout=timeout,
-    )
-
-
 def get_recording_summary(
     recording_id: int,
     timeout: float = 60.0,

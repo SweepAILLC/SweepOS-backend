@@ -4342,38 +4342,6 @@ def cancel_calendly_event(
         raise HTTPException(status_code=500, detail=f"Error cancelling Calendly event: {str(e)}")
 
 
-@router.post("/fathom/sync")
-def sync_fathom_meetings(
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """
-    Start Fathom import in the background (returns immediately).
-
-    Lists meeting metadata from Fathom, stores records, and queues summary/transcript
-    enrichment without blocking the HTTP request (avoids 502/503 from long Fathom retries).
-    """
-    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
-    from app.long_jobs import schedule_background_work
-    from app.services.fathom_client import resolve_fathom_api_key
-    from app.services.fathom_ingest import run_fathom_sync_background
-
-    if not resolve_fathom_api_key(db, org_id, user=current_user):
-        return {"skipped": True, "reason": "no_fathom_key"}
-
-    schedule_background_work(run_fathom_sync_background, background_tasks, str(org_id))
-    return {
-        "started": True,
-        "background": True,
-        "skipped": False,
-        "message": (
-            "Fathom sync started. Meeting metadata imports now; summaries and transcripts "
-            "continue in the background and may take several minutes."
-        ),
-    }
-
-
 @router.get("/fathom/status")
 def get_fathom_status(
     db: Session = Depends(get_db),

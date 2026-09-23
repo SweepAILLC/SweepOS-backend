@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import uuid
 from typing import Any, Dict
-
-import httpx
-from sqlalchemy.exc import SQLAlchemyError
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -263,9 +259,14 @@ def post_content_studio_reanalyze(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Rate-limited: pull Fathom meetings, queue call-insight + call-library follow-ups,
-    invalidate client health caches (Intelligence / board), and regenerate the Content Studio
-    bundle (all sections + voice/marketing) from fresh signals.
+    Rate-limited: requeue any stuck/failed call-insight + call-library reports from
+    calls already ingested via the Fathom webhook, invalidate client health caches
+    (Intelligence / board), and regenerate the Content Studio bundle (all sections +
+    voice/marketing) from fresh signals.
+
+    Does not pull historical meetings from Fathom's API — that bulk sync was removed
+    (expensive and prone to overloading the worker); real-time webhook ingestion is
+    the only ingestion path now.
     """
     _require_content_studio_tab(db, current_user)
     org_id = _org_id(current_user)
@@ -277,57 +278,10 @@ def post_content_studio_reanalyze(
     )
     urow = _user_orm(db, current_user)
 
-    from app.services.fathom_ingest import queue_fathom_sync_followups, sync_recent_meetings_for_org
+    from app.services.call_library_queue import requeue_stuck_pending_reports
 
-    try:
-        result = sync_recent_meetings_for_org(db, org_id, user=current_user)
-    except httpx.HTTPStatusError as e:
-        if e.response is not None and e.response.status_code == 401:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "Fathom rejected the API key (401). Regenerate it at Fathom → Settings → API Access, "
-                    "then paste it under Integrations (organization key), save, and sync again. "
-                    "Alternatively set FATHOM_API_KEY in the server environment."
-                ),
-            ) from e
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Fathom API error ({e.response.status_code if e.response else 'unknown'}). Try again later.",
-        ) from e
-    except (RuntimeError, ValueError) as e:
-        msg = str(e)
-        logger.warning("content_studio reanalyze fathom sync: %s", msg)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=msg if msg else "Fathom sync could not run (configuration or API response).",
-        ) from e
-    except json.JSONDecodeError as e:
-        logger.exception("content_studio reanalyze: JSON decode")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Fathom returned invalid JSON. Try again in a moment.",
-        ) from e
-    except SQLAlchemyError as e:
-        logger.exception("content_studio reanalyze: database error during Fathom sync")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Database error while syncing Fathom. Run database migrations "
-                "(`alembic upgrade head`) and ensure columns exist on `fathom_call_records`."
-            ),
-        ) from e
-    except Exception as e:
-        logger.exception("content_studio reanalyze: Fathom sync failed")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Fathom sync failed: {e!s}",
-        ) from e
-
-    if not isinstance(result, dict):
-        result = {}
-
-    queue_fathom_sync_followups(background_tasks, org_id, result)
+    requeued = requeue_stuck_pending_reports(db, org_id, background_tasks)
+    result = {"requeued_call_library_reports": requeued}
 
     cids = [row[0] for row in db.query(Client.id).filter(Client.org_id == org_id).all()]
     for cid in cids:

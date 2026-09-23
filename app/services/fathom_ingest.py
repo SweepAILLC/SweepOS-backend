@@ -269,8 +269,6 @@ def ingest_meeting_payload(
     db: Session,
     org_id: uuid.UUID,
     meeting: Dict[str, Any],
-    *,
-    bulk_sync: bool = False,
 ) -> Tuple[str, Optional[uuid.UUID], Optional[uuid.UUID]]:
     """
     Process a Fathom Meeting JSON object (webhook or list API).
@@ -315,7 +313,7 @@ def ingest_meeting_payload(
                 pass
 
     fathom_key = resolve_fathom_api_key(db, org_id)
-    if (not summary_md or not transcript_text) and fathom_key and not bulk_sync:
+    if (not summary_md or not transcript_text) and fathom_key:
         try:
             if not summary_md:
                 s = get_recording_summary(rid, api_key=fathom_key)
@@ -338,10 +336,7 @@ def ingest_meeting_payload(
     rec = upsert_call_record(
         db, org_id, client_id, rid, summary_md, transcript_text, meeting_at, **common_upsert_kwargs
     )
-    if bulk_sync:
-        rec.sentiment_status = rec.sentiment_status or "pending"
-    else:
-        apply_sentiment_to_record(db, rec)
+    apply_sentiment_to_record(db, rec)
     if client_id is not None:
         invalidate_health_score_cache(db, client_id, org_id, do_commit=False)
     db.commit()
@@ -374,56 +369,6 @@ def ingest_meeting_payload(
     return "ok", client_id, rec.id
 
 
-def _fathom_record_needs_enrichment(
-    db: Session, org_id: uuid.UUID, fathom_row_id: uuid.UUID
-) -> bool:
-    """True when summary/transcript is thin or sentiment is not complete yet."""
-    from app.services.call_insight_context import is_meeting_snapshot_thin
-
-    rec = (
-        db.query(FathomCallRecord)
-        .filter(FathomCallRecord.id == fathom_row_id, FathomCallRecord.org_id == org_id)
-        .first()
-    )
-    if not rec:
-        return False
-    if (rec.sentiment_status or "") != "complete":
-        return True
-    return is_meeting_snapshot_thin(rec.summary_text, rec.transcript_snippet)
-
-
-def _fathom_record_needs_library_queue(
-    db: Session, org_id: uuid.UUID, fathom_row_id: uuid.UUID
-) -> bool:
-    """True when Call Library report is missing, pending, or recoverable-failed."""
-    from app.models.call_library_report import CallLibraryReport
-
-    row = (
-        db.query(CallLibraryReport)
-        .filter(
-            CallLibraryReport.org_id == org_id,
-            CallLibraryReport.fathom_call_record_id == fathom_row_id,
-        )
-        .first()
-    )
-    if not row:
-        return True
-    if row.status == "complete":
-        return False
-    if row.status == "pending":
-        return True
-    if row.status == "failed":
-        if row.failure_reason == "analysis_failed":
-            return False
-        return row.failure_reason in (
-            "llm_failed",
-            "llm_empty",
-            "budget_deferred",
-            "no_content",
-        )
-    return False
-
-
 def _fathom_record_needs_call_insight(
     db: Session, org_id: uuid.UUID, fathom_row_id: uuid.UUID
 ) -> bool:
@@ -443,181 +388,6 @@ def _fathom_record_needs_call_insight(
         .first()
     )
     return not (existing and existing.status == "complete" and existing.insight_json)
-
-
-def sync_recent_meetings_for_org(
-    db: Session,
-    org_id: uuid.UUID,
-    max_pages: Optional[int] = None,
-    *,
-    user: Optional[Any] = None,
-    max_seconds: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Poll Fathom list meetings (when API key set). Session-independent.
-
-    All meetings are ingested for marketing insights (Content Studio, Call Library).
-    Calls link to pipeline clients when attendee emails match; unlinked calls are
-    relinked automatically when clients are added later or at the end of each sync.
-
-    API key: logged-in user's Settings key, or any org member's key, or FATHOM_API_KEY env.
-    """
-    from app.services import fathom_client
-
-    api_key = resolve_fathom_api_key(db, org_id, user=user)
-    if not api_key:
-        return {"skipped": True, "reason": "no_fathom_key"}
-
-    if max_pages is None:
-        max_pages = int(getattr(app_settings, "FATHOM_SYNC_MAX_PAGES", 5) or 5)
-    delay_ms = int(getattr(app_settings, "FATHOM_SYNC_DELAY_MS", 0) or 0)
-    page_delay_ms = int(getattr(app_settings, "FATHOM_SYNC_PAGE_DELAY_MS", 1100) or 1100)
-
-    cursor = None
-    ingested = 0
-    ingested_unlinked = 0
-    total_seen = 0
-    pending_insight_record_ids: List[uuid.UUID] = []
-    pending_library_record_ids: List[uuid.UUID] = []
-    pending_enrichment_record_ids: List[uuid.UUID] = []
-    ingest_errors = 0
-    if max_seconds is None:
-        max_seconds = int(getattr(app_settings, "FATHOM_SYNC_MAX_SECONDS", 90) or 90)
-    started_at = time.time()
-
-    for _ in range(max_pages):
-        # Hard wall-clock guard: stop the sync if we've been running too long
-        if max_seconds > 0 and time.time() - started_at > max_seconds:
-            break
-        data = fathom_client.list_meetings_for_bulk_sync(cursor=cursor, api_key=api_key)
-        items = data.get("items") or []
-        for m in items:
-            total_seen += 1
-            try:
-                status, _cid, fathom_row_id = ingest_meeting_payload(
-                    db, org_id, m, bulk_sync=True
-                )
-            except Exception:
-                ingest_errors += 1
-                logger.exception(
-                    "fathom ingest failed org=%s recording_id=%s",
-                    org_id,
-                    m.get("recording_id"),
-                )
-                continue
-            if status in ("ok", "ok_unlinked") and fathom_row_id:
-                # Only queue enrichment/insights for records that still need work.
-                # Re-syncing historical meetings must not re-burn sentiment/insight LLM.
-                if _fathom_record_needs_enrichment(db, org_id, fathom_row_id):
-                    pending_enrichment_record_ids.append(fathom_row_id)
-                    if status == "ok" and _fathom_record_needs_call_insight(
-                        db, org_id, fathom_row_id
-                    ):
-                        pending_insight_record_ids.append(fathom_row_id)
-                if _fathom_record_needs_library_queue(db, org_id, fathom_row_id):
-                    pending_library_record_ids.append(fathom_row_id)
-            if status == "ok":
-                ingested += 1
-            elif status == "ok_unlinked":
-                ingested += 1
-                ingested_unlinked += 1
-            if delay_ms > 0:
-                time.sleep(delay_ms / 1000.0)
-        cursor = data.get("next_cursor")
-        if cursor and page_delay_ms > 0:
-            time.sleep(page_delay_ms / 1000.0)
-        if not cursor:
-            break
-
-    from app.services.fathom_client_link import relink_orphan_fathom_records_for_org
-
-    relinked = relink_orphan_fathom_records_for_org(db, org_id)
-    if relinked:
-        db.commit()
-        for rec_id, _client_id in relinked:
-            if _fathom_record_needs_call_insight(db, org_id, rec_id):
-                if rec_id not in pending_insight_record_ids:
-                    pending_insight_record_ids.append(rec_id)
-            if _fathom_record_needs_library_queue(db, org_id, rec_id):
-                if rec_id not in pending_library_record_ids:
-                    pending_library_record_ids.append(rec_id)
-            if _fathom_record_needs_enrichment(db, org_id, rec_id):
-                if rec_id not in pending_enrichment_record_ids:
-                    pending_enrichment_record_ids.append(rec_id)
-
-    return {
-        "skipped": False,
-        "ingested": ingested,
-        "processed": ingested,
-        "ingested_unlinked": ingested_unlinked,
-        "relinked_to_clients": len(relinked),
-        "ingest_errors": ingest_errors,
-        "skipped_no_client_match": 0,
-        "meetings_seen": total_seen,
-        "pending_insight_record_ids": [str(x) for x in pending_insight_record_ids],
-        "call_insights_queued": len(pending_insight_record_ids),
-        "pending_library_record_ids": [str(x) for x in pending_library_record_ids],
-        "library_reports_queued": len(pending_library_record_ids),
-        "pending_enrichment_record_ids": [str(x) for x in pending_enrichment_record_ids],
-    }
-
-
-def run_fathom_sync_background(org_id_str: str) -> None:
-    """Run Fathom list + ingest off the HTTP thread (retries / rate limits won't 503 the browser)."""
-    from app.db.session import SessionLocal
-
-    db = SessionLocal()
-    try:
-        org_id = uuid.UUID(org_id_str)
-        bg_max = int(getattr(app_settings, "FATHOM_SYNC_BACKGROUND_MAX_SECONDS", 300) or 300)
-        result = sync_recent_meetings_for_org(db, org_id, max_seconds=bg_max)
-        if result.get("skipped"):
-            logger.info("fathom background sync skipped org=%s reason=%s", org_id, result.get("reason"))
-            return
-        queue_fathom_sync_followups(None, org_id, result)
-        logger.info(
-            "fathom background sync done org=%s ingested=%s seen=%s relinked=%s errors=%s",
-            org_id,
-            result.get("ingested"),
-            result.get("meetings_seen"),
-            result.get("relinked_to_clients"),
-            result.get("ingest_errors"),
-        )
-    except Exception:
-        logger.exception("fathom background sync failed org=%s", org_id_str)
-    finally:
-        db.close()
-
-
-def queue_fathom_sync_followups(background_tasks: Any, org_id: uuid.UUID, sync_result: Dict[str, Any]) -> None:
-    """Queue call-insight and call-library background jobs after sync (shared with integrations + Content Studio)."""
-    from app.long_jobs import schedule_background_work, schedule_delayed_background_work
-    from app.services.call_insight_service import run_call_insight_background
-
-    oid_str = str(org_id)
-    enrichment_ids = {str(x) for x in (sync_result.get("pending_enrichment_record_ids") or [])}
-
-    # Insights only for client-linked rows not handled solely by enrichment.
-    for rid in sync_result.get("pending_insight_record_ids") or []:
-        if str(rid) in enrichment_ids:
-            continue
-        schedule_background_work(run_call_insight_background, background_tasks, oid_str, str(rid))
-
-    # Bulk list sync has no summary/transcript — enrichment jobs below fetch content
-    # from Fathom, then each job queues Call Library analysis when ready.
-    # Do NOT schedule library LLM here (causes no_content / wasted tokens).
-
-    stagger = float(getattr(app_settings, "FATHOM_ENRICHMENT_STAGGER_SEC", 3) or 3)
-    for i, rid in enumerate(sorted(enrichment_ids)):
-        delay_sec = i * stagger
-        schedule_delayed_background_work(
-            run_fathom_webhook_enrichment_and_followups,
-            background_tasks,
-            delay_sec,
-            oid_str,
-            str(rid),
-            "1",
-        )
 
 
 def _refresh_fathom_row_from_api(db: Session, rec: FathomCallRecord, api_key: Optional[str]) -> bool:
@@ -790,7 +560,7 @@ def run_fathom_webhook_enrichment_and_followups(
 def queue_fathom_webhook_record_followups(
     background_tasks: Any, org_id: uuid.UUID, fathom_call_record_id: uuid.UUID
 ) -> None:
-    """Prefer this for single-meeting webhooks instead of immediate queue_fathom_sync_followups."""
+    """Queue Call Library + enrichment follow-ups for a single webhook-ingested meeting."""
     from app.db.session import SessionLocal
     from app.long_jobs import schedule_background_work
     from app.services.call_insight_context import is_meeting_snapshot_thin
