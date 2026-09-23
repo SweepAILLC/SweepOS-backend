@@ -310,10 +310,16 @@ def _paragraphs_deterministic(signals: Dict[str, Any]) -> List[str]:
     return paras[:8]
 
 
+PROMPT_VERSION = "v1.0"
+
+
 def synthesize_paragraphs_with_llm(db: Session, org_id: uuid.UUID, signals: Dict[str, Any]) -> Optional[List[str]]:
     if not llm_available() or not signals.get("has_any"):
         return None
     bundle = _signals_to_brief_text(signals)
+    # Strategy guidance for the operator ("the audience is the operator reading
+    # their Content Studio"), not client-facing content — exempt from LLM.md's
+    # "generative calls" persona requirement.
     system = """You are a GTM content strategist for coaches and B2C/B2SMB service businesses.
 Return ONLY valid JSON: {"paragraphs": [ string, ... ]}
 Write 5–7 short paragraphs (each 2–5 sentences). The audience is the operator reading their Content Studio.
@@ -327,7 +333,10 @@ No markdown. No bullet lists inside strings."""
 
     user = f"SIGNALS (from Fathom meetings, transcripts, and aggregated themes):\n{bundle}"
     try:
-        raw = chat_json(system, user, temperature=0.35, org_id=org_id, feature="content_studio")
+        raw = chat_json(
+            system, user, temperature=0.35, org_id=org_id,
+            feature="content_studio", prompt_version=PROMPT_VERSION,
+        )
         paras = raw.get("paragraphs")
         if not isinstance(paras, list):
             return None

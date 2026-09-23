@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.ai_persona import SWEEPBOT_SYSTEM
 from app.core.config import settings as app_settings
 from app.models.automation import (
     AutomationEmailJob,
@@ -397,8 +398,13 @@ def _fallback_plain(
 # AI-generated mode
 # ---------------------------------------------------------------------------
 
+PROMPT_VERSION = "v1.0"
+
+# Drafts an outbound email a coach sends to their client — generative, client-facing
+# per LLM.md, so it carries the required SweepBot persona ahead of the task rules.
 _AI_SYSTEM = (
-    "You are an outbound email writer for a small coaching business. "
+    SWEEPBOT_SYSTEM + "\n\n"
+    "You are acting as an outbound email writer for a small coaching business. "
     "Output a single JSON object only, with keys: 'subject' (string), 'body_plain' (string). "
     "The body_plain must be ready to send: no bracket placeholders, no markdown headings, no HTML. "
     "DATA.intel.intelligence_profile is the full export of the operator's Intelligence tab: voice "
@@ -563,7 +569,10 @@ def _build_ai_draft(
             ref_append = _referral_natural_voice_append(rule, chosen_names)
             if ref_append:
                 system += ref_append
-            j = chat_json(system, user_prompt, temperature=0.5, org_id=org_id, feature="automation")
+            j = chat_json(
+                system, user_prompt, temperature=0.5, org_id=org_id,
+                feature="automation", prompt_version=PROMPT_VERSION,
+            )
             subject = str(j.get("subject", "")).strip()
             body_plain = str(j.get("body_plain", "")).strip()
         except Exception as e:

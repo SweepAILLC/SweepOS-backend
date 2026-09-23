@@ -23,6 +23,11 @@ from app.services.llm_client import chat_json, llm_available, truncate_for_token
 
 logger = logging.getLogger(__name__)
 
+PROMPT_VERSION = "v1.0"
+# Both prompts in this file produce a structured coaching-audit report for the
+# coach/org, never shown to the client — exempt from LLM.md's "generative calls"
+# persona requirement.
+
 # Fathom markdown_formatted summaries wrap nearly every bullet in a timestamp deep-link.
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)]+)\)")
 _BARE_FATHOM_URL_RE = re.compile(r"https?://(?:www\.)?fathom\.video/\S+", re.IGNORECASE)
@@ -299,6 +304,7 @@ def generate_call_library_report(
             max_input_chars=max_input,
             min_user_chars=min_user,
             feature="call_library",
+            prompt_version=PROMPT_VERSION,
         )
     except RuntimeError as e:
         if "llm_budget" in str(e).lower() or "llm_slot" in str(e).lower():
@@ -382,6 +388,7 @@ def generate_glance_call_report(
             max_input_chars=4500,
             min_user_chars=0,
             feature="call_library_glance",
+            prompt_version=PROMPT_VERSION,
         )
         if isinstance(raw, dict):
             ai_summary = str(

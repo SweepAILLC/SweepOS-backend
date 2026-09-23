@@ -24,6 +24,7 @@ class LlmUsageEvent(Base):
     provider = Column(String(32), nullable=False)  # openai | gemini
     model = Column(String(128), nullable=True)
     feature = Column(String(64), nullable=False, default="unknown")
+    prompt_version = Column(String(16), nullable=True)  # e.g. "v1.0" — LLM.md requires every prompt versioned
     prompt_tokens = Column(Integer, nullable=False, default=0)
     completion_tokens = Column(Integer, nullable=False, default=0)
     total_tokens = Column(Integer, nullable=False, default=0)

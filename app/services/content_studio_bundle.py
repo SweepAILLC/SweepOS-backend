@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from app.core.ai_persona import SWEEPBOT_SYSTEM
 from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
 from app.models.user import User
 from app.services.content_sop import SOP_VERSION, marketing_intel_knowledge_block
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 # Bumped to invalidate every previously-generated bundle when grounding shape changes.
 # v7: ideas grounded in top/bottom post performance + period deltas (not advice dims).
 BUNDLE_VERSION = 7
+PROMPT_VERSION = "v1.0"  # LLM.md prompt-versioning/logging — distinct from BUNDLE_VERSION above
 
 # Each entry: (stage, default title, default intro hint shown when LLM cannot run).
 STAGE_SPECS: List[Tuple[str, str, str]] = [
@@ -459,7 +461,9 @@ def draft_content_studio_bundle_llm(
 
     grounding = _stage_grounding_block(signals)
 
-    system = """You are a short-form video content strategist for coaches and service businesses.
+    # Generates the actual content concepts/hooks for the coach's calendar — treated as
+    # generative per LLM.md, same as content_angle_map.py's messaging-angle generator.
+    system = SWEEPBOT_SYSTEM + "\n\n" + """You are acting as a short-form video content strategist for coaches and service businesses.
 Return ONLY valid JSON (no markdown) with this exact top-level shape:
 {
   "stages": [
@@ -539,7 +543,10 @@ Fingerprint (opaque): {fingerprint}
 """
 
     try:
-        raw = chat_json(system, user, temperature=0.4, org_id=org_id, feature="content_studio")
+        raw = chat_json(
+            system, user, temperature=0.4, org_id=org_id,
+            feature="content_studio", prompt_version=PROMPT_VERSION,
+        )
     except Exception as e:
         logger.exception("content studio bundle LLM: %s", e)
         return None

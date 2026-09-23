@@ -39,8 +39,12 @@ LOG = logging.getLogger(__name__)
 
 _VALID_NAMES = ("referral", "upsell", "testimonial")
 _MAX_CHOICES = 3
+PROMPT_VERSION = "v1.0"
 
 
+# Picks WHICH opportunity type to pursue (a constrained JSON decision), not the
+# client-facing email text itself (that's automation_drafts.py) — exempt from
+# LLM.md's "generative calls" persona requirement.
 _PICKER_SYSTEM = (
     "You are the strategic decision layer for a coaching business's automated outreach. "
     "On every fired playbook you decide which of {referral, upsell, testimonial} should "
@@ -285,7 +289,10 @@ def _call_llm_picker(
     )
     user_prompt = "DATA = " + json.dumps(payload, ensure_ascii=False, default=str)
     user_prompt = truncate_for_tokens(user_prompt, 12000)
-    raw = chat_json(_PICKER_SYSTEM, user_prompt, temperature=0.2, org_id=org_id, feature="automation")
+    raw = chat_json(
+        _PICKER_SYSTEM, user_prompt, temperature=0.2, org_id=org_id,
+        feature="automation", prompt_version=PROMPT_VERSION,
+    )
     chosen = _validate_names(raw.get("chosen") or [])[:cap]
     if not chosen:
         return None

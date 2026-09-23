@@ -17,6 +17,7 @@ from app.services.user_ai_profile_context import extract_ai_profile_for_llm
 
 STAGE_SET = frozenset({"TOF", "MOF", "BOF"})
 MAX_COMPLETED_IDS = 250
+PROMPT_VERSION = "v1.0"
 
 
 def content_studio_state_from_profile(ai_profile: Any) -> Tuple[str, List[str]]:
@@ -186,6 +187,8 @@ def analyze_transcript_llm(
     if purpose == "mixed" and (mixed_note or "").strip():
         meta += f" Operator note: {(mixed_note or '').strip()[:1500]}"
 
+    # Analyzes a transcript into structured operator-facing JSON, not client-facing
+    # generation — exempt from LLM.md's "generative calls" persona requirement.
     system = """You analyze sales or coaching call transcripts for conversion quality.
 Return ONLY valid JSON (no markdown) with this exact structure:
 {
@@ -208,7 +211,10 @@ INTELLIGENCE_PROFILE (optional context for the operator):
 TRANSCRIPT:
 {transcript[:48000]}"""
 
-    return chat_json(system, user, temperature=0.2, org_id=org_id, feature="content_studio")
+    return chat_json(
+        system, user, temperature=0.2, org_id=org_id,
+        feature="content_studio", prompt_version=PROMPT_VERSION,
+    )
 
 
 def persist_transcript_analysis(

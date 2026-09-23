@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import desc, nullslast
 from sqlalchemy.orm import Session
 
+from app.core.ai_persona import SWEEPBOT_SYSTEM
 from app.models.client import Client
 from app.models.client_call_insight import ClientCallInsight
 from app.models.fathom_call_record import FathomCallRecord
@@ -30,6 +31,8 @@ from app.services.user_ai_profile_context import (
     extract_ai_profile_for_llm,
     resolve_performance_campaign_templates_for_task,
 )
+
+PROMPT_VERSION = "v1.0"
 
 
 def _ai_profile_context(user: Optional[User]) -> Optional[Dict[str, Any]]:
@@ -453,8 +456,12 @@ def _llm_intent_instruction(client: Client, action: Dict[str, Any]) -> str:
 
 
 def _expert_email_system_prompt() -> str:
+    # This drafts an email a coach will send to their client — a generative, client-facing
+    # call per LLM.md, so it must carry the required SweepBot persona ahead of the
+    # task-specific copywriter instructions below.
     return (
-        "You are a senior conversion copywriter for coaching, fitness, and wellness businesses. "
+        SWEEPBOT_SYSTEM + "\n\n"
+        "You are acting as a senior conversion copywriter for coaching, fitness, and wellness businesses. "
         "Write ONE complete email that is ready to send as-is: the recipient should not need to edit anything. "
         "Use ONLY facts and signals in DATA (business name, recipient profile, health snapshot, CRM notes, prospect fields, "
         "call sentiment, summary/transcript sample for tone mirroring, prospect_voice_profile from call transcripts "
@@ -588,7 +595,10 @@ def _llm_draft(
     user = "DATA:\n" + truncate_for_tokens(json.dumps(user_payload, default=str), 36000)
 
     try:
-        raw = chat_json(system, user, temperature=0.42, timeout=90.0, org_id=org_id, feature="ai_recommendation")
+        raw = chat_json(
+            system, user, temperature=0.42, timeout=90.0, org_id=org_id,
+            feature="ai_recommendation", prompt_version=PROMPT_VERSION,
+        )
     except Exception:
         return None
 
@@ -808,7 +818,10 @@ def build_performance_task_email_draft(
     user = "DATA:\n" + truncate_for_tokens(json.dumps(user_payload, default=str), 36000)
 
     try:
-        raw = chat_json(system, user, temperature=0.42, timeout=90.0, org_id=org_id, feature="ai_recommendation")
+        raw = chat_json(
+            system, user, temperature=0.42, timeout=90.0, org_id=org_id,
+            feature="ai_recommendation", prompt_version=PROMPT_VERSION,
+        )
     except Exception:
         return _perf_task_template_draft(
             db,

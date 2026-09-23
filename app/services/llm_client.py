@@ -59,11 +59,13 @@ def chat_json(
     max_input_chars: Optional[int] = None,
     min_user_chars: int = 0,
     feature: str = "unknown",
+    prompt_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Single-turn chat; request JSON object in response. Parses first JSON object from text.
 
     org_id: when set, enforces per-org LLM budget (drops call if over limit — callers should handle failure).
+    prompt_version: e.g. "v1.0" — LLM.md requires every prompt versioned and logged for traceability.
     """
     provider, api_key = _resolve_provider_and_key()
     if not api_key:
@@ -91,6 +93,7 @@ def chat_json(
             max_input_chars=max_input_chars,
             min_user_chars=min_user_chars,
             feature=feature,
+            prompt_version=prompt_version,
         )
     finally:
         release_llm_slot()
@@ -110,6 +113,7 @@ def _chat_json_after_budget(
     max_input_chars,
     min_user_chars: int,
     feature: str,
+    prompt_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     max_total = int(
         max_input_chars
@@ -147,6 +151,7 @@ def _chat_json_after_budget(
                 provider=provider,
                 model=usage.get("model") or model,
                 feature=feature,
+                prompt_version=prompt_version,
                 prompt_tokens=int(usage.get("prompt_tokens") or 0),
                 completion_tokens=int(usage.get("completion_tokens") or 0),
                 total_tokens=int(usage.get("total_tokens") or 0),

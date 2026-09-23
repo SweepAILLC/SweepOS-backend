@@ -7,6 +7,10 @@ from typing import Any, Dict, List, Optional
 
 from app.services.llm_client import chat_json, llm_available, truncate_for_tokens
 
+PROMPT_VERSION = "v1.0"
+
+# Outputs a numeric score/grade from structured data, never shown to the client —
+# exempt from LLM.md's "generative calls" persona requirement.
 SYSTEM_BASE = (
     "You output a client/lead health score from structured data only. Respond with valid JSON only. "
     'Schema: {"score": number 0-100, "grade": "A"|"B"|"C"|"D"|"F", "explanation": string max 400 chars}. '
@@ -51,7 +55,10 @@ def compute_ai_health_score(
     user = "DATA:\n" + truncate_for_tokens(json.dumps(block, default=str), 14000)
 
     try:
-        raw = chat_json(sys_prompt, user, temperature=0.0, timeout=90.0, org_id=org_id, feature="health_score")
+        raw = chat_json(
+            sys_prompt, user, temperature=0.0, timeout=90.0, org_id=org_id,
+            feature="health_score", prompt_version=PROMPT_VERSION,
+        )
     except Exception:
         return None
 

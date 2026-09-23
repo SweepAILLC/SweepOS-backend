@@ -15,6 +15,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.core.ai_persona import SWEEPBOT_SYSTEM
 from app.models.client_call_insight import ClientCallInsight
 from app.models.content_angle_map import ContentAngleMap
 from app.models.organization import Organization
@@ -76,20 +77,6 @@ BRAND_PLACEHOLDERS = [
     "[Proof they have lived the client's problem]",
     "[The promise they actually stand behind]",
 ]
-
-KAI_SYSTEM = """You are Kai, the AI Growth Engine for Sweep Coach OS. Your role is to help coaches build stronger relationships with their clients through personalized, empathetic, and data-driven communication.
-
-Core principles:
-- Be warm, professional, and coach-like in tone
-- Prioritize client outcomes and relationship building
-- Use data and context to inform recommendations
-- Always cite sources and evidence for claims
-- Flag uncertainty and request human review when appropriate
-- Respect client boundaries and communication preferences
-- Maintain consistency with Sweep brand voice (see BRAND.md)
-
-You are NOT a replacement for human judgment. You are a tool to amplify coach effectiveness.
-"""
 
 CONSULTING_TIERS = frozenset({"pro_consulting", "core_consulting"})
 
@@ -509,13 +496,14 @@ def _draft_card_llm(
     if extra_context:
         user_prompt += f"\nOPTIONAL CALL SIGNALS (refine, do not invent):\n{extra_context[:3500]}\n"
     parsed = chat_json(
-        KAI_SYSTEM,
+        SWEEPBOT_SYSTEM,
         user_prompt,
         temperature=0.7,
         timeout=60.0,
         org_id=org_id,
         feature=feature,
         max_tokens=600,
+        prompt_version=PROMPT_VERSION,
     )
     raw = parsed.get("angles") if isinstance(parsed, dict) else None
     if not isinstance(raw, list):

@@ -7,6 +7,10 @@ from typing import Any, Dict, Optional, Tuple
 from app.core.config import settings
 from app.services.llm_client import chat_json, llm_available, truncate_for_tokens
 
+PROMPT_VERSION = "v1.0"
+
+# Sentiment classification into structured JSON, never shown to the client —
+# exempt from LLM.md's "generative calls" persona requirement.
 SYSTEM = (
     "You are a classifier. Given a meeting summary and a transcript excerpt, output ONLY valid JSON "
     'with no other text. Schema: {"sentiment_label": "positive"|"neutral"|"negative", '
@@ -43,7 +47,10 @@ def derive_sentiment(
 
     user = "DATA - Summary:\n" + sm + "\n\nDATA - Transcript excerpt:\n" + tr
     try:
-        raw = chat_json(SYSTEM, user, temperature=0.0, timeout=90.0, org_id=org_id, feature="fathom_sentiment")
+        raw = chat_json(
+            SYSTEM, user, temperature=0.0, timeout=90.0, org_id=org_id,
+            feature="fathom_sentiment", prompt_version=PROMPT_VERSION,
+        )
     except RuntimeError as e:
         if "llm_budget" in str(e).lower() or "llm_slot" in str(e).lower():
             return "failed", {"error": "llm_budget_exceeded"}
