@@ -19,7 +19,9 @@ class ManualPayment(Base):
     client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id"), nullable=False, index=True)
     
     # Payment details
-    amount_cents = Column(Integer, nullable=False)  # Amount in cents
+    amount_cents = Column(Integer, nullable=False)  # Cash collected in cents
+    # Deal/contract revenue for Sales KPI `revenue`. Null = treat as amount_cents.
+    revenue_cents = Column(Integer, nullable=True)
     currency = Column(String(3), default="usd", nullable=False)
     payment_date = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
     

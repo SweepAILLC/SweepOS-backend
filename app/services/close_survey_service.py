@@ -566,6 +566,7 @@ def submit_close_survey(
             org_id=org.id,
             client_id=client.id,
             amount_cents=cash_cents,
+            revenue_cents=contract_cents if contract_cents else cash_cents,
             currency="usd",
             payment_date=when,
             description=f"Post-sales survey · {entry_day.isoformat()}",

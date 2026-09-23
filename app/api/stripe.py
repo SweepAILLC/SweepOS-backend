@@ -106,6 +106,11 @@ def _manual_payment_stripe_responses(
                 client_name=disp_name,
                 client_email=disp_email,
                 amount_cents=mp.amount_cents or 0,
+                revenue_cents=(
+                    int(mp.revenue_cents)
+                    if mp.revenue_cents is not None
+                    else int(mp.amount_cents or 0)
+                ),
                 currency=mp.currency or "usd",
                 status="succeeded",
                 subscription_id=f"Manual · {method}",

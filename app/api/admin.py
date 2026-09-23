@@ -101,90 +101,11 @@ from datetime import date, datetime, timedelta, timezone
 router = APIRouter()
 
 
-def _cents_map(rows) -> dict:
-    out = {}
-    for org_id, cents in rows:
-        out[org_id] = float(cents or 0) / 100.0
-    return out
-
-
 def _org_performance_maps(db: Session, now: datetime):
-    """Batched cash / MRR maps for the organizations grid."""
-    thirty = now - timedelta(days=30)
-    sixty = now - timedelta(days=60)
+    """Batched cash / MRR maps for the organizations grid (Finances combined cash)."""
+    from app.services.finances_cash import org_combined_cash_maps
 
-    stripe_all = _cents_map(
-        db.query(StripePayment.org_id, func.coalesce(func.sum(StripePayment.amount_cents), 0))
-        .filter(StripePayment.status == "succeeded")
-        .group_by(StripePayment.org_id)
-        .all()
-    )
-    stripe_30 = _cents_map(
-        db.query(StripePayment.org_id, func.coalesce(func.sum(StripePayment.amount_cents), 0))
-        .filter(StripePayment.status == "succeeded", StripePayment.created_at >= thirty)
-        .group_by(StripePayment.org_id)
-        .all()
-    )
-    stripe_prev = _cents_map(
-        db.query(StripePayment.org_id, func.coalesce(func.sum(StripePayment.amount_cents), 0))
-        .filter(
-            StripePayment.status == "succeeded",
-            StripePayment.created_at >= sixty,
-            StripePayment.created_at < thirty,
-        )
-        .group_by(StripePayment.org_id)
-        .all()
-    )
-
-    whop_all = whop_30 = whop_prev = {}
-    try:
-        whop_all = _cents_map(
-            db.query(WhopPayment.org_id, func.coalesce(func.sum(WhopPayment.amount_cents), 0))
-            .filter(func.lower(WhopPayment.status) == "paid")
-            .group_by(WhopPayment.org_id)
-            .all()
-        )
-        whop_30 = _cents_map(
-            db.query(WhopPayment.org_id, func.coalesce(func.sum(WhopPayment.amount_cents), 0))
-            .filter(func.lower(WhopPayment.status) == "paid", WhopPayment.created_at >= thirty)
-            .group_by(WhopPayment.org_id)
-            .all()
-        )
-        whop_prev = _cents_map(
-            db.query(WhopPayment.org_id, func.coalesce(func.sum(WhopPayment.amount_cents), 0))
-            .filter(
-                func.lower(WhopPayment.status) == "paid",
-                WhopPayment.created_at >= sixty,
-                WhopPayment.created_at < thirty,
-            )
-            .group_by(WhopPayment.org_id)
-            .all()
-        )
-    except Exception:
-        db.rollback()
-
-    manual_all = manual_30 = manual_prev = {}
-    try:
-        pay_ts = func.coalesce(ManualPayment.payment_date, ManualPayment.created_at)
-        manual_all = _cents_map(
-            db.query(ManualPayment.org_id, func.coalesce(func.sum(ManualPayment.amount_cents), 0))
-            .group_by(ManualPayment.org_id)
-            .all()
-        )
-        manual_30 = _cents_map(
-            db.query(ManualPayment.org_id, func.coalesce(func.sum(ManualPayment.amount_cents), 0))
-            .filter(pay_ts >= thirty)
-            .group_by(ManualPayment.org_id)
-            .all()
-        )
-        manual_prev = _cents_map(
-            db.query(ManualPayment.org_id, func.coalesce(func.sum(ManualPayment.amount_cents), 0))
-            .filter(pay_ts >= sixty, pay_ts < thirty)
-            .group_by(ManualPayment.org_id)
-            .all()
-        )
-    except Exception:
-        db.rollback()
+    cash_30, cash_prev, cash_all = org_combined_cash_maps(db, now)
 
     mrr = {}
     try:
@@ -198,16 +119,7 @@ def _org_performance_maps(db: Session, now: datetime):
     except Exception:
         db.rollback()
 
-    def merge(a, b, c):
-        keys = set(a) | set(b) | set(c)
-        return {k: a.get(k, 0) + b.get(k, 0) + c.get(k, 0) for k in keys}
-
-    return (
-        merge(stripe_30, whop_30, manual_30),
-        merge(stripe_prev, whop_prev, manual_prev),
-        merge(stripe_all, whop_all, manual_all),
-        mrr,
-    )
+    return cash_30, cash_prev, cash_all, mrr
 
 
 def _utc_naive(dt_aware: datetime) -> datetime:

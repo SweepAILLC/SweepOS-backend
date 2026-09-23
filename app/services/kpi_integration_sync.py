@@ -1,8 +1,7 @@
-"""Live sync of KPI auto fields from calendar, payment, and Instagram DM sources.
+"""Live sync of KPI auto fields from calendar and payment sources.
 
-Force-refreshes: calls_booked, calls_taken, closes, no_shows, cash_collected,
-plus new_conversations / respondents once Instagram DM autopilot is proven for
-the org. Never writes revenue (manual-only).
+Force-refreshes: calls_booked, calls_taken, closes, no_shows, cash_collected.
+Never writes revenue (manual-only).
 """
 from __future__ import annotations
 
@@ -225,29 +224,6 @@ def has_payment_source(db: Session, org_id: uuid.UUID) -> bool:
     )
 
 
-def has_instagram_dm_source(db: Session, org_id: uuid.UUID) -> bool:
-    """True only once a DM read has actually succeeded for this org.
-
-    Gating on proven access (rather than "Instagram is connected") keeps orgs
-    without instagram_business_manage_messages on manual entry instead of
-    force-setting their new_conversations / respondents to zero.
-    """
-    return instagram_dm_active_since(db, org_id) is not None
-
-
-def instagram_dm_active_since(db: Session, org_id: uuid.UUID) -> Optional[date]:
-    """First day DM autopilot may write KPI values for this org.
-
-    NOT SHIPPED YET: Instagram DM data via Composio is still in progress and is
-    intentionally disabled — always returns None ("never auto-fill") regardless
-    of org state. has_instagram_dm_source() and every _dm_auto_on() call site in
-    kpi.py key off this, so this one line keeps the whole feature inert without
-    touching those call sites. Re-enable by restoring the composio_client call
-    below once the feature is ready to ship.
-    """
-    return None
-
-
 def _payment_cash_by_day(
     db: Session,
     org_id: uuid.UUID,
@@ -345,7 +321,6 @@ def compute_live_fields_for_day(
     *,
     calendar_available: Optional[bool] = None,
     payments_available: Optional[bool] = None,
-    instagram_dm_since: Any = _RESOLVE,
     checkins: Optional[Iterable[ClientCheckIn]] = None,
     cash_by_day: Optional[Dict[date, int]] = None,
     conversion_dates: Optional[Dict[uuid.UUID, date]] = None,
@@ -355,12 +330,6 @@ def compute_live_fields_for_day(
     start, end = day_bounds_utc(entry_day)
     cal = has_calendar_source(db, org_id) if calendar_available is None else calendar_available
     pay = has_payment_source(db, org_id) if payments_available is None else payments_available
-    dm_since = (
-        instagram_dm_active_since(db, org_id)
-        if instagram_dm_since is _RESOLVE
-        else instagram_dm_since
-    )
-    dms = dm_since is not None and entry_day >= dm_since
 
     if checkins is None:
         checkins = db.query(ClientCheckIn).filter(ClientCheckIn.org_id == org_id).all()
@@ -402,12 +371,6 @@ def compute_live_fields_for_day(
         if cash_by_day is None:
             cash_by_day = _payment_cash_by_day(db, org_id, entry_day, entry_day)
         out["cash_collected"] = round(cash_by_day.get(entry_day, 0) / 100.0, 2)
-
-    if dms:
-        # NOT SHIPPED: Instagram DM data via Composio is disabled (see
-        # instagram_dm_active_since above) — `dms` is always False, so this
-        # branch is currently unreachable.
-        pass
 
     return out
 
@@ -496,7 +459,6 @@ def sync_kpi_day_from_integrations(
     checkins: Optional[Iterable[ClientCheckIn]] = None,
     calendar_available: Optional[bool] = None,
     payments_available: Optional[bool] = None,
-    instagram_dm_since: Any = _RESOLVE,
     cash_by_day: Optional[Dict[date, int]] = None,
     conversion_dates: Optional[Dict[uuid.UUID, date]] = None,
 ) -> Optional[OrgKpiDailyEntry]:
@@ -507,19 +469,13 @@ def sync_kpi_day_from_integrations(
     """
     cal = has_calendar_source(db, org_id) if calendar_available is None else calendar_available
     pay = has_payment_source(db, org_id) if payments_available is None else payments_available
-    dm_since = (
-        instagram_dm_active_since(db, org_id)
-        if instagram_dm_since is _RESOLVE
-        else instagram_dm_since
-    )
-    dms = dm_since is not None and entry_day >= dm_since
 
     if checkins is None:
         checkins = db.query(ClientCheckIn).filter(ClientCheckIn.org_id == org_id).all()
     if conversion_dates is None:
         conversion_dates = conversion_dates_by_client(db, org_id, checkins)
 
-    if not cal and not pay and not dms and not conversion_dates:
+    if not cal and not pay and not conversion_dates:
         return None
 
     values = compute_live_fields_for_day(
@@ -528,7 +484,6 @@ def sync_kpi_day_from_integrations(
         entry_day,
         calendar_available=cal,
         payments_available=pay,
-        instagram_dm_since=dm_since,
         checkins=checkins,
         cash_by_day=cash_by_day,
         conversion_dates=conversion_dates,
@@ -574,6 +529,41 @@ def sync_kpi_day_from_integrations(
     return row
 
 
+def apply_manual_payment_kpi(
+    db: Session,
+    org_id: uuid.UUID,
+    when: Optional[datetime],
+    *,
+    revenue_delta_usd: float = 0.0,
+) -> None:
+    """Refresh live cash/closes for `when`, then add `revenue` onto that KPI day.
+
+    Cash is recomputed from all payments. Revenue stays additive so close-survey
+    contract amounts and grid edits are not overwritten.
+    """
+    sync_kpi_for_datetime(db, org_id, when, commit=True)
+    if not revenue_delta_usd:
+        return
+    ts = _ensure_utc(when)
+    if ts is None:
+        return
+    try:
+        from app.api.kpi import _upsert_kpi_entry_for_org
+
+        _upsert_kpi_entry_for_org(
+            db,
+            org_id,
+            ts.date(),
+            {"revenue": float(revenue_delta_usd)},
+            additive=True,
+        )
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
 def sync_kpi_for_datetime(
     db: Session,
     org_id: uuid.UUID,
@@ -615,14 +605,10 @@ def refresh_kpi_live_fields_for_range(
         return
     cal = has_calendar_source(db, org_id)
     pay = has_payment_source(db, org_id)
-    dm_since = instagram_dm_active_since(db, org_id)
-    # Days before activation are never DM-sourced, so a historic range has no
-    # DM work to do even when autopilot is on.
-    dms = dm_since is not None and dm_since <= end
 
     checkins = db.query(ClientCheckIn).filter(ClientCheckIn.org_id == org_id).all()
     conversion_dates = conversion_dates_by_client(db, org_id, checkins)
-    if not cal and not pay and not dms and not conversion_dates:
+    if not cal and not pay and not conversion_dates:
         return
 
     cash_by_day: Optional[Dict[date, int]] = None
@@ -654,7 +640,6 @@ def refresh_kpi_live_fields_for_range(
             checkins=checkins,
             calendar_available=cal,
             payments_available=pay,
-            instagram_dm_since=dm_since,
             cash_by_day=cash_by_day,
             conversion_dates=conversion_dates,
         )

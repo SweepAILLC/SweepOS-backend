@@ -131,6 +131,7 @@ class StripePaymentResponse(BaseModel):
     client_name: Optional[str] = None
     client_email: Optional[str] = None
     amount_cents: int
+    revenue_cents: Optional[int] = None
     currency: str
     status: str
     subscription_id: Optional[str] = None

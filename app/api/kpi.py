@@ -46,20 +46,9 @@ from app.services.kpi_integration_sync import (
     compute_live_fields_for_day,
     get_revenue_contributors_for_day,
     has_calendar_source as _has_calendar_source,
-    has_instagram_dm_source as _has_instagram_dm_source,
     has_payment_source as _has_payment_source,
-    instagram_dm_active_since as _instagram_dm_active_since,
     refresh_kpi_live_fields_for_range,
 )
-
-# Instagram DM autopilot fills these two once the org's messaging scope is proven.
-INSTAGRAM_DM_COLUMNS = ("new_conversations", "respondents")
-
-
-def _dm_auto_on(since: Optional[date], entry_day: date) -> bool:
-    """DM autopilot only governs days from activation forward — earlier days keep
-    whatever the org entered by hand."""
-    return since is not None and entry_day >= since
 
 router = APIRouter()
 
@@ -228,10 +217,6 @@ def _autopopulate_from_integrations(
             out["closes"] = 0
         if payments_available and "cash_collected" not in out:
             out["cash_collected"] = 0.0
-        if _dm_auto_on(_instagram_dm_active_since(db, org_id), entry_day):
-            for field in INSTAGRAM_DM_COLUMNS:
-                if field not in out:
-                    out[field] = 0
 
     return out
 
@@ -242,7 +227,6 @@ def _with_auto_zero_defaults(
     *,
     calendar_available: bool,
     payments_available: bool,
-    instagram_dm_auto: bool = False,
 ) -> KpiDailyEntryRead:
     """Coerce null auto fields to 0 for days through today (display / API consistency)."""
     if entry_day > date.today():
@@ -264,11 +248,6 @@ def _with_auto_zero_defaults(
     if payments_available and data.get("cash_collected") is None:
         data["cash_collected"] = 0.0
         changed = True
-    if instagram_dm_auto:
-        for field in INSTAGRAM_DM_COLUMNS:
-            if data.get(field) is None:
-                data[field] = 0
-                changed = True
     if not changed:
         return read
     data.update(compute_rates(data))
@@ -323,7 +302,6 @@ def list_kpi_entries(
     rows = q.order_by(OrgKpiDailyEntry.entry_date.asc()).all()
     calendar_available = _has_calendar_source(db, org_id)
     payments_available = _has_payment_source(db, org_id)
-    instagram_dm_since = _instagram_dm_active_since(db, org_id)
     dirty = False
     for r in rows:
         if r.entry_date > today:
@@ -343,11 +321,6 @@ def list_kpi_entries(
         if payments_available and r.cash_collected is None:
             r.cash_collected = 0.0
             dirty = True
-        if _dm_auto_on(instagram_dm_since, r.entry_date):
-            for field in INSTAGRAM_DM_COLUMNS:
-                if getattr(r, field) is None:
-                    setattr(r, field, 0)
-                    dirty = True
     if dirty:
         db.commit()
         for r in rows:
@@ -358,7 +331,6 @@ def list_kpi_entries(
             r.entry_date,
             calendar_available=calendar_available,
             payments_available=payments_available,
-            instagram_dm_auto=_dm_auto_on(instagram_dm_since, r.entry_date),
         )
         for r in rows
     ]
@@ -546,7 +518,6 @@ def _upsert_kpi_entry_for_org(
         entry_day,
         calendar_available=_has_calendar_source(db, org_id),
         payments_available=_has_payment_source(db, org_id),
-        instagram_dm_auto=_dm_auto_on(_instagram_dm_active_since(db, org_id), entry_day),
     )
 
 
@@ -668,7 +639,6 @@ def get_kpi_autopopulate_status(
     org_id = _org_id(current_user)
     calendar_available = _has_calendar_source(db, org_id)
     payments_available = _has_payment_source(db, org_id)
-    instagram_dm_available = _has_instagram_dm_source(db, org_id)
     cols = ["new_followers"]
     if calendar_available:
         cols.extend(["calls_booked", "calls_booked_activity", "calls_taken", "no_shows"])
@@ -676,12 +646,9 @@ def get_kpi_autopopulate_status(
         cols.append("closes")
     if payments_available:
         cols.append("cash_collected")
-    if instagram_dm_available:
-        cols.extend(INSTAGRAM_DM_COLUMNS)
     return KpiAutopopulateStatusResponse(
         calendar_available=calendar_available,
         payments_available=payments_available,
-        instagram_dm_available=instagram_dm_available,
         autopopulated_columns=cols,
     )
 
@@ -909,7 +876,6 @@ def get_public_kpi_entry(
         day,
         calendar_available=_has_calendar_source(db, bench.org_id),
         payments_available=_has_payment_source(db, bench.org_id),
-        instagram_dm_auto=_dm_auto_on(_instagram_dm_active_since(db, bench.org_id), day),
     )
 
 

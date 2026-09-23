@@ -52,9 +52,51 @@ from app.models.user import User
 from app.models.whop_payment import WhopPayment
 from app.utils.stripe_helpers import extract_email_from_payment_raw
 from app.utils.stripe_ids import normalize_stripe_id_for_dedup
+from app.services.kpi_integration_sync import apply_manual_payment_kpi
 from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
 router = APIRouter()
+
+
+def _parse_payment_datetime(payment_date: Optional[str]) -> datetime:
+    if not payment_date:
+        return datetime.now(timezone.utc)
+    raw = payment_date[:-1] + "+00:00" if payment_date.endswith("Z") else payment_date
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _manual_revenue_cents(revenue: Optional[float], cash_cents: int) -> int:
+    if revenue is None:
+        return cash_cents
+    if revenue < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Revenue cannot be negative",
+        )
+    return int(round(revenue * 100))
+
+
+def _manual_payment_payload(mp: ManualPayment, client_id: str) -> dict:
+    cash = int(mp.amount_cents or 0)
+    rev = int(mp.revenue_cents) if mp.revenue_cents is not None else cash
+    return {
+        "id": str(mp.id),
+        "client_id": client_id,
+        "amount_cents": cash,
+        "amount": cash / 100.0,
+        "revenue_cents": rev,
+        "revenue": rev / 100.0,
+        "currency": mp.currency,
+        "payment_date": mp.payment_date.isoformat() if mp.payment_date else None,
+        "description": mp.description,
+        "payment_method": mp.payment_method,
+        "receipt_url": mp.receipt_url,
+        "status": "succeeded",
+        "type": "manual_payment",
+    }
 
 
 from app.models.stripe_payment import StripePayment
@@ -259,6 +301,11 @@ def get_client_payments(
             self.created_at = manual_payment.payment_date
             self.description = manual_payment.description
             self.payment_method = manual_payment.payment_method
+            self.revenue_cents = (
+                int(manual_payment.revenue_cents)
+                if manual_payment.revenue_cents is not None
+                else int(manual_payment.amount_cents or 0)
+            )
     
     for manual_payment in manual_payments:
         all_payments.append(ManualPaymentWrapper(manual_payment))
@@ -431,6 +478,12 @@ def get_client_payments(
                 "type": payment_type,
                 "description": description,  # For manual payments
                 "payment_method": payment_method,  # For manual payments
+                "revenue_cents": getattr(payment, "revenue_cents", None),
+                "revenue": (
+                    getattr(payment, "revenue_cents", None) / 100.0
+                    if getattr(payment, "revenue_cents", None) is not None
+                    else None
+                ),
             })
     
     return {
@@ -444,7 +497,8 @@ def get_client_payments(
 @router.post("/{client_id}/manual-payment", status_code=status.HTTP_201_CREATED)
 def create_manual_payment(
     client_id: str,
-    amount: float = Query(..., ge=0.01, description="Payment amount in dollars"),
+    amount: float = Query(..., ge=0.01, description="Cash collected in dollars"),
+    revenue: Optional[float] = Query(None, ge=0, description="Deal revenue in dollars. Defaults to cash collected."),
     payment_date: Optional[str] = Query(None, description="Payment date (ISO format). Defaults to now."),
     description: Optional[str] = Query(None, description="Payment description/notes"),
     payment_method: Optional[str] = Query(None, description="Payment method (e.g., cash, check, bank_transfer)"),
@@ -482,34 +536,22 @@ def create_manual_payment(
             detail="Client not found"
         )
     
-    # Parse payment date
-    # The frontend sends ISO strings with timezone info (from toISOString())
-    # We preserve the timezone-aware datetime to maintain the user's local date
-    if payment_date:
-        try:
-            # Handle ISO format strings (may include 'Z' or timezone offset)
-            if payment_date.endswith('Z'):
-                payment_date = payment_date.replace('Z', '+00:00')
-            payment_datetime = datetime.fromisoformat(payment_date)
-            # If no timezone info, assume it's already in UTC (shouldn't happen with toISOString())
-            if payment_datetime.tzinfo is None:
-                payment_datetime = payment_datetime.replace(tzinfo=timezone.utc)
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid payment_date format: {str(e)}"
-            )
-    else:
-        payment_datetime = datetime.now(timezone.utc)
-    
-    # Convert amount to cents
+    try:
+        payment_datetime = _parse_payment_datetime(payment_date)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid payment_date format: {str(e)}",
+        )
+
     amount_cents = int(round(amount * 100))
-    
-    # Create manual payment
+    revenue_cents = _manual_revenue_cents(revenue, amount_cents)
+
     manual_payment = ManualPayment(
         org_id=org_id,
         client_id=client_uuid,
         amount_cents=amount_cents,
+        revenue_cents=revenue_cents,
         currency="usd",
         payment_date=payment_datetime,
         description=description,
@@ -538,28 +580,19 @@ def create_manual_payment(
     except Exception as lc_err:
         print(f"[MANUAL PAYMENT] lifecycle/close enqueue skipped for {client.id}: {lc_err}")
 
+    apply_manual_payment_kpi(
+        db, org_id, manual_payment.payment_date, revenue_delta_usd=revenue_cents / 100.0
+    )
     invalidate_terminal_monthly_trends_cache(org_id)
-
-    return {
-        "id": str(manual_payment.id),
-        "client_id": client_id,
-        "amount_cents": manual_payment.amount_cents,
-        "amount": manual_payment.amount_cents / 100.0,
-        "currency": manual_payment.currency,
-        "payment_date": manual_payment.payment_date.isoformat(),
-        "description": manual_payment.description,
-        "payment_method": manual_payment.payment_method,
-        "receipt_url": manual_payment.receipt_url,
-        "status": "succeeded",
-        "type": "manual_payment"
-    }
+    return _manual_payment_payload(manual_payment, client_id)
 
 
 @router.patch("/{client_id}/manual-payment/{payment_id}")
 def update_manual_payment(
     client_id: str,
     payment_id: str,
-    amount: float = Query(..., ge=0.01, description="Payment amount in dollars"),
+    amount: float = Query(..., ge=0.01, description="Cash collected in dollars"),
+    revenue: Optional[float] = Query(None, ge=0, description="Deal revenue in dollars. Defaults to cash collected."),
     payment_date: Optional[str] = Query(None, description="Payment date (ISO format). Defaults to existing."),
     description: Optional[str] = Query(None, description="Payment description/notes"),
     payment_method: Optional[str] = Query(None, description="Payment method (e.g., cash, check, bank_transfer)"),
@@ -596,21 +629,26 @@ def update_manual_payment(
     if not manual_payment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Manual payment not found")
 
+    old_when = manual_payment.payment_date
+    old_rev_cents = (
+        int(manual_payment.revenue_cents)
+        if manual_payment.revenue_cents is not None
+        else int(manual_payment.amount_cents or 0)
+    )
+
     if payment_date:
         try:
-            if payment_date.endswith("Z"):
-                payment_date = payment_date.replace("Z", "+00:00")
-            payment_datetime = datetime.fromisoformat(payment_date)
-            if payment_datetime.tzinfo is None:
-                payment_datetime = payment_datetime.replace(tzinfo=timezone.utc)
-            manual_payment.payment_date = payment_datetime
+            manual_payment.payment_date = _parse_payment_datetime(payment_date)
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid payment_date format: {str(e)}",
             )
 
-    manual_payment.amount_cents = int(round(amount * 100))
+    amount_cents = int(round(amount * 100))
+    revenue_cents = _manual_revenue_cents(revenue, amount_cents)
+    manual_payment.amount_cents = amount_cents
+    manual_payment.revenue_cents = revenue_cents
     if description is not None:
         manual_payment.description = description or None
     if payment_method is not None:
@@ -620,21 +658,13 @@ def update_manual_payment(
 
     db.commit()
     db.refresh(manual_payment)
+    if old_when is not None and old_rev_cents:
+        apply_manual_payment_kpi(db, org_id, old_when, revenue_delta_usd=-(old_rev_cents / 100.0))
+    apply_manual_payment_kpi(
+        db, org_id, manual_payment.payment_date, revenue_delta_usd=revenue_cents / 100.0
+    )
     invalidate_terminal_monthly_trends_cache(org_id)
-
-    return {
-        "id": str(manual_payment.id),
-        "client_id": client_id,
-        "amount_cents": manual_payment.amount_cents,
-        "amount": manual_payment.amount_cents / 100.0,
-        "currency": manual_payment.currency,
-        "payment_date": manual_payment.payment_date.isoformat(),
-        "description": manual_payment.description,
-        "payment_method": manual_payment.payment_method,
-        "receipt_url": manual_payment.receipt_url,
-        "status": "succeeded",
-        "type": "manual_payment",
-    }
+    return _manual_payment_payload(manual_payment, client_id)
 
 
 @router.delete("/{client_id}/manual-payment/{payment_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -684,9 +714,19 @@ def delete_manual_payment(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Manual payment not found"
         )
-    
+
+    old_when = manual_payment.payment_date
+    old_rev_cents = (
+        int(manual_payment.revenue_cents)
+        if manual_payment.revenue_cents is not None
+        else int(manual_payment.amount_cents or 0)
+    )
     db.delete(manual_payment)
     db.commit()
+    if old_when is not None and old_rev_cents:
+        apply_manual_payment_kpi(db, org_id, old_when, revenue_delta_usd=-(old_rev_cents / 100.0))
+    else:
+        apply_manual_payment_kpi(db, org_id, old_when, revenue_delta_usd=0.0)
     invalidate_terminal_monthly_trends_cache(org_id)
     
     return None

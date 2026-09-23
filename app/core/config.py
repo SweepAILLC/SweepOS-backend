@@ -123,14 +123,6 @@ class Settings(BaseSettings):
     # Manual Sync sliding-window rate limit.
     INSTAGRAM_MANUAL_SYNC_MAX_PER_HOUR: int = 3
 
-    # Instagram DM -> KPI autopilot (new_conversations / respondents).
-    # Composio has no Instagram triggers, so DM state is polled.
-    INSTAGRAM_DM_SYNC_ENABLED: bool = True
-    # How often the worker polls DM threads for every connected org.
-    INSTAGRAM_DM_SYNC_INTERVAL_SEC: int = 3600
-    # Per-run cap on threads inspected so one huge inbox cannot stall the worker.
-    INSTAGRAM_DM_MAX_THREADS_PER_SYNC: int = 200
-    
     # Stripe
     STRIPE_CLIENT_ID: Optional[str] = None
     STRIPE_SECRET_KEY: Optional[str] = None
