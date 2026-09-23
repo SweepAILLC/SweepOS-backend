@@ -6,6 +6,11 @@ from app.services.call_library_ai import (
     OBJECTION_HANDLING_SOP,
     PITCHING_SOP,
     _build_library_user_payload,
+    _normalize_deal_outcome,
+    _normalize_discovery_audit,
+    _normalize_objection_handling_audit,
+    _normalize_pitching_audit,
+    _normalize_report,
     clean_fathom_summary_text,
     generate_call_library_report,
     is_substantive_call_library_report,
@@ -122,3 +127,112 @@ class TestSubstantiveReportGuard:
         assert not is_substantive_call_library_report(
             {"analysis_kind": "glance", "fathom_summary": "", "ai_summary": ""}
         )
+
+
+class TestNormalizeDealOutcome:
+    def test_cash_collected_on_call_carries_amount(self):
+        out = _normalize_deal_outcome(
+            {
+                "cash_collected_on_call": True,
+                "amount": "500",
+                "currency": "usd",
+                "billing": "one_time",
+                "payment_confirmation": "Card charged live on call.",
+                "confidence": "high",
+                "evidence": "Rep read back card confirmation.",
+            }
+        )
+        assert out["cash_collected_on_call"] is True
+        assert out["verbally_agreed_not_paid"] is False
+        assert out["amount"] == 500.0
+        assert out["currency"] == "USD"
+        assert out["billing"] == "one_time"
+        assert out["payment_confirmation"] == "Card charged live on call."
+
+    def test_verbal_agreement_without_payment_has_no_amount(self):
+        out = _normalize_deal_outcome(
+            {
+                "cash_collected_on_call": False,
+                "verbally_agreed_not_paid": True,
+                "amount": "2000",
+                "confidence": "medium",
+                "evidence": "Prospect said they'd pay after payday.",
+            }
+        )
+        assert out["cash_collected_on_call"] is False
+        assert out["verbally_agreed_not_paid"] is True
+        assert out["amount"] is None
+        assert out["payment_confirmation"] == ""
+        assert out["evidence"]
+
+    def test_cash_collected_and_verbal_agreement_are_mutually_exclusive(self):
+        out = _normalize_deal_outcome(
+            {"cash_collected_on_call": True, "verbally_agreed_not_paid": True, "amount": "100"}
+        )
+        assert out["cash_collected_on_call"] is True
+        assert out["verbally_agreed_not_paid"] is False
+
+    def test_missing_or_invalid_shape_defaults_to_not_closed(self):
+        assert _normalize_deal_outcome(None)["cash_collected_on_call"] is False
+        assert _normalize_deal_outcome({})["cash_collected_on_call"] is False
+        assert _normalize_deal_outcome("not a dict")["amount"] is None
+
+    def test_negative_amount_rejected(self):
+        out = _normalize_deal_outcome({"cash_collected_on_call": True, "amount": "-50"})
+        assert out["amount"] is None
+
+
+class TestNormalizeCombinedSectionAudits:
+    def test_discovery_audit_combined_shape(self):
+        out = _normalize_discovery_audit(
+            {"discovery_score": 85, "discovery_summary": "Strong pain digging.", "quote": "It's costing me clients."}
+        )
+        assert out == {
+            "discovery_score": 85.0,
+            "discovery_summary": "Strong pain digging.",
+            "quote": "It's costing me clients.",
+        }
+
+    def test_pitching_audit_combined_shape(self):
+        out = _normalize_pitching_audit({"pitch_score": 60, "pitch_summary": "Rushed the value stack."})
+        assert out["pitch_score"] == 60.0
+        assert out["pitch_summary"] == "Rushed the value stack."
+        assert out["quote"] is None
+
+    def test_objection_handling_audit_combined_shape_keeps_objections_list(self):
+        out = _normalize_objection_handling_audit(
+            {
+                "objection_score": 40,
+                "objection_summary": "Led with logistics, not fear.",
+                "objections": [{"objection_label": "too_expensive", "classification": "fear"}],
+            }
+        )
+        assert out["objection_score"] == 40.0
+        assert out["objection_summary"] == "Led with logistics, not fear."
+        assert len(out["objections"]) == 1
+
+    def test_scores_clamped_to_0_100(self):
+        assert _normalize_discovery_audit({"discovery_score": 500})["discovery_score"] == 100.0
+        assert _normalize_pitching_audit({"pitch_score": -20})["pitch_score"] == 0.0
+
+
+class TestNormalizeReportHasNoCustomerResponse:
+    def test_customer_response_key_absent(self):
+        out = _normalize_report({"call_score": 80})
+        assert "customer_response" not in out
+
+    def test_deal_outcome_present_with_new_shape(self):
+        out = _normalize_report({"deal_outcome": {"cash_collected_on_call": True, "amount": "300"}})
+        assert out["deal_outcome"]["cash_collected_on_call"] is True
+        assert out["deal_outcome"]["amount"] == 300.0
+
+    def test_low_signal_zeroes_deal_outcome_even_if_llm_claimed_cash(self):
+        out = _normalize_report(
+            {
+                "low_signal": True,
+                "low_signal_reason": "Call cut off after 30 seconds.",
+                "deal_outcome": {"cash_collected_on_call": True, "amount": "999"},
+            }
+        )
+        assert out["deal_outcome"]["cash_collected_on_call"] is False
+        assert out["deal_outcome"]["amount"] is None

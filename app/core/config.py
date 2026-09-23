@@ -253,11 +253,14 @@ class Settings(BaseSettings):
 
     # Call Library LLM (sales coaching reports — separate tuning for speed/cost)
     CALL_LIBRARY_LLM_MODEL: Optional[str] = None  # defaults to HEALTH_SCORE_LLM_MODEL
-    CALL_LIBRARY_MAX_TRANSCRIPT_CHARS: int = 12000
+    # Raised for schema v2 (combined narrative+score sections, intentionality/emotional
+    # critique, weaknesses root-cause) — deeper analysis needs more transcript in and
+    # more room to write out, vs. the old compact per-dimension mini-verdicts.
+    CALL_LIBRARY_MAX_TRANSCRIPT_CHARS: int = 18000
     CALL_LIBRARY_MAX_SUMMARY_CHARS: int = 6000
     CALL_LIBRARY_LLM_TIMEOUT_SEC: float = 120.0
-    CALL_LIBRARY_MAX_OUTPUT_TOKENS: int = 2500  # compact rubric prompt; enough for full report
-    CALL_LIBRARY_MAX_INPUT_CHARS_TOTAL: int = 40000
+    CALL_LIBRARY_MAX_OUTPUT_TOKENS: int = 3500
+    CALL_LIBRARY_MAX_INPUT_CHARS_TOTAL: int = 52000
     CALL_LIBRARY_MIN_USER_INPUT_CHARS: int = 10000
     CALL_LIBRARY_MAX_ANALYSIS_ATTEMPTS: int = 3  # permanent failure after this many LLM misses
     CALL_LIBRARY_STAGGER_SEC: float = 1.5  # gap between queued library jobs (≈40/min)

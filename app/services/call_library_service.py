@@ -189,7 +189,15 @@ def _stored_analysis_kind(row: CallLibraryReport) -> Optional[str]:
 
 
 def _coerce_deal_outcome(report_json: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Pull the persisted columns out of an LLM report's deal_outcome block."""
+    """Pull the persisted columns out of an LLM report's deal_outcome block.
+
+    `deal_closed` now means cash was actually confirmed collected ON the call —
+    schema v2's `cash_collected_on_call`, not the old ambiguous `closed` (which a
+    verbal agreement to pay later could also satisfy). Old report rows already
+    persisted their `deal_closed` value at generation time under the old field;
+    this function only runs for newly generated reports, so it never re-derives
+    anything for historical rows.
+    """
     fallback = {
         "closed": False,
         "value_cents": None,
@@ -202,7 +210,9 @@ def _coerce_deal_outcome(report_json: Optional[Dict[str, Any]]) -> Dict[str, Any
     if not isinstance(raw, dict):
         return fallback
 
-    closed = bool(raw.get("closed"))
+    # New schema (v2) field, falling back to the old key so a report generated
+    # mid-deploy (old prompt, already in flight) doesn't silently lose its outcome.
+    closed = bool(raw.get("cash_collected_on_call", raw.get("closed")))
     if not closed:
         return fallback
 

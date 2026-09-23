@@ -1,14 +1,18 @@
 """LLM-powered call analysis for the Call Library.
 
-Produces a structured report with sections:
+Produces a structured report with sections (schema v2 — combined per-section
+narrative+score, no customer_response, strict on-call cash-collected outcome):
   1. call_context           — who, what they discussed, relationship background
-  2. discovery_audit        — 5-dimension discovery scoring (SOP-grounded)
-  3. pitching_audit         — 5-dimension pitch scoring (SOP-grounded)
-  4. objection_handling_audit — fear-first objection scoring + per-objection paths
+  2. discovery_audit        — combined analysis + one score (SOP-grounded, 5 dims reasoned internally)
+  3. pitching_audit         — combined analysis + one score (SOP-grounded, 5 dims reasoned internally)
+  4. objection_handling_audit — combined analysis + one score, plus real per-objection list
   5. strengths              — timestamped bullets of what went well
-  6. weaknesses             — timestamped bullets of what went wrong
-  7. customer_response      — emotional tone, questions, buying signals
-  8. overall_impression     — one-paragraph verdict
+  6. weaknesses             — timestamped bullets; root-causes the failure to collect cash when applicable
+  7. overall_impression     — one-paragraph verdict
+  8. deal_outcome           — cash_collected_on_call (strict, on-call only) vs. verbally_agreed_not_paid
+
+Older reports (pre schema-v2) remain stored in their original shape — this module
+only affects newly generated reports; nothing here backfills or recomputes old rows.
 """
 from __future__ import annotations
 
@@ -23,7 +27,7 @@ from app.services.llm_client import chat_json, llm_available, truncate_for_token
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v2.0"  # combined per-section narrative+score, cash_collected_on_call, no customer_response
 # Both prompts in this file produce a structured coaching-audit report for the
 # coach/org, never shown to the client — exempt from LLM.md's "generative calls"
 # persona requirement.
@@ -147,23 +151,32 @@ sop_path_followed (bool), steps_hit[], steps_missed[], handled_well, summary, qu
 """
 
 # Compact rubrics for LLM scoring (full SOPs above remain for Resources/docs fallbacks).
+# Each section reasons through the 5 (or 4) scored dimensions internally, then reports
+# ONE combined narrative + ONE combined score per section — not a separate card per
+# dimension. The rubric still drives the score; it just stops being individually
+# rendered as five mini-verdicts.
 DISCOVERY_AUDIT_RUBRIC = """\
-DISCOVERY (each dim 1-10; discovery_score = sum(dim×20), 0-100):
+DISCOVERY (reason through each dim 1-10, then discovery_score = sum(dim×20), 0-100):
 pain_identification | pain_impact | tangible_goals | intangible_goals | rapport_trust_authority
 9-10 root/explicit+confirmed; 7-8 solid; 5-6 surface; 3-4 weak; 1-2 missing.
+Write discovery_summary as ONE combined analysis that names which dimensions were strong/weak
+and why, quoting the transcript — not five separate mini-verdicts.
 """
 
 PITCHING_RUBRIC = """\
-PITCH (each dim 1-10; pitch_score = sum(dim×20)):
+PITCH (reason through each dim 1-10, then pitch_score = sum(dim×20)):
 pain_weaving | natural_solution_framing | goal_bridge | positioning_clarity | credibility_in_context
 Score only if a pitch/offer occurred; otherwise omit pitching_audit and note none found.
+Write pitch_summary as ONE combined analysis, quoting the transcript.
 """
 
 OBJECTION_HANDLING_RUBRIC = """\
-OBJECTIONS — fear before logistics. Aggregate dims 1-10 (×25 → objection_score):
+OBJECTIONS — fear before logistics. Reason through each aggregate dim 1-10 (×25 → objection_score):
 fear_handled_first | classification_accuracy | sop_path_adherence | resolution_quality
 Labels: think_about_it|too_expensive|bad_timing|wont_work|need_partner|other
 Class: fear|logistics|mixed. If none, omit objection_handling_audit and note none found.
+Write objection_summary as ONE combined analysis across all dims and objections encountered.
+Keep objections[] as a real per-objection list (not a scored dimension).
 """
 
 
@@ -187,7 +200,9 @@ def _build_system_prompt(
     custom_block = ("\n\nOrg custom guidance:\n" + "\n\n".join(custom_bits)) if custom_bits else ""
 
     return f"""\
-You are an expert sales coach. Analyze DATA and return ONE JSON object only (no markdown).
+You are an expert sales coach auditing this call to develop a world-class sales rep — be
+specific and critical, not encouraging-by-default. Analyze DATA and return ONE JSON object
+only (no markdown).
 
 Score with these rubrics:
 {DISCOVERY_AUDIT_RUBRIC}
@@ -195,22 +210,61 @@ Score with these rubrics:
 {OBJECTION_HANDLING_RUBRIC}
 {custom_block}
 
+INTENTIONALITY & EMOTIONAL READ (apply throughout discovery_audit, objection_handling_audit,
+and weaknesses — this is the difference between a shallow recap and a real audit):
+- For every notable question the salesperson asked, judge whether it was asked with clear
+  strategic intent (to surface a specific root pain, goal, or objection) or was rote /
+  script-following with no real listening behind it. Name the difference explicitly when it
+  matters to the score.
+- For every notable prospect response, read the ACTUAL emotional register behind the words —
+  genuine urgency or excitement vs. polite deflection vs. guarded/compliant answers given just
+  to keep the call moving vs. real vulnerability. Flag mismatches explicitly (e.g. prospect said
+  "sounds great" in a flat, brief way right after describing something painful — likely
+  deflection, not genuine buy-in). Quote the moment.
+
 JSON keys (omit sections with no evidence — do NOT invent empty audits):
 - call_context: {{salesperson, prospect, topic, background}}
-- discovery_audit: {{discovery_score, pain_identification|pain_impact|tangible_goals|intangible_goals|rapport_trust_authority each {{score,summary,quote}}, discovery_summary}} — omit if no discovery
-- pitching_audit: {{pitch_score, pain_weaving|natural_solution_framing|goal_bridge|positioning_clarity|credibility_in_context each {{score,summary,quote}}, pitch_summary}} — omit if no pitch
-- objection_handling_audit: {{objection_score, fear_handled_first|classification_accuracy|sop_path_adherence|resolution_quality each {{score,summary,quote}}, objections[], objection_summary}} — omit if no objections
-- strengths[] / weaknesses[]: {{title, detail, timestamp, quote}} — 0-4 each; [] if none
-- customer_response: {{emotional_tone, questions_asked[], buying_signals[], objections_or_barriers[]}}
-- overall_impression: short coaching paragraph
-- call_score: 0-100 overall quality
-- deal_outcome: {{closed(bool default false), amount|null, currency, billing(one_time|recurring_monthly|recurring_annual|unknown), confidence(high|medium|low), evidence}}
-- low_signal / low_signal_reason when DATA is too thin
+- discovery_audit: {{discovery_score, discovery_summary, quote}} — one combined analysis
+  covering all 5 dimensions (name which were strong/weak and why), not five separate verdicts.
+  Omit if no discovery occurred.
+- pitching_audit: {{pitch_score, pitch_summary, quote}} — one combined analysis covering all
+  5 dimensions. Omit if no pitch occurred.
+- objection_handling_audit: {{objection_score, objection_summary, objections[]}} — one combined
+  analysis covering all 4 aggregate dims; objections[] stays a real per-objection list (label,
+  classification, fear_addressed_first, sop_path_followed, steps_hit[], steps_missed[],
+  handled_well, summary, quote). Omit if no objections occurred.
+- strengths[] / weaknesses[]: {{title, detail, timestamp, quote}} — 0-4 each; [] if none.
+  IF cash was NOT collected on this call (deal_outcome.cash_collected_on_call = false), the
+  top 1-2 weaknesses MUST directly diagnose WHY the call didn't end in collected cash — a
+  specific unresolved fear, a missed urgency-building moment in discovery, an objection
+  mishandled, a partner/logistics block left unclosed — grounded in a transcript quote, not a
+  generic "could have done better" note. If cash WAS collected, weaknesses can be normal
+  improvement notes.
+- overall_impression: short coaching paragraph.
+- call_score: 0-100 overall quality.
+- deal_outcome: {{
+    cash_collected_on_call(bool, default false): true ONLY if payment was actually processed
+      or confirmed as received DURING this call — a card charged live, a payment confirmation
+      screen-shared, an invoice paid and confirmed on the call. NEVER true for a promise to pay
+      later, an invoice sent to be paid after the call, or a payment plan agreed to but not yet
+      charged.
+    verbally_agreed_not_paid(bool, default false): true if the prospect said yes / agreed to
+      buy but payment happens off this call (later, invoiced, "I'll send it tonight"). This is
+      NOT a close for scoring purposes — it is a distinct, weaker outcome from
+      cash_collected_on_call and the two are mutually exclusive.
+    amount|null, currency, billing(one_time|recurring_monthly|recurring_annual|unknown),
+    payment_confirmation(string): HOW it was confirmed on the call, empty if not collected.
+    confidence(high|medium|low), evidence(string): quotes the exact moment payment was
+      confirmed, or the exact moment the prospect agreed without paying.
+  }}
+- low_signal / low_signal_reason when DATA is too thin.
 
 RULES:
 - Use ONLY DATA. Never invent quotes, names, or events.
 - Skip sections with no evidence (report nothing found via omission or a one-line summary field).
-- closed=true only on unambiguous close; amount only if stated; evidence quotes the close line.
+- cash_collected_on_call=true only on unambiguous, on-call payment confirmation; amount only if
+  stated; evidence quotes the confirmation moment. Do not confuse a verbal close with cash
+  collected — most "closed" calls do NOT collect cash live; check this carefully.
 - Quotes verbatim from transcript; timestamps as shown or null.
 - Valid JSON only.
 """
@@ -520,10 +574,12 @@ _ALLOWED_CONFIDENCE = {"high", "medium", "low"}
 
 def _empty_deal_outcome() -> Dict[str, Any]:
     return {
-        "closed": False,
+        "cash_collected_on_call": False,
+        "verbally_agreed_not_paid": False,
         "amount": None,
         "currency": "USD",
         "billing": "unknown",
+        "payment_confirmation": "",
         "confidence": "low",
         "evidence": "",
     }
@@ -532,14 +588,19 @@ def _empty_deal_outcome() -> Dict[str, Any]:
 def _normalize_deal_outcome(raw: Any) -> Dict[str, Any]:
     """Coerce the LLM-emitted deal_outcome into a strict, safe shape.
 
-    Important: `closed` defaults to False on any ambiguity so a missing field
-    or an LLM hiccup never falsely marks a deal as closed.
+    Important: `cash_collected_on_call` defaults to False on any ambiguity so a
+    missing field or an LLM hiccup never falsely marks cash as collected. Cash
+    collected on the call and "agreed but paying later" are mutually exclusive —
+    a verbal agreement to pay off-call is explicitly NOT a close for scoring.
     """
     out = _empty_deal_outcome()
     if not isinstance(raw, dict):
         return out
 
-    out["closed"] = bool(raw.get("closed"))
+    out["cash_collected_on_call"] = bool(raw.get("cash_collected_on_call"))
+    out["verbally_agreed_not_paid"] = (
+        bool(raw.get("verbally_agreed_not_paid")) and not out["cash_collected_on_call"]
+    )
 
     amount_raw = raw.get("amount")
     try:
@@ -550,6 +611,10 @@ def _normalize_deal_outcome(raw: Any) -> Dict[str, Any]:
                 out["amount"] = min(amt, 1_000_000_000.0)
     except (TypeError, ValueError):
         pass
+    if not out["cash_collected_on_call"]:
+        # Only cash actually collected on the call carries a dollar figure —
+        # a verbal agreement's stated price isn't "the deal value" yet.
+        out["amount"] = None
 
     currency = str(raw.get("currency") or "USD").upper().strip()
     if 2 <= len(currency) <= 8 and currency.isalpha():
@@ -563,49 +628,16 @@ def _normalize_deal_outcome(raw: Any) -> Dict[str, Any]:
     confidence = str(raw.get("confidence") or "low").lower().strip()
     out["confidence"] = confidence if confidence in _ALLOWED_CONFIDENCE else "low"
 
+    payment_confirmation = str(raw.get("payment_confirmation") or "")[:400]
+    out["payment_confirmation"] = payment_confirmation if out["cash_collected_on_call"] else ""
+
     evidence = str(raw.get("evidence") or "")[:600]
-    out["evidence"] = evidence if out["closed"] else ""
+    out["evidence"] = evidence if (out["cash_collected_on_call"] or out["verbally_agreed_not_paid"]) else ""
     return out
 
 
 def _empty_discovery_audit() -> Dict[str, Any]:
-    def dim(name: str) -> Dict[str, Any]:
-        base: Dict[str, Any] = {"score": None, "summary": "", "quote": None}
-        if name in ("tangible_goals", "intangible_goals"):
-            base["goals_uncovered"] = []
-        return base
-
-    return {
-        "discovery_score": None,
-        "pain_identification": dim("pain_identification"),
-        "pain_impact": dim("pain_impact"),
-        "tangible_goals": dim("tangible_goals"),
-        "intangible_goals": dim("intangible_goals"),
-        "rapport_trust_authority": dim("rapport_trust_authority"),
-        "discovery_summary": "",
-    }
-
-
-def _normalize_discovery_dimension(raw: Any, has_goals: bool = False) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"score": None, "summary": "", "quote": None}
-    if has_goals:
-        out["goals_uncovered"] = []
-    if not isinstance(raw, dict):
-        return out
-    score = raw.get("score")
-    try:
-        if score is not None:
-            v = float(score)
-            out["score"] = max(1.0, min(10.0, v))
-    except (TypeError, ValueError):
-        pass
-    out["summary"] = str(raw.get("summary") or "")[:600]
-    quote = raw.get("quote")
-    out["quote"] = str(quote)[:400] if quote else None
-    if has_goals:
-        goals = raw.get("goals_uncovered")
-        out["goals_uncovered"] = _str_list(goals, 10, 200) if isinstance(goals, list) else []
-    return out
+    return {"discovery_score": None, "discovery_summary": "", "quote": None}
 
 
 def _normalize_discovery_audit(raw: Any) -> Dict[str, Any]:
@@ -619,28 +651,14 @@ def _normalize_discovery_audit(raw: Any) -> Dict[str, Any]:
             out["discovery_score"] = max(0.0, min(100.0, v))
     except (TypeError, ValueError):
         pass
-    out["pain_identification"] = _normalize_discovery_dimension(raw.get("pain_identification"))
-    out["pain_impact"] = _normalize_discovery_dimension(raw.get("pain_impact"))
-    out["tangible_goals"] = _normalize_discovery_dimension(raw.get("tangible_goals"), has_goals=True)
-    out["intangible_goals"] = _normalize_discovery_dimension(raw.get("intangible_goals"), has_goals=True)
-    out["rapport_trust_authority"] = _normalize_discovery_dimension(raw.get("rapport_trust_authority"))
-    out["discovery_summary"] = str(raw.get("discovery_summary") or "")[:1500]
+    out["discovery_summary"] = str(raw.get("discovery_summary") or "")[:2500]
+    quote = raw.get("quote")
+    out["quote"] = str(quote)[:400] if quote else None
     return out
 
 
 def _empty_pitching_audit() -> Dict[str, Any]:
-    def dim() -> Dict[str, Any]:
-        return {"score": None, "summary": "", "quote": None}
-
-    return {
-        "pitch_score": None,
-        "pain_weaving": dim(),
-        "natural_solution_framing": dim(),
-        "goal_bridge": dim(),
-        "positioning_clarity": dim(),
-        "credibility_in_context": dim(),
-        "pitch_summary": "",
-    }
+    return {"pitch_score": None, "pitch_summary": "", "quote": None}
 
 
 def _normalize_pitching_audit(raw: Any) -> Dict[str, Any]:
@@ -654,31 +672,14 @@ def _normalize_pitching_audit(raw: Any) -> Dict[str, Any]:
             out["pitch_score"] = max(0.0, min(100.0, v))
     except (TypeError, ValueError):
         pass
-    for key in (
-        "pain_weaving",
-        "natural_solution_framing",
-        "goal_bridge",
-        "positioning_clarity",
-        "credibility_in_context",
-    ):
-        out[key] = _normalize_discovery_dimension(raw.get(key))
-    out["pitch_summary"] = str(raw.get("pitch_summary") or "")[:1500]
+    out["pitch_summary"] = str(raw.get("pitch_summary") or "")[:2500]
+    quote = raw.get("quote")
+    out["quote"] = str(quote)[:400] if quote else None
     return out
 
 
 def _empty_objection_handling_audit() -> Dict[str, Any]:
-    def dim() -> Dict[str, Any]:
-        return {"score": None, "summary": "", "quote": None}
-
-    return {
-        "objection_score": None,
-        "fear_handled_first": dim(),
-        "classification_accuracy": dim(),
-        "sop_path_adherence": dim(),
-        "resolution_quality": dim(),
-        "objections": [],
-        "objection_summary": "",
-    }
+    return {"objection_score": None, "objection_summary": "", "objections": []}
 
 
 _ALLOWED_OBJECTION_LABELS = {
@@ -731,15 +732,8 @@ def _normalize_objection_handling_audit(raw: Any) -> Dict[str, Any]:
             out["objection_score"] = max(0.0, min(100.0, v))
     except (TypeError, ValueError):
         pass
-    for key in (
-        "fear_handled_first",
-        "classification_accuracy",
-        "sop_path_adherence",
-        "resolution_quality",
-    ):
-        out[key] = _normalize_discovery_dimension(raw.get(key))
     out["objections"] = _normalize_objections_list(raw.get("objections"))
-    out["objection_summary"] = str(raw.get("objection_summary") or "")[:1500]
+    out["objection_summary"] = str(raw.get("objection_summary") or "")[:2500]
     return out
 
 
@@ -758,12 +752,6 @@ def _normalize_report(raw: Dict[str, Any]) -> Dict[str, Any]:
         "objection_handling_audit": _empty_objection_handling_audit(),
         "strengths": [],
         "weaknesses": [],
-        "customer_response": {
-            "emotional_tone": "",
-            "questions_asked": [],
-            "buying_signals": [],
-            "objections_or_barriers": [],
-        },
         "overall_impression": "",
         "call_score": None,
         "deal_outcome": _empty_deal_outcome(),
@@ -810,16 +798,6 @@ def _normalize_report(raw: Dict[str, Any]) -> Dict[str, Any]:
         items = raw.get(key)
         if isinstance(items, list):
             out[key] = _normalize_observation_list(items)
-
-    # customer_response
-    cr = raw.get("customer_response")
-    if isinstance(cr, dict):
-        out["customer_response"] = {
-            "emotional_tone": str(cr.get("emotional_tone") or "")[:600],
-            "questions_asked": _str_list(cr.get("questions_asked"), 10, 300),
-            "buying_signals": _str_list(cr.get("buying_signals"), 8, 300),
-            "objections_or_barriers": _str_list(cr.get("objections_or_barriers"), 8, 300),
-        }
 
     # overall_impression
     oi = raw.get("overall_impression")
