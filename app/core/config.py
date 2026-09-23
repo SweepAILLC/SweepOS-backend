@@ -183,6 +183,11 @@ class Settings(BaseSettings):
     # compares it directly. Per-org secret (oauth_tokens.webhook_secret) wins over
     # this env fallback; see app.services.ghl_client.resolve_ghl_webhook_secret.
     GHL_WEBHOOK_SECRET: Optional[str] = None
+    # Brevo webhook config lets you set a static custom header (no built-in HMAC
+    # signing) — the org pastes a shared secret into "X-Brevo-Signature" and Sweep
+    # compares it directly. Per-org secret (oauth_tokens.webhook_secret) wins over
+    # this env fallback; see app.api.email_ingestion._resolve_brevo_webhook_secret.
+    BREVO_WEBHOOK_SECRET: Optional[str] = None
     CALENDAR_RECONCILE_WEBHOOKS_ON_STARTUP: bool = True
     # Optional Cal.com platform API key for **local dev testing only** (ENVIRONMENT=development).
     # Production uses OAuth tokens stored via Integrations.

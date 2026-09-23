@@ -2,21 +2,34 @@
 Brevo webhook handler for contact creation events.
 When new contacts are added to Brevo, this processes them and creates clients
 in the database if they pass spam detection.
+
+Org-scoped like every other provider's webhook: configure this URL in Brevo's
+webhook settings (per org, since Brevo has no concept of our multi-tenancy) as
+{BACKEND_PUBLIC_URL}/webhooks/brevo/{org_id}, with a custom "X-Brevo-Signature"
+header set to a shared secret (Brevo can't HMAC-sign the body, only send a
+static custom header — same trust model as the GHL webhook). Set the secret
+via BREVO_WEBHOOK_SECRET (env, org-wide) or per-org on oauth_tokens.webhook_secret.
+An org with a webhook already configured against the old un-scoped
+/brevo/webhook URL must update it to include their org_id.
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Header
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
+from app.core.config import settings
+from app.core.encryption import decrypt_token
 from app.db.session import get_db
 from app.models.client import Client, LifecycleState
 from app.services.email_spam_detector import detect_spam_email, SpamDetectionResult
 from app.models.oauth_token import OAuthToken, OAuthProvider
+from app.api.calendar_webhooks import _parse_org, _read_body_async
 from typing import Optional, Dict, Any
 import uuid
 import json
 import hmac
-import hashlib
+import logging
 from datetime import datetime
 
+LOG = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -27,21 +40,44 @@ def get_brevo_auth_headers(db: Session, org_id: uuid.UUID, user_id: uuid.UUID):
     return _get_brevo_auth_headers(db, org_id, user_id)
 
 
-@router.post("/brevo/webhook")
+def _resolve_brevo_webhook_secret(db: Session, org_id: uuid.UUID, token: Optional[OAuthToken]) -> Optional[str]:
+    """Per-org shared secret on the Brevo oauth_tokens row, else the env-wide fallback."""
+    if token and token.webhook_secret:
+        try:
+            return decrypt_token(token.webhook_secret)
+        except Exception:
+            LOG.warning("brevo webhook: secret decrypt failed org=%s", org_id)
+    return getattr(settings, "BREVO_WEBHOOK_SECRET", None) or None
+
+
+def _verify_brevo_shared_secret(secret: Optional[str], header_value: str) -> None:
+    """Static equality check (constant-time) — Brevo custom webhook headers are a fixed
+    value set in their dashboard, not a per-request HMAC of the body."""
+    if not secret:
+        # Matches the Fathom/Calendly/Cal.com/GHL posture: warn-and-accept when unset,
+        # so local dev / first-time connection still works; set the env var in prod.
+        LOG.warning("brevo webhook: no shared secret configured; accepting")
+        return
+    if not header_value or not hmac.compare_digest(header_value.strip(), secret.strip()):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid webhook signature")
+
+
+@router.post("/brevo/{org_id}")
 async def brevo_webhook(
+    org_id: str,
     request: Request,
     db: Session = Depends(get_db),
     x_brevo_signature: Optional[str] = Header(None, alias="X-Brevo-Signature")
 ):
     """
-    Handle Brevo webhook events for contact creation.
-    
+    Handle Brevo webhook events for contact creation, scoped to one org.
+
     When a new contact is created in Brevo, this webhook is triggered.
     The system will:
     1. Run spam detection on the contact
     2. If it's a real person: Create a client in the database with lifecycle_state = "cold_lead"
     3. If it's spam: Log it but don't create a client
-    
+
     Brevo webhook payload format:
     {
         "event": "contact_added",
@@ -55,27 +91,32 @@ async def brevo_webhook(
         "blacklisted": false,
         ...
     }
-    
-    Note: In production, verify webhook signature using X-Brevo-Signature header.
     """
+    org_uuid = _parse_org(org_id)
+    token = (
+        db.query(OAuthToken)
+        .filter(OAuthToken.provider == OAuthProvider.BREVO, OAuthToken.org_id == org_uuid)
+        .first()
+    )
+    if not token:
+        # Don't process a contact for an org that never connected Brevo — this is exactly
+        # the wrong-org data leak this endpoint used to have when it guessed instead.
+        LOG.warning("brevo webhook: org=%s has no Brevo connection; ignoring", org_uuid)
+        return Response(status_code=200, content="Org not connected")
+
+    # Verify the shared secret before doing anything else, and outside the broad
+    # try/except below — HTTPException is an Exception too, and that handler's job
+    # is to turn processing errors into a 200-with-error-body for Brevo, not to
+    # swallow an intentional 403 rejection into a false "success" response.
+    body = await _read_body_async(request)
+    secret = _resolve_brevo_webhook_secret(db, org_uuid, token)
+    _verify_brevo_shared_secret(secret, x_brevo_signature or "")
+
     try:
-        # Get raw body for signature verification (if needed)
-        body = await request.body()
         payload = json.loads(body.decode('utf-8'))
-        
-        print(f"[BREVO_WEBHOOK] Received webhook: {payload.get('event', 'unknown')}")
-        
-        # Verify webhook signature (optional but recommended)
-        # TODO: Implement signature verification if Brevo provides a secret
-        # if x_brevo_signature:
-        #     expected_signature = hmac.new(
-        #         settings.BREVO_WEBHOOK_SECRET.encode(),
-        #         body,
-        #         hashlib.sha256
-        #     ).hexdigest()
-        #     if not hmac.compare_digest(x_brevo_signature, expected_signature):
-        #         raise HTTPException(status_code=401, detail="Invalid webhook signature")
-        
+
+        print(f"[BREVO_WEBHOOK] org={org_uuid} received webhook: {payload.get('event', 'unknown')}")
+
         # Only process contact creation events
         event_type = payload.get("event", "")
         if event_type not in ["contact_added", "contact_created"]:
@@ -121,38 +162,13 @@ async def brevo_webhook(
                 })
             )
         
-        # Find which org this contact belongs to
-        # We need to determine org_id from the contact's list or other metadata
-        # For now, we'll try to find the org by checking all Brevo connections
-        brevo_tokens = db.query(OAuthToken).filter(
-            OAuthToken.provider == OAuthProvider.BREVO
-        ).all()
-        
-        if not brevo_tokens:
-            print(f"[BREVO_WEBHOOK] No Brevo connections found")
-            return Response(status_code=200, content="No Brevo connections")
-        
-        # Get the list ID from the webhook (if available)
-        list_id = payload.get("listid")
-        
-        # Try to match org by list ID or use first available org
-        # In a multi-tenant setup, you might want to include org_id in webhook metadata
-        org_id = None
-        for token in brevo_tokens:
-            # If list_id is provided, we could check which org owns that list
-            # For now, we'll use the first org (you may want to improve this logic)
-            if not org_id:
-                org_id = token.org_id
-                break
-        
-        if not org_id:
-            print(f"[BREVO_WEBHOOK] Could not determine org_id")
-            return Response(status_code=200, content="Could not determine org")
-        
+        # org_uuid was already resolved from the URL path and verified connected, above —
+        # no more scanning every Brevo connection in the database to guess.
+
         # Check if client already exists
         existing_client = db.query(Client).filter(
             Client.email == email_address,
-            Client.org_id == org_id
+            Client.org_id == org_uuid
         ).first()
         
         if existing_client:
@@ -188,10 +204,14 @@ async def brevo_webhook(
             else:
                 existing_client.notes = merge_note
             
-            # Update source if not already set
-            if not existing_client.source:
-                existing_client.source = "brevo_webhook"
-            
+            # Update source if not already set. Client has no `source` column —
+            # this used to reference one that doesn't exist, which threw on every
+            # merge and was silently swallowed by the blanket except below.
+            meta = dict(existing_client.meta) if isinstance(existing_client.meta, dict) else {}
+            if not meta.get("source"):
+                meta["source"] = "brevo_webhook"
+                existing_client.meta = meta
+
             db.commit()
             db.refresh(existing_client)
             
@@ -211,12 +231,12 @@ async def brevo_webhook(
         
         # Create new client in database
         client = Client(
-            org_id=org_id,
+            org_id=org_uuid,
             email=email_address,
             first_name=first_name,
             last_name=last_name,
             lifecycle_state=LifecycleState.COLD_LEAD,
-            source="brevo_webhook",
+            meta={"source": "brevo_webhook"},
             notes=f"Added via Brevo webhook. Contact ID: {payload.get('id', 'N/A')}"
         )
         
