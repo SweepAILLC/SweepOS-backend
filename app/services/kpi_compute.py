@@ -370,7 +370,9 @@ def overall_day_tier(
 
 
 SNAPSHOT_CARD_DEFS = (
-    {"key": "total_conversations", "label": "Total Conversations", "kind": "int", "aggregation": "sum", "tier_metric": None},
+    # Every lead that came in: each new conversation is a lead, plus inbound ICP leads
+    # (EODs) and paid funnel opt-ins (passed in by the caller).
+    {"key": "total_leads", "label": "Total Leads", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "calls_booked", "label": "Sales Calls Booked", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "calls_booked_activity", "label": "Calls Booked (Activity)", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "calls_taken", "label": "Sales Calls Taken", "kind": "int", "aggregation": "sum", "tier_metric": None},
@@ -394,6 +396,7 @@ def build_kpi_snapshot(
     calendar_available: bool = False,
     payments_available: bool = False,
     generated_at: Optional[Any] = None,
+    paid_leads_by_day: Optional[Dict[date, int]] = None,
 ) -> KpiSnapshotResponse:
     """Compact insights payload for owner dashboard, terminal graphs, and cross-tab cards."""
     from datetime import datetime, timezone
@@ -412,21 +415,21 @@ def build_kpi_snapshot(
     # Precompute rates onto dicts once
     dicts = [entry_to_dict(e) for e in scoped]
 
-    def _total_conversations(d: Dict[str, Any]) -> float:
-        return float(
-            (d.get("new_conversations") or 0)
-            + (d.get("followups_sent") or 0)
-            + (d.get("outreach_sent") or 0)
-            + (d.get("conversations_nurtured") or 0)
-        )
+    paid_by_day = {
+        d: n for d, n in (paid_leads_by_day or {}).items() if range_start <= d <= range_end
+    }
 
     cards: List[KpiSnapshotCard] = []
     for defn in SNAPSHOT_CARD_DEFS:
         key = defn["key"]
-        if key == "total_conversations":
-            total = sum(_total_conversations(d) for d in dicts)
-            any_val = bool(dicts)
-            value = round(total, 2) if any_val else None
+        breakdown: Optional[Dict[str, float]] = None
+        if key == "total_leads":
+            convos = sum(float(d.get("new_conversations") or 0) for d in dicts)
+            inbound = sum(float(d.get("inbound_icp_leads") or 0) for d in dicts)
+            paid = float(sum(paid_by_day.values()))
+            any_val = bool(dicts) or paid > 0
+            value = round(convos + inbound + paid, 2) if any_val else None
+            breakdown = {"conversations": convos, "inbound": inbound, "paid": paid} if any_val else None
             tier_val = None
         elif defn["aggregation"] == "sum":
             total = 0.0
@@ -454,6 +457,7 @@ def build_kpi_snapshot(
                 kind=defn["kind"],
                 aggregation=defn["aggregation"],
                 tier=tier,
+                breakdown=breakdown,
             )
         )
 
@@ -465,8 +469,8 @@ def build_kpi_snapshot(
         # One point per calendar date — sum across rows sharing a date first
         # (an org with per-rep entries can have several rows for one date).
         by_date = _group_by_date(scoped)
-        for entry_date in sorted(by_date.keys()):
-            rows_for_date = by_date[entry_date]
+        for entry_date in sorted(set(by_date.keys()) | set(paid_by_day.keys())):
+            rows_for_date = by_date.get(entry_date, [])
             day_dicts = [entry_to_dict(e) for e in rows_for_date]
             summed = {
                 k: sum(float(dd.get(k) or 0) for dd in day_dicts)
@@ -475,6 +479,7 @@ def build_kpi_snapshot(
                     "followups_sent",
                     "new_conversations",
                     "conversations_nurtured",
+                    "inbound_icp_leads",
                     "respondents",
                     "calls_booked",
                     "calls_taken",
@@ -495,6 +500,9 @@ def build_kpi_snapshot(
                     date=entry_date,
                     outreach_sent=int(summed["outreach_sent"]),
                     total_conversations=total_convos,
+                    total_leads=int(
+                        summed["new_conversations"] + summed["inbound_icp_leads"] + paid_by_day.get(entry_date, 0)
+                    ),
                     calls_booked=int(summed["calls_booked"]),
                     calls_taken=int(summed["calls_taken"]),
                     closes=int(summed["closes"]),

@@ -101,6 +101,7 @@ def invite_user_to_org(
         email=body.email,
         role=role,
         created_by=current_user.id,
+        team_role=body.team_role,
     )
     email_sent = False
     if body.send_email:

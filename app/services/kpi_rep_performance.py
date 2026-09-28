@@ -26,7 +26,7 @@ from app.schemas.kpi import (
 from app.services.org_members import user_display_name
 
 _PERSONAL_BEST_LOOKBACK_MONTHS = 12
-_FUNNEL_FIELDS = ("outreach_sent", "calls_booked", "calls_booked_activity", "calls_taken", "no_shows")
+_FUNNEL_FIELDS = ("outreach_sent", "respondents", "calls_booked", "calls_booked_activity", "calls_taken", "no_shows")
 
 
 def _month_key(d: date) -> str:
@@ -36,6 +36,7 @@ def _month_key(d: date) -> str:
 def _empty_month_bucket() -> Dict[str, int]:
     return {
         "outreach_sent": 0,
+        "respondents": 0,
         "calls_booked": 0,
         "calls_booked_activity": 0,
         "calls_taken": 0,
@@ -46,11 +47,17 @@ def _empty_month_bucket() -> Dict[str, int]:
 
 
 def _metrics_from_bucket(bucket: Dict[str, int]) -> KpiRepPerformanceMetrics:
+    outreach_sent = bucket.get("outreach_sent", 0)
+    respondents = bucket.get("respondents", 0)
     calls_booked = bucket.get("calls_booked", 0)
     calls_taken = bucket.get("calls_taken", 0)
     closes = bucket.get("closes", 0)
     return KpiRepPerformanceMetrics(
-        outreach_sent=bucket.get("outreach_sent", 0),
+        outreach_sent=outreach_sent,
+        respondents=respondents,
+        # Same formulas as the org KPI rollup (kpi_compute.build_monthly_rollups).
+        reply_rate_pct=safe_pct(respondents, outreach_sent),
+        convo_to_booking_pct=safe_pct(calls_booked, respondents),
         calls_booked=calls_booked,
         calls_booked_activity=bucket.get("calls_booked_activity", 0),
         calls_taken=calls_taken,
@@ -153,6 +160,7 @@ def build_rep_performance(
         best_month: Dict[str, Optional[str]] = {k: None for k in best_bucket}
         for key in (
             "outreach_sent",
+            "respondents",
             "calls_booked",
             "calls_booked_activity",
             "calls_taken",

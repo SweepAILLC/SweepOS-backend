@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -237,8 +237,10 @@ def llm_usage_timeseries(
     org_id: Optional[uuid.UUID] = None,
     days: int = 30,
     scope: Optional[str] = None,
+    window: Optional[Tuple[datetime, datetime]] = None,
 ) -> Dict[str, Any]:
-    """Daily estimated LLM API cost series for platform or a single org."""
+    """Daily estimated LLM API cost series for platform or a single org.
+    `window` (naive UTC [start, end)) comes from the shared date-range filter and wins over days/scope."""
     from app.models.llm_usage_event import LlmUsageEvent
     from app.models.organization import Organization
     from app.services.finances_cash import finances_period_bounds
@@ -246,7 +248,7 @@ def llm_usage_timeseries(
     if scope is not None and scope not in ("mtd", "all"):
         raise ValueError("scope must be mtd or all")
 
-    start, end = finances_period_bounds(scope, max(1, int(days or 30)))
+    start, end = window if window is not None else finances_period_bounds(scope, max(1, int(days or 30)))
     # llm_usage_events.created_at is timestamptz; finances bounds are naive UTC
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)

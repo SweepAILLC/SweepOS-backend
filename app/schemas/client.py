@@ -45,6 +45,8 @@ class ClientBase(BaseModel):
     phone: Optional[str] = None
     instagram: Optional[str] = None
     lifecycle_state: LifecycleState = LifecycleState.QUALIFIED
+    source_channel: Optional[str] = None  # "organic" | "paid"
+    source_funnel_id: Optional[uuid.UUID] = None
     stripe_customer_id: Optional[str] = None
     estimated_mrr: Optional[Union[float, Decimal]] = 0.0
     notes: Optional[str] = None
@@ -153,6 +155,8 @@ class ClientUpdate(BaseModel):
     phone: Optional[str] = None
     instagram: Optional[str] = None
     lifecycle_state: Optional[LifecycleState] = None
+    source_channel: Optional[str] = None
+    source_funnel_id: Optional[uuid.UUID] = None
     stripe_customer_id: Optional[str] = None
     estimated_mrr: Optional[float] = None
     notes: Optional[str] = None

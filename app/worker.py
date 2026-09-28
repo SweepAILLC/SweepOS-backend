@@ -113,6 +113,11 @@ def _dispatcher_loop() -> None:
     last_call_library_drain = 0.0
     last_stripe_catchup = 0.0
     last_instagram_sync = 0.0
+    # 0.0 so the first tick after boot runs it — a deploy applies the rule immediately.
+    last_follow_up_sweep = 0.0
+    follow_up_sweep_interval = float(
+        getattr(settings, "FOLLOW_UP_SWEEP_INTERVAL_SEC", 900) or 900
+    )
     call_library_drain_interval = float(
         getattr(settings, "CALL_LIBRARY_WORKER_DRAIN_INTERVAL_SEC", 180) or 180
     )
@@ -188,6 +193,20 @@ def _dispatcher_loop() -> None:
                     except Exception:
                         LOG.exception("call_library worker drain failed")
                     last_call_library_drain = now
+                if now - last_follow_up_sweep >= follow_up_sweep_interval:
+                    try:
+                        from app.services.client_automation import sweep_expired_follow_ups_all_orgs
+
+                        n = sweep_expired_follow_ups_all_orgs(db)
+                        if n:
+                            LOG.info("follow-up expiry sweep moved %d card(s)", n)
+                    except Exception:
+                        LOG.exception("follow-up expiry sweep failed")
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                    last_follow_up_sweep = now
                 if stripe_catchup_interval > 0 and now - last_stripe_catchup >= stripe_catchup_interval:
                     try:
                         from app.services.stripe_webhook_onboard import catchup_stripe_recent_for_all_orgs

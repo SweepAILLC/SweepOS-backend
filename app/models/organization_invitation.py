@@ -17,6 +17,8 @@ class OrganizationInvitation(Base):
     invitee_email = Column(String(255), nullable=True, index=True)
     invitation_type = Column(String(50), nullable=False, default="USER")  # 'ORG_ADMIN' | 'USER'
     role = Column(String(50), nullable=False, default="member")  # owner | admin | member
+    # Rep type applied on accept when role is member: "sales" | "marketing" | NULL.
+    team_role = Column(String(16), nullable=True)
     token = Column(String(255), nullable=False, unique=True, index=True)
     expires_at = Column(DateTime, nullable=True)
     used_at = Column(DateTime, nullable=True)

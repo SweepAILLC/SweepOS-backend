@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -97,6 +98,12 @@ class OrgKpiDailyEntry(Base):
     cash_collected = Column(Numeric(12, 2), nullable=True)
     revenue = Column(Numeric(12, 2), nullable=True)
     setter_context = Column(Text, nullable=True)
+    # Client ids the setter's calls_booked count for this day/rep refers to —
+    # from the EOD picker, prefills setter_user_id on the client's close event.
+    setter_booked_client_ids = Column(JSON, nullable=True)
+    # Set only when a person submits their EOD (the Team KPIs accountability
+    # signal). Calendar sync and CSV import create rows but never set it.
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

@@ -16,7 +16,7 @@ from app.schemas.brevo import (
     BrevoSendEmailRequest, BrevoSendEmailResponse, BrevoEmailRecipient,
     BrevoAnalyticsResponse, BrevoAccountStatistics, BrevoTransactionalStatistics, BrevoCampaignStatistics
 )
-from app.models.client import Client, LifecycleState
+from app.models.client import Client, LifecycleState, find_client_by_email
 from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
 from app.models.client_checkin import ClientCheckIn
 from app.models.stripe_payment import StripePayment
@@ -2416,10 +2416,8 @@ def create_clients_from_brevo_contacts(
                 phone = attributes.get("SMS") or attributes.get("PHONE") or attributes.get("phone")
                 
                 # Check if client already exists
-                existing_client = db.query(Client).filter(
-                    Client.email == email,
-                    Client.org_id == org_id
-                ).first()
+                # Any email on the profile (primary or merged-in) so combined contacts stay combined.
+                existing_client = find_client_by_email(db, org_id, email)
                 
                 if existing_client:
                     # Merge: Update existing client with Brevo contact data
@@ -3348,9 +3346,9 @@ def get_calendar_upcoming_summary(
 
             now_naive = now.replace(tzinfo=None) if now.tzinfo else now
             one_month_ago_naive = one_month_ago.replace(tzinfo=None) if one_month_ago.tzinfo else one_month_ago
-            show_up_rate = admin_api._org_show_up_rate_pct(
+            show_up_rate = admin_api._org_sales_call_rates(
                 db, org_id, one_month_ago_naive, now_naive, now_naive
-            )
+            )["show_up_rate_pct"]
         except Exception as show_up_err:
             print(f"[CALENDAR SUMMARY] Could not compute sales-call show-up rate: {show_up_err}")
         
@@ -3505,6 +3503,8 @@ def get_calendar_trend_summary(
         le=365,
         description="Rolling day window when scope is omitted (e.g. 30).",
     ),
+    start: Optional[str] = Query(None, description="Inclusive org-local YYYY-MM-DD; with `end`, overrides scope/range."),
+    end: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -3524,11 +3524,14 @@ def get_calendar_trend_summary(
         range_days = 30
 
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    from app.services.date_window import explicit_window
+
     payload = compute_calendar_trend_summary(
         db,
         org_id,
         scope=scope,
         range_days=range_days,
+        window=explicit_window(db, org_id, start, end),
     )
     return CalendarTrendSummaryResponse(**payload)
 
@@ -3567,6 +3570,10 @@ def get_calendar_synced_bookings(
     past_since: Optional[str] = Query(
         None,
         description="ISO datetime — only return past rows with start_time on or after this instant.",
+    ),
+    past_until: Optional[str] = Query(
+        None,
+        description="ISO datetime — only return past rows ending before this instant (date-range filter end).",
     ),
     provider: Optional[str] = Query(
         None,
@@ -3626,6 +3633,14 @@ def get_calendar_synced_bookings(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid past_since; use ISO-8601 datetime.",
+            )
+    if past_until:
+        try:
+            past_q = past_q.filter(effective_end < parse_utc_instant(past_until))
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid past_until; use ISO-8601 datetime.",
             )
     past_rows = past_q.order_by(ClientCheckIn.start_time.desc()).limit(past_limit).all()
 

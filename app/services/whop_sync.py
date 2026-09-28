@@ -442,6 +442,20 @@ def apply_whop_first_payment_signals(db: Session, org_id: uuid.UUID, signals: Li
         )
         from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
+        try:
+            from app.services.call_library_auto_close import supersede_auto_payment_if_matched
+
+            for sig in paid_signals:
+                supersede_auto_payment_if_matched(
+                    db,
+                    org_id,
+                    sig["client_id"],
+                    amount_cents=int(sig.get("amount_cents") or 0),
+                    near_date=sig.get("paid_at"),
+                )
+        except Exception:
+            pass
+
         for cid in {sig["client_id"] for sig in paid_signals}:
             client_row = db.query(Client).filter(Client.id == cid).first()
             if not client_row:

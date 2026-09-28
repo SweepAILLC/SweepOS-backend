@@ -24,6 +24,7 @@ from app.models.client import (
 
 DEFAULT_FOLLOW_UP_DAYS = 14
 META_FOLLOW_UP_DUE_AT = "follow_up_due_at"
+META_FOLLOW_UP_ANCHOR_AT = "follow_up_anchor_at"
 META_LIFECYCLE_MANUAL_AT = "lifecycle_manual_at"
 META_LIFECYCLE_MANUAL_STAGE = "lifecycle_manual_stage"
 
@@ -158,6 +159,135 @@ def client_has_recorded_payment(
     return manual is not None
 
 
+def _amount_and_date_match(
+    a_cents: Optional[int],
+    a_date: Optional[datetime],
+    b_cents: int,
+    b_date: Optional[datetime],
+    *,
+    window_days: int,
+    tolerance_pct: float,
+) -> bool:
+    if a_cents is None or a_cents <= 0 or b_cents <= 0:
+        return False
+    diff_pct = abs(a_cents - b_cents) / max(a_cents, b_cents) * 100.0
+    if diff_pct > tolerance_pct:
+        return False
+    if a_date is None or b_date is None:
+        return True
+    a_naive = _as_naive_utc(a_date)
+    b_naive = _as_naive_utc(b_date)
+    if a_naive is None or b_naive is None:
+        return True
+    return abs((a_naive - b_naive).days) <= window_days
+
+
+def find_matching_real_payment(
+    db: Session,
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+    *,
+    amount: Optional[float],
+    near_date: Optional[datetime],
+    window_days: int = 7,
+    tolerance_pct: float = 15.0,
+) -> bool:
+    """
+    True when a real (non-auto-detected) payment already covers this deal —
+    same client, amount within tolerance, dated within window_days of near_date.
+    Used before creating a call_library_auto ManualPayment row, so Fathom's read
+    never duplicates a payment that already landed through Stripe/Whop/manual entry.
+    """
+    if amount is None:
+        return False
+    target_cents = int(round(amount * 100))
+    from app.models.manual_payment import ManualPayment
+    from app.models.stripe_payment import StripePayment
+    from app.models.whop_payment import WhopPayment
+
+    for p in (
+        db.query(StripePayment)
+        .filter(
+            StripePayment.org_id == org_id,
+            StripePayment.client_id == client_id,
+            StripePayment.status == "succeeded",
+        )
+        .all()
+    ):
+        if _amount_and_date_match(
+            target_cents, near_date, int(p.amount_cents or 0), p.created_at,
+            window_days=window_days, tolerance_pct=tolerance_pct,
+        ):
+            return True
+
+    for p in (
+        db.query(WhopPayment)
+        .filter(WhopPayment.org_id == org_id, WhopPayment.client_id == client_id)
+        .all()
+    ):
+        if (p.status or "").lower() not in ("paid", "succeeded", "completed", "successful"):
+            continue
+        if _amount_and_date_match(
+            target_cents, near_date, int(p.amount_cents or 0), p.created_at,
+            window_days=window_days, tolerance_pct=tolerance_pct,
+        ):
+            return True
+
+    for p in (
+        db.query(ManualPayment)
+        .filter(
+            ManualPayment.org_id == org_id,
+            ManualPayment.client_id == client_id,
+            ManualPayment.source != "call_library_auto",
+        )
+        .all()
+    ):
+        if _amount_and_date_match(
+            target_cents, near_date, int(p.amount_cents or 0), p.payment_date,
+            window_days=window_days, tolerance_pct=tolerance_pct,
+        ):
+            return True
+
+    return False
+
+
+def find_auto_payment_to_supersede(
+    db: Session,
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+    *,
+    amount_cents: int,
+    near_date: Optional[datetime],
+    window_days: int = 7,
+    tolerance_pct: float = 15.0,
+):
+    """
+    The reverse direction: a real payment just landed — find an earlier
+    call_library_auto row (not yet superseded) for this client that it covers,
+    so the auto-detected row can be marked superseded_at and stop double-counting
+    alongside the real payment. Priority: the payment processor always wins.
+    """
+    from app.models.manual_payment import ManualPayment
+
+    candidates = (
+        db.query(ManualPayment)
+        .filter(
+            ManualPayment.org_id == org_id,
+            ManualPayment.client_id == client_id,
+            ManualPayment.source == "call_library_auto",
+            ManualPayment.superseded_at.is_(None),
+        )
+        .all()
+    )
+    for p in candidates:
+        if _amount_and_date_match(
+            amount_cents, near_date, int(p.amount_cents or 0), p.payment_date,
+            window_days=window_days, tolerance_pct=tolerance_pct,
+        ):
+            return p
+    return None
+
+
 def _succeeded_payment_count(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> int:
     """Succeeded Stripe + paid-like Whop + manual rows for this client."""
     from app.models.manual_payment import ManualPayment
@@ -258,6 +388,59 @@ def _has_unclosed_past_sales_call(
     return False
 
 
+def find_active_sale_closed_mismatches(
+    db: Session,
+    org_id: uuid.UUID,
+) -> list[uuid.UUID]:
+    """
+    Data-integrity flag: clients whose lifecycle already advanced to ACTIVE
+    (a real payment landed) but whose most recent past sales call still shows
+    `sale_closed != True`. This drift happens when the booking's event type was
+    never tagged `is_sales_call` (missing CalendarBookingSales/EventTypeSalesCall
+    default) — the payment correctly promotes lifecycle_state, but nothing
+    stamps sale_closed, so anything reading sale_closed specifically still
+    shows this client as open. One query for active clients, one for their
+    sales check-ins — no N+1.
+    """
+    from app.models.client_checkin import ClientCheckIn
+
+    active_client_ids = {
+        row[0]
+        for row in db.query(Client.id)
+        .filter(Client.org_id == org_id, Client.lifecycle_state == LifecycleState.ACTIVE)
+        .all()
+    }
+    if not active_client_ids:
+        return []
+
+    now_naive = _as_naive_utc(datetime.utcnow())
+    latest_call_by_client: dict[uuid.UUID, ClientCheckIn] = {}
+    rows = (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.client_id.in_(active_client_ids),
+            ClientCheckIn.is_sales_call.is_(True),
+            ClientCheckIn.cancelled.is_(False),
+        )
+        .all()
+    )
+    for row in rows:
+        start = _as_naive_utc(row.start_time)
+        if start is None or (now_naive is not None and start > now_naive):
+            continue
+        current = latest_call_by_client.get(row.client_id)
+        current_start = _as_naive_utc(current.start_time) if current else None
+        if current is None or (current_start is not None and start > current_start):
+            latest_call_by_client[row.client_id] = row
+
+    return [
+        client_id
+        for client_id, call in latest_call_by_client.items()
+        if call.sale_closed is not True
+    ]
+
+
 def update_client_progress(db: Session, client: Client) -> bool:
     """Calculate and update client's program progress."""
     if not client.program_start_date or not client.program_duration_days:
@@ -339,9 +522,31 @@ def revert_booked_without_sales_call(db: Session, client: Client) -> bool:
     return True
 
 
-def update_expired_follow_ups_to_cold_lead(db: Session, client: Client) -> bool:
+def restart_follow_up_timer(client: Client, *, now: Optional[datetime] = None) -> None:
     """
-    Qualified / nurturing / booked leads whose follow-up timer has elapsed → cold_lead.
+    Reset the follow-up bar to 0% without touching last_activity_at (no real
+    activity happened). The frontend bar anchors on max(last_activity_at,
+    meta.follow_up_anchor_at), so both sides agree the new window starts now.
+    """
+    now_naive = _as_naive_utc(now or datetime.utcnow())
+    meta = dict(client.meta) if isinstance(client.meta, dict) else {}
+    meta[META_FOLLOW_UP_ANCHOR_AT] = now_naive.isoformat() + "Z"
+    meta[META_FOLLOW_UP_DUE_AT] = (now_naive + timedelta(days=DEFAULT_FOLLOW_UP_DAYS)).isoformat() + "Z"
+    client.meta = meta
+    try:
+        flag_modified(client, "meta")
+    except Exception:
+        # Plain objects in unit tests have no SQLAlchemy instance state.
+        pass
+
+
+def update_expired_follow_ups(db: Session, client: Client) -> bool:
+    """
+    Follow-up bar hit 100% on an unpaid lead with no upcoming sales call:
+    - qualified -> nurturing, with a fresh follow-up window
+    - nurturing / booked -> cold_lead
+    One step per run, so a qualified lead gets a full nurturing window before
+    it can reach cold_lead.
     """
     state = _lifecycle_str(client.lifecycle_state)
     if state not in {s.value for s in (LifecycleState.QUALIFIED, LifecycleState.NURTURING, LifecycleState.BOOKED)}:
@@ -352,12 +557,62 @@ def update_expired_follow_ups_to_cold_lead(db: Session, client: Client) -> bool:
         return False
     if not is_follow_up_expired(client):
         return False
+    if state == LifecycleState.QUALIFIED.value:
+        print(
+            f"[CLIENT_AUTOMATION] Client {client.id} ({client.email}): "
+            "follow-up expired in qualified → NURTURING"
+        )
+        client.lifecycle_state = LifecycleState.NURTURING
+        restart_follow_up_timer(client)
+        return True
     print(
         f"[CLIENT_AUTOMATION] Client {client.id} ({client.email}): "
         f"follow-up expired in {state} → COLD_LEAD"
     )
     client.lifecycle_state = LifecycleState.COLD_LEAD
     return True
+
+
+def sweep_expired_follow_ups_all_orgs(db: Session, *, now: Optional[datetime] = None) -> int:
+    """
+    Worker sweep: apply the follow-up expiry rule to every lead card already
+    at 100%, across all orgs. Runs on worker boot (so a deploy applies it to
+    existing cards immediately) and on an interval after that — the rule
+    otherwise only fires during a calendar sync.
+
+    Qualified and nurturing only: booked cards keep their existing sync-time
+    handling (booked->nurturing on an unclosed past call comes first there), so
+    the sweep never jumps a booked card straight to cold_lead on its own.
+
+    Only the follow-up rule runs here, not the full lifecycle pass. Honors the
+    manual-lock like apply_automatic_lifecycle_for_client does. The expiry
+    check is pure Python and runs first, so the per-client payment/upcoming-call
+    queries only run for cards that are actually due.
+    """
+    candidates = (
+        db.query(Client)
+        .filter(
+            Client.lifecycle_state.in_([LifecycleState.QUALIFIED, LifecycleState.NURTURING])
+        )
+        .all()
+    )
+    changed = 0
+    for client in candidates:
+        if not is_follow_up_expired(client, now=now):
+            continue
+        if is_manual_lifecycle_protected(client, now=now):
+            continue
+        sp = db.begin_nested()
+        try:
+            if update_expired_follow_ups(db, client):
+                changed += 1
+            sp.commit()
+        except Exception as client_err:
+            sp.rollback()
+            print(f"[CLIENT_AUTOMATION] follow-up sweep skip for {client.id}: {client_err}")
+    if changed:
+        db.commit()
+    return changed
 
 
 def apply_funnel_lead_lifecycle(client: Client) -> bool:
@@ -461,21 +716,36 @@ def apply_automatic_lifecycle_for_client(
     """
     Apply all automatic lifecycle rules for one client (priority order):
     1. Payment → active
-    2. Program progress → offboarding @ 75%, dead @ 100%
-    3. Upcoming sales call → booked (pre-payment)
+    2. Upcoming sales call → booked (pre-payment)
+    3. Program progress → offboarding @ 75%, dead @ 100%
     4. Past unclosed sales call without payment → nurturing
     5. Booked without sales call basis → qualified (backfill)
-    6. Follow-up expired → cold_lead
+    6. Follow-up expired → qualified steps to nurturing; nurturing/booked to cold_lead
+
+    The manual-lock (`is_manual_lifecycle_protected`) only gates 3-6 — automation
+    second-guessing or downgrading a stage an operator just set by hand. It never
+    blocks 1 or 2: a real payment or a brand-new booking is a new external signal,
+    not automation re-litigating stale state, so neither should sit blocked for
+    the 14-day window just because the card was dragged for an unrelated reason
+    earlier. This is what lets Manual Payment and Whop payments (which route
+    through this function) behave the same as Stripe's payment webhook (which
+    bypasses this function and calls move_client_to_active_on_payment directly)
+    — one rule, applied consistently everywhere a payment or booking lands.
     """
-    if not force and is_manual_lifecycle_protected(client):
-        return False
-
-    changed = False
-
     if client_has_recorded_payment(db, client.org_id, client.id):
         if move_client_to_active_on_payment(db, client):
             db.flush()
             return True
+
+    state = _lifecycle_str(client.lifecycle_state)
+    if state in {s.value for s in PRE_PAYMENT_LIFECYCLE_STATES}:
+        if update_to_booked_on_upcoming_sales_call(db, client):
+            return True
+
+    if not force and is_manual_lifecycle_protected(client):
+        return False
+
+    changed = False
 
     if client.program_start_date and client.program_duration_days:
         if update_client_progress(db, client):
@@ -487,13 +757,11 @@ def apply_automatic_lifecycle_for_client(
     if state not in {s.value for s in PRE_PAYMENT_LIFECYCLE_STATES}:
         return changed
 
-    if update_to_booked_on_upcoming_sales_call(db, client):
-        return True
     if update_booked_to_nurturing(db, client):
         changed = True
     elif revert_booked_without_sales_call(db, client):
         changed = True
-    elif update_expired_follow_ups_to_cold_lead(db, client):
+    elif update_expired_follow_ups(db, client):
         changed = True
     return changed
 

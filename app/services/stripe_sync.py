@@ -16,7 +16,7 @@ from app.core.encryption import decrypt_token, encrypt_token
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
-from app.models.client import Client
+from app.models.client import Client, find_client_by_email
 
 
 def sync_stripe_historical_data(db: Session, org_id: uuid.UUID = None, background: bool = False):
@@ -299,10 +299,8 @@ def sync_stripe_historical_data(db: Session, org_id: uuid.UUID = None, backgroun
                 
                 # If not found by stripe_customer_id, try to find by email to avoid duplicates
                 if not client and customer_email:
-                    client = db.query(Client).filter(
-                        Client.email == customer_email,
-                        Client.org_id == org_id  # Multi-tenant filter
-                    ).first()
+                    # Any email on the profile (primary or merged-in) so combined contacts stay combined.
+                    client = find_client_by_email(db, org_id, customer_email)
                     
                     # If found by email, link the stripe_customer_id to avoid future duplicates
                     if client:
@@ -469,10 +467,7 @@ def sync_stripe_historical_data(db: Session, org_id: uuid.UUID = None, backgroun
                     
                     # Try to find existing client by email to avoid duplicates
                     if customer_email:
-                        client = db.query(Client).filter(
-                            Client.email == customer_email,
-                            Client.org_id == org_id
-                        ).first()
+                        client = find_client_by_email(db, org_id, customer_email)
                         
                         if client:
                             # Link the stripe_customer_id to the existing client

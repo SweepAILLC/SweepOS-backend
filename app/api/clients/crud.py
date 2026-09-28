@@ -42,7 +42,7 @@ from app.core.rate_limit import check_sliding_window
 from app.db.session import get_db, SessionLocal
 from app.long_jobs import schedule_background_work
 from app.models.calendar_booking_sales import CalendarBookingSales
-from app.models.client import Client, LifecycleState
+from app.models.client import Client, LifecycleState, find_client_by_email
 from app.models.client_checkin import ClientCheckIn
 from app.models.manual_payment import ManualPayment
 from app.models.organization import Organization
@@ -138,13 +138,10 @@ def create_client(
     # Selected org from JWT — same scope as list/delete (UUID-normalized)
     org_id = scope_org_id(current_user)
     
-    # Indexed-friendly duplicate check (case-insensitive); JSON `emails` overlap is rare on manual create
+    # Duplicate check covers merged-in emails too, so a combined contact is never re-split
     if client_data.email:
         trimmed = client_data.email.strip()
-        existing_client = db.query(Client).filter(
-            Client.org_id == org_id,
-            func.lower(Client.email) == trimmed.lower(),
-        ).first()
+        existing_client = find_client_by_email(db, org_id, trimmed)
         if existing_client:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

@@ -141,3 +141,33 @@ def emit_new_payment_discord(
     except Exception:
         LOG.warning("emit_new_payment_discord failed org=%s payment=%s", org_id, payment_id, exc_info=True)
         return False
+
+
+def emit_automation_failure_discord(
+    *,
+    org_id: uuid.UUID,
+    where: str,
+    error: BaseException,
+    client_id: Optional[uuid.UUID] = None,
+) -> None:
+    """
+    Fire-and-forget alert for a pipeline-automation failure that would otherwise
+    only reach a print()/logger.warning nobody watches. No claim_dispatch guard —
+    these are rare and each occurrence is worth its own alert, not deduped.
+    """
+    try:
+        from app.services import discord_notify
+
+        fields = [("Where", where)]
+        if client_id:
+            fields.append(("Client", str(client_id)))
+        fields.append(("Error", str(error)[:500]))
+        discord_notify.send_discord_event_background(
+            org_id,
+            "automation_failure",
+            title="Pipeline automation error",
+            description=where,
+            fields=fields,
+        )
+    except Exception:
+        LOG.warning("emit_automation_failure_discord failed org=%s where=%s", org_id, where, exc_info=True)

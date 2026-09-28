@@ -14,6 +14,7 @@ from app.models.event import Event
 from app.models.funnel import Funnel, FunnelStep
 from app.models.funnel_lead_notification import FunnelLeadNotification
 from app.models.funnel_simulator_scenario import FunnelSimulatorScenario
+from app.services.kpi_org_totals import fold_org_daily_totals
 from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.schemas.kpi import safe_avg, safe_pct
 from app.services.kpi_integration_sync import has_calendar_source
@@ -386,7 +387,7 @@ def build_funnel_simulator_baselines(
         )
         .all()
     )
-    kpi = _kpi_fields(kpi_rows)
+    kpi = _kpi_fields(fold_org_daily_totals(kpi_rows))  # one daily ledger (kpi_org_totals)
 
     calendar_available = has_calendar_source(db, org_id)
     funnel_ids = [f.id for f in selected]

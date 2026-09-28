@@ -29,6 +29,14 @@ class ManualPayment(Base):
     description = Column(Text, nullable=True)  # Payment description/notes
     payment_method = Column(String(100), nullable=True)  # e.g., "cash", "check", "bank_transfer", "other"
     receipt_url = Column(String(500), nullable=True)  # Optional receipt/document URL
+
+    # Provenance: "manual" (human-entered, default) | "call_library_auto" (auto-created
+    # from a Call Library report's deal_outcome.cash_collected_on_call).
+    source = Column(String(32), nullable=True, default="manual")
+    call_library_report_id = Column(UUID(as_uuid=True), ForeignKey("call_library_reports.id"), nullable=True)
+    # Set when a real Stripe/Whop payment later matches and supersedes this
+    # auto-detected row — it stays as an audit trail but stops counting in sums.
+    superseded_at = Column(DateTime(timezone=True), nullable=True)
     
     # Metadata
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)  # User who created the payment

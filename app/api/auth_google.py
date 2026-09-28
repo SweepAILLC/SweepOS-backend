@@ -171,6 +171,7 @@ def _create_user_from_invite(
             user_id=new_user_id,
             org_id=org_id,
             is_primary=True,
+            team_role=getattr(inv, "team_role", None),
         )
     )
     consume_invitation(inv)

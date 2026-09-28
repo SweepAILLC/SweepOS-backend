@@ -2,7 +2,7 @@ import json
 
 from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 
@@ -103,6 +103,15 @@ class FunnelLeadIn(BaseModel):
     quiz_answers: Optional[Dict[str, Any]] = None
     opt_in_data: Optional[Dict[str, Any]] = None
     funnel_step_reached: Optional[str] = None
+    utm: Optional[Dict[str, Any]] = Field(
+        None, description="UTM params from the landing URL: source, medium, campaign, term, content"
+    )
+    session_id: Optional[str] = Field(
+        None, max_length=200, description="trackEvent session id; used to look up UTM when `utm` is omitted"
+    )
+    visitor_id: Optional[str] = Field(
+        None, max_length=200, description="trackEvent visitor id; fallback UTM lookup key"
+    )
 
     @model_validator(mode="after")
     def validate_prospect_payload_size(self):
@@ -210,3 +219,100 @@ class EventExplorerFilter(BaseModel):
     limit: int = 50
     offset: int = 0
 
+
+
+# ---------------------------------------------------------------------------
+# Funnels dashboard + weekly ad spend (PRD phase 8)
+# ---------------------------------------------------------------------------
+
+
+class FunnelAdSpendIn(BaseModel):
+    """Set one week's spend. funnel_id omitted = unassigned (counts toward "All funnels" only)."""
+    funnel_id: Optional[UUID] = None
+    week_start: date = Field(..., description="Any day in the week; normalized to its Monday")
+    amount_usd: float = Field(..., ge=0, le=10_000_000, description="0 with no counts clears the week")
+    ads_deployed: Optional[int] = Field(None, ge=0, le=10_000, description="Sheet: New Ads Deployed")
+    angles_deployed: Optional[int] = Field(None, ge=0, le=10_000, description="Sheet: New Angles Deployed")
+
+
+class FunnelAdSpendRead(BaseModel):
+    id: UUID
+    funnel_id: Optional[UUID] = None
+    week_start: date
+    amount_usd: float
+    ads_deployed: Optional[int] = None
+    angles_deployed: Optional[int] = None
+
+
+class FunnelScorecardMetric(BaseModel):
+    key: str
+    label: str
+    group: str  # "ads" | "funnel" | "close" | "economics"
+    format: str  # "int" | "usd" | "pct" (fraction) | "ratio"
+    better: str  # "up" | "down" | "neutral"
+    values: List[Optional[float]] = []  # one per FunnelScorecard.weeks entry
+    benchmark: Optional[float] = None  # average of the complete weeks' values
+
+
+class FunnelScorecardWeek(BaseModel):
+    week_start: date  # Monday
+    in_progress: bool = False  # current week: shown, but excluded from the benchmark
+
+
+class FunnelScorecard(BaseModel):
+    weeks: List[FunnelScorecardWeek] = []
+    benchmark_weeks: int = 0  # complete weeks averaged into each benchmark
+    benchmark_source: str = "range"  # "compare" when the benchmark is the compare range's average week
+    metrics: List[FunnelScorecardMetric] = []
+
+
+class FunnelDashboardTracking(BaseModel):
+    status: str  # "live" | "silent" | "errors" | "no_funnels"
+    last_event_at: Optional[datetime] = None
+    errors_24h: int = 0
+
+
+class FunnelDashboardMoney(BaseModel):
+    has_spend: bool
+    spend_usd: float
+    paid_cash_usd: float
+    cpl_usd: Optional[float] = None
+    cac_usd: Optional[float] = None
+    roas: Optional[float] = None
+    profit_usd: Optional[float] = None
+
+
+class FunnelDashboardWeek(BaseModel):
+    week_start: date
+    spend_usd: float
+    cash_usd: float
+    opt_ins: int
+    closed: int
+    cac_usd: Optional[float] = None
+
+
+class FunnelDashboardSource(BaseModel):
+    source: str
+    opt_ins: int
+    booked: int
+    closed: int
+    cash_usd: float
+
+
+class FunnelDashboardResponse(BaseModel):
+    window_start: date
+    window_end: date
+    channel: str
+    funnel_id: Optional[UUID] = None
+    tracking: FunnelDashboardTracking
+    visitors: Optional[int] = None
+    summary: "KpiFunnelSummaryResponse"
+    money: Optional[FunnelDashboardMoney] = None
+    weekly: List[FunnelDashboardWeek]
+    sources: List[FunnelDashboardSource]
+    scorecard: FunnelScorecard
+
+
+from app.schemas.kpi import KpiFunnelSummaryResponse  # noqa: E402  (after models: avoids import cycles)
+
+FunnelDashboardResponse.model_rebuild()

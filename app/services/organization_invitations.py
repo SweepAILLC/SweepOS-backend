@@ -127,6 +127,7 @@ def invitation_response(
         invitee_email=inv.invitee_email,
         invitation_type=inv.invitation_type,
         role=inv.role,
+        team_role=getattr(inv, "team_role", None),
         expires_at=inv.expires_at,
         used_at=inv.used_at,
         created_at=inv.created_at,
@@ -143,6 +144,7 @@ def create_user_invitation(
     email: str,
     role: str,
     created_by: UUID,
+    team_role: Optional[str] = None,
 ) -> OrganizationInvitation:
     """Create a pending USER invitation. Does not send email."""
     email_normalized = (email or "").strip().lower()
@@ -151,6 +153,10 @@ def create_user_invitation(
     role_normalized = (role or "member").strip().lower()
     if role_normalized not in ("owner", "admin", "member"):
         role_normalized = "member"
+    from app.models.team_kpi import TEAM_ROLES
+
+    # A rep type only applies to member access.
+    rep_type = team_role if role_normalized == "member" and team_role in TEAM_ROLES else None
 
     if org.max_user_seats is not None:
         current_count = db.query(func.count(User.id)).filter(User.org_id == org.id).scalar() or 0
@@ -197,6 +203,7 @@ def create_user_invitation(
         invitee_email=email_normalized,
         invitation_type="USER",
         role=role_normalized,
+        team_role=rep_type,
         token=token,
         expires_at=now + timedelta(days=INVITATION_EXPIRES_DAYS),
         created_by=created_by,

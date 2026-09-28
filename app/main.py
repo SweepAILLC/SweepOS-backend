@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey, ghl, ghl_webhooks
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey, ghl, ghl_webhooks, team
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -148,6 +148,7 @@ app.include_router(portal.router, prefix="/portal", tags=["portal"])
 app.include_router(portal_funnel_simulator.router, prefix="/portal", tags=["portal"])
 app.include_router(content_angle_map.router, prefix="/portal", tags=["portal"])
 app.include_router(kpi.router, prefix="/kpi", tags=["kpi"])
+app.include_router(team.router, prefix="/team", tags=["team"])
 app.include_router(close_survey.router, prefix="/close-survey", tags=["close-survey"])
 app.include_router(instagram.router, prefix="/instagram", tags=["instagram"])
 

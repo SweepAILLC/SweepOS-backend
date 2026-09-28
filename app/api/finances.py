@@ -25,6 +25,7 @@ from app.schemas.finances import (
     FinancesTimelinePoint,
 )
 from app.api.stripe import check_stripe_connected
+from app.services.date_window import EPOCH, explicit_window
 from app.services.finances_cash import finances_period_bounds
 
 router = APIRouter()
@@ -114,7 +115,11 @@ def _manual_in_window(
     db: Session, org_id: uuid.UUID, since: datetime, until: datetime
 ) -> List[ManualPayment]:
     out: List[ManualPayment] = []
-    for p in db.query(ManualPayment).filter(ManualPayment.org_id == org_id).all():
+    for p in (
+        db.query(ManualPayment)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
+        .all()
+    ):
         ts = p.payment_date or p.created_at
         if not ts:
             continue
@@ -137,6 +142,10 @@ def _manual_order_count_since(db: Session, org_id: uuid.UUID, since: datetime, u
 def finances_summary(
     range_days: int = Query(30, alias="range", ge=1, le=3660),
     scope: str | None = Query(None, description="Use 'mtd' for month-to-date primary window (matches Stripe dashboard)."),
+    start: str | None = Query(None, description="Inclusive org-local YYYY-MM-DD; with `end`, overrides range/scope."),
+    end: str | None = Query(None, description="Inclusive org-local YYYY-MM-DD."),
+    compare_start: str | None = Query(None, description="Prior-period window start (default: same length before `start`)."),
+    compare_end: str | None = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -144,11 +153,20 @@ def finances_summary(
     Primary KPI window: rolling `range` days ending now, unless scope=mtd (calendar month-to-date)
     or scope=all (all recorded history). Combined cash = Stripe + Whop + manual payments.
     Field `last_30_days_revenue` holds the **primary** window total (not always 30d).
+    `start` / `end` (the shared date-range filter) override range/scope; `compare_*` sets the
+    prior window, else it is the same length immediately before.
     """
     org_id = _org_id(current_user)
     now = datetime.utcnow()
     mtd_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    period_start, period_end = finances_period_bounds(scope, range_days, now)
+    explicit = explicit_window(db, org_id, start, end)
+    if explicit is not None:
+        period_start, period_end = explicit
+        if period_start == EPOCH:
+            scope = "all"  # all history: no prior period
+    else:
+        period_start, period_end = finances_period_bounds(scope, range_days, now)
+    compare = explicit_window(db, org_id, compare_start, compare_end, name="compare_")
 
     st_ok = check_stripe_connected(db, org_id)
     wh_ok = _whop_connected(db, org_id)
@@ -171,10 +189,13 @@ def finances_summary(
 
     prior_revenue: float | None = None
     prior_orders: int | None = None
-    if scope != "all":
-        span = period_end - period_start
-        prior_end = period_start
-        prior_start = prior_end - span
+    if compare is not None or scope != "all":
+        if compare is not None:
+            prior_start, prior_end = compare
+        else:
+            span = period_end - period_start
+            prior_end = period_start
+            prior_start = prior_end - span
         sp = _stripe_succeeded_cents_since(db, org_id, prior_start, prior_end) if st_ok else 0
         wp = _whop_paid_cents_since(db, org_id, prior_start, prior_end) if wh_ok else 0
         mp = _manual_cents_since(db, org_id, prior_start, prior_end)
@@ -222,11 +243,17 @@ def finances_revenue_timeline(
     range_days: int = Query(30, ge=1, le=3660, alias="range"),
     scope: str | None = Query(None, description="'mtd' = calendar month start; 'all' = entire history."),
     group_by: str = Query("day"),
+    start: str | None = Query(None, description="Inclusive org-local YYYY-MM-DD; with `end`, overrides range/scope."),
+    end: str | None = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     org_id = _org_id(current_user)
-    since, _until = finances_period_bounds(scope, range_days)
+    explicit = explicit_window(db, org_id, start, end)
+    since, until = explicit if explicit is not None else finances_period_bounds(scope, range_days)
+    # Legacy windows end "now"; only explicit windows cap the end (future-dated rows excluded either way).
+    if explicit is None:
+        until = datetime.max
     gb = group_by if group_by in ("day", "week") else "day"
 
     stripe_by_key: Dict[str, float] = defaultdict(float)
@@ -238,6 +265,7 @@ def finances_revenue_timeline(
                 StripePayment.org_id == org_id,
                 StripePayment.status == "succeeded",
                 StripePayment.created_at >= since,
+                StripePayment.created_at < until,
             )
             .order_by(StripePayment.created_at.desc())
             .all()
@@ -260,7 +288,7 @@ def finances_revenue_timeline(
     if _whop_connected(db, org_id):
         for p in (
             db.query(WhopPayment)
-            .filter(WhopPayment.org_id == org_id, WhopPayment.created_at >= since)
+            .filter(WhopPayment.org_id == org_id, WhopPayment.created_at >= since, WhopPayment.created_at < until)
             .all()
         ):
             if (p.status or "").lower() != "paid":
@@ -276,12 +304,16 @@ def finances_revenue_timeline(
             whop_by_key[key] += (p.amount_cents or 0) / 100.0
 
     manual_by_key: Dict[str, float] = defaultdict(float)
-    for p in db.query(ManualPayment).filter(ManualPayment.org_id == org_id).all():
+    for p in (
+        db.query(ManualPayment)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
+        .all()
+    ):
         ts = p.payment_date or p.created_at
         if not ts:
             continue
         ts = _naive_utc(ts)
-        if ts < since:
+        if ts < since or ts >= until:
             continue
         if gb == "week":
             iso = ts.isocalendar()

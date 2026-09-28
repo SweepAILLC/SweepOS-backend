@@ -11,6 +11,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.services.kpi_org_totals import fold_org_daily_totals
 from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.schemas.kpi import KpiFlag, KpiMonthlyRollup, MetricThreshold, TierName
 from app.services.kpi_compute import (
@@ -36,12 +37,14 @@ TIER_RANK = {"strong": 2, "okay": 1, "weak": 0}
 
 def _load_entries(db: Session, org_id: UUID, lookback_days: int = 200) -> List[OrgKpiDailyEntry]:
     start = date.today() - timedelta(days=lookback_days)
-    return (
+    rows = (
         db.query(OrgKpiDailyEntry)
         .filter(OrgKpiDailyEntry.org_id == org_id, OrgKpiDailyEntry.entry_date >= start)
         .order_by(OrgKpiDailyEntry.entry_date.asc())
         .all()
     )
+    # One daily ledger: team EOD activity counts once; calendar fields aren't doubled by host rows.
+    return fold_org_daily_totals(rows)  # type: ignore[return-value]
 
 
 def _rollup_metric(rollup: KpiMonthlyRollup, metric: str) -> Optional[float]:

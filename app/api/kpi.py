@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -20,12 +20,15 @@ from app.schemas.kpi import (
     KpiAutopopulateStatusResponse,
     KpiBenchmarks,
     KpiBenchmarksUpdate,
+    KpiBookableClient,
+    KpiBookableClientsResponse,
     KpiBulkImportRequest,
     KpiBulkImportResponse,
     KpiDailyEntryRead,
     KpiEntryLinkResponse,
     KpiDailyEntryUpdate,
     KpiFlagsResponse,
+    KpiFunnelSummaryResponse,
     KpiMonthlyRollup,
     KpiRepOptionsResponse,
     KpiRepPerformanceResponse,
@@ -42,8 +45,12 @@ from app.services.kpi_compute import (
     normalize_thresholds,
     thresholds_as_dict,
 )
+from app.services.kpi_org_totals import fold_org_daily_totals
 from app.services.kpi_integration_sync import (
+    paid_leads_by_day,
+    compute_funnel_summary,
     compute_live_fields_for_day,
+    find_clients_booked_on_day,
     get_revenue_contributors_for_day,
     has_calendar_source as _has_calendar_source,
     has_payment_source as _has_payment_source,
@@ -76,6 +83,7 @@ UPSERT_FIELDS = (
     "cash_collected",
     "revenue",
     "setter_context",
+    "setter_booked_client_ids",
 )
 
 # Survey submissions merge-add these into the day's existing totals.
@@ -294,12 +302,13 @@ def list_kpi_entries(
     q = db.query(OrgKpiDailyEntry).filter(OrgKpiDailyEntry.org_id == org_id)
     q = q.filter(OrgKpiDailyEntry.entry_date >= range_start)
     q = q.filter(OrgKpiDailyEntry.entry_date <= range_end)
-    # Grid/Calendar render one row per date — stay on the org-aggregate row
-    # (rep_user_id NULL) by default so that assumption holds even for orgs
-    # using per-rep entry. Pass rep_user_id to instead scope to one rep's own
-    # rows (used by the By Rep view's calendar tab).
-    q = q.filter(OrgKpiDailyEntry.rep_user_id == rep_uuid)
-    rows = q.order_by(OrgKpiDailyEntry.entry_date.asc()).all()
+    # Grid/Calendar render one row per date. Default: the org day from the one
+    # daily ledger (org row + team EOD activity, calendar/cash from the org row
+    # only — kpi_org_totals). Pass rep_user_id to scope to one rep's own rows.
+    if rep_uuid is not None:
+        q = q.filter(OrgKpiDailyEntry.rep_user_id == rep_uuid)
+    all_rows = q.order_by(OrgKpiDailyEntry.entry_date.asc()).all()
+    rows = [r for r in all_rows if r.rep_user_id == rep_uuid]
     calendar_available = _has_calendar_source(db, org_id)
     payments_available = _has_payment_source(db, org_id)
     dirty = False
@@ -325,6 +334,7 @@ def list_kpi_entries(
         db.commit()
         for r in rows:
             db.refresh(r)
+    out_rows = rows if rep_uuid is not None else fold_org_daily_totals(all_rows)
     return [
         _with_auto_zero_defaults(
             KpiDailyEntryRead.from_orm_row(r),
@@ -332,8 +342,38 @@ def list_kpi_entries(
             calendar_available=calendar_available,
             payments_available=payments_available,
         )
-        for r in rows
+        for r in out_rows
     ]
+
+
+@router.get("/funnel-summary", response_model=KpiFunnelSummaryResponse)
+def get_kpi_funnel_summary(
+    start: str = Query(..., description="YYYY-MM-DD inclusive"),
+    end: str = Query(..., description="YYYY-MM-DD inclusive"),
+    channel: Optional[str] = Query(
+        None, description="'organic', 'paid', or omit/'all' for both"
+    ),
+    funnel_id: Optional[uuid.UUID] = Query(None, description="Scope to one funnel (implicitly paid)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Opt-ins -> Booked -> Showed -> Closed -> Cash stage strip — shared with the
+    Funnels dashboard, see kpi_integration_sync.compute_funnel_summary."""
+    org_id = _org_id(current_user)
+    range_start = _parse_date(start)
+    range_end = _parse_date(end)
+    ch = (channel or "").strip().lower() or None
+    if ch not in (None, "all", "organic", "paid"):
+        raise HTTPException(status_code=400, detail="channel must be 'organic', 'paid', or 'all'")
+    if ch == "all":
+        ch = None
+    if funnel_id is not None:
+        from app.models.funnel import Funnel
+
+        if not db.query(Funnel.id).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first():
+            raise HTTPException(status_code=404, detail="Funnel not found")
+    result = compute_funnel_summary(db, org_id, range_start, range_end, ch, funnel_id)
+    return KpiFunnelSummaryResponse(**result)
 
 
 @router.put("/entries/{entry_date}", response_model=KpiDailyEntryRead)
@@ -357,6 +397,7 @@ def upsert_kpi_entry(
         entry_day=d,
         payload=body.model_dump(exclude_unset=True),
         rep_user_id=rep_uuid,
+        mark_submitted=rep_uuid is not None,
     )
 
 
@@ -427,6 +468,10 @@ def _merge_additive_payload(row: OrgKpiDailyEntry, payload: Dict[str, Any]) -> D
                 merged[field] = f"{existing}\n{text}"
             else:
                 merged[field] = text or existing or None
+        elif field == "setter_booked_client_ids":
+            existing_ids = getattr(row, field, None) or []
+            incoming_ids = incoming if isinstance(incoming, list) else []
+            merged[field] = list(dict.fromkeys([*existing_ids, *incoming_ids]))
         else:
             # Absolute set: total_followers, best_content_type, calls_booked (rare on survey)
             merged[field] = incoming
@@ -462,6 +507,7 @@ def _upsert_kpi_entry_for_org(
     *,
     additive: bool = False,
     rep_user_id: Optional[uuid.UUID] = None,
+    mark_submitted: bool = False,
 ) -> KpiDailyEntryRead:
     row = (
         db.query(OrgKpiDailyEntry)
@@ -502,6 +548,13 @@ def _upsert_kpi_entry_for_org(
     _sync_calls_booked_from_booking_split(
         db, org_id, row, payload, additive=additive
     )
+
+    # Team KPIs accountability: a person's EOD counts as submitted only when they
+    # (or an admin on their behalf) save their own row with actual fields. Keep the
+    # first submission time of the day. Org-aggregate rows, calendar sync and CSV
+    # import never reach this with mark_submitted.
+    if mark_submitted and rep_user_id is not None and payload and row.submitted_at is None:
+        row.submitted_at = datetime.now(timezone.utc)
 
     row.updated_at = datetime.utcnow()
     db.commit()
@@ -572,7 +625,8 @@ def list_kpi_rollups(
         .order_by(OrgKpiDailyEntry.entry_date.asc())
         .all()
     )
-    return build_monthly_rollups(rows, months=months)
+    # One daily ledger: summing raw rows double-counted calendar fields (org row + host rows).
+    return build_monthly_rollups(fold_org_daily_totals(rows), months=months)
 
 
 # ---------------------------------------------------------------------------
@@ -693,12 +747,12 @@ def get_kpi_snapshot(
             OrgKpiDailyEntry.org_id == org_id,
             OrgKpiDailyEntry.entry_date >= range_start,
             OrgKpiDailyEntry.entry_date <= range_end,
-            # Org aggregate only — per-rep host rows would double-count sales calls.
-            OrgKpiDailyEntry.rep_user_id.is_(None),
         )
         .order_by(OrgKpiDailyEntry.entry_date.asc())
         .all()
     )
+    # One daily ledger: team EOD activity counts, calendar fields stay org-row only.
+    rows = fold_org_daily_totals(rows)
     bench = _get_or_seed_benchmarks(db, org_id)
     flags = []
     if include_flags:
@@ -717,6 +771,7 @@ def get_kpi_snapshot(
         calendar_available=_has_calendar_source(db, org_id),
         payments_available=_has_payment_source(db, org_id),
         generated_at=utcnow(),
+        paid_leads_by_day=paid_leads_by_day(db, org_id, range_start, range_end),
     )
 
 
@@ -757,6 +812,29 @@ def get_kpi_revenue_contributors(
         entry_date=day,
         total_cents=sum(c.amount_cents for c in contributors),
         contributors=contributors,
+    )
+
+
+@router.get("/entries/{entry_date}/bookable-clients", response_model=KpiBookableClientsResponse)
+def get_kpi_bookable_clients(
+    entry_date: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Clients booked this day — the EOD setter picker's search list."""
+    org_id = _org_id(current_user)
+    day = _parse_date(entry_date)
+    clients = find_clients_booked_on_day(db, org_id, day)
+    return KpiBookableClientsResponse(
+        entry_date=day,
+        clients=[
+            KpiBookableClient(
+                client_id=c.id,
+                client_name=(f"{c.first_name or ''} {c.last_name or ''}".strip() or c.email or "Unknown"),
+                email=c.email,
+            )
+            for c in clients
+        ],
     )
 
 
@@ -834,7 +912,45 @@ def _notify_discord_eod_form(
 def get_public_kpi_reps(token: str, db: Session = Depends(get_db)):
     """Rep options for the public entry form's 'who are you?' picker."""
     bench = _resolve_bench_by_token(db, token)
-    return KpiRepOptionsResponse(reps=list_org_member_options(db, bench.org_id))
+    sales = _sales_rep_ids(db, bench.org_id)
+    members = list_org_member_options(db, bench.org_id)
+    if sales:
+        return KpiRepOptionsResponse(reps=[m for m in members if uuid.UUID(str(m.id)) in sales], require_rep=True)
+    return KpiRepOptionsResponse(reps=members)
+
+
+def _sales_rep_ids(db: Session, org_id: uuid.UUID) -> set:
+    """Members whose role is Sales rep (Settings → Team) — they owe the daily EOD."""
+    from app.models.user_organization import UserOrganization
+
+    return {
+        uid
+        for (uid,) in db.query(UserOrganization.user_id)
+        .filter(UserOrganization.org_id == org_id, UserOrganization.team_role == "sales")
+        .all()
+    }
+
+
+@router.get(
+    "/public/{token}/entries/{entry_date}/bookable-clients",
+    response_model=KpiBookableClientsResponse,
+)
+def get_public_kpi_bookable_clients(token: str, entry_date: str, db: Session = Depends(get_db)):
+    """Clients booked this day — the public EOD form's setter picker search list."""
+    bench = _resolve_bench_by_token(db, token)
+    day = _parse_date(entry_date)
+    clients = find_clients_booked_on_day(db, bench.org_id, day)
+    return KpiBookableClientsResponse(
+        entry_date=day,
+        clients=[
+            KpiBookableClient(
+                client_id=c.id,
+                client_name=(f"{c.first_name or ''} {c.last_name or ''}".strip() or c.email or "Unknown"),
+                email=c.email,
+            )
+            for c in clients
+        ],
+    )
 
 
 @router.get("/reps", response_model=KpiRepOptionsResponse)
@@ -892,6 +1008,10 @@ def upsert_public_kpi_entry(
     bench = _resolve_bench_by_token(db, token)
     day = _parse_date(entry_date)
     rep_uuid = _validated_rep_user_id(db, bench.org_id, rep_user_id)
+    if rep_uuid is None and _sales_rep_ids(db, bench.org_id):
+        # With sales reps set up, an unattributed EOD would land in the shared org row:
+        # not stamped as anyone's EOD and missing from the rep filter / team view.
+        raise HTTPException(status_code=400, detail="Choose your name at the top of the form before submitting.")
     # Public survey submissions add to the day's existing totals; grid edits stay absolute.
     result = _upsert_kpi_entry_for_org(
         db=db,
@@ -900,6 +1020,7 @@ def upsert_public_kpi_entry(
         payload=body.model_dump(exclude_unset=True),
         additive=True,
         rep_user_id=rep_uuid,
+        mark_submitted=rep_uuid is not None,
     )
     _notify_discord_eod_form(db, bench.org_id, day, rep_uuid, body)
     return result

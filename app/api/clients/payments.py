@@ -96,6 +96,8 @@ def _manual_payment_payload(mp: ManualPayment, client_id: str) -> dict:
         "receipt_url": mp.receipt_url,
         "status": "succeeded",
         "type": "manual_payment",
+        "source": getattr(mp, "source", None) or "manual",
+        "call_library_report_id": str(mp.call_library_report_id) if getattr(mp, "call_library_report_id", None) else None,
     }
 
 
@@ -579,6 +581,13 @@ def create_manual_payment(
         )
     except Exception as lc_err:
         print(f"[MANUAL PAYMENT] lifecycle/close enqueue skipped for {client.id}: {lc_err}")
+        from app.services.integration_side_effects import emit_automation_failure_discord
+        emit_automation_failure_discord(
+            org_id=org_id,
+            where="clients.payments.apply_automatic_lifecycle_for_client",
+            error=lc_err,
+            client_id=client.id,
+        )
 
     apply_manual_payment_kpi(
         db, org_id, manual_payment.payment_date, revenue_delta_usd=revenue_cents / 100.0

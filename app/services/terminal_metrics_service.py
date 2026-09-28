@@ -131,8 +131,9 @@ def build_calendar_monthly_coaching_periods(db: Session, org: Organization) -> C
     while month_cursor <= now_utc_dash:
         month_end_exclusive = min(admin_api._add_one_calendar_month_first(month_cursor), now_utc_dash)
 
-        sup = admin_api._org_show_up_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
-        cr = admin_api._org_close_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+        _rates = admin_api._org_sales_call_rates(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+        sup = _rates["show_up_rate_pct"]
+        cr = _rates["close_rate_pct"]
 
         periods_out.append(
             CalendarMonthlyRateRow(
@@ -326,8 +327,9 @@ def build_terminal_monthly_trends(db: Session, org: Organization) -> TerminalMon
             or 0
         )
 
-        sup = admin_api._org_show_up_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
-        cr = admin_api._org_close_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+        _rates = admin_api._org_sales_call_rates(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+        sup = _rates["show_up_rate_pct"]
+        cr = _rates["close_rate_pct"]
 
         periods_out.append(
             HealthTrendPeriod(

@@ -380,6 +380,25 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         except Exception as kpi_err:
             print(f"[KPI_SYNC] ⚠️ Error syncing cash_collected: {kpi_err}")
         
+        # A real payment always wins over an earlier Call Library auto-detected
+        # close for the same deal — supersede it before lifecycle automation runs.
+        if client:
+            try:
+                from app.services.call_library_auto_close import supersede_auto_payment_if_matched
+
+                supersede_auto_payment_if_matched(
+                    db, org_id, client.id, amount_cents=int(amount_cents or 0), near_date=created_at,
+                )
+            except Exception as supersede_err:
+                print(f"[CLIENT_AUTOMATION] ⚠️  Error superseding auto payment: {supersede_err}")
+                from app.services.integration_side_effects import emit_automation_failure_discord
+                emit_automation_failure_discord(
+                    org_id=org_id,
+                    where="stripe_processor.supersede_auto_payment_if_matched",
+                    error=supersede_err,
+                    client_id=client.id,
+                )
+
         # Move client back to active if they received a payment (automation rule)
         if client:
             try:
@@ -393,6 +412,13 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
             except Exception as automation_error:
                 # Don't fail payment processing if automation fails
                 print(f"[CLIENT_AUTOMATION] ⚠️  Error in automation: {str(automation_error)}")
+                from app.services.integration_side_effects import emit_automation_failure_discord
+                emit_automation_failure_discord(
+                    org_id=org_id,
+                    where="stripe_processor.move_client_to_active_on_payment",
+                    error=automation_error,
+                    client_id=client.id,
+                )
             # Mark most recent sales call as closed on FIRST payment only.
             # Later charges (retainers, upsells) must not add another KPI close.
             if first_payment_signal:
@@ -407,6 +433,13 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
                             print(f"[KPI_SYNC] ⚠️ Error syncing closes after sale_closed: {kpi_err}")
                 except Exception as sales_err:
                     print(f"[SALES_CLOSE] ⚠️  Error marking sales call closed: {str(sales_err)}")
+                    from app.services.integration_side_effects import emit_automation_failure_discord
+                    emit_automation_failure_discord(
+                        org_id=org_id,
+                        where="stripe_processor.mark_latest_sales_call_closed",
+                        error=sales_err,
+                        client_id=client.id,
+                    )
             else:
                 try:
                     from app.services.kpi_integration_sync import sync_kpi_for_datetime

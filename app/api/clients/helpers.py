@@ -362,7 +362,11 @@ def recompute_client_lifetime_revenue(db: Session, org_id: uuid.UUID, client: Cl
     stripe_cents = stripe_succeeded_cents_for_client(db, org_id, client.id)
     manual_cents = (
         db.query(ManualPayment)
-        .filter(ManualPayment.org_id == org_id, ManualPayment.client_id == client.id)
+        .filter(
+            ManualPayment.org_id == org_id,
+            ManualPayment.client_id == client.id,
+            ManualPayment.superseded_at.is_(None),
+        )
         .all()
     )
     manual_total = sum(int(p.amount_cents or 0) for p in manual_cents)

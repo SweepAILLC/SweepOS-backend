@@ -18,6 +18,8 @@ class InviteUserRequest(BaseModel):
     """Invite user to org (email and/or copyable single-use link)."""
     email: str
     role: Optional[str] = "member"  # owner | admin | member
+    # Rep type for a member invite ("sales" | "marketing"); ignored for owner/admin.
+    team_role: Optional[str] = None
     send_email: bool = True
 
 
@@ -27,6 +29,7 @@ class InvitationResponse(BaseModel):
     invitee_email: Optional[str] = None
     invitation_type: str
     role: str
+    team_role: Optional[str] = None
     expires_at: Optional[datetime] = None
     used_at: Optional[datetime] = None
     created_at: datetime

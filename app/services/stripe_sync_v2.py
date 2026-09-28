@@ -1552,6 +1552,13 @@ def reconcile_stripe_data(db: Session, org_id: uuid.UUID) -> dict:
                         batch_dirty += 1
                     except Exception as lc_err:
                         print(f"[RECONCILE] lifecycle skip for {client.id}: {lc_err}")
+                        from app.services.integration_side_effects import emit_automation_failure_discord
+                        emit_automation_failure_discord(
+                            org_id=org_id,
+                            where="stripe_sync_v2.reconcile.apply_automatic_lifecycle_for_client",
+                            error=lc_err,
+                            client_id=client.id,
+                        )
 
             results["clients_reconciled"] += 1
 

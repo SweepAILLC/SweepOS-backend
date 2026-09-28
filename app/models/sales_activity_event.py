@@ -45,5 +45,8 @@ class SalesActivityEvent(Base):
     cash_collected_cents = Column(Integer, nullable=True)
     is_closed = Column(Boolean, nullable=False, default=False)
     source = Column(String(32), nullable=False, default="close_survey")
+    call_library_report_id = Column(
+        UUID(as_uuid=True), ForeignKey("call_library_reports.id", ondelete="SET NULL"), nullable=True
+    )
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

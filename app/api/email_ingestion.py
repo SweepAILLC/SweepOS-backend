@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.encryption import decrypt_token
 from app.db.session import get_db
-from app.models.client import Client, LifecycleState
+from app.models.client import Client, LifecycleState, find_client_by_email
 from app.services.email_spam_detector import detect_spam_email, SpamDetectionResult
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.api.calendar_webhooks import _parse_org, _read_body_async
@@ -166,10 +166,8 @@ async def brevo_webhook(
         # no more scanning every Brevo connection in the database to guess.
 
         # Check if client already exists
-        existing_client = db.query(Client).filter(
-            Client.email == email_address,
-            Client.org_id == org_uuid
-        ).first()
+        # Any email on the profile (primary or merged-in) so combined contacts stay combined.
+        existing_client = find_client_by_email(db, org_uuid, email_address)
         
         if existing_client:
             # Merge: Update existing client with Brevo contact data

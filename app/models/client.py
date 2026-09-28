@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, Numeric, JSON, Integer, Text, ForeignKey, Index, or_, TypeDecorator
+from sqlalchemy import Column, String, DateTime, Numeric, JSON, Integer, Text, ForeignKey, Index, or_, TypeDecorator, func
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
@@ -109,6 +109,10 @@ class Client(Base):
         default=LifecycleState.QUALIFIED,
         nullable=False,
     )
+    # Attribution channel — set automatically at creation (create_lead_from_funnel
+    # sets both when the client came from a tracked funnel), not asked for later.
+    source_channel = Column(String, nullable=True, default="organic")  # "organic" | "paid"
+    source_funnel_id = Column(UUID(as_uuid=True), ForeignKey("funnels.id"), nullable=True)
     last_activity_at = Column(DateTime, nullable=True)
     stripe_customer_id = Column(String, nullable=True, index=True)
     estimated_mrr = Column(Numeric(10, 2), default=0, nullable=False)
@@ -194,10 +198,25 @@ def find_client_by_email(db: Session, org_id: uuid.UUID, email: str) -> Optional
     if not email:
         return None
     normalized = re.sub(r'\s+', '', email.lower().strip())
-    candidates = db.query(Client).filter(
-        Client.org_id == org_id,
-        or_(Client.email.isnot(None), Client.emails.isnot(None))
-    ).all()
+    if not normalized:
+        return None
+    # Primary email first (single indexed-friendly query) — the common case.
+    primary = (
+        db.query(Client)
+        .filter(Client.org_id == org_id, func.lower(func.trim(Client.email)) == normalized)
+        .order_by(Client.created_at.asc())
+        .first()
+    )
+    if primary is not None:
+        return primary
+    # Secondary emails live in a JSON list on merged profiles only, so this scan
+    # stays small: a merged contact keeps matching on every email it absorbed.
+    candidates = (
+        db.query(Client)
+        .filter(Client.org_id == org_id, Client.emails.isnot(None))
+        .order_by(Client.created_at.asc())
+        .all()
+    )
     for c in candidates:
         if normalized in c.get_all_emails_normalized():
             return c

@@ -5,7 +5,9 @@ Never writes revenue (manual-only).
 """
 from __future__ import annotations
 
+import json
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -36,6 +38,73 @@ def _sales_call_unique_key(ci: ClientCheckIn) -> str:
         provider = (getattr(ci, "provider", None) or "").strip()
         return f"{provider}:{event_id}"
     return f"id:{ci.id}"
+
+
+_BOOKING_TS_KEYS = ("createdAt", "created_at", "dateAdded", "date_added")
+
+
+def sales_call_booked_at(ci: ClientCheckIn) -> Optional[datetime]:
+    """
+    When the call was *booked* (not when it happens). Cal.com stores `createdAt`,
+    Calendly `created_at`, GHL `dateAdded` in raw_event_data. The row's own
+    created_at is a sync timestamp — backfills land days after the call — so it is
+    only trusted when it precedes the call; otherwise fall back to the call time.
+    """
+    raw = getattr(ci, "raw_event_data", None)
+    if raw:
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            for key in _BOOKING_TS_KEYS:
+                val = data.get(key)
+                if isinstance(val, str) and val:
+                    try:
+                        return _ensure_utc(datetime.fromisoformat(val.replace("Z", "+00:00")))
+                    except ValueError:
+                        continue
+    start = _ensure_utc(getattr(ci, "start_time", None))
+    created = _ensure_utc(getattr(ci, "created_at", None))
+    if created is not None and start is not None and created <= start:
+        return created
+    return start
+
+
+def count_sales_calls(
+    checkins: Iterable[ClientCheckIn],
+    start: datetime,
+    end: datetime,
+) -> Dict[str, int]:
+    """
+    The one definition of the calendar-derived sales-call counts, for any window
+    ([start, end] inclusive, tz-aware). Used by Sales KPIs (per day, per rep) and
+    the Funnels scorecard (per week) so the two tabs cannot disagree.
+
+    - calls_booked: calls *scheduled* in the window, not cancelled ("Calls on Calendar")
+    - calls_booked_activity: calls *booked* in the window (provider booking timestamp),
+      not cancelled ("Booked Calls")
+    - calls_taken: scheduled in the window, attended ("Live Calls")
+    - no_shows: scheduled in the window, marked no-show
+    Duplicate rows for the same calendar event count once.
+    """
+    scheduled: List[ClientCheckIn] = []
+    booked: List[ClientCheckIn] = []
+    for ci in checkins:
+        st = _ensure_utc(ci.start_time)
+        if st and start <= st <= end:
+            scheduled.append(ci)
+        booked_at = sales_call_booked_at(ci)
+        if booked_at and start <= booked_at <= end:
+            booked.append(ci)
+    return {
+        "calls_booked": _count_unique_sales_calls(scheduled, lambda ci: not ci.cancelled),
+        "calls_booked_activity": _count_unique_sales_calls(booked, lambda ci: not ci.cancelled),
+        "calls_taken": _count_unique_sales_calls(
+            scheduled, lambda ci: bool(ci.completed) and not ci.cancelled and not ci.no_show
+        ),
+        "no_shows": _count_unique_sales_calls(scheduled, lambda ci: bool(ci.no_show)),
+    }
 
 
 def _count_unique_sales_calls(rows: Iterable[ClientCheckIn], predicate) -> int:
@@ -106,7 +175,7 @@ def _first_payment_dates_by_client(db: Session, org_id: uuid.UUID) -> Dict[uuid.
         add(p.client_id, p.created_at)
     for p in (
         db.query(ManualPayment.client_id, ManualPayment.payment_date, ManualPayment.created_at)
-        .filter(ManualPayment.org_id == org_id)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
         .all()
     ):
         add(p.client_id, p.payment_date or p.created_at)
@@ -162,6 +231,331 @@ def conversion_dates_by_client(
     )
 
 
+def compute_sales_call_rates_for_window(
+    db: Session,
+    org_id: uuid.UUID,
+    window_start: datetime,
+    window_end: datetime,
+    *,
+    now_utc: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """
+    Shared close-rate / show-up-rate engine — the single source of truth for
+    Sales KPIs, the Terminal general dashboard, and the Terminal calendar/
+    booking widget. Replaces three previously-independent implementations
+    (admin.py::_org_close_rate_pct/_org_show_up_rate_pct, calendar_trend_summary.py's
+    inline math) that disagreed on provider scope, payment sources, and
+    denominator — see the PRD audit "three different close-rate formulas."
+
+    window_start/window_end are a half-open [start, end) datetime range.
+    Pass `now_utc` to clip the booked/taken portion to calls that have
+    already happened (needed for "this month so far" / rolling-30d windows
+    where window_end is in the future) — conversion dates are never clipped,
+    since a real payment/close timestamp is already bounded by reality.
+
+    Denominator for close rate: calls_taken (completed, not cancelled, not
+    no-show) — a no-show is a show-up-rate failure, not a close-rate failure.
+    Providers: all (Cal.com, Calendly, GHL) — none excluded.
+    Payment sources: Stripe + Whop + ManualPayment (superseded rows already
+    excluded upstream) + sale_closed + funnel form-close, via the existing
+    conversion_dates_by_client — the most complete signal set already used by
+    Sales KPIs' `closes` field.
+    """
+    # Callers pass a mix of naive-UTC and aware datetimes; normalize so the
+    # comparisons below never raise on naive-vs-aware.
+    def _as_utc(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+    window_start = _as_utc(window_start)
+    window_end = _as_utc(window_end)
+    if now_utc is not None:
+        now_utc = _as_utc(now_utc)
+    effective_end = min(window_end, now_utc) if now_utc is not None else window_end
+
+    booked_total = 0
+    taken_total = 0
+    if effective_end > window_start:
+        windowed_checkins = (
+            db.query(ClientCheckIn)
+            .filter(
+                ClientCheckIn.org_id == org_id,
+                ClientCheckIn.is_sales_call.is_(True),
+                ClientCheckIn.cancelled.is_(False),
+                ClientCheckIn.start_time >= window_start,
+                ClientCheckIn.start_time < effective_end,
+            )
+            .all()
+        )
+        booked_total = len(windowed_checkins)
+        taken_total = sum(1 for c in windowed_checkins if bool(c.completed) and not c.no_show)
+
+    # conversion_dates_by_client needs ALL org checkins, unfiltered (matching
+    # refresh_kpi_live_fields_for_range's own precedent exactly), to correctly
+    # resolve each client's sale_closed date — then the resulting dates are
+    # filtered to this window.
+    all_checkins = db.query(ClientCheckIn).filter(ClientCheckIn.org_id == org_id).all()
+    conversion_dates = conversion_dates_by_client(db, org_id, all_checkins)
+    closed_count = sum(
+        1
+        for d in conversion_dates.values()
+        if window_start <= datetime.combine(d, time.min, tzinfo=timezone.utc) < window_end
+    )
+
+    show_up_rate_pct = round((taken_total / booked_total) * 100.0, 1) if booked_total else None
+    close_rate_pct = round((closed_count / taken_total) * 100.0, 1) if taken_total else None
+
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "sales_calls_booked": booked_total,
+        "sales_calls_taken": taken_total,
+        "closed_count": closed_count,
+        "show_up_rate_pct": show_up_rate_pct,
+        "close_rate_pct": close_rate_pct,
+    }
+
+
+@dataclass
+class FunnelFacts:
+    """
+    Raw per-client facts for one window + scope, shared by the Sales KPIs funnel
+    strip (compute_funnel_summary) and the Funnels dashboard (weekly buckets,
+    UTM-source rows) so both read one data pass and can never disagree.
+    """
+
+    window_start: date
+    window_end: date
+    # client_id -> created_at (paid / funnel-scoped opt-ins created in window)
+    opt_ins: Dict[uuid.UUID, datetime]
+    # client_id -> first sales-call start in window (booked) / first attended call (showed)
+    booked: Dict[uuid.UUID, datetime]
+    showed: Dict[uuid.UUID, datetime]
+    # client_id -> conversion date in window
+    closed: Dict[uuid.UUID, date]
+    # (client_id, paid_at, amount_cents)
+    cash: List[Tuple[Optional[uuid.UUID], datetime, int]]
+    # (entry_date, outreach_sent, respondents) from org-aggregate daily KPI rows;
+    # empty when scoped to a single funnel (organic outreach has no funnel)
+    outreach_rows: List[Tuple[date, int, int]]
+    include_organic_outreach: bool
+    # Client ids in the channel/funnel scope; None = whole org (no filter).
+    scope_ids: Optional[Set[uuid.UUID]] = None
+
+
+def collect_funnel_facts(
+    db: Session,
+    org_id: uuid.UUID,
+    window_start: date,
+    window_end: date,
+    channel: Optional[str] = None,
+    funnel_id: Optional[uuid.UUID] = None,
+) -> FunnelFacts:
+    """
+    Scope: `channel` None/"all", "organic", or "paid"; `funnel_id` narrows to
+    clients whose source_funnel_id is that funnel (implicitly paid). A handful
+    of single filtered scans, no per-row N+1.
+    """
+    start, _ = day_bounds_utc(window_start)
+    _, end = day_bounds_utc(window_end)
+
+    # One narrow scan of the org's clients drives both the scope set and opt-ins.
+    client_rows = (
+        db.query(Client.id, Client.source_channel, Client.source_funnel_id, Client.created_at)
+        .filter(Client.org_id == org_id)
+        .all()
+    )
+    scope_ids: Optional[Set[uuid.UUID]] = None
+    if channel in ("organic", "paid") or funnel_id is not None:
+        scope_ids = set()
+        for cid, ch, fid, _created in client_rows:
+            if funnel_id is not None and fid != funnel_id:
+                continue
+            if channel == "paid" and ch != "paid":
+                continue
+            if channel == "organic" and ch == "paid":
+                continue
+            scope_ids.add(cid)
+
+    def _in_scope(cid: Optional[uuid.UUID]) -> bool:
+        return scope_ids is None or cid in scope_ids
+
+    opt_ins: Dict[uuid.UUID, datetime] = {}
+    if channel != "organic":
+        for cid, ch, _fid, created in client_rows:
+            created_utc = _ensure_utc(created)
+            if ch != "paid" or created_utc is None or not (start <= created_utc <= end):
+                continue
+            if _in_scope(cid):
+                opt_ins[cid] = created_utc
+
+    include_organic_outreach = funnel_id is None and channel != "paid"
+    outreach_rows: List[Tuple[date, int, int]] = []
+    if include_organic_outreach:
+        # One daily ledger: organic respondents include setters' EODs.
+        from app.services.kpi_org_totals import fold_org_daily_totals
+
+        for r in fold_org_daily_totals(
+            db.query(OrgKpiDailyEntry)
+            .filter(
+                OrgKpiDailyEntry.org_id == org_id,
+                OrgKpiDailyEntry.entry_date >= window_start,
+                OrgKpiDailyEntry.entry_date <= window_end,
+            )
+            .all()
+        ):
+            outreach_rows.append((r.entry_date, r.outreach_sent or 0, r.respondents or 0))
+
+    booked: Dict[uuid.UUID, datetime] = {}
+    showed: Dict[uuid.UUID, datetime] = {}
+    for c in (
+        db.query(ClientCheckIn)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.is_sales_call.is_(True),
+            ClientCheckIn.cancelled.is_(False),
+            ClientCheckIn.start_time >= start,
+            ClientCheckIn.start_time <= end,
+        )
+        .order_by(ClientCheckIn.start_time.asc())
+        .all()
+    ):
+        if not c.client_id or not _in_scope(c.client_id):
+            continue
+        booked.setdefault(c.client_id, _ensure_utc(c.start_time))
+        if bool(c.completed) and not c.no_show:
+            showed.setdefault(c.client_id, _ensure_utc(c.start_time))
+
+    all_checkins = db.query(ClientCheckIn).filter(ClientCheckIn.org_id == org_id).all()
+    closed = {
+        cid: d
+        for cid, d in conversion_dates_by_client(db, org_id, all_checkins).items()
+        if window_start <= d <= window_end and _in_scope(cid)
+    }
+
+    cash: List[Tuple[Optional[uuid.UUID], datetime, int]] = []
+    for p in (
+        db.query(StripePayment)
+        .filter(
+            StripePayment.org_id == org_id,
+            StripePayment.status == "succeeded",
+            StripePayment.created_at >= start,
+            StripePayment.created_at <= end,
+        )
+        .all()
+    ):
+        if _in_scope(p.client_id):
+            cash.append((p.client_id, _ensure_utc(p.created_at), p.amount_cents or 0))
+    for p in (
+        db.query(WhopPayment)
+        .filter(
+            WhopPayment.org_id == org_id,
+            WhopPayment.created_at >= start,
+            WhopPayment.created_at <= end,
+        )
+        .all()
+    ):
+        if (p.status or "").lower() not in _WHOP_PAID:
+            continue
+        if _in_scope(p.client_id):
+            cash.append((p.client_id, _ensure_utc(p.created_at), p.amount_cents or 0))
+    for p in (
+        db.query(ManualPayment)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
+        .all()
+    ):
+        ts = _ensure_utc(p.payment_date or p.created_at)
+        if ts is None or ts < start or ts > end:
+            continue
+        if _in_scope(p.client_id):
+            cash.append((p.client_id, ts, p.amount_cents or 0))
+
+    return FunnelFacts(
+        window_start=window_start,
+        window_end=window_end,
+        opt_ins=opt_ins,
+        booked=booked,
+        showed=showed,
+        closed=closed,
+        cash=cash,
+        outreach_rows=outreach_rows,
+        include_organic_outreach=include_organic_outreach,
+        scope_ids=scope_ids,
+    )
+
+
+def _pct(n: int, d: int) -> Optional[float]:
+    return round((n / d) * 100.0, 1) if d else None
+
+
+def paid_leads_by_day(db: Session, org_id: uuid.UUID, window_start: date, window_end: date) -> Dict[date, int]:
+    """
+    Paid funnel opt-ins per org-local day (same definition as the Funnels dashboard's
+    paid opt-ins). Feeds the KPI snapshot's Total Leads alongside logged conversations.
+    """
+    from app.services.date_window import org_tz
+
+    tz = org_tz(db, org_id)
+    facts = collect_funnel_facts(db, org_id, window_start, window_end, "paid", None)
+    out: Dict[date, int] = {}
+    for created in facts.opt_ins.values():
+        created_utc = _ensure_utc(created)
+        if created_utc is None:
+            continue
+        day = created_utc.astimezone(tz).date()
+        if window_start <= day <= window_end:
+            out[day] = out.get(day, 0) + 1
+    return out
+
+
+def summarize_funnel_facts(facts: FunnelFacts, channel: Optional[str] = None) -> Dict[str, Any]:
+    """Stage counts + ratios for the funnel strip (KpiFunnelSummaryResponse shape)."""
+    outreach_sent = sum(o for _d, o, _r in facts.outreach_rows)
+    respondents = sum(r for _d, _o, r in facts.outreach_rows)
+    # Organic has no landing-page opt-in step — respondents are its top-of-funnel proxy.
+    opt_ins = len(facts.opt_ins) + (respondents if facts.include_organic_outreach else 0)
+    booked, showed, closed = len(facts.booked), len(facts.showed), len(facts.closed)
+    cash_cents = sum(c for _cid, _ts, c in facts.cash)
+    return {
+        "window_start": facts.window_start,
+        "window_end": facts.window_end,
+        "channel": channel or "all",
+        "outreach_sent": outreach_sent,
+        "respondents": respondents,
+        "opt_ins": opt_ins,
+        "booked": booked,
+        "showed": showed,
+        "closed": closed,
+        "cash_usd": round(cash_cents / 100.0, 2),
+        "reply_rate_pct": _pct(respondents, outreach_sent),
+        "lead_to_book_rate_pct": _pct(booked, opt_ins),
+        "show_rate_pct": _pct(showed, booked),
+        "close_rate_pct": _pct(closed, showed),
+        "cash_per_close_usd": round(cash_cents / 100.0 / closed, 2) if closed else None,
+    }
+
+
+def compute_funnel_summary(
+    db: Session,
+    org_id: uuid.UUID,
+    window_start: date,
+    window_end: date,
+    channel: Optional[str] = None,
+    funnel_id: Optional[uuid.UUID] = None,
+) -> Dict[str, Any]:
+    """
+    Opt-ins -> Booked -> Showed -> Closed -> Cash stage strip (PRD phases 7-8)
+    — replaces the Google Sheet's hand-typed `Call Funnel` tab with a live query.
+    Shared by Sales KPIs and the Funnels dashboard via collect_funnel_facts.
+
+    `channel`: None/"all", "organic", or "paid". Organic has no landing-page
+    opt-in step — its top-of-funnel proxy is the outreach_sent/respondents
+    aggregate from daily KPI entries. Paid opt-ins are Client rows created via
+    a tracked funnel in the window. `funnel_id` scopes everything to one funnel.
+    """
+    facts = collect_funnel_facts(db, org_id, window_start, window_end, channel, funnel_id)
+    return summarize_funnel_facts(facts, channel)
+
+
 def _count_host_conversions(
     rows: Iterable[ClientCheckIn],
     conversion_dates: Dict[uuid.UUID, date],
@@ -195,6 +589,63 @@ def day_bounds_utc(entry_day: date) -> Tuple[datetime, datetime]:
     start = datetime.combine(entry_day, time.min, tzinfo=timezone.utc)
     end = datetime.combine(entry_day, time.max, tzinfo=timezone.utc)
     return start, end
+
+
+def find_clients_booked_on_day(
+    db: Session,
+    org_id: uuid.UUID,
+    entry_day: date,
+) -> List[Client]:
+    """
+    Clients whose booking was *made* on this day (ClientCheckIn.created_at),
+    matching the same window calls_booked_activity counts — the EOD picker's
+    search list, so the count a setter logs and the clients they can tag stay
+    the same set.
+    """
+    start, end = day_bounds_utc(entry_day)
+    client_ids = {
+        row[0]
+        for row in db.query(ClientCheckIn.client_id)
+        .filter(
+            ClientCheckIn.org_id == org_id,
+            ClientCheckIn.created_at >= start,
+            ClientCheckIn.created_at <= end,
+            ClientCheckIn.cancelled.is_(False),
+        )
+        .all()
+    }
+    if not client_ids:
+        return []
+    return db.query(Client).filter(Client.id.in_(client_ids)).all()
+
+
+def find_setter_claim_for_client(
+    db: Session,
+    org_id: uuid.UUID,
+    client_id: uuid.UUID,
+) -> Optional[uuid.UUID]:
+    """
+    Which setter (rep_user_id) claimed this client via the EOD picker, if any —
+    the most recent per-rep daily-entry row whose setter_booked_client_ids
+    contains this client. Used to prefill setter_user_id on the client's close
+    event (Close Survey / auto-close); not wired into either yet.
+    """
+    rows = (
+        db.query(OrgKpiDailyEntry)
+        .filter(
+            OrgKpiDailyEntry.org_id == org_id,
+            OrgKpiDailyEntry.rep_user_id.isnot(None),
+            OrgKpiDailyEntry.setter_booked_client_ids.isnot(None),
+        )
+        .order_by(OrgKpiDailyEntry.entry_date.desc())
+        .all()
+    )
+    cid_str = str(client_id)
+    for row in rows:
+        ids = row.setter_booked_client_ids or []
+        if cid_str in ids:
+            return row.rep_user_id
+    return None
 
 
 def has_calendar_source(db: Session, org_id: uuid.UUID) -> bool:
@@ -253,7 +704,11 @@ def _payment_cash_by_day(
         if (p.status or "").lower() not in ("paid", "succeeded", "completed", "successful"):
             continue
         add(_ensure_utc(p.created_at), int(p.amount_cents or 0))
-    for p in db.query(ManualPayment).filter(ManualPayment.org_id == org_id).all():
+    for p in (
+        db.query(ManualPayment)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
+        .all()
+    ):
         add(_ensure_utc(p.payment_date or p.created_at), int(p.amount_cents or 0))
     return by_day
 
@@ -305,7 +760,11 @@ def get_revenue_contributors_for_day(
         if ts and range_start <= ts <= range_end:
             add(str(p.id), p.client_id, int(p.amount_cents or 0), "whop")
 
-    for p in db.query(ManualPayment).filter(ManualPayment.org_id == org_id).all():
+    for p in (
+        db.query(ManualPayment)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
+        .all()
+    ):
         ts = _ensure_utc(p.payment_date or p.created_at)
         if ts and range_start <= ts <= range_end:
             add(str(p.id), p.client_id, int(p.amount_cents or 0), "manual")
@@ -339,33 +798,8 @@ def compute_live_fields_for_day(
     out["closes"] = count_conversions_on_day(conversion_dates, entry_day)
 
     if cal:
-        scoped: List[ClientCheckIn] = []
-        booked_on_day: List[ClientCheckIn] = []
-        for ci in checkins:
-            st = _ensure_utc(ci.start_time)
-            if st and start <= st <= end:
-                scoped.append(ci)
-            created = _ensure_utc(ci.created_at)
-            if created and start <= created <= end:
-                booked_on_day.append(ci)
-        out["calls_taken"] = _count_unique_sales_calls(
-            scoped,
-            lambda ci: bool(ci.completed) and not ci.cancelled and not ci.no_show,
-        )
-        out["calls_booked"] = _count_unique_sales_calls(
-            scoped,
-            lambda ci: not ci.cancelled,
-        )
-        out["no_shows"] = _count_unique_sales_calls(
-            scoped,
-            lambda ci: bool(ci.no_show),
-        )
-        # Booking *activity* — when the booking was made, not when the meeting is
-        # scheduled for. A call booked today for next week counts here today.
-        out["calls_booked_activity"] = _count_unique_sales_calls(
-            booked_on_day,
-            lambda ci: not ci.cancelled,
-        )
+        # Shared with the Funnels scorecard — see count_sales_calls.
+        out.update(count_sales_calls(checkins, start, end))
 
     if pay:
         if cash_by_day is None:
@@ -387,33 +821,21 @@ def _compute_host_breakdown_for_day(
     toward the org-aggregate row as before)."""
     start, end = day_bounds_utc(entry_day)
     by_host: Dict[uuid.UUID, List[ClientCheckIn]] = {}
-    booked_by_host: Dict[uuid.UUID, List[ClientCheckIn]] = {}
     for ci in checkins:
         host_id = getattr(ci, "host_user_id", None)
-        if not host_id:
-            continue
-        st = _ensure_utc(ci.start_time)
-        if st and start <= st <= end:
+        if host_id:
             by_host.setdefault(host_id, []).append(ci)
-        created = _ensure_utc(ci.created_at)
-        if created and start <= created <= end:
-            booked_by_host.setdefault(host_id, []).append(ci)
 
     out: Dict[uuid.UUID, Dict[str, int]] = {}
-    for host_id in set(by_host.keys()) | set(booked_by_host.keys()):
-        rows = by_host.get(host_id, [])
-        booked_rows = booked_by_host.get(host_id, [])
+    for host_id, host_rows in by_host.items():
+        scheduled = [ci for ci in host_rows if (st := _ensure_utc(ci.start_time)) and start <= st <= end]
+        # Shared with the org row and the Funnels scorecard — see count_sales_calls.
+        counts = count_sales_calls(host_rows, start, end)
+        if not scheduled and not any(counts.values()):
+            continue
         out[host_id] = {
-            "calls_taken": _count_unique_sales_calls(
-                rows,
-                lambda ci: bool(ci.completed) and not ci.cancelled and not ci.no_show,
-            ),
-            "calls_booked": _count_unique_sales_calls(rows, lambda ci: not ci.cancelled),
-            "calls_booked_activity": _count_unique_sales_calls(
-                booked_rows, lambda ci: not ci.cancelled
-            ),
-            "closes": _count_host_conversions(rows, conversion_dates or {}, entry_day),
-            "no_shows": _count_unique_sales_calls(rows, lambda ci: bool(ci.no_show)),
+            **counts,
+            "closes": _count_host_conversions(scheduled, conversion_dates or {}, entry_day),
         }
     return out
 

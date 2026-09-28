@@ -85,6 +85,7 @@ class KpiDailyEntryBase(BaseModel):
     cash_collected: Optional[Decimal] = None
     revenue: Optional[Decimal] = None
     setter_context: Optional[str] = None
+    setter_booked_client_ids: Optional[List[str]] = None
 
 
 class KpiDailyEntryCreate(KpiDailyEntryBase):
@@ -111,6 +112,11 @@ class KpiDailyEntryRead(KpiDailyEntryBase):
     org_id: UUID
     entry_date: date
     rep_user_id: Optional[UUID] = None
+    # Team KPIs: when the person submitted this day's EOD (None = not submitted).
+    submitted_at: Optional[datetime] = None
+    # Org days only: per-rep EOD contribution to each activity field (the one daily
+    # ledger). Editors show "+N from team EODs" and edit only the org-only part.
+    team_eod_totals: Dict[str, int] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 
@@ -128,6 +134,8 @@ class KpiDailyEntryRead(KpiDailyEntryBase):
             "org_id": row.org_id,
             "entry_date": row.entry_date,
             "rep_user_id": getattr(row, "rep_user_id", None),
+            "submitted_at": getattr(row, "submitted_at", None),
+            "team_eod_totals": dict(getattr(row, "team_eod_totals", None) or {}),
             "total_followers": row.total_followers,
             "new_followers": row.new_followers,
             "content_posted": row.content_posted,
@@ -151,6 +159,7 @@ class KpiDailyEntryRead(KpiDailyEntryBase):
             "cash_collected": row.cash_collected,
             "revenue": row.revenue,
             "setter_context": getattr(row, "setter_context", None),
+            "setter_booked_client_ids": getattr(row, "setter_booked_client_ids", None),
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
@@ -301,6 +310,9 @@ class KpiRepOption(BaseModel):
 
 class KpiRepOptionsResponse(BaseModel):
     reps: List[KpiRepOption] = Field(default_factory=list)
+    # True when the org has sales reps: the EOD form lists only them and a rep is required,
+    # so every EOD is attributed (never silently written into the shared org row).
+    require_rep: bool = False
 
 
 class KpiAutopopulateStatusResponse(BaseModel):
@@ -323,12 +335,16 @@ class KpiSnapshotCard(BaseModel):
     kind: Literal["int", "pct", "currency"] = "int"
     aggregation: Literal["sum", "avg", "ratio"] = "sum"
     tier: Optional[TierName] = None
+    # Parts of a summed card, e.g. Total Leads = conversations + inbound + paid.
+    breakdown: Optional[Dict[str, float]] = None
 
 
 class KpiSnapshotSeriesPoint(BaseModel):
     date: date
     outreach_sent: Optional[int] = None
     total_conversations: Optional[int] = None
+    # Each new conversation is a lead, plus inbound ICP leads and paid funnel opt-ins.
+    total_leads: Optional[int] = None
     calls_booked: Optional[int] = None
     calls_taken: Optional[int] = None
     closes: Optional[int] = None
@@ -368,12 +384,16 @@ class KpiRepPerformanceMetrics(BaseModel):
     (the closer log) — a rep may have either, both, or neither populated."""
 
     outreach_sent: int = 0
+    respondents: int = 0
     calls_booked: int = 0
     calls_booked_activity: int = 0
     calls_taken: int = 0
     no_shows: int = 0
     closes: int = 0
     cash_collected_cents: int = 0
+    # Setter rates (Team KPIs setter targets mirror the org KPI % bands for these).
+    reply_rate_pct: Optional[float] = None  # respondents ÷ outreach sent
+    convo_to_booking_pct: Optional[float] = None  # calls booked ÷ respondents
     show_up_pct: Optional[float] = None
     closing_rate_pct: Optional[float] = None
 
@@ -417,3 +437,32 @@ class KpiRevenueContributorsResponse(BaseModel):
     entry_date: date
     total_cents: int
     contributors: List[KpiRevenueContributor] = Field(default_factory=list)
+
+
+class KpiBookableClient(BaseModel):
+    client_id: UUID
+    client_name: str
+    email: Optional[str] = None
+
+
+class KpiBookableClientsResponse(BaseModel):
+    entry_date: date
+    clients: List[KpiBookableClient] = Field(default_factory=list)
+
+
+class KpiFunnelSummaryResponse(BaseModel):
+    window_start: date
+    window_end: date
+    channel: str
+    outreach_sent: int
+    respondents: int
+    opt_ins: int
+    booked: int
+    showed: int
+    closed: int
+    cash_usd: float
+    reply_rate_pct: Optional[float] = None
+    lead_to_book_rate_pct: Optional[float] = None
+    show_rate_pct: Optional[float] = None
+    close_rate_pct: Optional[float] = None
+    cash_per_close_usd: Optional[float] = None

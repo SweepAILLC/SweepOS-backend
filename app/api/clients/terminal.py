@@ -161,7 +161,7 @@ def get_terminal_summary(
     manual_tot = {"today": 0.0, "last_7": 0.0, "last_30": 0.0, "mtd": 0.0}
     manual_payments = (
         db.query(ManualPayment)
-        .filter(ManualPayment.org_id == org_id)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
         .all()
     )
     for p in manual_payments:
@@ -278,6 +278,7 @@ def get_terminal_summary(
             .filter(
                 ManualPayment.org_id == org_id,
                 ManualPayment.payment_date >= since,
+                ManualPayment.superseded_at.is_(None),
             )
             .group_by(ManualPayment.client_id)
         )

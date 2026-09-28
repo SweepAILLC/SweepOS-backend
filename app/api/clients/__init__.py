@@ -3,13 +3,14 @@ from typing import List
 
 from fastapi import APIRouter, status
 
-from app.api.clients import automation, checkins, crud, import_clients, insights, payments, terminal
+from app.api.clients import automation, checkins, crud, grid, import_clients, insights, payments, terminal
 from app.schemas.client import Client as ClientSchema
 
 router = APIRouter(tags=["clients"])
 
 # Static/collection routes before /{client_id} paths (see README.md)
 router.include_router(terminal.router)
+router.include_router(grid.router)
 router.include_router(insights.router)
 router.include_router(automation.router)
 router.include_router(checkins.router)

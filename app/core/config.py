@@ -134,6 +134,8 @@ class Settings(BaseSettings):
     STRIPE_RECONCILE_WEBHOOKS_ON_STARTUP: bool = True
     # Worker safety-net: incremental Stripe (+ recent Treasury) catch-up when webhooks miss.
     STRIPE_CATCHUP_INTERVAL_SEC: int = 600
+    # Worker: pipeline follow-up expiry sweep (qualified → nurturing → cold_lead). Also runs on boot.
+    FOLLOW_UP_SWEEP_INTERVAL_SEC: int = 900
     
     # Brevo
     BREVO_CLIENT_ID: Optional[str] = None

@@ -13,11 +13,13 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.models.org_kpi_benchmark import OrgKpiBenchmark
+from app.services.kpi_org_totals import fold_org_daily_totals
 from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.schemas.kpi import DEFAULT_CONTENT_TYPE_TAGS, DEFAULT_KPI_THRESHOLDS
 from app.services.kpi_bottleneck_service import detect_bottlenecks, utcnow
 from app.services.kpi_compute import build_kpi_snapshot, build_monthly_rollups
 from app.services.kpi_integration_sync import (
+    paid_leads_by_day,
     has_calendar_source,
     has_payment_source,
     refresh_kpi_live_fields_for_range,
@@ -119,6 +121,7 @@ def get_kpi_snapshot_for_mcp(
         .order_by(OrgKpiDailyEntry.entry_date.asc())
         .all()
     )
+    rows = fold_org_daily_totals(rows)  # one daily ledger (kpi_org_totals)
     bench = _get_or_seed_benchmarks(db, org_id)
     flags = []
     if include_flags:
@@ -138,6 +141,7 @@ def get_kpi_snapshot_for_mcp(
         calendar_available=has_calendar_source(db, org_id),
         payments_available=has_payment_source(db, org_id),
         generated_at=utcnow(),
+        paid_leads_by_day=paid_leads_by_day(db, org_id, range_start, range_end),
     )
     payload = _serialize(snapshot)
     payload["org_id"] = str(org_id)
@@ -171,7 +175,7 @@ def get_kpi_monthly_rollups_for_mcp(
         .order_by(OrgKpiDailyEntry.entry_date.asc())
         .all()
     )
-    rollups = build_monthly_rollups(rows, months=n)
+    rollups = build_monthly_rollups(fold_org_daily_totals(rows), months=n)
     return {
         "org_id": str(org_id),
         "months_requested": n,
@@ -211,7 +215,7 @@ def get_kpi_trends_for_mcp(
         .order_by(OrgKpiDailyEntry.entry_date.asc())
         .all()
     )
-    rollups = build_monthly_rollups(rows, months=n)
+    rollups = build_monthly_rollups(fold_org_daily_totals(rows), months=n)
     # Chronological (oldest → newest) for trend reading
     chron = list(reversed(rollups))
 

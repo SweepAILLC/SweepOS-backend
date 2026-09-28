@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models.client import Client, LifecycleState, parse_lifecycle_state_from_db
+from app.models.client import Client, LifecycleState, find_client_by_email, parse_lifecycle_state_from_db
 from app.models.client_checkin import ClientCheckIn
 from app.models.calendar_booking_sales import CalendarBookingSales
 from app.models.funnel import Funnel
@@ -165,14 +165,8 @@ def create_close_survey_client(
             detail="Provide at least a name or email",
         )
     if email:
-        existing = (
-            db.query(Client)
-            .filter(
-                Client.org_id == org.id,
-                func.lower(Client.email) == email.lower(),
-            )
-            .first()
-        )
+        # Covers merged-in emails too, so a combined contact is never re-split
+        existing = find_client_by_email(db, org.id, email)
         if existing:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -582,6 +576,13 @@ def submit_close_survey(
             apply_automatic_lifecycle_for_client(db, client)
         except Exception as lc_err:
             LOG.warning("lifecycle after manual pay skipped for %s: %s", client.id, lc_err)
+            from app.services.integration_side_effects import emit_automation_failure_discord
+            emit_automation_failure_discord(
+                org_id=client.org_id,
+                where="close_survey_service.apply_automatic_lifecycle_for_client",
+                error=lc_err,
+                client_id=client.id,
+            )
 
     # 2) Outcome → latest sales check-in state + lifecycle
     sales_event_when: Optional[datetime] = None

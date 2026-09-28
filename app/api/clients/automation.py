@@ -56,7 +56,11 @@ from app.utils.stripe_ids import normalize_stripe_id_for_dedup
 router = APIRouter()
 
 
-from app.services.client_automation import process_client_automation, reconcile_org_client_lifecycles
+from app.services.client_automation import (
+    find_active_sale_closed_mismatches,
+    process_client_automation,
+    reconcile_org_client_lifecycles,
+)
 
 
 @router.post("/automation/reconcile-lifecycle", status_code=status.HTTP_200_OK)
@@ -86,6 +90,39 @@ def reconcile_client_lifecycle_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error reconciling client lifecycles: {str(e)}",
         )
+
+
+@router.get("/automation/lifecycle-integrity-flags", status_code=status.HTTP_200_OK)
+def lifecycle_integrity_flags_endpoint(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Clients whose lifecycle already flipped to ACTIVE (a real payment landed)
+    but whose most recent sales call still isn't stamped sale_closed — a real
+    data-integrity drift, not automation failing to run. See
+    find_active_sale_closed_mismatches for why this happens.
+    """
+    org_id = effective_org_id(current_user)
+    mismatched_ids = find_active_sale_closed_mismatches(db, org_id)
+    clients = (
+        db.query(Client)
+        .filter(Client.id.in_(mismatched_ids))
+        .all()
+        if mismatched_ids
+        else []
+    )
+    return {
+        "count": len(clients),
+        "clients": [
+            {
+                "id": str(c.id),
+                "name": f"{c.first_name or ''} {c.last_name or ''}".strip() or c.email,
+                "email": c.email,
+            }
+            for c in clients
+        ],
+    }
 
 
 @router.post("/automation/process", status_code=status.HTTP_200_OK)

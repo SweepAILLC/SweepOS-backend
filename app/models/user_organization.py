@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, DateTime, Boolean
+from sqlalchemy import Column, ForeignKey, DateTime, Boolean, String
 from sqlalchemy.dialects.postgresql import UUID, JSON
 import uuid
 from datetime import datetime
@@ -18,6 +18,8 @@ class UserOrganization(Base):
     is_primary = Column(Boolean, default=False, nullable=False)  # Primary org for backward compatibility
     # Per-org Intelligence bank when the user has no dedicated users row in that org.
     ai_profile = Column(JSON, nullable=True)
+    # Rep type for member-access users: "sales" | "marketing"; NULL = plain member / admin / owner.
+    team_role = Column(String(16), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     
     # Composite unique constraint: one record per user-org pair

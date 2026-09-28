@@ -627,7 +627,7 @@ def generate_and_persist_report(
     except (TypeError, ValueError):
         call_score_f = None
 
-    _upsert_report(
+    library_row = _upsert_report(
         db,
         org_id,
         fathom_record_id,
@@ -644,6 +644,32 @@ def generate_and_persist_report(
         analysis_kind,
         fathom_record_id,
     )
+
+    if analysis_kind == "sales":
+        try:
+            from app.services.call_library_auto_close import (
+                attempt_auto_close_from_call_library_report,
+            )
+
+            outcome = attempt_auto_close_from_call_library_report(
+                db, org_id, fathom_record_id, library_row.id, report_json,
+            )
+            logger.info("call_library auto-close outcome=%s record=%s", outcome, fathom_record_id)
+        except Exception as auto_close_err:
+            logger.warning(
+                "call_library auto-close failed record=%s: %s", fathom_record_id, auto_close_err
+            )
+            try:
+                from app.services.integration_side_effects import emit_automation_failure_discord
+
+                emit_automation_failure_discord(
+                    org_id=org_id,
+                    where="call_library_auto_close.attempt_auto_close_from_call_library_report",
+                    error=auto_close_err,
+                    client_id=rec.client_id,
+                )
+            except Exception:
+                pass
 
     # Refresh AI call insights for the primary client now that the call is fully processed.
     if rec.client_id and rec.sentiment_status == "complete":

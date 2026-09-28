@@ -7,8 +7,8 @@ from fastapi import Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_, desc, asc, text, cast
 from sqlalchemy.dialects.postgresql import JSONB
-from typing import List, Optional, Union
-from datetime import datetime, timedelta, timezone
+from typing import Any, List, Optional, Union
+from datetime import date as date_type, datetime, timedelta, timezone
 from uuid import UUID
 import uuid
 import re
@@ -40,6 +40,9 @@ from app.schemas.funnel import (
     StepCount,
     UTMSourceStats,
     ReferrerStats,
+    FunnelAdSpendIn,
+    FunnelAdSpendRead,
+    FunnelDashboardResponse,
 )
 from app.models.client import find_client_by_email, find_client_by_phone
 from app.models.client import LifecycleState
@@ -100,6 +103,125 @@ def create_funnel(
     db.commit()
     db.refresh(funnel)
     return funnel
+
+
+# --- Funnels dashboard + weekly ad spend (PRD phase 8) ---------------------
+# Static paths: must stay above "/{funnel_id}" or FastAPI matches that first.
+
+
+def _parse_ymd(value: str, name: str) -> date_type:
+    try:
+        return date_type.fromisoformat(value)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid {name} '{value}'. Use YYYY-MM-DD.",
+        ) from e
+
+
+def _parse_channel(channel: Optional[str]) -> Optional[str]:
+    ch = (channel or "").strip().lower() or None
+    if ch not in (None, "all", "organic", "paid"):
+        raise HTTPException(status_code=400, detail="channel must be 'organic', 'paid', or 'all'")
+    return None if ch == "all" else ch
+
+
+def _require_org_funnel(db: Session, org_id, funnel_id: Optional[UUID]) -> None:
+    if funnel_id is None:
+        return
+    exists = db.query(Funnel.id).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not exists:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+
+
+@router.get("/dashboard", response_model=FunnelDashboardResponse)
+def get_funnel_dashboard(
+    start: str = Query(..., description="YYYY-MM-DD inclusive"),
+    end: str = Query(..., description="YYYY-MM-DD inclusive"),
+    channel: Optional[str] = Query(None, description="'organic', 'paid', or omit/'all'"),
+    funnel_id: Optional[UUID] = Query(None, description="Omit for all funnels"),
+    compare_start: Optional[str] = Query(None, description="Compare range (benchmark = its average week)"),
+    compare_end: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Whole Funnels dashboard in one call — see services/funnel_dashboard.py."""
+    from app.services.funnel_dashboard import compute_funnel_dashboard
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    window_start, window_end = _parse_ymd(start, "start"), _parse_ymd(end, "end")
+    if window_end < window_start:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+    _require_org_funnel(db, org_id, funnel_id)
+    compare = None
+    if compare_start and compare_end:
+        compare = (_parse_ymd(compare_start, "compare_start"), _parse_ymd(compare_end, "compare_end"))
+        if compare[1] < compare[0]:
+            raise HTTPException(status_code=400, detail="compare_end must be on or after compare_start")
+    return FunnelDashboardResponse(
+        **compute_funnel_dashboard(
+            db, org_id, window_start, window_end, _parse_channel(channel), funnel_id, compare=compare
+        )
+    )
+
+
+@router.get("/ad-spend", response_model=List[FunnelAdSpendRead])
+def list_funnel_ad_spend(
+    start: str = Query(..., description="YYYY-MM-DD inclusive"),
+    end: str = Query(..., description="YYYY-MM-DD inclusive"),
+    funnel_id: Optional[UUID] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from app.services.funnel_dashboard import list_ad_spend
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    _require_org_funnel(db, org_id, funnel_id)
+    rows = list_ad_spend(db, org_id, _parse_ymd(start, "start"), _parse_ymd(end, "end"), funnel_id)
+    return [
+        FunnelAdSpendRead(
+            id=r.id,
+            funnel_id=r.funnel_id,
+            week_start=r.week_start,
+            amount_usd=r.amount_cents / 100.0,
+            ads_deployed=r.ads_deployed,
+            angles_deployed=r.angles_deployed,
+        )
+        for r in rows
+    ]
+
+
+@router.put("/ad-spend", response_model=Optional[FunnelAdSpendRead])
+def put_funnel_ad_spend(
+    body: FunnelAdSpendIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Set one (funnel, week) spend. amount_usd = 0 clears it and returns null."""
+    from app.services.funnel_dashboard import upsert_ad_spend
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    _require_org_funnel(db, org_id, body.funnel_id)
+    row = upsert_ad_spend(
+        db,
+        org_id,
+        body.funnel_id,
+        body.week_start,
+        int(round(body.amount_usd * 100)),
+        getattr(current_user, "id", None),
+        ads_deployed=body.ads_deployed,
+        angles_deployed=body.angles_deployed,
+    )
+    if row is None:
+        return None
+    return FunnelAdSpendRead(
+        id=row.id,
+        funnel_id=row.funnel_id,
+        week_start=row.week_start,
+        amount_usd=row.amount_cents / 100.0,
+        ads_deployed=row.ads_deployed,
+        angles_deployed=row.angles_deployed,
+    )
 
 
 @router.get("/{funnel_id}", response_model=FunnelWithSteps)
@@ -457,6 +579,54 @@ def ingest_event(
 
 
 # Lead capture - Public endpoint: create/update client from funnel (lead forms, quiz funnels)
+UTM_KEYS = ("source", "medium", "campaign", "term", "content")
+
+
+def normalize_utm(raw: Any) -> Optional[dict]:
+    """Keep only the five standard UTM keys as short strings; accepts `utm_source` or `source`."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    for key in UTM_KEYS:
+        val = raw.get(key)
+        if val is None:
+            val = raw.get(f"utm_{key}")
+        if val is None:
+            continue
+        text_val = str(val).strip()[:200]
+        if text_val:
+            out[key] = text_val
+    return out or None
+
+
+def _resolve_lead_utm(db: Session, org_id: UUID, lead_data: FunnelLeadIn) -> Optional[dict]:
+    """
+    UTM for a lead capture: explicit `utm` on the payload wins; otherwise look up
+    the trackEvent session (org-scoped) by session_id, then visitor_id.
+    """
+    explicit = normalize_utm(lead_data.utm)
+    if explicit:
+        return explicit
+    for column, value in ((Session.session_id, lead_data.session_id), (Session.visitor_id, lead_data.visitor_id)):
+        if not value:
+            continue
+        try:
+            row = (
+                db.query(Session.utm)
+                .filter(Session.org_id == org_id, column == value, Session.utm.isnot(None))
+                .order_by(desc(Session.last_seen))
+                .first()
+            )
+        except Exception as e:
+            print(f"[FUNNEL LEAD] utm session lookup skipped: {e}")
+            db.rollback()
+            return None
+        found = normalize_utm(row[0]) if row else None
+        if found:
+            return found
+    return None
+
+
 @router.post("/leads", response_model=FunnelLeadResponse, status_code=status.HTTP_201_CREATED)
 def create_lead_from_funnel(
     lead_data: FunnelLeadIn,
@@ -495,6 +665,8 @@ def create_lead_from_funnel(
     if client is None and phone:
         client = find_client_by_phone(db, org_id, phone)
 
+    lead_utm = _resolve_lead_utm(db, org_id, lead_data)
+
     def _apply_prospect_meta(c: Client) -> None:
         # Always stamp funnel_id + captured_at so the Leads tab can list every capture.
         meta = c.meta if isinstance(c.meta, dict) else {}
@@ -512,6 +684,8 @@ def create_lead_from_funnel(
             prospect["opt_in_data"] = lead_data.opt_in_data or {}
         if lead_data.funnel_step_reached is not None:
             prospect["funnel_step_reached"] = lead_data.funnel_step_reached
+        if lead_utm:
+            prospect["utm"] = lead_utm
         meta = {**meta, "prospect": prospect}
         c.meta = meta
         flag_modified(c, "meta")
@@ -531,6 +705,11 @@ def create_lead_from_funnel(
         if notes is not None and notes:
             client.notes = (client.notes or "").strip() + ("\n\n" + notes if (client.notes or "").strip() else notes)
         _apply_prospect_meta(client)
+        # First-touch attribution: never overwrite a known channel, but a legacy
+        # row with no channel on record (pre-091) takes this funnel as its source.
+        if client.source_channel is None:
+            client.source_channel = "paid"
+            client.source_funnel_id = funnel.id
         from app.services.client_automation import apply_funnel_lead_lifecycle, apply_automatic_lifecycle_for_client
 
         apply_funnel_lead_lifecycle(client)
@@ -543,6 +722,13 @@ def create_lead_from_funnel(
             db.refresh(client)
         except Exception as lc_err:
             print(f"[FUNNEL LEAD] lifecycle reconcile skipped for {client.id}: {lc_err}")
+            from app.services.integration_side_effects import emit_automation_failure_discord
+            emit_automation_failure_discord(
+                org_id=org_id,
+                where="funnels.apply_automatic_lifecycle_for_client",
+                error=lc_err,
+                client_id=client.id,
+            )
         invalidate_health_score_cache(db, client.id, org_id)
         try:
             from app.services.funnel_lead_notifications import enqueue_funnel_lead_notification
@@ -578,6 +764,8 @@ def create_lead_from_funnel(
             instagram=instagram or None,
             notes=notes or None,
             lifecycle_state=LifecycleState.QUALIFIED,
+            source_channel="paid",
+            source_funnel_id=funnel.id,
         )
         _apply_prospect_meta(client)
         db.add(client)
@@ -1120,6 +1308,8 @@ def get_funnel_health(
 def get_funnel_analytics(
     funnel_id: UUID,
     range_days: int = Query(30, alias="range", ge=1, le=365),
+    start: Optional[str] = Query(None, description="Inclusive org-local YYYY-MM-DD; with `end`, overrides range."),
+    end: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1159,9 +1349,15 @@ def get_funnel_analytics(
             top_referrers=[]
         )
     
-    # Calculate date range
-    end_date = datetime.utcnow()
-    start_date = end_date - timedelta(days=range_days)
+    # Calculate date range (explicit start/end from the shared date-range filter wins)
+    from app.services.date_window import explicit_window
+
+    window = explicit_window(db, org_id, start, end)
+    if window is not None:
+        start_date, end_date = window
+    else:
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=range_days)
     
     # Get step counts
     step_counts = []

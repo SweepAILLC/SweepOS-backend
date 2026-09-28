@@ -85,6 +85,7 @@ EVENT_TYPES: List[Dict[str, str]] = [
     {"key": "new_lead", "label": "New leads (funnel captures)"},
     {"key": "new_booking", "label": "New bookings (Cal.com / Calendly)"},
     {"key": "new_transaction", "label": "New transactions (Stripe payments)"},
+    {"key": "automation_failure", "label": "Pipeline automation failures (lifecycle/close-stamp errors)"},
 ]
 _KNOWN_EVENT_KEYS = {e["key"] for e in EVENT_TYPES}
 
@@ -178,6 +179,7 @@ _EMBED_COLOR_BY_EVENT = {
     "new_lead": 0xF59E0B,       # amber
     "new_booking": 0x8B5CF6,    # violet
     "new_transaction": 0x10B981,  # emerald
+    "automation_failure": 0xEF4444,  # red
 }
 _DEFAULT_EMBED_COLOR = 0x9CA3AF  # gray, for any unlisted event_type
 

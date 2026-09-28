@@ -5,7 +5,7 @@ Only accessible to admin/owner users.
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func, desc, asc, and_, or_, text, exists
-from typing import List, Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 
 from app.db.session import get_db
@@ -60,6 +60,7 @@ from app.schemas.permission import (
 )
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.portal_todo import PortalTodo
+from app.services.kpi_org_totals import fold_org_daily_totals
 from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
 from app.models.org_kpi_benchmark import OrgKpiBenchmark
 from app.schemas.kpi import KpiRepPerformanceResponse, KpiSnapshotResponse
@@ -67,6 +68,7 @@ from app.services.kpi_bottleneck_service import detect_bottlenecks, utcnow
 from app.services.kpi_compute import build_kpi_snapshot
 from app.services.kpi_rep_performance import build_rep_performance
 from app.services.kpi_integration_sync import (
+    paid_leads_by_day,
     has_calendar_source,
     has_payment_source,
 )
@@ -229,87 +231,27 @@ def _add_one_calendar_month_first(dt_start: datetime) -> datetime:
     return dt_start.replace(month=m + 1)
 
 
-def _org_show_up_rate_pct(
+def _org_sales_call_rates(
     db: Session,
     org_id: UUID,
     period_start: datetime,
     period_end: datetime,
     now_utc: datetime,
-) -> Optional[float]:
-    base_filters = (
-        ClientCheckIn.org_id == org_id,
-        ClientCheckIn.is_sales_call == True,  # noqa: E712
-        ClientCheckIn.cancelled == False,  # noqa: E712
-        ClientCheckIn.provider.in_(["calcom", "calendly"]),
-        ClientCheckIn.start_time >= period_start,
-        ClientCheckIn.start_time < period_end,
-        ClientCheckIn.start_time < now_utc,
-    )
-    total = db.query(func.count(ClientCheckIn.id)).filter(*base_filters).scalar() or 0
-    if not total:
-        return None
-    no_shows = (
-        db.query(func.count(ClientCheckIn.id))
-        .filter(*base_filters, ClientCheckIn.no_show == True)  # noqa: E712
-        .scalar()
-        or 0
-    )
-    attended = total - no_shows
-    return round((attended / total) * 100.0, 1)
-
-
-def _org_close_rate_pct(
-    db: Session,
-    org_id: UUID,
-    period_start: datetime,
-    period_end: datetime,
-    now_utc: datetime,
-) -> Optional[float]:
+) -> Dict[str, Optional[float]]:
     """
-    Close rate for Terminal / health trends.
-
-    Matches Calendar KPI: a past sales call is closed when the operator marked
-    sale_closed OR the client has a succeeded Stripe payment. Stripe is optional.
+    Show-up rate + close rate for Terminal / health trends — shared engine,
+    see kpi_integration_sync.compute_sales_call_rates_for_window for the
+    exact denominator/provider/payment-source rules.
     """
-    has_succeeded_payment = exists().where(
-        and_(
-            StripePayment.client_id == ClientCheckIn.client_id,
-            StripePayment.org_id == org_id,
-            StripePayment.status == "succeeded",
-        )
+    from app.services.kpi_integration_sync import compute_sales_call_rates_for_window
+
+    result = compute_sales_call_rates_for_window(
+        db, org_id, period_start, period_end, now_utc=now_utc
     )
-    is_marked_closed = ClientCheckIn.sale_closed == True  # noqa: E712
-    base = (
-        db.query(func.count(ClientCheckIn.id))
-        .filter(
-            ClientCheckIn.org_id == org_id,
-            ClientCheckIn.is_sales_call == True,
-            ClientCheckIn.cancelled == False,
-            ClientCheckIn.provider.in_(["calcom", "calendly"]),
-            ClientCheckIn.start_time >= period_start,
-            ClientCheckIn.start_time < period_end,
-            ClientCheckIn.start_time < now_utc,
-        )
-    )
-    total = base.scalar() or 0
-    if not total:
-        return None
-    closed = (
-        db.query(func.count(ClientCheckIn.id))
-        .filter(
-            ClientCheckIn.org_id == org_id,
-            ClientCheckIn.is_sales_call == True,
-            ClientCheckIn.cancelled == False,
-            ClientCheckIn.provider.in_(["calcom", "calendly"]),
-            ClientCheckIn.start_time >= period_start,
-            ClientCheckIn.start_time < period_end,
-            ClientCheckIn.start_time < now_utc,
-            or_(is_marked_closed, has_succeeded_payment),
-        )
-        .scalar()
-        or 0
-    )
-    return round((closed / total) * 100.0, 1)
+    return {
+        "show_up_rate_pct": result["show_up_rate_pct"],
+        "close_rate_pct": result["close_rate_pct"],
+    }
 
 
 def _org_cash_usd_window(
@@ -1244,6 +1186,8 @@ def get_llm_usage_timeseries(
     days: int = Query(30, ge=1, le=1095, description="Rolling window in days when scope is unset."),
     scope: Optional[str] = Query(None, description="'mtd' = month-to-date; 'all' = entire history."),
     org_id: Optional[UUID] = Query(None, description="Filter to a single organization; omit for platform total."),
+    start: Optional[str] = Query(None, description="Inclusive YYYY-MM-DD (UTC days); with `end`, overrides days/scope."),
+    end: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     admin_user: User = Depends(require_admin),
 ):
@@ -1257,7 +1201,13 @@ def get_llm_usage_timeseries(
     try:
         from app.services.llm_usage import llm_usage_timeseries
 
-        raw = llm_usage_timeseries(db, org_id=org_id, days=days, scope=scope)
+        from zoneinfo import ZoneInfo
+
+        from app.services.date_window import parse_ymd, window_from_dates
+
+        end_d = parse_ymd(end, "end")
+        window = window_from_dates(parse_ymd(start, "start"), end_d, ZoneInfo("UTC")) if end_d else None
+        raw = llm_usage_timeseries(db, org_id=org_id, days=days, scope=scope, window=window)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
     return LlmUsageTimeseriesResponse(
@@ -1315,6 +1265,8 @@ def get_organization_dashboard(
         None,
         description="Use 'mtd' for month-to-date, 'all' for all-time (matches Terminal KPI filter).",
     ),
+    start: Optional[str] = Query(None, description="Inclusive org-local YYYY-MM-DD; with `end`, overrides range/scope."),
+    end: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     admin_user: User = Depends(require_admin)
 ):
@@ -1582,8 +1534,9 @@ def get_organization_dashboard(
             or 0
         )
 
-        sup = _org_show_up_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
-        cr = _org_close_rate_pct(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+        _rates = _org_sales_call_rates(db, org_id, month_cursor, month_end_exclusive, now_utc_dash)
+        sup = _rates["show_up_rate_pct"]
+        cr = _rates["close_rate_pct"]
 
         monthly_health_since_onboarding.append(
             HealthTrendPeriod(
@@ -1637,7 +1590,13 @@ def get_organization_dashboard(
     scope_norm = (scope or "").strip().lower() or None
     if scope_norm not in (None, "mtd", "all"):
         scope_norm = None
-    period_start, period_end = finances_period_bounds(scope_norm, range_days, now_naive)
+    from app.services.date_window import explicit_window
+
+    explicit = explicit_window(db, org_id, start, end)
+    if explicit is not None:
+        period_start, period_end = explicit
+    else:
+        period_start, period_end = finances_period_bounds(scope_norm, range_days, now_naive)
     st_ok = check_stripe_connected(db, org_id)
     wh_ok = _whop_connected(db, org_id)
     s_cents = _stripe_succeeded_cents_since(db, org_id, period_start, period_end) if st_ok else 0
@@ -1656,7 +1615,13 @@ def get_organization_dashboard(
 
     past_start_utc = _as_aware_utc(period_start)
     past_end_utc = _as_aware_utc(period_end)
-    upcoming_end_utc = _org_upcoming_window_end(scope_norm, range_days, now_utc_dash)
+    upcoming_end_utc = (
+        max(past_end_utc, now_utc_dash)
+        if explicit is not None
+        else _org_upcoming_window_end(scope_norm, range_days, now_utc_dash)
+    )
+    if explicit is not None:
+        past_end_utc = min(past_end_utc, now_utc_dash)
     kpi_upcoming_count = (
         db.query(func.count(ClientCheckIn.id))
         .filter(
@@ -1668,22 +1633,16 @@ def get_organization_dashboard(
         .scalar()
         or 0
     )
-    kpi_show_up_rate_pct = _org_show_up_rate_pct(
-        db, org_id, past_start_utc, past_end_utc, now_utc_dash
-    )
-    kpi_close_rate_pct = _org_close_rate_pct(
-        db, org_id, past_start_utc, past_end_utc, now_utc_dash
-    )
+    _kpi_rates = _org_sales_call_rates(db, org_id, past_start_utc, past_end_utc, now_utc_dash)
+    kpi_show_up_rate_pct = _kpi_rates["show_up_rate_pct"]
+    kpi_close_rate_pct = _kpi_rates["close_rate_pct"]
 
     # ----- Growth / coaching (30d), mirrors Owner Health product cards -----
     thirty_utc = now_utc_dash - timedelta(days=30)
     sixty_utc = now_utc_dash - timedelta(days=60)
-    show_up_rate_last_30d_pct = _org_show_up_rate_pct(
-        db, org_id, thirty_utc, now_utc_dash, now_utc_dash
-    )
-    close_rate_last_30d_pct = _org_close_rate_pct(
-        db, org_id, thirty_utc, now_utc_dash, now_utc_dash
-    )
+    _rates_30d = _org_sales_call_rates(db, org_id, thirty_utc, now_utc_dash, now_utc_dash)
+    show_up_rate_last_30d_pct = _rates_30d["show_up_rate_pct"]
+    close_rate_last_30d_pct = _rates_30d["close_rate_pct"]
     calls_booked_last_30d = _sales_calls_booked_count(
         db, start=thirty_utc, end=now_utc_dash, org_id=org_id
     )
@@ -2472,7 +2431,8 @@ def admin_get_kpi_entries(
         q = q.filter(OrgKpiDailyEntry.entry_date >= start)
     if end:
         q = q.filter(OrgKpiDailyEntry.entry_date <= end)
-    entries = q.order_by(OrgKpiDailyEntry.entry_date).all()
+    # One daily ledger (kpi_org_totals): org day = org row + team EOD activity.
+    entries = fold_org_daily_totals(q.order_by(OrgKpiDailyEntry.entry_date).all())
 
     def _rate(numer, denom):
         if numer is None or denom is None or denom == 0:
@@ -2713,11 +2673,11 @@ def admin_get_kpi_snapshot(
             OrgKpiDailyEntry.org_id == org_id,
             OrgKpiDailyEntry.entry_date >= range_start,
             OrgKpiDailyEntry.entry_date <= range_end,
-            OrgKpiDailyEntry.rep_user_id.is_(None),
         )
         .order_by(OrgKpiDailyEntry.entry_date.asc())
         .all()
     )
+    rows = fold_org_daily_totals(rows)  # one daily ledger (kpi_org_totals)
     bench = (
         db.query(OrgKpiBenchmark)
         .filter(OrgKpiBenchmark.org_id == org_id)
@@ -2737,6 +2697,7 @@ def admin_get_kpi_snapshot(
         calendar_available=has_calendar_source(db, org_id),
         payments_available=has_payment_source(db, org_id),
         generated_at=utcnow(),
+        paid_leads_by_day=paid_leads_by_day(db, org_id, range_start, range_end),
     )
 
 

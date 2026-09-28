@@ -882,6 +882,7 @@ def accept_invitation(
                 user_id=org_user_id,
                 org_id=org.id,
                 is_primary=False,
+                team_role=getattr(inv, "team_role", None),
             )
         )
         consume_invitation(inv)
@@ -952,6 +953,7 @@ def accept_invitation(
         user_id=new_user_id,
         org_id=org.id,
         is_primary=True,
+        team_role=getattr(inv, "team_role", None),
     )
     db.add(uo)
     consume_invitation(inv)

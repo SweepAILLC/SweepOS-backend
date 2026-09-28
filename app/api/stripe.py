@@ -14,6 +14,7 @@ import uuid
 
 from app.db.session import get_db
 from app.api.deps import get_current_user
+from app.services.date_window import explicit_window
 from app.models.user import User
 from app.models.oauth_token import OAuthToken, OAuthProvider
 from app.models.stripe_payment import StripePayment
@@ -60,8 +61,13 @@ def _stripe_date_range(scope: Optional[str], range_days: int):
 
 
 def _payments_window_from_params(
-    scope: Optional[str], range_days: Optional[int]
+    scope: Optional[str],
+    range_days: Optional[int],
+    window: Optional[tuple[datetime, datetime]] = None,
 ) -> tuple[Optional[datetime], Optional[datetime]]:
+    """`window` = explicit start/end from the shared date-range filter (wins over range/scope)."""
+    if window is not None:
+        return window
     if scope == "mtd" or range_days is not None:
         return _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
     return None, None
@@ -1243,6 +1249,10 @@ def delete_payment(
 def get_stripe_summary(
     range_days: int = Query(30, alias="range", ge=1, le=365),
     scope: Optional[str] = Query(None, description="Use 'mtd' for month-to-date"),
+    start: Optional[str] = Query(None, description="Inclusive org-local YYYY-MM-DD; with `end`, overrides range/scope."),
+    end: Optional[str] = Query(None),
+    compare_start: Optional[str] = Query(None, description="Prior window start (default: same length before `start`)."),
+    compare_end: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1257,11 +1267,18 @@ def get_stripe_summary(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Stripe not connected. Please connect Stripe via OAuth first."
         )
-    start_date, end_date = _stripe_date_range(scope, range_days)
-    if scope == "mtd":
-        prev_start_date = (start_date - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    explicit = explicit_window(db, org_id, start, end)
+    if explicit is not None:
+        # Shared date-range filter: prior window = compare range, else same length before.
+        start_date, end_date = explicit
+        compare = explicit_window(db, org_id, compare_start, compare_end, name="compare_")
+        prev_start_date = compare[0] if compare is not None else start_date - (end_date - start_date)
     else:
-        prev_start_date = start_date - timedelta(days=range_days)
+        start_date, end_date = _stripe_date_range(scope, range_days)
+        if scope == "mtd":
+            prev_start_date = (start_date - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            prev_start_date = start_date - timedelta(days=range_days)
     
     # Get current MRR (from active and trialing subscriptions)
     # Include both "active" and "trialing" status subscriptions
@@ -2197,6 +2214,8 @@ def get_payments(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     use_treasury: bool = Query(True, description="Use Treasury Transactions API as source of truth"),
+    start: Optional[str] = Query(None, description="Inclusive org-local YYYY-MM-DD; with `end`, overrides range/scope."),
+    end: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2206,10 +2225,11 @@ def get_payments(
     """
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    window = explicit_window(db, org_id, start, end)
     stripe_connected = check_stripe_connected(db, org_id)
 
     if not stripe_connected:
-        start_date, end_date = _payments_window_from_params(scope, range_days)
+        start_date, end_date = _payments_window_from_params(scope, range_days, window)
         return _paginate_merged_payment_responses(
             [],
             _manual_payment_stripe_responses(db, org_id, start_date, end_date, status_filter),
@@ -2268,8 +2288,8 @@ def get_payments(
                 query = query.filter(text("stripe_treasury_transactions.status = 'open'::treasurytransactionstatus"))
         
         # Filter by date range if provided
-        if scope == "mtd" or range_days is not None:
-            start_date, end_date = _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
+        start_date, end_date = _payments_window_from_params(scope, range_days, window)
+        if start_date is not None:
             txn_at = func.coalesce(StripeTreasuryTransaction.posted_at, StripeTreasuryTransaction.created)
             query = query.filter(and_(txn_at >= start_date, txn_at <= end_date))
         
@@ -2302,7 +2322,7 @@ def get_payments(
         deduplicated = list(by_canonical.values())
         deduplicated.sort(key=lambda t: (t.posted_at or t.created).timestamp() if (t.posted_at or t.created) else 0, reverse=True)
 
-        start_date, end_date = _payments_window_from_params(scope, range_days)
+        start_date, end_date = _payments_window_from_params(scope, range_days, window)
         client_map = _client_map_for_ids(db, [t.client_id for t in deduplicated])
         stripe_result = []
         for transaction in deduplicated:
@@ -2349,8 +2369,8 @@ def get_payments(
         query = query.filter(StripePayment.status == status_filter)
     
     # Filter by date range if provided
-    if scope == "mtd" or range_days is not None:
-        start_date, end_date = _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
+    start_date, end_date = _payments_window_from_params(scope, range_days, window)
+    if start_date is not None:
         query = query.filter(
             and_(
                 StripePayment.created_at >= start_date,
@@ -2418,7 +2438,7 @@ def get_payments(
     
     deduplicated.sort(key=lambda p: p.created_at.timestamp() if p.created_at else 0, reverse=True)
 
-    start_date, end_date = _payments_window_from_params(scope, range_days)
+    start_date, end_date = _payments_window_from_params(scope, range_days, window)
     client_map = _client_map_for_ids(db, [p.client_id for p in deduplicated])
     stripe_result = []
     for payment in deduplicated:
@@ -2632,10 +2652,11 @@ def _filter_failed_payments_by_window(
     rows: List[StripeFailedPaymentResponse],
     scope: Optional[str],
     range_days: Optional[int],
+    window: Optional[tuple[datetime, datetime]] = None,
 ) -> List[StripeFailedPaymentResponse]:
-    if scope != "mtd" and range_days is None:
+    start_date, end_date = _payments_window_from_params(scope, range_days, window)
+    if start_date is None:
         return rows
-    start_date, end_date = _stripe_date_range(scope if scope == "mtd" else None, range_days or 30)
 
     def in_window(r: StripeFailedPaymentResponse) -> bool:
         ts = r.latest_attempt_at or r.created_at or 0
@@ -2655,6 +2676,8 @@ def get_failed_payments(
     scope: Optional[str] = Query(None, description="Use 'mtd' for month-to-date"),
     use_treasury: bool = Query(True, description="Use Treasury Transactions API as source of truth"),
     exclude_resolved: bool = Query(False, description="Exclude resolved payments (for terminal queue)"),
+    start: Optional[str] = Query(None, description="Inclusive org-local YYYY-MM-DD; with `end`, overrides range/scope."),
+    end: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -2679,13 +2702,13 @@ def get_failed_payments(
         )
     
     # CRITICAL: Filter by org_id for multi-tenant isolation (use selected org from token)
-    
-    window_start, window_end = _payments_window_from_params(scope, range_days)
+    window = explicit_window(db, org_id, start, end)
+    window_start, window_end = _payments_window_from_params(scope, range_days, window)
     if not stripe_connected:
         result = _build_failed_payments_from_whop(
             db, org_id, exclude_resolved, window_start, window_end
         )
-        result = _filter_failed_payments_by_window(result, scope, range_days)
+        result = _filter_failed_payments_by_window(result, scope, range_days, window)
         return result[(page - 1) * page_size:page * page_size]
 
     # Use Treasury Transactions if requested
@@ -2790,7 +2813,7 @@ def get_failed_payments(
             _build_failed_payments_from_whop(db, org_id, exclude_resolved, window_start, window_end),
         )
         merged.sort(key=lambda r: r.latest_attempt_at, reverse=True)
-        merged = _filter_failed_payments_by_window(merged, scope, range_days)
+        merged = _filter_failed_payments_by_window(merged, scope, range_days, window)
         return merged[(page - 1) * page_size:page * page_size]
     
     # Fallback: StripePayment table only (no Treasury rows or use_treasury=False)
@@ -2801,7 +2824,7 @@ def get_failed_payments(
         result,
         _build_failed_payments_from_whop(db, org_id, exclude_resolved, window_start, window_end),
     )
-    result = _filter_failed_payments_by_window(result, scope, range_days)
+    result = _filter_failed_payments_by_window(result, scope, range_days, window)
     return result[(page - 1) * page_size:page * page_size]
 
 @router.get("/client/{client_id}/revenue", response_model=StripeClientRevenueResponse)

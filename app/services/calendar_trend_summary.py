@@ -138,17 +138,33 @@ def compute_calendar_trend_summary(
     scope: Optional[str] = None,
     range_days: Optional[int] = None,
     now: Optional[datetime] = None,
+    window: Optional[Tuple[datetime, datetime]] = None,
 ) -> dict:
     """
-    Show-up rate: past sales calls in window that are not no-shows / all past sales calls.
-    Matches calendar UI (past + not cancelled + not no_show = attended).
-    Close rate: share with sale_closed=True among past sales calls in window.
+    Show-up rate / close rate via the shared engine — see
+    kpi_integration_sync.compute_sales_call_rates_for_window for the exact
+    denominator/provider/payment-source rules (consolidates what used to be
+    three independent formulas across admin.py, this file, and Sales KPIs).
     """
+    from app.services.kpi_integration_sync import compute_sales_call_rates_for_window
+
     now_utc = now or datetime.now(timezone.utc)
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
 
-    w = calendar_trend_activity_window(scope=scope, range_days=range_days, now=now_utc)
+    if window is not None:
+        # Shared date-range filter: naive-UTC [start, end). Past = the part before now;
+        # upcoming = the part after now (empty for a fully past range).
+        lo = window[0].replace(tzinfo=timezone.utc)
+        hi = window[1].replace(tzinfo=timezone.utc)
+        w = CalendarTrendActivityWindow(
+            past_start=lo,
+            past_end=min(hi, now_utc),
+            upcoming_start=max(lo, now_utc),
+            upcoming_end=max(hi, now_utc),
+        )
+    else:
+        w = calendar_trend_activity_window(scope=scope, range_days=range_days, now=now_utc)
 
     past_count = _count_meetings_in_window(
         db, org_id, w.past_start, w.past_end, upcoming=False, now_utc=now_utc
@@ -157,23 +173,19 @@ def compute_calendar_trend_summary(
         db, org_id, w.upcoming_start, w.upcoming_end, upcoming=True, now_utc=now_utc
     )
 
-    sales_rows = _past_sales_calls_in_window(db, org_id, w.past_start, w.past_end)
-    sales_total = len(sales_rows)
-    showed_up = sum(1 for c in sales_rows if not getattr(c, "no_show", False))
-    closed = sum(1 for c in sales_rows if getattr(c, "sale_closed", None) is True)
-
-    show_up_rate_pct = round((showed_up / sales_total) * 100.0) if sales_total else None
-    close_rate_pct = round((closed / sales_total) * 100.0) if sales_total else None
+    rates = compute_sales_call_rates_for_window(
+        db, org_id, w.past_start, w.past_end, now_utc=now_utc
+    )
 
     return {
         "upcoming_count": upcoming_count,
         "past_count": past_count,
-        "close_rate_pct": close_rate_pct,
-        "sales_calls_in_range": sales_total,
-        "closed_sales_count": closed,
-        "show_up_rate_pct": show_up_rate_pct,
-        "attendance_eligible_past": sales_total,
-        "showed_up_count": showed_up,
+        "close_rate_pct": rates["close_rate_pct"],
+        "sales_calls_in_range": rates["sales_calls_booked"],
+        "closed_sales_count": rates["closed_count"],
+        "show_up_rate_pct": rates["show_up_rate_pct"],
+        "attendance_eligible_past": rates["sales_calls_booked"],
+        "showed_up_count": rates["sales_calls_taken"],
     }
 
 
