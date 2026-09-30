@@ -112,6 +112,28 @@ def _dispatcher_loop() -> None:
     last_heartbeat = 0.0
     last_call_library_drain = 0.0
     last_stripe_catchup = 0.0
+    last_calendar_catchup = 0.0
+    last_whop_catchup = 0.0
+    # Catch-ups run off-thread (calendar sync can take a while); never overlap one with itself.
+    catchup_running: dict = {}
+
+    def _run_catchup_async(name: str, fn) -> None:
+        if catchup_running.get(name):
+            return
+        catchup_running[name] = True
+
+        def _target() -> None:
+            try:
+                stats = fn()
+                if stats.get("synced") or stats.get("failed"):
+                    LOG.info("%s catch-up %s", name, stats)
+            except Exception:
+                LOG.exception("%s catch-up failed", name)
+            finally:
+                catchup_running[name] = False
+
+        threading.Thread(target=_target, daemon=True, name=f"{name}-catchup").start()
+
     last_instagram_sync = 0.0
     # 0.0 so the first tick after boot runs it — a deploy applies the rule immediately.
     last_follow_up_sweep = 0.0
@@ -124,6 +146,8 @@ def _dispatcher_loop() -> None:
     stripe_catchup_interval = float(
         getattr(settings, "STRIPE_CATCHUP_INTERVAL_SEC", 600) or 600
     )
+    calendar_catchup_interval = float(getattr(settings, "CALENDAR_CATCHUP_INTERVAL_SEC", 300) or 0)
+    whop_catchup_interval = float(getattr(settings, "WHOP_CATCHUP_INTERVAL_SEC", 300) or 0)
     # Check hourly for due orgs; per-org freshness still uses INSTAGRAM_SYNC_INTERVAL_SEC.
     instagram_sync_check_interval = float(
         getattr(settings, "INSTAGRAM_SYNC_CHECK_INTERVAL_SEC", 3600) or 3600
@@ -217,6 +241,16 @@ def _dispatcher_loop() -> None:
                     except Exception:
                         LOG.exception("stripe catch-up failed")
                     last_stripe_catchup = now
+                if calendar_catchup_interval > 0 and now - last_calendar_catchup >= calendar_catchup_interval:
+                    from app.services.integration_catchup import catchup_calendar_for_all_orgs
+
+                    _run_catchup_async("calendar", catchup_calendar_for_all_orgs)
+                    last_calendar_catchup = now
+                if whop_catchup_interval > 0 and now - last_whop_catchup >= whop_catchup_interval:
+                    from app.services.integration_catchup import catchup_whop_for_all_orgs
+
+                    _run_catchup_async("whop", catchup_whop_for_all_orgs)
+                    last_whop_catchup = now
                 if (
                     instagram_sync_check_interval > 0
                     and now - last_instagram_sync >= instagram_sync_check_interval

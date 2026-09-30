@@ -335,7 +335,7 @@ class KpiSnapshotCard(BaseModel):
     kind: Literal["int", "pct", "currency"] = "int"
     aggregation: Literal["sum", "avg", "ratio"] = "sum"
     tier: Optional[TierName] = None
-    # Parts of a summed card, e.g. Total Leads = conversations + inbound + paid.
+    # Parts of a summed card, e.g. Total Leads = conversations + respondents + inbound + paid.
     breakdown: Optional[Dict[str, float]] = None
 
 
@@ -343,7 +343,7 @@ class KpiSnapshotSeriesPoint(BaseModel):
     date: date
     outreach_sent: Optional[int] = None
     total_conversations: Optional[int] = None
-    # Each new conversation is a lead, plus inbound ICP leads and paid funnel opt-ins.
+    # Each new conversation and respondent is a lead, plus inbound ICP leads and paid funnel opt-ins.
     total_leads: Optional[int] = None
     calls_booked: Optional[int] = None
     calls_taken: Optional[int] = None

@@ -134,6 +134,10 @@ class Settings(BaseSettings):
     STRIPE_RECONCILE_WEBHOOKS_ON_STARTUP: bool = True
     # Worker safety-net: incremental Stripe (+ recent Treasury) catch-up when webhooks miss.
     STRIPE_CATCHUP_INTERVAL_SEC: int = 600
+    # Worker safety-net: pull Cal.com/Calendly bookings + Whop payments so new-booking /
+    # new-transaction notifications fire without anyone having the app open. 0 disables.
+    CALENDAR_CATCHUP_INTERVAL_SEC: int = 300
+    WHOP_CATCHUP_INTERVAL_SEC: int = 300
     # Worker: pipeline follow-up expiry sweep (qualified → nurturing → cold_lead). Also runs on boot.
     FOLLOW_UP_SWEEP_INTERVAL_SEC: int = 900
     

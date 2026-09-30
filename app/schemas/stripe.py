@@ -138,6 +138,8 @@ class StripePaymentResponse(BaseModel):
     receipt_url: Optional[str] = None
     created_at: int  # Unix timestamp
     description: Optional[str] = None  # Manual payments only
+    # Linked client already has a contract total on their offer enrollment.
+    client_deal_value_set: Optional[bool] = None
     payment_method: Optional[str] = None  # Manual payments only
 
     class Config:
