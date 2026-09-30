@@ -412,11 +412,46 @@ def _paginate_merged_payment_responses(
     page: int,
     page_size: int,
     extra_rows: Optional[List[StripePaymentResponse]] = None,
+    *,
+    db: Optional[Session] = None,
+    org_id=None,
 ) -> List[StripePaymentResponse]:
     merged = stripe_rows + manual_rows + (extra_rows or [])
     merged.sort(key=lambda p: p.created_at or 0, reverse=True)
     start = (page - 1) * page_size
-    return merged[start : start + page_size]
+    page_rows = merged[start : start + page_size]
+    if db is not None and org_id is not None:
+        _annotate_client_deal_value_set(db, org_id, page_rows)
+    return page_rows
+
+
+def _annotate_client_deal_value_set(db: Session, org_id, rows: List[StripePaymentResponse]) -> None:
+    """Flag linked payments whose client already has a contract total on their offer
+    (drives the Terminal's 'Set revenue' shortcut)."""
+    ids = set()
+    for r in rows:
+        if r.client_id:
+            try:
+                ids.add(uuid.UUID(str(r.client_id)))
+            except ValueError:
+                continue
+    if not ids:
+        return
+    set_ids = set()
+    for cid, oe in (
+        db.query(Client.id, Client.offer_enrollment)
+        .filter(Client.org_id == org_id, Client.id.in_(ids))
+        .all()
+    ):
+        total = oe.get("total_cents") if isinstance(oe, dict) else None
+        try:
+            if total is not None and int(total) > 0:
+                set_ids.add(str(cid))
+        except (TypeError, ValueError):
+            pass
+    for r in rows:
+        if r.client_id:
+            r.client_deal_value_set = str(r.client_id) in set_ids
 
 
 def _extract_invoice_id_from_treasury_raw(raw_data) -> Optional[str]:
@@ -2238,6 +2273,8 @@ def get_payments(
             extra_rows=_whop_payment_stripe_responses(
                 db, org_id, start_date, end_date, status_filter
             ),
+            db=db,
+            org_id=org_id,
         )
 
     # Use Treasury Transactions if requested — but prefer StripePayment when webhooks
@@ -2356,7 +2393,7 @@ def get_payments(
             db, org_id, start_date, end_date, status_filter
         )
         return _paginate_merged_payment_responses(
-            stripe_result, manual_result, page, page_size, extra_rows=whop_result
+            stripe_result, manual_result, page, page_size, extra_rows=whop_result, db=db, org_id=org_id
         )
     
     # Fallback to old payment system (when use_treasury=False)
@@ -2473,7 +2510,7 @@ def get_payments(
         db, org_id, start_date, end_date, status_filter
     )
     return _paginate_merged_payment_responses(
-        stripe_result, manual_result, page, page_size, extra_rows=whop_result
+        stripe_result, manual_result, page, page_size, extra_rows=whop_result, db=db, org_id=org_id
     )
 
 

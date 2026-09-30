@@ -370,8 +370,8 @@ def overall_day_tier(
 
 
 SNAPSHOT_CARD_DEFS = (
-    # Every lead that came in: each new conversation is a lead, plus inbound ICP leads
-    # (EODs) and paid funnel opt-ins (passed in by the caller).
+    # Every lead that came in: each new conversation and each outreach respondent is a
+    # lead, plus inbound ICP leads (EODs) and paid funnel opt-ins (passed in by the caller).
     {"key": "total_leads", "label": "Total Leads", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "calls_booked", "label": "Sales Calls Booked", "kind": "int", "aggregation": "sum", "tier_metric": None},
     {"key": "calls_booked_activity", "label": "Calls Booked (Activity)", "kind": "int", "aggregation": "sum", "tier_metric": None},
@@ -425,11 +425,16 @@ def build_kpi_snapshot(
         breakdown: Optional[Dict[str, float]] = None
         if key == "total_leads":
             convos = sum(float(d.get("new_conversations") or 0) for d in dicts)
+            respondents = sum(float(d.get("respondents") or 0) for d in dicts)
             inbound = sum(float(d.get("inbound_icp_leads") or 0) for d in dicts)
             paid = float(sum(paid_by_day.values()))
             any_val = bool(dicts) or paid > 0
-            value = round(convos + inbound + paid, 2) if any_val else None
-            breakdown = {"conversations": convos, "inbound": inbound, "paid": paid} if any_val else None
+            value = round(convos + respondents + inbound + paid, 2) if any_val else None
+            breakdown = (
+                {"conversations": convos, "respondents": respondents, "inbound": inbound, "paid": paid}
+                if any_val
+                else None
+            )
             tier_val = None
         elif defn["aggregation"] == "sum":
             total = 0.0
@@ -501,7 +506,10 @@ def build_kpi_snapshot(
                     outreach_sent=int(summed["outreach_sent"]),
                     total_conversations=total_convos,
                     total_leads=int(
-                        summed["new_conversations"] + summed["inbound_icp_leads"] + paid_by_day.get(entry_date, 0)
+                        summed["new_conversations"]
+                        + summed["respondents"]
+                        + summed["inbound_icp_leads"]
+                        + paid_by_day.get(entry_date, 0)
                     ),
                     calls_booked=int(summed["calls_booked"]),
                     calls_taken=int(summed["calls_taken"]),
