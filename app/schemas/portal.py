@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime, date
 from uuid import UUID
@@ -97,6 +97,12 @@ class FunnelSimulatorScenarioCreate(BaseModel):
     lookback_days: str = Field(default="90", max_length=16)
     inputs: dict = Field(default_factory=dict)
 
+    # The simulator sends 30 / 90 as numbers and "mtd" as a string.
+    @field_validator("lookback_days", mode="before")
+    @classmethod
+    def _lookback_to_str(cls, v):
+        return str(v) if isinstance(v, (int, float)) else v
+
 
 class FunnelSimulatorScenarioUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=120)
@@ -104,6 +110,11 @@ class FunnelSimulatorScenarioUpdate(BaseModel):
     funnel_id: Optional[UUID] = None
     lookback_days: Optional[str] = Field(None, max_length=16)
     inputs: Optional[dict] = None
+
+    @field_validator("lookback_days", mode="before")
+    @classmethod
+    def _lookback_to_str(cls, v):
+        return str(v) if isinstance(v, (int, float)) else v
 
 
 class FunnelSimulatorScenarioResponse(BaseModel):
