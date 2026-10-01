@@ -1,4 +1,8 @@
-"""Funnel Simulator portal endpoints — baselines + named scenarios."""
+"""Funnel Simulator endpoints — baselines + named scenarios (funnel snapshots).
+
+Snapshots live on the Funnels tab, which every org member sees, so these routes are
+org-scoped rather than gated on a consulting tier.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -9,12 +13,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
-from app.api.portal import require_consulting_org_id
+from app.api.portal import _org_id
 from app.db.session import get_db
 from app.models.funnel_simulator_scenario import (
     MAX_FUNNEL_SIMULATOR_SCENARIOS_PER_ORG,
     FunnelSimulatorScenario,
 )
+from app.models.funnel import Funnel
 from app.models.user import User
 from app.schemas.portal import (
     FunnelSimulatorScenarioCreate,
@@ -27,6 +32,23 @@ from app.services.funnel_simulator import (
 )
 
 router = APIRouter()
+
+
+def require_org_id(current_user: User = Depends(get_current_user)) -> UUID:
+    return _org_id(current_user)
+
+
+def _check_funnel(db: Session, org_id: UUID, funnel_id: Optional[UUID]) -> None:
+    """A snapshot may only point at one of this org's funnels."""
+    if funnel_id is None:
+        return
+    exists = (
+        db.query(Funnel.id)
+        .filter(Funnel.id == funnel_id, Funnel.org_id == org_id)
+        .first()
+    )
+    if not exists:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
 
 
 def _ensure(db: Session) -> None:
@@ -42,7 +64,7 @@ def get_funnel_simulator_baselines(
     days: int = Query(90, ge=1, le=365),
     mtd: bool = Query(False),
     funnel_id: Optional[UUID] = Query(None),
-    org_id: UUID = Depends(require_consulting_org_id),
+    org_id: UUID = Depends(require_org_id),
     db: Session = Depends(get_db),
 ):
     """Historic rates for the simulator: KPI rollups + unique new-lead book rate + LP conv."""
@@ -59,7 +81,7 @@ def get_funnel_simulator_baselines(
     response_model=List[FunnelSimulatorScenarioResponse],
 )
 def list_funnel_simulator_scenarios(
-    org_id: UUID = Depends(require_consulting_org_id),
+    org_id: UUID = Depends(require_org_id),
     db: Session = Depends(get_db),
 ):
     _ensure(db)
@@ -79,7 +101,7 @@ def list_funnel_simulator_scenarios(
 )
 def create_funnel_simulator_scenario(
     body: FunnelSimulatorScenarioCreate,
-    org_id: UUID = Depends(require_consulting_org_id),
+    org_id: UUID = Depends(require_org_id),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -97,6 +119,7 @@ def create_funnel_simulator_scenario(
     name = (body.name or "").strip()
     if not name:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Name is required")
+    _check_funnel(db, org_id, body.funnel_id)
     now = datetime.utcnow()
     row = FunnelSimulatorScenario(
         org_id=org_id,
@@ -122,7 +145,7 @@ def create_funnel_simulator_scenario(
 def update_funnel_simulator_scenario(
     scenario_id: UUID,
     body: FunnelSimulatorScenarioUpdate,
-    org_id: UUID = Depends(require_consulting_org_id),
+    org_id: UUID = Depends(require_org_id),
     db: Session = Depends(get_db),
 ):
     _ensure(db)
@@ -144,6 +167,7 @@ def update_funnel_simulator_scenario(
     if body.mode is not None:
         row.mode = body.mode
     if body.funnel_id is not None or (body.model_fields_set and "funnel_id" in body.model_fields_set):
+        _check_funnel(db, org_id, body.funnel_id)
         row.funnel_id = body.funnel_id
     if body.lookback_days is not None:
         row.lookback_days = str(body.lookback_days)[:16]
@@ -161,7 +185,7 @@ def update_funnel_simulator_scenario(
 )
 def delete_funnel_simulator_scenario(
     scenario_id: UUID,
-    org_id: UUID = Depends(require_consulting_org_id),
+    org_id: UUID = Depends(require_org_id),
     db: Session = Depends(get_db),
 ):
     _ensure(db)
