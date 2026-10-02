@@ -143,6 +143,10 @@ def _loopback_match(allowed: str, actual: str) -> bool:
     return (a.hostname or "") in hosts and (b.hostname or "") in hosts
 
 
+CONFIDENTIAL_AUTH_METHODS = ("client_secret_post", "client_secret_basic")
+SUPPORTED_AUTH_METHODS = ("none",) + CONFIDENTIAL_AUTH_METHODS
+
+
 def register_client(
     db: Session,
     *,
@@ -150,9 +154,20 @@ def register_client(
     client_name: Optional[str] = None,
     token_endpoint_auth_method: str = "none",
     grant_types: Optional[list[str]] = None,
-) -> McpOAuthClient:
+) -> tuple[McpOAuthClient, Optional[str]]:
+    """
+    RFC 7591 registration. Public clients (Claude) use PKCE only; confidential clients
+    (e.g. ChatGPT asking for client_secret_post/basic) also get a secret, returned once
+    and stored Fernet-encrypted. Returns (client, raw_secret_or_None).
+    """
+    from app.core.encryption import encrypt_token
+
     if not redirect_uris:
         raise HTTPException(status_code=400, detail="redirect_uris required")
+    method = token_endpoint_auth_method or "none"
+    if method not in SUPPORTED_AUTH_METHODS:
+        raise HTTPException(status_code=400, detail=f"unsupported token_endpoint_auth_method: {method}")
+    raw_secret = secrets.token_urlsafe(32) if method in CONFIDENTIAL_AUTH_METHODS else None
     client_id = f"mcp_{secrets.token_urlsafe(24)}"
     row = McpOAuthClient(
         id=uuid.uuid4(),
@@ -160,12 +175,37 @@ def register_client(
         client_name=client_name,
         redirect_uris=list(redirect_uris),
         grant_types=grant_types or ["authorization_code", "refresh_token"],
-        token_endpoint_auth_method=token_endpoint_auth_method or "none",
+        token_endpoint_auth_method=method,
+        client_secret_encrypted=encrypt_token(raw_secret) if raw_secret else None,
     )
     db.add(row)
     db.commit()
     db.refresh(row)
-    return row
+    return row, raw_secret
+
+
+def verify_client_secret(client: McpOAuthClient, presented: Optional[str]) -> bool:
+    """Clients registered with a secret must present it; public clients rely on PKCE."""
+    from app.core.encryption import decrypt_token
+
+    if not client.client_secret_encrypted:
+        return True
+    if not presented:
+        return False
+    try:
+        expected = decrypt_token(client.client_secret_encrypted)
+    except Exception:
+        return False
+    return hmac.compare_digest(expected, presented)
+
+
+def client_display_name(db: Session, client_id: Optional[str]) -> str:
+    """Human name of the MCP client app for consent / org-picker copy."""
+    if client_id:
+        name = db.query(McpOAuthClient.client_name).filter(McpOAuthClient.client_id == client_id).scalar()
+        if name:
+            return str(name)
+    return "your AI assistant"
 
 
 def start_authorize(

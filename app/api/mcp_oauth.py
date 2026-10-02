@@ -1,5 +1,6 @@
 """
-OAuth 2.0 Authorization Server endpoints for the Claude MCP connector.
+OAuth 2.0 Authorization Server endpoints for the MCP connector (Claude, ChatGPT, any
+spec-compliant MCP client).
 
 Discovery:
   GET /.well-known/oauth-protected-resource
@@ -76,7 +77,7 @@ def _as_metadata() -> dict:
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "token_endpoint_auth_methods_supported": list(svc.SUPPORTED_AUTH_METHODS),
         "scopes_supported": svc.mcp_scopes() + ["offline_access"],
         "revocation_endpoint_auth_methods_supported": ["none"],
         "resource_indicators_supported": True,
@@ -110,10 +111,10 @@ def openid_configuration(path: str = ""):
 
 @router.get("/mcp/oauth/org-choices")
 def mcp_org_choices(select_token: str = Query(...), db: Session = Depends(get_db)):
-    """List Sweep orgs available for the in-progress Claude MCP Google OAuth."""
+    """List Sweep orgs available for the in-progress MCP Google OAuth."""
     data = _decode_mcp_select_token(select_token)
     # Ensure pending grant still exists
-    svc._pending_mcp_grant(db, data["mcp_nonce"])
+    grant = svc._pending_mcp_grant(db, data["mcp_nonce"])
     choices = svc.resolve_org_choices_for_google(
         db,
         google_id=data.get("google_id") or "",
@@ -121,6 +122,7 @@ def mcp_org_choices(select_token: str = Query(...), db: Session = Depends(get_db
     )
     return {
         "email": data["email"],
+        "client_name": svc.client_display_name(db, grant.client_id),
         "organizations": [
             {"id": c["org_id"], "name": c["org_name"], "role": c.get("role")} for c in choices
         ],
@@ -161,25 +163,33 @@ def dynamic_client_registration(body: DCRRequest, db: Session = Depends(get_db))
         body.client_name,
         body.redirect_uris,
     )
-    client = svc.register_client(
-        db,
-        redirect_uris=body.redirect_uris,
-        client_name=body.client_name,
-        token_endpoint_auth_method=body.token_endpoint_auth_method or "none",
-        grant_types=body.grant_types,
-    )
-    return JSONResponse(
-        status_code=201,
-        content={
-            "client_id": client.client_id,
-            "client_id_issued_at": int(client.created_at.timestamp()) if client.created_at else None,
-            "client_name": client.client_name,
-            "redirect_uris": client.redirect_uris,
-            "grant_types": client.grant_types,
-            "token_endpoint_auth_method": client.token_endpoint_auth_method,
-            "response_types": ["code"],
-        },
-    )
+    try:
+        client, raw_secret = svc.register_client(
+            db,
+            redirect_uris=body.redirect_uris,
+            client_name=body.client_name,
+            token_endpoint_auth_method=body.token_endpoint_auth_method or "none",
+            grant_types=body.grant_types,
+        )
+    except HTTPException as e:
+        # RFC 7591 §3.2.2 error shape
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_client_metadata", "error_description": str(e.detail)},
+        )
+    content = {
+        "client_id": client.client_id,
+        "client_id_issued_at": int(client.created_at.timestamp()) if client.created_at else None,
+        "client_name": client.client_name,
+        "redirect_uris": client.redirect_uris,
+        "grant_types": client.grant_types,
+        "token_endpoint_auth_method": client.token_endpoint_auth_method,
+        "response_types": ["code"],
+    }
+    if raw_secret:
+        content["client_secret"] = raw_secret
+        content["client_secret_expires_at"] = 0  # never
+    return JSONResponse(status_code=201, content=content)
 
 
 def _run_authorize(
@@ -281,6 +291,24 @@ async def authorize_post(
     )
 
 
+def _basic_client_credentials(request: Request) -> tuple[Optional[str], Optional[str]]:
+    """RFC 6749 §2.3.1 client_secret_basic: Authorization: Basic base64(id:secret)."""
+    import base64
+    from urllib.parse import unquote
+
+    auth = request.headers.get("authorization") or ""
+    if not auth.lower().startswith("basic "):
+        return None, None
+    try:
+        decoded = base64.b64decode(auth.split(" ", 1)[1].strip()).decode("utf-8")
+    except Exception:
+        return None, None
+    cid, sep, secret = decoded.partition(":")
+    if not sep:
+        return None, None
+    return unquote(cid) or None, unquote(secret) or None
+
+
 @router.post("/mcp/oauth/token")
 async def token(
     request: Request,
@@ -312,12 +340,21 @@ async def token(
         refresh_token = refresh_token or body.get("refresh_token")
         resource = resource or body.get("resource")
 
+    basic_id, basic_secret = _basic_client_credentials(request)
+    if basic_id:
+        if client_id and client_id != basic_id:
+            return JSONResponse(status_code=400, content={"error": "invalid_request", "error_description": "client_id mismatch"})
+        client_id = basic_id
+        client_secret = basic_secret
     if not client_id:
         return JSONResponse(status_code=400, content={"error": "invalid_request", "error_description": "client_id required"})
     try:
-        svc.get_or_reject_client(db, client_id)
+        client = svc.get_or_reject_client(db, client_id)
     except HTTPException:
-        return JSONResponse(status_code=400, content={"error": "invalid_client"})
+        return JSONResponse(status_code=401, content={"error": "invalid_client"})
+    if not svc.verify_client_secret(client, client_secret):
+        _logger.warning("mcp_oauth_token client authentication failed client_id=%s", client_id)
+        return JSONResponse(status_code=401, content={"error": "invalid_client"})
 
     _logger.info(
         "mcp_oauth_token grant_type=%s client_id=%s resource=%s has_code=%s has_refresh=%s",
