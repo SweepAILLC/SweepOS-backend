@@ -1,0 +1,30 @@
+{
+  "funnels": [
+    {
+      "_id": "fnl_vsl_001",
+      "locationId": "loc_test",
+      "name": "VSL Strategy Call",
+      "type": "funnel",
+      "url": "/vsl",
+      "domainId": "",
+      "steps": [
+        {"id": "step-thanks", "name": "Thank You", "pages": ["pg3"], "sequence": 3, "type": "optin_funnel_page", "url": "/vsl-thank-you"},
+        {"id": "step-optin", "name": "Opt-in", "pages": ["pg1"], "sequence": 1, "type": "optin_funnel_page", "url": "/VSL-Optin/"},
+        {"id": "step-book", "name": "Book a Call", "pages": ["pg2"], "sequence": 2, "type": "optin_funnel_page", "url": "/vsl-book"},
+        {"id": "step-draft", "name": "Draft (no url)", "pages": [], "sequence": 4, "type": "optin_funnel_page"}
+      ]
+    },
+    {
+      "_id": "fnl_webinar_002",
+      "locationId": "loc_test",
+      "name": "Webinar",
+      "type": "funnel",
+      "url": "/webinar",
+      "steps": [
+        {"id": "w1", "name": "Register", "pages": ["pw1"], "sequence": 1, "type": "optin_funnel_page", "url": "/webinar-register"}
+      ]
+    }
+  ],
+  "count": 2,
+  "traceId": "trace-test"
+}

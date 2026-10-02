@@ -24,6 +24,7 @@ from app.models.client import Client
 from app.schemas.funnel import (
     Funnel as FunnelSchema,
     FunnelCreate,
+    FunnelGhlPairIn,
     FunnelUpdate,
     FunnelWithSteps,
     FunnelStep as FunnelStepSchema,
@@ -75,12 +76,13 @@ def create_funnel(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Create a new funnel"""
+    """Create a new funnel. With source="ghl", pair it with a GoHighLevel funnel in
+    the same transaction (admin/owner only; see app.services.ghl_funnels)."""
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
     
     # CRITICAL: Set org_id from selected org (token)
-    funnel_dict = funnel_data.model_dump()
+    funnel_dict = funnel_data.model_dump(exclude={"source", "ghl_funnel_id"})
     funnel_dict['org_id'] = org_id
     
     # Verify client_id belongs to org if provided
@@ -94,12 +96,62 @@ def create_funnel(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Client not found"
             )
-    
+
+    if funnel_data.source == "ghl":
+        _require_integration_manager(current_user, db)
+        ghl_funnel = _fetch_ghl_funnel_or_raise(db, org_id, funnel_data.ghl_funnel_id, current_user.id)
+        funnel = Funnel(**funnel_dict)
+        db.add(funnel)
+        return _pair_or_raise(db, funnel, ghl_funnel)
+
     funnel = Funnel(**funnel_dict)
     db.add(funnel)
     db.commit()
     db.refresh(funnel)
     return funnel
+
+
+def _require_integration_manager(user: User, db: Session) -> None:
+    from app.services.org_user_context import user_can_manage_org_integrations
+
+    if not user_can_manage_org_integrations(user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or owner access required to pair a GoHighLevel funnel.",
+        )
+
+
+def _fetch_ghl_funnel_or_raise(db: Session, org_id, ghl_funnel_id: str, user_id) -> dict:
+    from app.services import ghl_client as gc
+    from app.services.ghl_funnels import GhlFunnelNotFoundError, fetch_ghl_funnel
+
+    try:
+        return fetch_ghl_funnel(db, org_id, ghl_funnel_id, user_id=user_id)
+    except gc.GhlNotConnectedError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Connect GoHighLevel first.") from e
+    except GhlFunnelNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except gc.GhlApiError as e:
+        # A GHL 401 must not read as our own session expiring (same rule as app.api.ghl).
+        code = status.HTTP_400_BAD_REQUEST if e.status_code == 401 else status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(status_code=code, detail="GoHighLevel request failed. Check the GHL connection.") from e
+
+
+def _pair_or_raise(db: Session, funnel: Funnel, ghl_funnel: dict) -> Funnel:
+    from app.services.ghl_funnels import GhlFunnelAlreadyPairedError, pair_funnel_with_ghl
+
+    try:
+        return pair_funnel_with_ghl(db, funnel, ghl_funnel)
+    except GhlFunnelAlreadyPairedError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": f"This GoHighLevel funnel is already paired to '{e.funnel.name}'.",
+                "paired_funnel_id": str(e.funnel.id),
+                "paired_funnel_name": e.funnel.name,
+            },
+        ) from e
 
 
 # --- Funnels dashboard + weekly ad spend (PRD phase 8) ---------------------
@@ -299,6 +351,40 @@ def update_funnel(
     db.commit()
     db.refresh(funnel)
     return funnel
+
+
+@router.post("/{funnel_id}/ghl/pair", response_model=FunnelSchema)
+def pair_funnel_ghl(
+    funnel_id: UUID,
+    body: FunnelGhlPairIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pair an existing funnel with a GoHighLevel funnel (admin/owner)."""
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    _require_integration_manager(current_user, db)
+    funnel = db.query(Funnel).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not funnel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+    ghl_funnel = _fetch_ghl_funnel_or_raise(db, org_id, body.ghl_funnel_id, current_user.id)
+    return _pair_or_raise(db, funnel, ghl_funnel)
+
+
+@router.delete("/{funnel_id}/ghl/pair", response_model=FunnelSchema)
+def unpair_funnel_ghl(
+    funnel_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Unpair from GoHighLevel (admin/owner). Already-tagged leads keep their funnel."""
+    from app.services.ghl_funnels import unpair_funnel
+
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    _require_integration_manager(current_user, db)
+    funnel = db.query(Funnel).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not funnel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+    return unpair_funnel(db, funnel)
 
 
 @router.delete("/{funnel_id}", status_code=status.HTTP_204_NO_CONTENT)

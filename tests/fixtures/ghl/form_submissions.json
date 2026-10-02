@@ -1,0 +1,49 @@
+{
+  "submissions": [
+    {
+      "id": "sub_001",
+      "contactId": "ct_001",
+      "createdAt": "2026-09-14T16:30:00.000Z",
+      "formId": "form_optin",
+      "name": "Ada Lovelace",
+      "email": "ada@example.com",
+      "others": {
+        "__submissions_other_field__": "ada@example.com",
+        "__custom_field_id__": "20",
+        "first_name": "Ada",
+        "last_name": "Lovelace",
+        "phone": "+15550100001",
+        "email": "ada@example.com",
+        "monthly_revenue": "$10k-$25k",
+        "eventData": {
+          "fbc": "fb.1.123.456",
+          "page": {"url": "https://go.example-coach.com/vsl-optin?utm_source=facebook&utm_medium=paid&utm_campaign=sept", "title": "Opt-in"},
+          "type": "page-visit",
+          "domain": "go.example-coach.com",
+          "medium": "form",
+          "source": "Paid Social",
+          "adSource": "facebook",
+          "referrer": "https://l.facebook.com/",
+          "timestamp": 1789403400
+        },
+        "fieldsOriSequance": ["full_name", "first_name", "last_name", "phone", "email"]
+      }
+    },
+    {
+      "id": "sub_002",
+      "contactId": "ct_002",
+      "createdAt": "2026-09-14T18:00:00.000Z",
+      "formId": "form_popup",
+      "name": "Grace Hopper",
+      "email": "grace@example.com",
+      "others": {
+        "eventData": {
+          "page": {"url": "https://example-coach.com/blog/post", "title": "Blog"},
+          "medium": "form",
+          "source": "Organic Search"
+        }
+      }
+    }
+  ],
+  "meta": {"total": 2, "currentPage": 1, "nextPage": null, "prevPage": null}
+}

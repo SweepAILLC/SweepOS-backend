@@ -20,10 +20,11 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.calendar_webhooks import (
     _parse_iso_datetime,
@@ -133,6 +134,18 @@ def _ingest_and_process_ghl(db: Session, org_uuid: uuid.UUID, body: Dict[str, An
         raise
 
 
+def _stamp_ghl_contact_id(client: Any, contact_id: Optional[str]) -> None:
+    """Remember the GHL contact id so funnel lead intake can match this person even
+    when the opt-in carries a different email. Never overwrites an existing id."""
+    if not contact_id:
+        return
+    meta = client.meta if isinstance(client.meta, dict) else {}
+    if meta.get("ghl_contact_id"):
+        return
+    client.meta = {**meta, "ghl_contact_id": contact_id}
+    flag_modified(client, "meta")
+
+
 def _process_ghl_appointment_event(
     db: Session,
     org_uuid: uuid.UUID,
@@ -159,6 +172,8 @@ def _process_ghl_appointment_event(
         client = None
     if not client:
         return {"ok": True, "skipped": True, "reason": "no_matching_client"}
+    if not use_placeholder:
+        _stamp_ghl_contact_id(client, event.get("contact_id"))
 
     _, is_new = _upsert_check_in(
         db,

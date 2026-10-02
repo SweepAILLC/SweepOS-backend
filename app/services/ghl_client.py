@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 from sqlalchemy.orm import Session
@@ -25,6 +27,8 @@ LOG = logging.getLogger(__name__)
 GHL_API_BASE = "https://services.leadconnectorhq.com"
 GHL_API_VERSION = "2021-07-28"
 GHL_CONTACTS_PAGE_SIZE = 100
+GHL_FUNNELS_PAGE_SIZE = 50
+GHL_SUBMISSIONS_PAGE_SIZE = 100  # API max
 _REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
 
 
@@ -277,14 +281,217 @@ def normalize_ghl_appointment_event(payload: Dict[str, Any]) -> Optional[Dict[st
     raw_status = str(appointment.get("appointmentStatus") or appointment.get("status") or "").strip().lower()
     cancelled = raw_status in _GHL_CANCELLED_STATUSES or event_type.lower().endswith("delete")
 
+    contact_id = str(contact.get("id") or appointment.get("contactId") or payload.get("contact_id") or "").strip() or None
+
     return {
         "event_type": event_type,
         "event_id": event_id,
         "calendar_id": calendar_id,
+        "contact_id": contact_id,
         "title": (appointment.get("title") or "").strip() or None,
         "start_time": appointment.get("startTime"),
         "end_time": appointment.get("endTime"),
         "attendee_email": attendee_email,
         "attendee_name": attendee_name,
         "cancelled": cancelled,
+    }
+
+
+# --- Funnels + form/survey submissions (GHL-paired Sweep funnels) -------------------
+
+
+def normalize_funnel_path(raw: Any) -> Optional[str]:
+    """Path key shared by GHL step urls, submission page urls and the visitor snippet:
+    lowercase, leading slash, no trailing slash, no query. Full URLs are reduced to
+    their path, so custom domains and the GHL preview domain compare equal."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    path = urlsplit(text).path if "://" in text else text.split("?", 1)[0].split("#", 1)[0]
+    path = "/" + path.strip().strip("/").lower()
+    return path
+
+
+def normalize_ghl_funnel(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """GHL funnel list item -> {ghl_funnel_id, name, path, steps[{id, name, path, sequence, type}]}.
+    Steps are sorted by GHL's sequence; steps without a url are dropped."""
+    funnel_id = str(raw.get("_id") or raw.get("id") or "").strip()
+    if not funnel_id:
+        return None
+    steps: List[Dict[str, Any]] = []
+    for step in raw.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        path = normalize_funnel_path(step.get("url"))
+        if not path:
+            continue
+        try:
+            sequence = int(step.get("sequence"))
+        except (TypeError, ValueError):
+            sequence = len(steps) + 1
+        steps.append(
+            {
+                "id": str(step.get("id") or "") or None,
+                "name": (str(step.get("name") or "").strip() or None),
+                "path": path,
+                "sequence": sequence,
+                "type": step.get("type"),
+            }
+        )
+    steps.sort(key=lambda s: s["sequence"])
+    return {
+        "ghl_funnel_id": funnel_id,
+        "name": (str(raw.get("name") or "").strip() or "Untitled GHL funnel"),
+        "path": normalize_funnel_path(raw.get("url")),
+        "steps": steps,
+    }
+
+
+def list_ghl_funnels(headers: Dict[str, str], location_id: str) -> List[Dict[str, Any]]:
+    """Every funnel in the location, normalized (see normalize_ghl_funnel)."""
+    out: List[Dict[str, Any]] = []
+    offset = 0
+    with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+        while True:
+            resp = client.get(
+                f"{GHL_API_BASE}/funnels/funnel/list",
+                headers=headers,
+                params={"locationId": location_id, "limit": GHL_FUNNELS_PAGE_SIZE, "offset": offset},
+            )
+            _raise_for_status(resp, action="list funnels")
+            data = resp.json() if resp.content else {}
+            items = data.get("funnels") if isinstance(data, dict) else None
+            if isinstance(items, dict):  # docs show a single object; accept both shapes
+                items = [items]
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                if isinstance(item, dict):
+                    norm = normalize_ghl_funnel(item)
+                    if norm:
+                        out.append(norm)
+            total = data.get("count") if isinstance(data, dict) else None
+            offset += len(items)
+            if len(items) < GHL_FUNNELS_PAGE_SIZE or (isinstance(total, int) and offset >= total):
+                break
+    return out
+
+
+def _iter_submissions(
+    headers: Dict[str, str],
+    location_id: str,
+    *,
+    kind: str,
+    start: date,
+    end: date,
+) -> Iterator[Dict[str, Any]]:
+    """Page through /forms/submissions or /surveys/submissions for [start, end] (whole days)."""
+    page = 1
+    with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+        while True:
+            resp = client.get(
+                f"{GHL_API_BASE}/{kind}/submissions",
+                headers=headers,
+                params={
+                    "locationId": location_id,
+                    "page": page,
+                    "limit": GHL_SUBMISSIONS_PAGE_SIZE,
+                    "startAt": start.isoformat(),
+                    "endAt": end.isoformat(),
+                },
+            )
+            _raise_for_status(resp, action=f"list {kind} submissions")
+            data = resp.json() if resp.content else {}
+            rows = data.get("submissions") if isinstance(data, dict) else None
+            if not isinstance(rows, list) or not rows:
+                return
+            for row in rows:
+                if isinstance(row, dict):
+                    yield row
+            meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+            next_page = meta.get("nextPage")
+            if not next_page or len(rows) < GHL_SUBMISSIONS_PAGE_SIZE:
+                return
+            page = int(next_page)
+
+
+def iter_ghl_form_submissions(headers: Dict[str, str], location_id: str, start: date, end: date) -> Iterator[Dict[str, Any]]:
+    return _iter_submissions(headers, location_id, kind="forms", start=start, end=end)
+
+
+def iter_ghl_survey_submissions(headers: Dict[str, str], location_id: str, start: date, end: date) -> Iterator[Dict[str, Any]]:
+    return _iter_submissions(headers, location_id, kind="surveys", start=start, end=end)
+
+
+# Keys in a submission's `others` that are GHL plumbing or identity, not answers.
+_SUBMISSION_META_KEYS = frozenset(
+    {"eventData", "fieldsOriSequance", "fieldsOriSequence", "full_name", "first_name", "last_name", "email", "phone"}
+)
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def normalize_ghl_submission(raw: Dict[str, Any], kind: str) -> Optional[Dict[str, Any]]:
+    """Form/survey submission -> the fields lead intake needs. None when it has no id.
+
+    `utm_raw` holds utm_* params from the page URL, falling back to GHL's own
+    source/medium; callers run it through app.api.funnels.normalize_utm.
+    """
+    submission_id = str(raw.get("id") or "").strip()
+    if not submission_id:
+        return None
+    others = raw.get("others") if isinstance(raw.get("others"), dict) else {}
+    event = others.get("eventData") if isinstance(others.get("eventData"), dict) else {}
+    page = event.get("page") if isinstance(event.get("page"), dict) else {}
+    page_url = str(page.get("url") or event.get("url") or "").strip() or None
+
+    utm_raw: Dict[str, str] = {}
+    if page_url:
+        query = parse_qs(urlsplit(page_url).query)
+        for key in ("source", "medium", "campaign", "term", "content"):
+            val = (query.get(f"utm_{key}") or [None])[0]
+            if val:
+                utm_raw[key] = val
+    if not utm_raw:
+        for key in ("source", "medium"):
+            val = str(event.get(key) or "").strip()
+            if val:
+                utm_raw[key] = val
+
+    def _s(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        return str(value).strip() or None
+
+    answers = {
+        k: v
+        for k, v in others.items()
+        if k not in _SUBMISSION_META_KEYS and not (k.startswith("__") and k.endswith("__"))
+    }
+    return {
+        "submission_id": submission_id,
+        "kind": kind,
+        "contact_id": _s(raw.get("contactId")),
+        "form_id": _s(raw.get("formId") or raw.get("surveyId")),
+        "created_at": _parse_iso(raw.get("createdAt")),
+        "email": _s(raw.get("email") or others.get("email")),
+        "phone": _s(others.get("phone") or raw.get("phone")),
+        "name": _s(raw.get("name") or others.get("full_name")),
+        "first_name": _s(others.get("first_name")),
+        "last_name": _s(others.get("last_name")),
+        "page_url": page_url,
+        "page_path": normalize_funnel_path(page_url),
+        "referrer": _s(event.get("referrer")),
+        "ad_source": _s(event.get("adSource")),
+        "utm_raw": utm_raw,
+        "answers": answers,
     }

@@ -161,6 +161,42 @@ def list_calendars(
     }
 
 
+@router.get("/funnels")
+def list_funnels(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """GHL funnels in the connected location, for the funnel-create picker. Each item
+    says which Sweep funnel (if any) in this org is already paired to it."""
+    from app.services.ghl_funnels import paired_funnels_by_ghl_id
+
+    org_id = _org_id(current_user)
+    try:
+        headers, location_id = gc.get_ghl_connection(db, org_id, user_id=current_user.id)
+    except gc.GhlNotConnectedError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    try:
+        funnels = gc.list_ghl_funnels(headers, location_id)
+    except gc.GhlApiError as e:
+        raise HTTPException(status_code=_upstream_status(e), detail=str(e)) from e
+
+    paired = paired_funnels_by_ghl_id(db, org_id)
+    return {
+        "funnels": [
+            {
+                "id": f["ghl_funnel_id"],
+                "name": f["name"],
+                "path": f["path"],
+                "steps": [{"name": s["name"], "path": s["path"]} for s in f["steps"]],
+                "paired_funnel_id": str(paired[f["ghl_funnel_id"]].id) if f["ghl_funnel_id"] in paired else None,
+                "paired_funnel_name": paired[f["ghl_funnel_id"]].name if f["ghl_funnel_id"] in paired else None,
+            }
+            for f in funnels
+        ]
+    }
+
+
 @router.put("/calendars/sync-settings")
 def upsert_calendar_sync_setting(
     body: GhlCalendarSyncSettingIn,
