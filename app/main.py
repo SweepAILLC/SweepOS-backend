@@ -255,6 +255,12 @@ def _ensure_schema_columns_on_startup() -> None:
         _add_column_if_missing("organizations", "consulting_tier", "VARCHAR")
         _add_column_if_missing("organizations", "booking_url", "TEXT")
         _add_column_if_missing("organizations", "close_form_token", "UUID")
+
+        # GHL-paired funnels (migration 097). Columns only, so the app boots before the
+        # migration runs; 097 adds the pairing/contact-id indexes and is idempotent.
+        _add_column_if_missing("funnels", "source", "VARCHAR(16)")
+        _add_column_if_missing("funnels", "ghl_config", "JSONB")
+        _add_column_if_missing("clients", "opted_in_at", "TIMESTAMP WITH TIME ZONE")
         try:
             db.execute(text("SET LOCAL lock_timeout = '3s'"))
             db.execute(
