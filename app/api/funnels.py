@@ -24,6 +24,8 @@ from app.models.client import Client
 from app.schemas.funnel import (
     Funnel as FunnelSchema,
     FunnelCreate,
+    FunnelGhlExtraFormsIn,
+    FunnelGhlPairIn,
     FunnelUpdate,
     FunnelWithSteps,
     FunnelStep as FunnelStepSchema,
@@ -44,9 +46,6 @@ from app.schemas.funnel import (
     FunnelAdSpendRead,
     FunnelDashboardResponse,
 )
-from app.models.client import find_client_by_email, find_client_by_phone
-from app.models.client import LifecycleState
-from app.services.health_score_cache_service import invalidate_health_score_cache
 from sqlalchemy.orm.attributes import flag_modified
 
 router = APIRouter()
@@ -78,12 +77,13 @@ def create_funnel(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Create a new funnel"""
+    """Create a new funnel. With source="ghl", pair it with a GoHighLevel funnel in
+    the same transaction (admin/owner only; see app.services.ghl_funnels)."""
     # Get selected org_id from user object (set by get_current_user)
     org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
     
     # CRITICAL: Set org_id from selected org (token)
-    funnel_dict = funnel_data.model_dump()
+    funnel_dict = funnel_data.model_dump(exclude={"source", "ghl_funnel_id"})
     funnel_dict['org_id'] = org_id
     
     # Verify client_id belongs to org if provided
@@ -97,12 +97,62 @@ def create_funnel(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Client not found"
             )
-    
+
+    if funnel_data.source == "ghl":
+        _require_integration_manager(current_user, db)
+        ghl_funnel = _fetch_ghl_funnel_or_raise(db, org_id, funnel_data.ghl_funnel_id, current_user.id)
+        funnel = Funnel(**funnel_dict)
+        db.add(funnel)
+        return _pair_or_raise(db, funnel, ghl_funnel)
+
     funnel = Funnel(**funnel_dict)
     db.add(funnel)
     db.commit()
     db.refresh(funnel)
     return funnel
+
+
+def _require_integration_manager(user: User, db: Session) -> None:
+    from app.services.org_user_context import user_can_manage_org_integrations
+
+    if not user_can_manage_org_integrations(user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or owner access required to pair a GoHighLevel funnel.",
+        )
+
+
+def _fetch_ghl_funnel_or_raise(db: Session, org_id, ghl_funnel_id: str, user_id) -> dict:
+    from app.services import ghl_client as gc
+    from app.services.ghl_funnels import GhlFunnelNotFoundError, fetch_ghl_funnel
+
+    try:
+        return fetch_ghl_funnel(db, org_id, ghl_funnel_id, user_id=user_id)
+    except gc.GhlNotConnectedError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Connect GoHighLevel first.") from e
+    except GhlFunnelNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except gc.GhlApiError as e:
+        # A GHL 401 must not read as our own session expiring (same rule as app.api.ghl).
+        code = status.HTTP_400_BAD_REQUEST if e.status_code == 401 else status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(status_code=code, detail="GoHighLevel request failed. Check the GHL connection.") from e
+
+
+def _pair_or_raise(db: Session, funnel: Funnel, ghl_funnel: dict) -> Funnel:
+    from app.services.ghl_funnels import GhlFunnelAlreadyPairedError, pair_funnel_with_ghl
+
+    try:
+        return pair_funnel_with_ghl(db, funnel, ghl_funnel)
+    except GhlFunnelAlreadyPairedError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": f"This GoHighLevel funnel is already paired to '{e.funnel.name}'.",
+                "paired_funnel_id": str(e.funnel.id),
+                "paired_funnel_name": e.funnel.name,
+            },
+        ) from e
 
 
 # --- Funnels dashboard + weekly ad spend (PRD phase 8) ---------------------
@@ -302,6 +352,84 @@ def update_funnel(
     db.commit()
     db.refresh(funnel)
     return funnel
+
+
+@router.post("/{funnel_id}/ghl/pair", response_model=FunnelSchema)
+def pair_funnel_ghl(
+    funnel_id: UUID,
+    body: FunnelGhlPairIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Pair an existing funnel with a GoHighLevel funnel (admin/owner)."""
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    _require_integration_manager(current_user, db)
+    funnel = db.query(Funnel).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not funnel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+    ghl_funnel = _fetch_ghl_funnel_or_raise(db, org_id, body.ghl_funnel_id, current_user.id)
+    return _pair_or_raise(db, funnel, ghl_funnel)
+
+
+@router.post("/{funnel_id}/ghl/sync", status_code=status.HTTP_202_ACCEPTED)
+def sync_funnel_ghl_leads(
+    funnel_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Run the GHL lead reconcile pull for this org now (admin/owner). One pull covers
+    every GHL-paired funnel in the org; progress lands in ghl_config.sync."""
+    from app.long_jobs import schedule_background_work
+    from app.services.ghl_funnels import GHL_SOURCE
+    from app.services.ghl_lead_sync import run_ghl_lead_sync_job
+
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    _require_integration_manager(current_user, db)
+    funnel = db.query(Funnel).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not funnel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+    if funnel.source != GHL_SOURCE:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Funnel is not paired with GoHighLevel")
+    schedule_background_work(run_ghl_lead_sync_job, None, str(org_id), job_timeout=1800)
+    return {"started": True}
+
+
+@router.put("/{funnel_id}/ghl/extra-forms", response_model=FunnelSchema)
+def set_funnel_ghl_extra_forms(
+    funnel_id: UUID,
+    body: FunnelGhlExtraFormsIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Forms outside the funnel's pages whose submissions count as this funnel's
+    opt-ins (admin/owner). Takes effect on the next lead pull."""
+    from app.services.ghl_funnels import GHL_SOURCE, set_extra_form_ids
+
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    _require_integration_manager(current_user, db)
+    funnel = db.query(Funnel).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not funnel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+    if funnel.source != GHL_SOURCE:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Funnel is not paired with GoHighLevel")
+    return set_extra_form_ids(db, funnel, body.form_ids)
+
+
+@router.delete("/{funnel_id}/ghl/pair", response_model=FunnelSchema)
+def unpair_funnel_ghl(
+    funnel_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Unpair from GoHighLevel (admin/owner). Already-tagged leads keep their funnel."""
+    from app.services.ghl_funnels import unpair_funnel
+
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    _require_integration_manager(current_user, db)
+    funnel = db.query(Funnel).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not funnel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+    return unpair_funnel(db, funnel)
 
 
 @router.delete("/{funnel_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -638,158 +766,27 @@ def create_lead_from_funnel(
     Clients appear on the Client Board in Sweep OS.
 
     Dedupes by email first, then by phone (digits-normalized) within the org.
+    Shared with GHL lead intake via app.services.funnel_leads.upsert_funnel_lead.
     """
+    from app.services.funnel_leads import upsert_funnel_lead
+
     funnel = db.query(Funnel).filter(Funnel.id == lead_data.funnel_id).first()
     if not funnel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Funnel not found"
         )
-    org_id = funnel.org_id
-
-    # Normalize name: use 'name' or first_name/last_name
-    first_name = lead_data.first_name
-    last_name = lead_data.last_name
-    if lead_data.name and isinstance(lead_data.name, str) and lead_data.name.strip():
-        parts = lead_data.name.strip().split(None, 1)
-        first_name = first_name or parts[0]
-        last_name = last_name if last_name is not None else (parts[1] if len(parts) > 1 else None)
-    email = (lead_data.email or "").strip() or None
-    phone = (lead_data.phone or "").strip() or None
-    instagram = (lead_data.instagram or "").strip() or None
-    notes = (lead_data.notes or "").strip() or None
-
-    client = None
-    if email:
-        client = find_client_by_email(db, org_id, email)
-    if client is None and phone:
-        client = find_client_by_phone(db, org_id, phone)
-
-    lead_utm = _resolve_lead_utm(db, org_id, lead_data)
-
-    def _apply_prospect_meta(c: Client) -> None:
-        # Always stamp funnel_id + captured_at so the Leads tab can list every capture.
-        meta = c.meta if isinstance(c.meta, dict) else {}
-        prev = meta.get("prospect") if isinstance(meta.get("prospect"), dict) else {}
-        prospect = {
-            **prev,
-            "funnel_id": str(lead_data.funnel_id),
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if lead_data.source is not None:
-            prospect["source"] = lead_data.source
-        if lead_data.quiz_answers is not None:
-            prospect["quiz_answers"] = lead_data.quiz_answers or {}
-        if lead_data.opt_in_data is not None:
-            prospect["opt_in_data"] = lead_data.opt_in_data or {}
-        if lead_data.funnel_step_reached is not None:
-            prospect["funnel_step_reached"] = lead_data.funnel_step_reached
-        if lead_utm:
-            prospect["utm"] = lead_utm
-        meta = {**meta, "prospect": prospect}
-        c.meta = meta
-        flag_modified(c, "meta")
-
-    if client:
-        # Update existing client with provided fields
-        if first_name is not None and first_name:
-            client.first_name = first_name
-        if last_name is not None:
-            client.last_name = last_name
-        if email and (not client.email or not str(client.email).strip()):
-            client.email = email
-        if phone is not None and phone:
-            client.phone = phone
-        if instagram is not None and instagram:
-            client.instagram = instagram
-        if notes is not None and notes:
-            client.notes = (client.notes or "").strip() + ("\n\n" + notes if (client.notes or "").strip() else notes)
-        _apply_prospect_meta(client)
-        # First-touch attribution: never overwrite a known channel, but a legacy
-        # row with no channel on record (pre-091) takes this funnel as its source.
-        if client.source_channel is None:
-            client.source_channel = "paid"
-            client.source_funnel_id = funnel.id
-        from app.services.client_automation import apply_funnel_lead_lifecycle, apply_automatic_lifecycle_for_client
-
-        apply_funnel_lead_lifecycle(client)
-        client.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(client)
-        try:
-            apply_automatic_lifecycle_for_client(db, client)
-            db.commit()
-            db.refresh(client)
-        except Exception as lc_err:
-            print(f"[FUNNEL LEAD] lifecycle reconcile skipped for {client.id}: {lc_err}")
-            from app.services.integration_side_effects import emit_automation_failure_discord
-            emit_automation_failure_discord(
-                org_id=org_id,
-                where="funnels.apply_automatic_lifecycle_for_client",
-                error=lc_err,
-                client_id=client.id,
-            )
-        invalidate_health_score_cache(db, client.id, org_id)
-        try:
-            from app.services.funnel_lead_notifications import enqueue_funnel_lead_notification
-
-            enqueue_funnel_lead_notification(
-                db,
-                org_id=org_id,
-                client=client,
-                funnel=funnel,
-                lead=lead_data,
-                is_new_client=False,
-            )
-        except Exception as e:
-            print(f"[FUNNEL LEAD] notification enqueue skipped: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        return FunnelLeadResponse(client_id=client.id, created=False, message="Client updated")
-    else:
-        # Create new client (require at least email or name for a useful record)
-        if not email and not first_name and not last_name and not phone and not instagram:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="At least one of email, name, phone, or instagram is required"
-            )
-        client = Client(
-            org_id=org_id,
-            email=email or None,
-            first_name=first_name or None,
-            last_name=last_name or None,
-            phone=phone or None,
-            instagram=instagram or None,
-            notes=notes or None,
-            lifecycle_state=LifecycleState.QUALIFIED,
-            source_channel="paid",
-            source_funnel_id=funnel.id,
-        )
-        _apply_prospect_meta(client)
-        db.add(client)
-        db.commit()
-        db.refresh(client)
-        invalidate_health_score_cache(db, client.id, org_id)
-        try:
-            from app.services.funnel_lead_notifications import enqueue_funnel_lead_notification
-
-            enqueue_funnel_lead_notification(
-                db,
-                org_id=org_id,
-                client=client,
-                funnel=funnel,
-                lead=lead_data,
-                is_new_client=True,
-            )
-        except Exception as e:
-            print(f"[FUNNEL LEAD] notification enqueue skipped: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        return FunnelLeadResponse(client_id=client.id, created=True, message="Client created")
+    result = upsert_funnel_lead(
+        db,
+        funnel,
+        lead_data,
+        utm=_resolve_lead_utm(db, funnel.org_id, lead_data),
+    )
+    return FunnelLeadResponse(
+        client_id=result.client.id,
+        created=result.created,
+        message="Client created" if result.created else "Client updated",
+    )
 
 
 def _enrich_and_process_event(db: Session, event: Event, org_id: UUID):

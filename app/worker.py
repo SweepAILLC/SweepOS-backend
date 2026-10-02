@@ -114,6 +114,7 @@ def _dispatcher_loop() -> None:
     last_stripe_catchup = 0.0
     last_calendar_catchup = 0.0
     last_whop_catchup = 0.0
+    last_ghl_lead_catchup = 0.0
     # Catch-ups run off-thread (calendar sync can take a while); never overlap one with itself.
     catchup_running: dict = {}
 
@@ -148,6 +149,9 @@ def _dispatcher_loop() -> None:
     )
     calendar_catchup_interval = float(getattr(settings, "CALENDAR_CATCHUP_INTERVAL_SEC", 300) or 0)
     whop_catchup_interval = float(getattr(settings, "WHOP_CATCHUP_INTERVAL_SEC", 300) or 0)
+    # Checks which orgs are due; per-org cadence (15 min, or daily with a live webhook)
+    # lives in ghl_lead_sync.is_due.
+    ghl_lead_check_interval = 60.0
     # Check hourly for due orgs; per-org freshness still uses INSTAGRAM_SYNC_INTERVAL_SEC.
     instagram_sync_check_interval = float(
         getattr(settings, "INSTAGRAM_SYNC_CHECK_INTERVAL_SEC", 3600) or 3600
@@ -251,6 +255,11 @@ def _dispatcher_loop() -> None:
 
                     _run_catchup_async("whop", catchup_whop_for_all_orgs)
                     last_whop_catchup = now
+                if now - last_ghl_lead_catchup >= ghl_lead_check_interval:
+                    from app.services.ghl_lead_sync import catchup_ghl_leads_for_all_orgs
+
+                    _run_catchup_async("ghl_leads", catchup_ghl_leads_for_all_orgs)
+                    last_ghl_lead_catchup = now
                 if (
                     instagram_sync_check_interval > 0
                     and now - last_instagram_sync >= instagram_sync_check_interval

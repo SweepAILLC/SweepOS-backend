@@ -113,6 +113,9 @@ class Client(Base):
     # sets both when the client came from a tracked funnel), not asked for later.
     source_channel = Column(String, nullable=True, default="organic")  # "organic" | "paid"
     source_funnel_id = Column(UUID(as_uuid=True), ForeignKey("funnels.id"), nullable=True)
+    # When the lead opted in, if later than created_at (GHL sync, re-attribution).
+    # Funnel opt-in counts use coalesce(opted_in_at, created_at).
+    opted_in_at = Column(DateTime(timezone=True), nullable=True)
     last_activity_at = Column(DateTime, nullable=True)
     stripe_customer_id = Column(String, nullable=True, index=True)
     estimated_mrr = Column(Numeric(10, 2), default=0, nullable=False)

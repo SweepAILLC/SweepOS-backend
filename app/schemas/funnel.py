@@ -1,7 +1,7 @@
 import json
 
 from pydantic import BaseModel, Field, model_validator
-from typing import List, Optional, Dict, Any
+from typing import List, Literal, Optional, Dict, Any
 from datetime import date, datetime
 from uuid import UUID
 
@@ -42,7 +42,29 @@ class FunnelBase(BaseModel):
 
 
 class FunnelCreate(FunnelBase):
-    pass
+    # "ghl" pairs the new funnel with a GoHighLevel funnel (ghl_funnel_id required).
+    source: Optional[Literal["sweep", "ghl"]] = None
+    ghl_funnel_id: Optional[str] = Field(default=None, min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def _ghl_needs_funnel_id(self):
+        if self.source == "ghl" and not self.ghl_funnel_id:
+            raise ValueError("ghl_funnel_id is required when source is 'ghl'")
+        return self
+
+
+class FunnelGhlPairIn(BaseModel):
+    ghl_funnel_id: str = Field(..., min_length=1, max_length=255)
+
+
+class FunnelGhlExtraFormsIn(BaseModel):
+    form_ids: List[str] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def _ids_are_short(self):
+        if any(len(f) > 255 for f in self.form_ids):
+            raise ValueError("form ids must be at most 255 characters")
+        return self
 
 
 class FunnelUpdate(BaseModel):
@@ -56,6 +78,8 @@ class FunnelUpdate(BaseModel):
 class Funnel(FunnelBase):
     id: UUID
     org_id: UUID
+    source: Optional[str] = None
+    ghl_config: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
     steps: List[FunnelStep] = []

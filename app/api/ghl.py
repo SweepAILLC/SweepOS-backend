@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -39,6 +39,13 @@ class GhlStatusResponse(BaseModel):
     last_sync_at: Optional[str] = None
     needs_reconnect: bool = False
     message: Optional[str] = None
+    webhook_secret_set: bool = False
+    missing_scopes: List[str] = Field(default_factory=list)
+
+
+class GhlWebhookSecretResponse(BaseModel):
+    secret: str
+    header: str = "x-ghl-webhook-secret"
 
 
 class GhlSyncResponse(BaseModel):
@@ -78,7 +85,7 @@ def connect_ghl(
 
     # Verify against GHL before persisting — a bad key must never silently save as "connected".
     try:
-        gc.verify_ghl_connection(
+        granted = gc.verify_ghl_connection(
             {
                 "Authorization": f"Bearer {api_key}",
                 "Version": gc.GHL_API_VERSION,
@@ -97,7 +104,17 @@ def connect_ghl(
     except gc.GhlConfigError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
-    return GhlStatusResponse(connected=True, location_id=row.account_id)
+    missing = sorted(scope for scope, ok in granted.items() if not ok)
+    return GhlStatusResponse(
+        connected=True,
+        location_id=row.account_id,
+        missing_scopes=missing,
+        message=(
+            "Connected. Add these scopes to the private integration for every feature to work: " + ", ".join(missing)
+            if missing
+            else None
+        ),
+    )
 
 
 @router.delete("/disconnect")
@@ -124,7 +141,28 @@ def get_ghl_status(
         connected=True,
         location_id=token_row.account_id,
         last_sync_at=token_row.last_sync_at.isoformat() if token_row.last_sync_at else None,
+        webhook_secret_set=bool(token_row.webhook_secret),
     )
+
+
+@router.post("/webhook-secret", response_model=GhlWebhookSecretResponse)
+def rotate_webhook_secret(
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """Generate (or rotate) the org's GHL webhook secret. Shown once: the client pastes
+    it as the `x-ghl-webhook-secret` header on every GHL Workflow Webhook action.
+    Rotating invalidates the old value immediately."""
+    import secrets
+
+    org_id = _org_id(current_user)
+    secret = secrets.token_urlsafe(32)
+    if gc.set_ghl_webhook_secret(db, org_id, secret) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Connect GoHighLevel first.")
+    logger.info("ghl webhook secret rotated org=%s by user=%s", org_id, current_user.id)
+    response.headers["Cache-Control"] = "no-store"
+    return GhlWebhookSecretResponse(secret=secret)
 
 
 @router.get("/calendars")
@@ -157,6 +195,59 @@ def list_calendars(
             }
             for c in calendars
             if isinstance(c, dict) and c.get("id")
+        ]
+    }
+
+
+@router.get("/forms")
+def list_forms(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """GHL forms + surveys in the connected location, for a funnel's extra-forms picker."""
+    org_id = _org_id(current_user)
+    try:
+        headers, location_id = gc.get_ghl_connection(db, org_id, user_id=current_user.id)
+    except gc.GhlNotConnectedError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    try:
+        return {"forms": gc.list_ghl_forms_and_surveys(headers, location_id)}
+    except gc.GhlApiError as e:
+        raise HTTPException(status_code=_upstream_status(e), detail=str(e)) from e
+
+
+@router.get("/funnels")
+def list_funnels(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """GHL funnels in the connected location, for the funnel-create picker. Each item
+    says which Sweep funnel (if any) in this org is already paired to it."""
+    from app.services.ghl_funnels import paired_funnels_by_ghl_id
+
+    org_id = _org_id(current_user)
+    try:
+        headers, location_id = gc.get_ghl_connection(db, org_id, user_id=current_user.id)
+    except gc.GhlNotConnectedError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    try:
+        funnels = gc.list_ghl_funnels(headers, location_id)
+    except gc.GhlApiError as e:
+        raise HTTPException(status_code=_upstream_status(e), detail=str(e)) from e
+
+    paired = paired_funnels_by_ghl_id(db, org_id)
+    return {
+        "funnels": [
+            {
+                "id": f["ghl_funnel_id"],
+                "name": f["name"],
+                "path": f["path"],
+                "steps": [{"name": s["name"], "path": s["path"]} for s in f["steps"]],
+                "paired_funnel_id": str(paired[f["ghl_funnel_id"]].id) if f["ghl_funnel_id"] in paired else None,
+                "paired_funnel_name": paired[f["ghl_funnel_id"]].name if f["ghl_funnel_id"] in paired else None,
+            }
+            for f in funnels
         ]
     }
 
