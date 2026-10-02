@@ -161,6 +161,7 @@ def flush_due_inbound_webhooks(db: Session, *, limit: int = 20) -> int:
         process_calcom_webhook_payload,
         process_calendly_webhook_payload,
     )
+    from app.api.ghl_webhooks import process_ghl_webhook_payload
     from app.api.webhooks import process_whop_webhook_payload
     from app.services.ghl_lead_sync import PROVIDER as GHL_SYNC_PROVIDER, process_submission_payload
 
@@ -169,6 +170,7 @@ def flush_due_inbound_webhooks(db: Session, *, limit: int = 20) -> int:
         "calendly": process_calendly_webhook_payload,
         "whop": process_whop_webhook_payload,
         "stripe": _process_stripe_inbox,
+        "ghl": process_ghl_webhook_payload,
         GHL_SYNC_PROVIDER: process_submission_payload,
     }
     attempted = 0

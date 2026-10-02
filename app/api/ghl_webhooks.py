@@ -134,6 +134,26 @@ def _ingest_and_process_ghl(db: Session, org_uuid: uuid.UUID, body: Dict[str, An
         raise
 
 
+def process_ghl_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dict[str, Any]) -> None:
+    """Inbox retry processor for provider "ghl" (inbound_webhook_inbox.flush_due_inbound_webhooks).
+    Same work as a live delivery, minus re-recording the inbox row."""
+    event = normalize_ghl_appointment_event(body)
+    if event is None:
+        return
+    setting = (
+        db.query(GhlCalendarSyncSetting)
+        .filter(
+            GhlCalendarSyncSetting.org_id == org_uuid,
+            GhlCalendarSyncSetting.calendar_id == event["calendar_id"],
+            GhlCalendarSyncSetting.enabled.is_(True),
+        )
+        .first()
+    )
+    if setting is None:
+        return
+    _process_ghl_appointment_event(db, org_uuid, event, setting, body)
+
+
 def _stamp_ghl_contact_id(client: Any, contact_id: Optional[str]) -> None:
     """Remember the GHL contact id so funnel lead intake can match this person even
     when the opt-in carries a different email. Never overwrites an existing id."""
