@@ -138,6 +138,8 @@ class Settings(BaseSettings):
     # new-transaction notifications fire without anyone having the app open. 0 disables.
     CALENDAR_CATCHUP_INTERVAL_SEC: int = 300
     WHOP_CATCHUP_INTERVAL_SEC: int = 300
+    # GHL lead reconcile pull per org without a live opt-in webhook (daily when one is live).
+    GHL_LEAD_SYNC_INTERVAL_SEC: int = 900
     # Worker: pipeline follow-up expiry sweep (qualified → nurturing → cold_lead). Also runs on boot.
     FOLLOW_UP_SWEEP_INTERVAL_SEC: int = 900
     

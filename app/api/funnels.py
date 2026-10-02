@@ -370,6 +370,29 @@ def pair_funnel_ghl(
     return _pair_or_raise(db, funnel, ghl_funnel)
 
 
+@router.post("/{funnel_id}/ghl/sync", status_code=status.HTTP_202_ACCEPTED)
+def sync_funnel_ghl_leads(
+    funnel_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Run the GHL lead reconcile pull for this org now (admin/owner). One pull covers
+    every GHL-paired funnel in the org; progress lands in ghl_config.sync."""
+    from app.long_jobs import schedule_background_work
+    from app.services.ghl_funnels import GHL_SOURCE
+    from app.services.ghl_lead_sync import run_ghl_lead_sync_job
+
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    _require_integration_manager(current_user, db)
+    funnel = db.query(Funnel).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not funnel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+    if funnel.source != GHL_SOURCE:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Funnel is not paired with GoHighLevel")
+    schedule_background_work(run_ghl_lead_sync_job, None, str(org_id), job_timeout=1800)
+    return {"started": True}
+
+
 @router.delete("/{funnel_id}/ghl/pair", response_model=FunnelSchema)
 def unpair_funnel_ghl(
     funnel_id: UUID,
