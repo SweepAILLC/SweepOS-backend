@@ -330,3 +330,71 @@ class TestExtraFormsAndListing:
         with _mock_http(handler):
             out = gc.list_ghl_forms_and_surveys(HEADERS, "loc")
         assert out == [{"id": "f1", "name": "Opt-in", "kind": "form"}, {"id": "s1", "name": "Quiz", "kind": "survey"}]
+
+
+class TestRealPayloadShapes:
+    """GHL-0: shapes observed on a real sub-account (values here are synthetic)."""
+
+    def _subs(self):
+        return _fixture("form_submissions_embedded.json")["submissions"]
+
+    def test_embedded_form_routes_by_the_page_that_embeds_it(self):
+        out = gc.normalize_ghl_submission(self._subs()[0], "forms")
+        assert out["page_path"] == "/vsl-optin"  # from the iframe's referrer, not the widget URL
+        assert out["widget_url"].endswith("/widget/form/form_embed")
+        assert out["utm_raw"] == {"source": "facebook", "campaign": "fall"}
+
+    def test_plumbing_and_ip_never_become_answers(self):
+        out = gc.normalize_ghl_submission(self._subs()[0], "forms")
+        assert out["answers"] == {"fieldABC123randomId": "Scale to $20k/month"}
+
+    def test_builder_preview_has_no_funnel_page(self):
+        out = gc.normalize_ghl_submission(self._subs()[1], "forms")
+        assert out["page_path"] == "/"  # app.gohighlevel.com root: matches no funnel step
+        assert out["widget_url"] is not None
+
+    def test_survey_url_params_feed_utm(self):
+        out = gc.normalize_ghl_submission(self._subs()[2], "surveys")
+        assert out["utm_raw"] == {"source": "instagram", "medium": "bio"}
+        assert out["form_id"] == "survey_q"
+
+
+class TestScopes:
+    def _handler(self, missing):
+        def handler(req):
+            if any(req.url.path.startswith(p) for p in missing):
+                return httpx.Response(401, json={"statusCode": 401, "message": "The token is not authorized for this scope."})
+            return httpx.Response(200, json={})
+        return handler
+
+    def test_probe_reports_missing_scopes(self):
+        with _mock_http(self._handler(["/locations/", "/calendars/"])):
+            granted = gc.verify_ghl_connection(HEADERS, "loc")
+        assert granted["locations.readonly"] is False and granted["calendars.readonly"] is False
+        assert granted["funnels/funnel.readonly"] is True
+
+    def test_invalid_token_is_an_error_not_a_missing_scope(self):
+        bad = lambda req: httpx.Response(401, json={"statusCode": 401, "message": "Invalid Private Integration token"})
+        with _mock_http(bad), pytest.raises(gc.GhlApiError) as exc:
+            gc.verify_ghl_connection(HEADERS, "loc")
+        assert exc.value.scope_missing is False
+
+    def test_token_with_no_usable_scope_fails(self):
+        with _mock_http(self._handler(["/"])), pytest.raises(gc.GhlApiError):
+            gc.verify_ghl_connection(HEADERS, "loc")
+
+    def test_scope_error_is_flagged_on_api_calls(self):
+        with _mock_http(self._handler(["/funnels/"])), pytest.raises(gc.GhlApiError) as exc:
+            gc.list_ghl_funnels(HEADERS, "loc")
+        assert exc.value.scope_missing is True
+
+    def test_surveys_list_respects_ghl_limit_of_50(self):
+        seen = {}
+
+        def handler(req):
+            seen[req.url.path] = int(req.url.params["limit"])
+            return httpx.Response(200, json={})
+
+        with _mock_http(handler):
+            gc.list_ghl_forms_and_surveys(HEADERS, "loc")
+        assert seen == {"/forms/": 100, "/surveys/": 50}

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
@@ -40,6 +40,7 @@ class GhlStatusResponse(BaseModel):
     needs_reconnect: bool = False
     message: Optional[str] = None
     webhook_secret_set: bool = False
+    missing_scopes: List[str] = Field(default_factory=list)
 
 
 class GhlWebhookSecretResponse(BaseModel):
@@ -84,7 +85,7 @@ def connect_ghl(
 
     # Verify against GHL before persisting — a bad key must never silently save as "connected".
     try:
-        gc.verify_ghl_connection(
+        granted = gc.verify_ghl_connection(
             {
                 "Authorization": f"Bearer {api_key}",
                 "Version": gc.GHL_API_VERSION,
@@ -103,7 +104,17 @@ def connect_ghl(
     except gc.GhlConfigError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
-    return GhlStatusResponse(connected=True, location_id=row.account_id)
+    missing = sorted(scope for scope, ok in granted.items() if not ok)
+    return GhlStatusResponse(
+        connected=True,
+        location_id=row.account_id,
+        missing_scopes=missing,
+        message=(
+            "Connected. Add these scopes to the private integration for every feature to work: " + ", ".join(missing)
+            if missing
+            else None
+        ),
+    )
 
 
 @router.delete("/disconnect")

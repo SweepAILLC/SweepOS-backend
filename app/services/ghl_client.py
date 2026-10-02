@@ -39,9 +39,12 @@ class GhlNotConnectedError(Exception):
 class GhlApiError(Exception):
     """Wraps an upstream GHL error so callers can decide retry/reconnect semantics."""
 
-    def __init__(self, message: str, *, status_code: Optional[int] = None):
+    def __init__(self, message: str, *, status_code: Optional[int] = None, scope_missing: bool = False):
         super().__init__(message)
         self.status_code = status_code
+        # 401 "The token is not authorized for this scope": the token is valid but the
+        # Private Integration lacks this scope (vs. "Invalid Private Integration token").
+        self.scope_missing = scope_missing
 
 
 class GhlConfigError(Exception):
@@ -168,7 +171,17 @@ def get_ghl_connection(
     return headers, token_row.account_id
 
 
+def _is_scope_error(resp: httpx.Response) -> bool:
+    return resp.status_code == 401 and "not authorized for this scope" in resp.text.lower()
+
+
 def _raise_for_status(resp: httpx.Response, *, action: str) -> None:
+    if _is_scope_error(resp):
+        raise GhlApiError(
+            f"GHL {action} failed: the private integration token is missing a required scope",
+            status_code=401,
+            scope_missing=True,
+        )
     if resp.status_code == 401:
         raise GhlApiError(f"GHL {action} failed: token expired or revoked", status_code=401)
     if resp.status_code >= 400:
@@ -178,26 +191,55 @@ def _raise_for_status(resp: httpx.Response, *, action: str) -> None:
         )
 
 
-def verify_ghl_connection(headers: Dict[str, str], location_id: str) -> bool:
-    """Lightweight call to confirm the token + locationId pair is valid."""
+# Read scopes Sweep uses, each with a cheap probe call. A Private Integration token
+# can be valid with any subset of them.
+GHL_SCOPE_PROBES: Dict[str, tuple] = {
+    "locations.readonly": ("/locations/{loc}", {}),
+    "contacts.readonly": ("/contacts/", {"limit": 1}),
+    "calendars.readonly": ("/calendars/", {}),
+    "funnels/funnel.readonly": ("/funnels/funnel/list", {"limit": 1}),
+    "forms.readonly": ("/forms/", {"limit": 1}),
+    "surveys.readonly": ("/surveys/", {"limit": 1}),
+}
+
+
+def probe_ghl_scopes(headers: Dict[str, str], location_id: str) -> Dict[str, bool]:
+    """{scope: granted} for GHL_SCOPE_PROBES. Raises GhlApiError for an invalid token
+    or location (anything other than success or a missing-scope 401)."""
+    granted: Dict[str, bool] = {}
     with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
-        resp = client.get(
-            f"{GHL_API_BASE}/locations/{location_id}",
-            headers=headers,
-        )
-    _raise_for_status(resp, action="connection check")
-    return True
+        for scope, (path, extra) in GHL_SCOPE_PROBES.items():
+            params = {} if "{loc}" in path else {"locationId": location_id, **extra}
+            resp = client.get(f"{GHL_API_BASE}{path.format(loc=location_id)}", headers=headers, params=params)
+            if _is_scope_error(resp):
+                granted[scope] = False
+                continue
+            _raise_for_status(resp, action=f"scope check ({scope})")
+            granted[scope] = True
+    return granted
+
+
+def verify_ghl_connection(headers: Dict[str, str], location_id: str) -> Dict[str, bool]:
+    """Confirm the token + locationId pair is valid and report which scopes it has.
+
+    A token missing locations.readonly is still valid; it fails only when no probe
+    succeeds (every scope missing) or GHL rejects the token/location outright."""
+    granted = probe_ghl_scopes(headers, location_id)
+    if not any(granted.values()):
+        raise GhlApiError("GHL connection check failed: the token has none of the scopes Sweep uses", status_code=401)
+    return granted
 
 
 def list_ghl_forms_and_surveys(headers: Dict[str, str], location_id: str) -> List[Dict[str, Any]]:
-    """[{id, name, kind: "form"|"survey"}] for the extra-forms picker (first 100 of each)."""
+    """[{id, name, kind: "form"|"survey"}] for the extra-forms picker (first page of each:
+    GHL caps forms at 100 and surveys at 50 per page)."""
     out: List[Dict[str, Any]] = []
     with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
-        for kind, path, key in (("form", "/forms/", "forms"), ("survey", "/surveys/", "surveys")):
+        for kind, path, key, limit in (("form", "/forms/", "forms", 100), ("survey", "/surveys/", "surveys", 50)):
             resp = client.get(
                 f"{GHL_API_BASE}{path}",
                 headers=headers,
-                params={"locationId": location_id, "limit": 100},
+                params={"locationId": location_id, "limit": limit},
             )
             _raise_for_status(resp, action=f"list {key}")
             data = resp.json() if resp.content else {}
@@ -443,9 +485,22 @@ def iter_ghl_survey_submissions(headers: Dict[str, str], location_id: str, start
 
 
 # Keys in a submission's `others` that are GHL plumbing or identity, not answers.
+# Real payloads (GHL-0) also carry the submitter's IP, a signature hash and session
+# ids; none of that is an answer and the IP must not be stored.
 _SUBMISSION_META_KEYS = frozenset(
-    {"eventData", "fieldsOriSequance", "fieldsOriSequence", "full_name", "first_name", "last_name", "email", "phone"}
+    {
+        "eventData", "fieldsOriSequance", "fieldsOriSequence",
+        "full_name", "first_name", "last_name", "email", "phone",
+        "formId", "location_id", "submissionId", "sessionId", "sessionFingerprint",
+        "signatureHash", "ip", "Timezone", "terms_and_conditions",
+    }
 )
+
+
+def _is_ghl_widget_url(url: Optional[str]) -> bool:
+    """GHL serves embedded forms/surveys from its own widget host (e.g.
+    link.apisystem.tech/widget/form/<id>); that URL is the iframe, not the funnel page."""
+    return bool(url) and "/widget/" in urlsplit(url).path
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:
@@ -471,11 +526,27 @@ def normalize_ghl_submission(raw: Dict[str, Any], kind: str) -> Optional[Dict[st
     others = raw.get("others") if isinstance(raw.get("others"), dict) else {}
     event = others.get("eventData") if isinstance(others.get("eventData"), dict) else {}
     page = event.get("page") if isinstance(event.get("page"), dict) else {}
-    page_url = str(page.get("url") or event.get("url") or "").strip() or None
+    page_url = str(page.get("url") or event.get("documentURL") or event.get("url") or "").strip() or None
+    # An embedded form reports its widget iframe as the page; the funnel page that
+    # embeds it is the iframe's referrer.
+    referrer = str(event.get("referrer") or "").strip() or None
+    if _is_ghl_widget_url(page_url) and referrer and not _is_ghl_widget_url(referrer):
+        host_url = referrer
+    elif _is_ghl_widget_url(page_url):
+        host_url = None
+    else:
+        host_url = page_url
 
     utm_raw: Dict[str, str] = {}
-    if page_url:
-        query = parse_qs(urlsplit(page_url).query)
+    url_params = event.get("url_params") if isinstance(event.get("url_params"), dict) else {}
+    for key in ("source", "medium", "campaign", "term", "content"):
+        val = str(url_params.get(f"utm_{key}") or "").strip()
+        if val:
+            utm_raw[key] = val
+    for url in (host_url, page_url):
+        if not url or utm_raw:
+            continue
+        query = parse_qs(urlsplit(url).query)
         for key in ("source", "medium", "campaign", "term", "content"):
             val = (query.get(f"utm_{key}") or [None])[0]
             if val:
@@ -507,8 +578,11 @@ def normalize_ghl_submission(raw: Dict[str, Any], kind: str) -> Optional[Dict[st
         "name": _s(raw.get("name") or others.get("full_name")),
         "first_name": _s(others.get("first_name")),
         "last_name": _s(others.get("last_name")),
-        "page_url": page_url,
-        "page_path": normalize_funnel_path(page_url),
+        # The funnel page the person was on (None when only GHL's widget URL is known);
+        # routing matches page_path against the paired funnel's step paths.
+        "page_url": host_url,
+        "page_path": normalize_funnel_path(host_url),
+        "widget_url": page_url if _is_ghl_widget_url(page_url) else None,
         "referrer": _s(event.get("referrer")),
         "ad_source": _s(event.get("adSource")),
         "utm_raw": utm_raw,

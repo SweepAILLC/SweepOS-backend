@@ -1,0 +1,74 @@
+{
+  "submissions": [
+    {
+      "id": "sub_embed_001",
+      "contactId": "ct_embed_001",
+      "formId": "form_embed",
+      "name": "Test Person",
+      "email": "test.person@example.com",
+      "createdAt": "2026-09-30T15:00:09.906Z",
+      "external": false,
+      "others": {
+        "first_name": "Test",
+        "phone": "+15550100002",
+        "email": "test.person@example.com",
+        "fieldABC123randomId": "Scale to $20k/month",
+        "terms_and_conditions": "I agree",
+        "formId": "form_embed",
+        "location_id": "loc_test",
+        "sessionId": "sess-123",
+        "Timezone": "America/Chicago",
+        "submissionId": "sub_embed_001",
+        "signatureHash": "deadbeef",
+        "ip": "203.0.113.7",
+        "fieldsOriSequance": ["first_name", "phone", "email"],
+        "eventData": {
+          "page": {"url": "https://link.apisystem.tech/widget/form/form_embed", "title": "Opt-in"},
+          "documentURL": "https://link.apisystem.tech/widget/form/form_embed",
+          "referrer": "https://go.example-coach.com/VSL-Optin?utm_source=facebook&utm_campaign=fall",
+          "domain": "link.apisystem.tech",
+          "medium": "form",
+          "source": "Paid Social",
+          "type": "page-visit",
+          "parentId": "form_embed",
+          "parentName": "Ads Form"
+        }
+      }
+    },
+    {
+      "id": "sub_preview_002",
+      "contactId": "ct_preview_002",
+      "formId": "form_embed",
+      "name": "Builder Preview",
+      "email": "preview@example.com",
+      "createdAt": "2026-09-30T16:00:00.000Z",
+      "others": {
+        "eventData": {
+          "page": {"url": "https://link.apisystem.tech/widget/form/form_embed"},
+          "referrer": "https://app.gohighlevel.com/",
+          "medium": "form",
+          "source": "Direct traffic"
+        }
+      }
+    },
+    {
+      "id": "sub_survey_003",
+      "contactId": "ct_survey_003",
+      "surveyId": "survey_q",
+      "name": "Survey Taker",
+      "email": "survey@example.com",
+      "createdAt": "2026-09-30T17:00:00.000Z",
+      "others": {
+        "q1RandomId": ["Option A"],
+        "eventData": {
+          "page": {"url": "https://api.leadconnectorhq.com/widget/survey/survey_q"},
+          "referrer": "https://leadgen-apps-form-survey-builder.leadconnectorhq.com/",
+          "url_params": {"utm_source": "instagram", "utm_medium": "bio"},
+          "medium": "survey",
+          "source": "Referral"
+        }
+      }
+    }
+  ],
+  "meta": {"total": 3, "currentPage": 1, "nextPage": null, "prevPage": null}
+}
