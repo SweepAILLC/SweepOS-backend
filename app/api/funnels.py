@@ -44,9 +44,6 @@ from app.schemas.funnel import (
     FunnelAdSpendRead,
     FunnelDashboardResponse,
 )
-from app.models.client import find_client_by_email, find_client_by_phone
-from app.models.client import LifecycleState
-from app.services.health_score_cache_service import invalidate_health_score_cache
 from sqlalchemy.orm.attributes import flag_modified
 
 router = APIRouter()
@@ -638,158 +635,27 @@ def create_lead_from_funnel(
     Clients appear on the Client Board in Sweep OS.
 
     Dedupes by email first, then by phone (digits-normalized) within the org.
+    Shared with GHL lead intake via app.services.funnel_leads.upsert_funnel_lead.
     """
+    from app.services.funnel_leads import upsert_funnel_lead
+
     funnel = db.query(Funnel).filter(Funnel.id == lead_data.funnel_id).first()
     if not funnel:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Funnel not found"
         )
-    org_id = funnel.org_id
-
-    # Normalize name: use 'name' or first_name/last_name
-    first_name = lead_data.first_name
-    last_name = lead_data.last_name
-    if lead_data.name and isinstance(lead_data.name, str) and lead_data.name.strip():
-        parts = lead_data.name.strip().split(None, 1)
-        first_name = first_name or parts[0]
-        last_name = last_name if last_name is not None else (parts[1] if len(parts) > 1 else None)
-    email = (lead_data.email or "").strip() or None
-    phone = (lead_data.phone or "").strip() or None
-    instagram = (lead_data.instagram or "").strip() or None
-    notes = (lead_data.notes or "").strip() or None
-
-    client = None
-    if email:
-        client = find_client_by_email(db, org_id, email)
-    if client is None and phone:
-        client = find_client_by_phone(db, org_id, phone)
-
-    lead_utm = _resolve_lead_utm(db, org_id, lead_data)
-
-    def _apply_prospect_meta(c: Client) -> None:
-        # Always stamp funnel_id + captured_at so the Leads tab can list every capture.
-        meta = c.meta if isinstance(c.meta, dict) else {}
-        prev = meta.get("prospect") if isinstance(meta.get("prospect"), dict) else {}
-        prospect = {
-            **prev,
-            "funnel_id": str(lead_data.funnel_id),
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if lead_data.source is not None:
-            prospect["source"] = lead_data.source
-        if lead_data.quiz_answers is not None:
-            prospect["quiz_answers"] = lead_data.quiz_answers or {}
-        if lead_data.opt_in_data is not None:
-            prospect["opt_in_data"] = lead_data.opt_in_data or {}
-        if lead_data.funnel_step_reached is not None:
-            prospect["funnel_step_reached"] = lead_data.funnel_step_reached
-        if lead_utm:
-            prospect["utm"] = lead_utm
-        meta = {**meta, "prospect": prospect}
-        c.meta = meta
-        flag_modified(c, "meta")
-
-    if client:
-        # Update existing client with provided fields
-        if first_name is not None and first_name:
-            client.first_name = first_name
-        if last_name is not None:
-            client.last_name = last_name
-        if email and (not client.email or not str(client.email).strip()):
-            client.email = email
-        if phone is not None and phone:
-            client.phone = phone
-        if instagram is not None and instagram:
-            client.instagram = instagram
-        if notes is not None and notes:
-            client.notes = (client.notes or "").strip() + ("\n\n" + notes if (client.notes or "").strip() else notes)
-        _apply_prospect_meta(client)
-        # First-touch attribution: never overwrite a known channel, but a legacy
-        # row with no channel on record (pre-091) takes this funnel as its source.
-        if client.source_channel is None:
-            client.source_channel = "paid"
-            client.source_funnel_id = funnel.id
-        from app.services.client_automation import apply_funnel_lead_lifecycle, apply_automatic_lifecycle_for_client
-
-        apply_funnel_lead_lifecycle(client)
-        client.updated_at = datetime.utcnow()
-        db.commit()
-        db.refresh(client)
-        try:
-            apply_automatic_lifecycle_for_client(db, client)
-            db.commit()
-            db.refresh(client)
-        except Exception as lc_err:
-            print(f"[FUNNEL LEAD] lifecycle reconcile skipped for {client.id}: {lc_err}")
-            from app.services.integration_side_effects import emit_automation_failure_discord
-            emit_automation_failure_discord(
-                org_id=org_id,
-                where="funnels.apply_automatic_lifecycle_for_client",
-                error=lc_err,
-                client_id=client.id,
-            )
-        invalidate_health_score_cache(db, client.id, org_id)
-        try:
-            from app.services.funnel_lead_notifications import enqueue_funnel_lead_notification
-
-            enqueue_funnel_lead_notification(
-                db,
-                org_id=org_id,
-                client=client,
-                funnel=funnel,
-                lead=lead_data,
-                is_new_client=False,
-            )
-        except Exception as e:
-            print(f"[FUNNEL LEAD] notification enqueue skipped: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        return FunnelLeadResponse(client_id=client.id, created=False, message="Client updated")
-    else:
-        # Create new client (require at least email or name for a useful record)
-        if not email and not first_name and not last_name and not phone and not instagram:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="At least one of email, name, phone, or instagram is required"
-            )
-        client = Client(
-            org_id=org_id,
-            email=email or None,
-            first_name=first_name or None,
-            last_name=last_name or None,
-            phone=phone or None,
-            instagram=instagram or None,
-            notes=notes or None,
-            lifecycle_state=LifecycleState.QUALIFIED,
-            source_channel="paid",
-            source_funnel_id=funnel.id,
-        )
-        _apply_prospect_meta(client)
-        db.add(client)
-        db.commit()
-        db.refresh(client)
-        invalidate_health_score_cache(db, client.id, org_id)
-        try:
-            from app.services.funnel_lead_notifications import enqueue_funnel_lead_notification
-
-            enqueue_funnel_lead_notification(
-                db,
-                org_id=org_id,
-                client=client,
-                funnel=funnel,
-                lead=lead_data,
-                is_new_client=True,
-            )
-        except Exception as e:
-            print(f"[FUNNEL LEAD] notification enqueue skipped: {e}")
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        return FunnelLeadResponse(client_id=client.id, created=True, message="Client created")
+    result = upsert_funnel_lead(
+        db,
+        funnel,
+        lead_data,
+        utm=_resolve_lead_utm(db, funnel.org_id, lead_data),
+    )
+    return FunnelLeadResponse(
+        client_id=result.client.id,
+        created=result.created,
+        message="Client created" if result.created else "Client updated",
+    )
 
 
 def _enrich_and_process_event(db: Session, event: Event, org_id: UUID):
