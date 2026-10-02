@@ -4,6 +4,11 @@ from app.api import auth, clients, events, oauth, integrations, stripe, whop, fi
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
+from app.middleware.public_cors import (
+    PublicTrackingCorsMiddleware,
+    is_public_cors_path,
+    public_cors_headers,
+)
 import logging
 import threading
 
@@ -75,6 +80,8 @@ app.add_middleware(
 )
 # Global throttle (after CORS registration so this runs first on each request — see Starlette order)
 app.add_middleware(GlobalRateLimitMiddleware)
+# Outermost: public tracking routes answer any origin (no credentials); see app/middleware/public_cors.py
+app.add_middleware(PublicTrackingCorsMiddleware)
 
 # Add LLM-specific exception handlers first (more specific)
 from app.core.llm_exceptions import LLMException
@@ -102,9 +109,13 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": "Internal server error"}
     )
     
-    # Add CORS headers manually (same allowed origins as middleware)
+    # Add CORS headers manually (same rules as the middleware). Unhandled errors are
+    # answered by ServerErrorMiddleware, outside every user middleware, so set them here.
     origin = request.headers.get("origin")
-    if origin and origin in _allowed_origins:
+    if is_public_cors_path(request.url.path):
+        for key, value in public_cors_headers():
+            response.headers[key.decode()] = value.decode()
+    elif origin and origin in _allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Access-Control-Allow-Methods"] = "*"
