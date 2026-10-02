@@ -1,5 +1,5 @@
 """
-Remote MCP server for Claude custom connector (Streamable HTTP).
+Remote MCP server for Claude and ChatGPT custom connectors (Streamable HTTP).
 
 Mounted at /mcp. Unauthenticated requests return 401 with WWW-Authenticate
 pointing at protected-resource metadata (Claude OAuth discovery).
@@ -11,15 +11,17 @@ import logging
 import uuid
 from typing import Any, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 import asyncio
 
 from app.db.session import SessionLocal
 from app.services.client_profile_bundle import (
+    BOOKING_STATUSES,
     build_client_profile_bundle,
     list_clients_for_mcp,
+    list_pipeline_grid_for_mcp,
     search_clients_by_email,
 )
 from app.services.brevo_mcp_bundle import list_brevo_senders_for_mcp, send_client_email_for_mcp
@@ -56,6 +58,7 @@ from app.services.resource_library import (
     get_library_item,
 )
 from app.services.mcp_oauth_service import mcp_resource, verify_mcp_access_token
+from app.services.mcp_search_fetch import fetch_for_mcp, search_for_mcp
 from app.services.terminal_dashboard_bundle import build_terminal_dashboard_for_mcp
 
 logger = logging.getLogger(__name__)
@@ -64,15 +67,42 @@ router = APIRouter()
 
 SERVER_INFO = {
     "name": "sweepos",
-    "version": "1.8.0",
+    "version": "1.10.0",
     "protocolVersion": "2025-03-26",
 }
 
-# Claude.ai currently prefers 2025-11-25; accept both.
-SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-03-26")
+# Claude.ai currently prefers 2025-11-25; ChatGPT sends 2025-06-18.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
 
 
 TOOLS = [
+    {
+        "name": "search",
+        "description": (
+            "Search the connected SweepOS org for clients (name/email/phone), funnels (name), "
+            "SOP / consulting docs, and org resource-library items. Returns ids to pass to fetch. "
+            "Use the specific tools (get_pipeline_grid, get_funnel_dashboard, get_kpi_snapshot, ...) "
+            "for metrics and filtered lists."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Search text"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "fetch",
+        "description": (
+            "Fetch the full record for an id returned by search: client:<uuid> (full profile with "
+            "attribution and call analysis), funnel:<uuid> (steps, 30-day analytics, health), "
+            "doc:<resource_id> (SOP markdown), or library:<uuid> (org resource)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "Id from search results"}},
+            "required": ["id"],
+        },
+    },
     {
         "name": "get_connection_context",
         "description": (
@@ -83,7 +113,12 @@ TOOLS = [
     },
     {
         "name": "list_clients",
-        "description": "List clients in the connected SweepOS organization. Optionally filter by text query or lifecycle_state.",
+        "description": (
+            "List clients in the connected SweepOS organization with their channel tag "
+            "(organic/paid), source funnel name, and UTM. Optionally filter by text query, "
+            "lifecycle_state, source_channel, or funnel_id. For booking status and funnel "
+            "answers use get_pipeline_grid."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -92,6 +127,8 @@ TOOLS = [
                     "type": "string",
                     "description": "cold_lead | nurturing | qualified | booked | active | offboarding | dead",
                 },
+                "source_channel": {"type": "string", "enum": ["organic", "paid"]},
+                "funnel_id": {"type": "string", "description": "Funnel UUID (from list_funnels)"},
                 "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 100},
             },
         },
@@ -100,7 +137,9 @@ TOOLS = [
         "name": "get_client_profile",
         "description": (
             "Return a full client profile package: contact info, pipeline/program stage, "
-            "financial investments, current offer/balance due, call analysis + ROI tags, and workspace info."
+            "financial investments, current offer/balance due, call analysis + ROI tags, workspace info, "
+            "and attribution (channel tag, source funnel, UTM, funnel quiz/opt-in answers, latest "
+            "sales-call booking status)."
         ),
         "inputSchema": {
             "type": "object",
@@ -339,6 +378,211 @@ TOOLS = [
         "description": (
             "KPI bottleneck and trend flags only (below-benchmark metrics, stage comparisons, "
             "multi-month declines). Lighter than get_kpi_trends when you only need alerts."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_pipeline_grid",
+        "description": (
+            "Pipeline Grid view: every client card with contact, lifecycle stage, channel tag "
+            "(organic/paid), source funnel, UTM (source/medium/campaign/term/content), funnel "
+            "metadata (quiz + opt-in answers), and latest sales-call booking status "
+            "(booked | not_yet | closed | canceled | no_show) with booking_at. Filter to answer "
+            "questions like 'which paid leads from funnel X haven't booked yet'."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search name, email, or phone"},
+                "lifecycle_state": {
+                    "type": "string",
+                    "description": "cold_lead | nurturing | qualified | booked | active | offboarding | dead",
+                },
+                "source_channel": {"type": "string", "enum": ["organic", "paid"]},
+                "funnel_id": {"type": "string", "description": "Funnel UUID (from list_funnels)"},
+                "booking_status": {"type": "string", "enum": list(BOOKING_STATUSES)},
+                "include_answers": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Include flattened funnel quiz/opt-in answers per client",
+                },
+                "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 500},
+            },
+        },
+    },
+    {
+        "name": "list_funnels",
+        "description": (
+            "List the org's funnels (id, name, slug, domain) with their steps. Use the ids with "
+            "get_funnel_dashboard, get_funnel_analytics, list_funnel_leads, and the funnel_id "
+            "filters on client/KPI tools. Organic (non-funnel) traffic is channel='organic', not a funnel."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_funnel_dashboard",
+        "description": (
+            "Funnels dashboard in one call (same as the Funnels tab): weekly scorecard with "
+            "benchmark week, opt-ins -> booked -> showed -> closed -> cash stages, ad spend, "
+            "cost per result, and cash. channel='organic' is the Organic card, channel='paid' "
+            "or a funnel_id scopes to paid funnels. Pass compare_start/compare_end to benchmark "
+            "against another range (its average week). Defaults to the last 30 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "channel": {"type": "string", "enum": ["organic", "paid", "all"]},
+                "funnel_id": {"type": "string", "description": "Funnel UUID; omit for all funnels"},
+                "compare_start": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "compare_end": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+            },
+        },
+    },
+    {
+        "name": "get_funnel_analytics",
+        "description": (
+            "Deep analytics for one funnel: definition + steps, step counts and step-to-step "
+            "conversion, bookings, revenue, top UTM sources and referrers, plus tracking health "
+            "(last event, events/min, 24h errors). Defaults to the last 30 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "funnel_id": {"type": "string", "description": "Funnel UUID"},
+                "range_days": {"type": "integer", "default": 30, "minimum": 1, "maximum": 365},
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive; with end, overrides range_days"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+            },
+            "required": ["funnel_id"],
+        },
+    },
+    {
+        "name": "list_funnel_leads",
+        "description": (
+            "Leads captured by one funnel (the funnel Leads tab): contact, lead source, step "
+            "reached, live pipeline stage, new-vs-existing client, captured_at, and quiz/opt-in "
+            "answers. Newest first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "funnel_id": {"type": "string", "description": "Funnel UUID"},
+                "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000},
+            },
+            "required": ["funnel_id"],
+        },
+    },
+    {
+        "name": "get_funnel_ad_spend",
+        "description": (
+            "Weekly ad spend entries per funnel (amount_usd, ads_deployed, angles_deployed per "
+            "week_start) in a date range. Defaults to the last 90 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "funnel_id": {"type": "string", "description": "Funnel UUID; omit for all funnels"},
+            },
+        },
+    },
+    {
+        "name": "get_kpi_funnel_summary",
+        "description": (
+            "Opt-ins -> Booked -> Showed -> Closed -> Cash stage strip for a date range, split "
+            "by channel (organic / paid / all) or one funnel. Lighter than get_funnel_dashboard "
+            "when you only need stage totals and conversion. Defaults to the last 30 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "channel": {"type": "string", "enum": ["organic", "paid", "all"]},
+                "funnel_id": {"type": "string", "description": "Funnel UUID (implicitly paid)"},
+            },
+        },
+    },
+    {
+        "name": "get_team_members",
+        "description": (
+            "Sales/marketing team roster: each member's user_id, name, email, access role, "
+            "team_role (sales | marketing | null) and whether they owe a daily EOD form, plus "
+            "the org's EOD/reminder/digest settings. Use user_id as rep_user_id in other KPI tools."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_team_overview",
+        "description": (
+            "Team KPI tracking (Organic tab team cards): per sales-team member EOD submission "
+            "status by day, setter activity and notes, closer activity, and each metric vs the "
+            "same span of the previous period plus best month, with 'needs attention' flags. "
+            "Use period=week|month with an optional anchor date, or an explicit start/end range."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "period": {"type": "string", "enum": ["week", "month"], "default": "month"},
+                "anchor": {"type": "string", "description": "Any YYYY-MM-DD inside the period; defaults to today"},
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive (range mode; requires end)"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive; switches to range mode"},
+            },
+        },
+    },
+    {
+        "name": "get_kpi_rep_performance",
+        "description": (
+            "Per-rep (setter/closer) funnel and close/cash totals for a window, the equal-length "
+            "previous period, and each metric's personal-best month. Defaults to the last 30 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "default": 30, "minimum": 1, "maximum": 365},
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive (overrides days)"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+            },
+        },
+    },
+    {
+        "name": "get_kpi_daily_entries",
+        "description": (
+            "Daily KPI ledger rows (the Organic KPI calendar/grid): outreach, replies, follow-ups, "
+            "conversations, bookings, calls taken, no-shows, closes, cash, followers, content, "
+            "computed rates, plus EOD text (best_content_type, setter_context). Org aggregate by "
+            "default; pass rep_user_id (from get_team_members) for one rep's own EOD rows. "
+            "Defaults to the last 30 days; max 366 days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "end": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+                "rep_user_id": {"type": "string", "description": "Optional rep user UUID"},
+            },
+        },
+    },
+    {
+        "name": "get_kpi_day_detail",
+        "description": (
+            "Drill into one KPI day: which clients' payments made up cash_collected (Stripe/Whop/"
+            "manual) and which clients were booked that day."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"entry_date": {"type": "string", "description": "YYYY-MM-DD"}},
+            "required": ["entry_date"],
+        },
+    },
+    {
+        "name": "get_kpi_benchmarks",
+        "description": (
+            "Org KPI targets (Targets drawer): per-metric % bands used for bottleneck flags and "
+            "scorecard coloring, plus content-type tags."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -654,6 +898,18 @@ TOOLS = [
 ]
 
 
+# Tool annotations: ChatGPT (and Claude) skip the write-confirmation prompt for read-only
+# tools. Everything is read-only except send_client_email, which emails a real client.
+_WRITE_TOOLS = {"send_client_email"}
+for _tool in TOOLS:
+    _tool["annotations"] = {
+        "title": _tool["name"].replace("_", " ").capitalize(),
+        "readOnlyHint": _tool["name"] not in _WRITE_TOOLS,
+        "destructiveHint": False,
+        "openWorldHint": _tool["name"] in _WRITE_TOOLS,
+    }
+
+
 def _www_authenticate() -> str:
     from app.services.mcp_oauth_service import mcp_issuer, mcp_resource
 
@@ -703,11 +959,61 @@ def _dump(value: Any) -> Any:
     """Serialize Pydantic model instances (and lists of them) to plain JSON-able data."""
     if isinstance(value, list):
         return [_dump(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _dump(v) for k, v in value.items()}
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     if hasattr(value, "dict"):
         return value.dict()
     return value
+
+
+class _McpUser:
+    """current_user stand-in for calling REST handlers directly; org comes from the MCP token."""
+
+    def __init__(self, user_id: Optional[uuid.UUID], org_id: uuid.UUID):
+        self.id = user_id
+        self.org_id = org_id
+        self.selected_org_id = org_id
+
+
+def _call_api(db: Session, fn, **kwargs) -> Any:
+    """Run a REST handler and return its JSON-able payload, or an {"error": ...} dict."""
+    try:
+        return _dump(fn(db=db, **kwargs))
+    except HTTPException as exc:
+        return {"error": exc.detail}
+    except Exception:
+        logger.exception("MCP tool handler %s failed", getattr(fn, "__name__", fn))
+        db.rollback()
+        return {"error": "internal error"}
+
+
+def _uuid_arg(args: dict, key: str) -> Optional[uuid.UUID]:
+    """Parse an optional UUID argument; raises ValueError on a malformed value."""
+    raw = args.get(key)
+    return uuid.UUID(str(raw)) if raw else None
+
+
+def _date_window(args: dict, default_days: int, max_days: Optional[int] = None) -> tuple[str, str]:
+    """start/end strings from args, defaulting to the trailing `default_days` ending today."""
+    from datetime import date, timedelta
+
+    end = args.get("end") or date.today().isoformat()
+    start = args.get("start")
+    if not start:
+        try:
+            start = (date.fromisoformat(end) - timedelta(days=default_days - 1)).isoformat()
+        except ValueError:
+            start = end  # let the handler report the bad date
+    if max_days:
+        try:
+            floor = date.fromisoformat(end) - timedelta(days=max_days - 1)
+            if date.fromisoformat(start) < floor:
+                start = floor.isoformat()
+        except ValueError:
+            pass
+    return start, end
 
 
 def _require_system_owner(db: Session, user_id: Optional[uuid.UUID]):
@@ -763,15 +1069,46 @@ def _run_tool(
                 ),
             }
         )
+    if name == "search":
+        return _text_result(search_for_mcp(db, org_id, str(args.get("query") or "")))
+    if name == "fetch":
+        return _text_result(fetch_for_mcp(db, org_id, str(args.get("id") or ""), user_id=user_id))
     if name == "list_clients":
+        try:
+            funnel_id = _uuid_arg(args, "funnel_id")
+        except ValueError:
+            return _text_result({"error": "invalid funnel_id"})
         rows = list_clients_for_mcp(
             db,
             org_id,
             query=args.get("query"),
             lifecycle_state=args.get("lifecycle_state"),
+            source_channel=args.get("source_channel"),
+            funnel_id=funnel_id,
             limit=int(args.get("limit") or 50),
         )
         return _text_result({"clients": rows, "count": len(rows)})
+    if name == "get_pipeline_grid":
+        try:
+            funnel_id = _uuid_arg(args, "funnel_id")
+        except ValueError:
+            return _text_result({"error": "invalid funnel_id"})
+        include_answers = args.get("include_answers")
+        return _text_result(
+            list_pipeline_grid_for_mcp(
+                db,
+                org_id,
+                query=args.get("query"),
+                lifecycle_state=args.get("lifecycle_state"),
+                source_channel=args.get("source_channel"),
+                funnel_id=funnel_id,
+                booking_status=args.get("booking_status"),
+                include_answers=True if include_answers is None else bool(include_answers),
+                limit=int(args.get("limit") or 100),
+            )
+        )
+    if name in FUNNEL_TEAM_TOOLS:
+        return _run_funnel_team_tool(name, args, org_id, db, user_id=user_id)
     if name == "get_client_profile":
         cid = args.get("client_id")
         if not cid:
@@ -1160,6 +1497,223 @@ def _run_tool(
         except Exception as exc:
             return _text_result({"error": getattr(exc, "detail", str(exc))})
         return _text_result(_dump(payload))
+    return _text_result({"error": f"Unknown tool: {name}"})
+
+
+FUNNEL_TEAM_TOOLS = {
+    "list_funnels",
+    "get_funnel_dashboard",
+    "get_funnel_analytics",
+    "list_funnel_leads",
+    "get_funnel_ad_spend",
+    "get_kpi_funnel_summary",
+    "get_team_members",
+    "get_team_overview",
+    "get_kpi_rep_performance",
+    "get_kpi_daily_entries",
+    "get_kpi_day_detail",
+    "get_kpi_benchmarks",
+}
+
+
+def _run_funnel_team_tool(
+    name: str,
+    args: dict,
+    org_id: uuid.UUID,
+    db: Session,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+) -> dict:
+    """Funnels / team KPI tools — thin wrappers over the same REST handlers the app uses."""
+    from app.api import funnels as funnels_api
+    from app.api import kpi as kpi_api
+    from app.api import team as team_api
+
+    user = _McpUser(user_id, org_id)
+    try:
+        funnel_id = _uuid_arg(args, "funnel_id")
+    except ValueError:
+        return _text_result({"error": "invalid funnel_id"})
+
+    if name == "list_funnels":
+        from sqlalchemy import asc
+        from app.models.funnel import Funnel, FunnelStep
+        from app.schemas.funnel import FunnelStep as FunnelStepSchema
+
+        funnels = db.query(Funnel).filter(Funnel.org_id == org_id).order_by(Funnel.created_at.desc()).all()
+        steps_by_funnel: dict = {}
+        for step in (
+            db.query(FunnelStep).filter(FunnelStep.org_id == org_id).order_by(asc(FunnelStep.step_order)).all()
+        ):
+            steps_by_funnel.setdefault(step.funnel_id, []).append(
+                FunnelStepSchema.model_validate(step, from_attributes=True).model_dump(mode="json")
+            )
+        rows = [
+            {
+                "funnel_id": str(f.id),
+                "name": f.name,
+                "slug": f.slug,
+                "domain": f.domain,
+                "env": f.env,
+                "client_id": str(f.client_id) if f.client_id else None,
+                "created_at": f.created_at.isoformat() if f.created_at else None,
+                "steps": steps_by_funnel.get(f.id, []),
+            }
+            for f in funnels
+        ]
+        return _text_result({"funnels": rows, "count": len(rows)})
+
+    if name == "get_funnel_dashboard":
+        start, end = _date_window(args, 30)
+        channel = args.get("channel")
+        return _text_result(
+            _call_api(
+                db,
+                funnels_api.get_funnel_dashboard,
+                start=start,
+                end=end,
+                channel=None if channel == "all" else channel,
+                funnel_id=funnel_id,
+                compare_start=args.get("compare_start"),
+                compare_end=args.get("compare_end"),
+                current_user=user,
+            )
+        )
+
+    if name == "get_funnel_analytics":
+        if not funnel_id:
+            return _text_result({"error": "funnel_id required"})
+        funnel = _call_api(db, funnels_api.get_funnel, funnel_id=funnel_id, current_user=user)
+        if isinstance(funnel, dict) and "error" in funnel:
+            return _text_result(funnel)
+        return _text_result(
+            {
+                "funnel": funnel,
+                "analytics": _call_api(
+                    db,
+                    funnels_api.get_funnel_analytics,
+                    funnel_id=funnel_id,
+                    range_days=int(args.get("range_days") or 30),
+                    start=args.get("start"),
+                    end=args.get("end"),
+                    current_user=user,
+                ),
+                "health": _call_api(db, funnels_api.get_funnel_health, funnel_id=funnel_id, current_user=user),
+            }
+        )
+
+    if name == "list_funnel_leads":
+        if not funnel_id:
+            return _text_result({"error": "funnel_id required"})
+        return _text_result(
+            _call_api(
+                db,
+                funnels_api.list_funnel_leads,
+                funnel_id=funnel_id,
+                limit=max(1, min(int(args.get("limit") or 200), 1000)),
+                current_user=user,
+            )
+        )
+
+    if name == "get_funnel_ad_spend":
+        start, end = _date_window(args, 90)
+        payload = _call_api(
+            db,
+            funnels_api.list_funnel_ad_spend,
+            start=start,
+            end=end,
+            funnel_id=funnel_id,
+            current_user=user,
+        )
+        if isinstance(payload, list):
+            payload = {"start": start, "end": end, "weeks": payload}
+        return _text_result(payload)
+
+    if name == "get_kpi_funnel_summary":
+        start, end = _date_window(args, 30)
+        return _text_result(
+            _call_api(
+                db,
+                kpi_api.get_kpi_funnel_summary,
+                start=start,
+                end=end,
+                channel=args.get("channel"),
+                funnel_id=funnel_id,
+                current_user=user,
+            )
+        )
+
+    if name == "get_team_members":
+        members = _call_api(db, team_api.get_team_members, current_user=user)
+        if isinstance(members, dict):
+            return _text_result(members)
+        return _text_result(
+            {
+                "members": members,
+                "count": len(members),
+                "settings": _call_api(db, team_api.get_team_kpi_settings, current_user=user),
+            }
+        )
+
+    if name == "get_team_overview":
+        period = args.get("period") or "month"
+        return _text_result(
+            _call_api(
+                db,
+                team_api.get_team_overview,
+                period=period,
+                anchor=args.get("anchor"),
+                start=args.get("start"),
+                end=args.get("end"),
+                current_user=user,
+            )
+        )
+
+    if name == "get_kpi_rep_performance":
+        return _text_result(
+            _call_api(
+                db,
+                kpi_api.get_kpi_rep_performance,
+                days=max(1, min(int(args.get("days") or 30), 365)),
+                start=args.get("start"),
+                end=args.get("end"),
+                current_user=user,
+            )
+        )
+
+    if name == "get_kpi_daily_entries":
+        start, end = _date_window(args, 30, max_days=366)
+        payload = _call_api(
+            db,
+            kpi_api.list_kpi_entries,
+            start=start,
+            end=end,
+            sync=False,
+            rep_user_id=args.get("rep_user_id"),
+            current_user=user,
+        )
+        if isinstance(payload, list):
+            payload = {"start": start, "end": end, "entries": payload, "count": len(payload)}
+        return _text_result(payload)
+
+    if name == "get_kpi_day_detail":
+        entry_date = str(args.get("entry_date") or "").strip()
+        if not entry_date:
+            return _text_result({"error": "entry_date required"})
+        return _text_result(
+            {
+                "revenue": _call_api(
+                    db, kpi_api.get_kpi_revenue_contributors, entry_date=entry_date, current_user=user
+                ),
+                "booked_clients": _call_api(
+                    db, kpi_api.get_kpi_bookable_clients, entry_date=entry_date, current_user=user
+                ),
+            }
+        )
+
+    if name == "get_kpi_benchmarks":
+        return _text_result(_call_api(db, kpi_api.get_kpi_benchmarks, current_user=user))
+
     return _text_result({"error": f"Unknown tool: {name}"})
 
 
