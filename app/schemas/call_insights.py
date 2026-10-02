@@ -40,8 +40,15 @@ class CallInsightsRollupOut(BaseModel):
     accumulated_clips: List[Dict[str, Any]] = Field(default_factory=list)
     accumulated_wins: List[str] = Field(default_factory=list)
     accumulated_testimonial_stories: List[str] = Field(default_factory=list)
+    accumulated_roi_testimonials: List[Dict[str, Any]] = Field(default_factory=list)
+    latest_upsell_signal: Optional[Dict[str, Any]] = None
+    latest_referral_signal: Optional[Dict[str, Any]] = None
+    latest_revive_playbook: Optional[Dict[str, Any]] = None
     prospect_voice_profile: Dict[str, Any] = Field(default_factory=dict)
     latest_framework_review: Optional[FrameworkReviewOut] = None
+    # Sales/CSM hand-off brief: situation, objections, why (not) closed, sales call date.
+    deal_brief: Optional[Dict[str, Any]] = None
+    org_validated_theme_keys: List[str] = Field(default_factory=list)
 
 
 class OfferSuggestionOut(BaseModel):
@@ -60,6 +67,8 @@ class ClientCallInsightsResponse(BaseModel):
     summary: Optional[ClientInsightSummaryOut] = None
     insights: List[CallInsightPerCallOut] = Field(default_factory=list)
     rollup: Optional[CallInsightsRollupOut] = None
+    roi_state: Optional[Dict[str, Any]] = None
+    pipeline: Optional[Dict[str, Any]] = None
     offer_suggestion: Optional[OfferSuggestionOut] = None
 
 

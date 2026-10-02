@@ -226,6 +226,8 @@ def get_client_call_insights(
         summary=summary_out,
         insights=insights_out,
         rollup=rollup_out,
+        roi_state=data.get("roi_state"),
+        pipeline=data.get("pipeline"),
         offer_suggestion=offer_out,
     )
 
