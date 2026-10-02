@@ -495,3 +495,97 @@ def normalize_ghl_submission(raw: Dict[str, Any], kind: str) -> Optional[Dict[st
         "utm_raw": utm_raw,
         "answers": answers,
     }
+
+
+def _first(*values: Any) -> Optional[str]:
+    for v in values:
+        if v is None:
+            continue
+        text = str(v).strip()
+        if text:
+            return text
+    return None
+
+
+SWEEP_WEBHOOK_KEYS = frozenset({"sweep_event", "sweep_funnel_id"})
+
+
+def webhook_custom_data(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Workflow Webhook action custom data (key/value pairs the client adds in GHL)."""
+    for key in ("customData", "custom_data"):
+        value = body.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def webhook_sweep_field(body: Dict[str, Any], key: str) -> Optional[str]:
+    """`sweep_event` / `sweep_funnel_id` from custom data, or the top level as a fallback."""
+    return _first(webhook_custom_data(body).get(key), body.get(key))
+
+
+def normalize_ghl_workflow_opt_in(body: Dict[str, Any], *, received_at: datetime) -> Dict[str, Any]:
+    """A GHL Workflow (Form/Survey Submitted -> Webhook) payload in the same shape as
+    normalize_ghl_submission, so the webhook and the reconcile pull share one processor.
+
+    Workflow payloads carry the contact's standard fields at the top level (and/or a
+    nested `contact`), the client's custom data, and the contact's attribution. Field
+    names vary by trigger, so several spellings are accepted; GHL-0 pins the real one.
+    """
+    contact = body.get("contact") if isinstance(body.get("contact"), dict) else {}
+    custom = webhook_custom_data(body)
+    attribution: Dict[str, Any] = {}
+    for src in (contact, body):
+        for key in ("attributionSource", "attribution_source", "lastAttributionSource"):
+            if isinstance(src.get(key), dict):
+                attribution = src[key]
+                break
+        if attribution:
+            break
+
+    page_url = _first(
+        custom.get("page_url"),
+        body.get("page_url"),
+        (body.get("page") or {}).get("url") if isinstance(body.get("page"), dict) else None,
+        attribution.get("url"),
+        attribution.get("pageUrl"),
+    )
+    utm_raw: Dict[str, str] = {}
+    if page_url:
+        query = parse_qs(urlsplit(page_url).query)
+        for key in ("source", "medium", "campaign", "term", "content"):
+            val = (query.get(f"utm_{key}") or [None])[0]
+            if val:
+                utm_raw[key] = val
+    if not utm_raw:
+        spelled = {
+            "source": ("utmSource", "utm_source"),
+            "medium": ("utmMedium", "utm_medium"),
+            "campaign": ("utmCampaign", "utm_campaign", "campaign"),
+            "term": ("utmTerm", "utm_term"),
+            "content": ("utmContent", "utm_content"),
+        }
+        for key, names in spelled.items():
+            val = _first(*(attribution.get(n) for n in names))
+            if val:
+                utm_raw[key] = val
+
+    answers = {k: v for k, v in custom.items() if k not in SWEEP_WEBHOOK_KEYS and k != "page_url"}
+    return {
+        "submission_id": _first(custom.get("submission_id"), body.get("submission_id"), body.get("submissionId")),
+        "kind": "forms",
+        "contact_id": _first(body.get("contact_id"), body.get("contactId"), contact.get("id")),
+        "form_id": _first(custom.get("form_id"), body.get("form_id"), body.get("formId")),
+        "created_at": received_at,
+        "email": _first(body.get("email"), contact.get("email")),
+        "phone": _first(body.get("phone"), contact.get("phone")),
+        "name": _first(body.get("full_name"), body.get("name"), contact.get("name")),
+        "first_name": _first(body.get("first_name"), body.get("firstName"), contact.get("firstName")),
+        "last_name": _first(body.get("last_name"), body.get("lastName"), contact.get("lastName")),
+        "page_url": page_url,
+        "page_path": normalize_funnel_path(page_url),
+        "referrer": _first(attribution.get("referrer")),
+        "ad_source": _first(attribution.get("adSource"), attribution.get("sessionSource")),
+        "utm_raw": utm_raw,
+        "answers": answers,
+    }

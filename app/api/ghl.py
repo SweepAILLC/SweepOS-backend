@@ -12,7 +12,7 @@ import logging
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -39,6 +39,12 @@ class GhlStatusResponse(BaseModel):
     last_sync_at: Optional[str] = None
     needs_reconnect: bool = False
     message: Optional[str] = None
+    webhook_secret_set: bool = False
+
+
+class GhlWebhookSecretResponse(BaseModel):
+    secret: str
+    header: str = "x-ghl-webhook-secret"
 
 
 class GhlSyncResponse(BaseModel):
@@ -124,7 +130,28 @@ def get_ghl_status(
         connected=True,
         location_id=token_row.account_id,
         last_sync_at=token_row.last_sync_at.isoformat() if token_row.last_sync_at else None,
+        webhook_secret_set=bool(token_row.webhook_secret),
     )
+
+
+@router.post("/webhook-secret", response_model=GhlWebhookSecretResponse)
+def rotate_webhook_secret(
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """Generate (or rotate) the org's GHL webhook secret. Shown once: the client pastes
+    it as the `x-ghl-webhook-secret` header on every GHL Workflow Webhook action.
+    Rotating invalidates the old value immediately."""
+    import secrets
+
+    org_id = _org_id(current_user)
+    secret = secrets.token_urlsafe(32)
+    if gc.set_ghl_webhook_secret(db, org_id, secret) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Connect GoHighLevel first.")
+    logger.info("ghl webhook secret rotated org=%s by user=%s", org_id, current_user.id)
+    response.headers["Cache-Control"] = "no-store"
+    return GhlWebhookSecretResponse(secret=secret)
 
 
 @router.get("/calendars")
