@@ -27,6 +27,7 @@ from app.services.roi_signal_validation import (
     client_has_expansion_win_basis,
     merge_client_roi_meta,
     normalize_display_tags_for_client,
+    quote_in_transcript,
     upsell_referral_testimonial_gate_bypass,
     _insight_wins_are_substantial,
 )
@@ -430,6 +431,7 @@ def run_call_insight_for_fathom_record(
     insight_json = validate_and_normalize_insight_json(insight_json)
 
     trans_text = str((pack.get("call_text") or {}).get("transcript") or "")
+    _drop_unverified_deal_context_quotes(insight_json, trans_text)
     prior_roi: Dict[str, Any] = {}
     if isinstance(client.meta, dict):
         pr = client.meta.get("roi_state")
@@ -590,8 +592,8 @@ def refresh_latest_call_insight_background(
 ) -> None:
     """New DB session for thread/RQ after check-in sync.
 
-    force=False (default): honours the recency guard — no-ops when the latest
-    insight is complete and was computed within _INSIGHT_RECENCY_HOURS.
+    force=False (default): only analyzes the latest call when it has no complete
+    insight yet (new call); never re-runs an existing one.
     force=True: deletes and re-runs regardless (manual user refresh).
     """
     from app.db.session import SessionLocal
@@ -614,9 +616,6 @@ def refresh_latest_call_insight_background(
         db.close()
 
 
-_INSIGHT_RECENCY_HOURS = 2  # Skip re-run if insight was computed within this window
-
-
 def refresh_latest_call_insight(
     db: Session,
     org_id: uuid.UUID,
@@ -624,12 +623,12 @@ def refresh_latest_call_insight(
     *,
     force: bool = False,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """Re-run LLM for the latest Fathom recording.
+    """Run the LLM for the latest Fathom recording.
 
-    By default (force=False) this is a no-op if a complete insight already
-    exists and was computed within _INSIGHT_RECENCY_HOURS.  The calendar-sync
-    background path calls this without force; the manual UI refresh endpoint
-    passes force=True so the user always gets a fresh result.
+    force=False (calendar sync, lifecycle hooks): analyzes the latest call only when it has
+    no complete insight yet. Existing insights are never re-run automatically, so prompt
+    changes and deploys do not trigger re-analysis of past calls.
+    force=True (manual Re-analyze button): deletes and re-runs.
     """
     rec = (
         db.query(FathomCallRecord)
@@ -651,22 +650,117 @@ def refresh_latest_call_insight(
             .first()
         )
         if existing and existing.status == "complete" and existing.insight_json:
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=_INSIGHT_RECENCY_HOURS)
-            if existing.computed_at and existing.computed_at.replace(tzinfo=timezone.utc) > cutoff:
-                logger.debug(
-                    "refresh_latest_call_insight skipped recent_insight client=%s record=%s computed_at=%s",
-                    client_id,
-                    rec.id,
-                    existing.computed_at,
-                )
-                return "skipped", {"reason": "recent_insight"}
+            return "skipped", {"reason": "already_computed"}
+        return run_call_insight_for_fathom_record(db, org_id, rec.id)
 
     db.query(ClientCallInsight).filter(ClientCallInsight.fathom_call_record_id == rec.id).delete()
     db.commit()
     return run_call_insight_for_fathom_record(db, org_id, rec.id, bypass_cooldown=True)
 
 
-def _build_call_insights_rollup(db: Session, client: Client, rows: List[ClientCallInsight]) -> Dict[str, Any]:
+def _drop_unverified_deal_context_quotes(insight_json: Dict[str, Any], transcript: str) -> None:
+    """Blank objection quotes the transcript does not contain (keeps the objection itself)."""
+    dc = insight_json.get("deal_context")
+    if not isinstance(dc, dict):
+        return
+    for obj in dc.get("objections") or []:
+        if isinstance(obj, dict) and obj.get("quote") and not quote_in_transcript(obj["quote"], transcript):
+            obj["quote"] = ""
+
+
+_SALES_CALL_TYPES = ("sales_call", "sales_follow_up")
+_DEAL_LIST_CAP = 3
+
+
+def _deal_context_has_content(dc: Dict[str, Any]) -> bool:
+    return bool(
+        str(dc.get("situation") or "").strip()
+        or dc.get("objections")
+        or dc.get("struggles")
+        or dc.get("decision_drivers")
+    )
+
+
+def _build_deal_brief(
+    rows: List[ClientCallInsight], pipeline: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """
+    Compact hand-off brief from per-call deal_context (rows newest-first).
+    Situation/struggles/drivers come from the latest sales call (what they said when deciding);
+    why_not_closed and next_move come from the newest call (where they stand today).
+    """
+    entries: List[Tuple[Dict[str, Any], Optional[str]]] = []
+    for r in rows:
+        if r.status != "complete" or not isinstance(r.insight_json, dict):
+            continue
+        dc = r.insight_json.get("deal_context")
+        if not isinstance(dc, dict) or not _deal_context_has_content(dc):
+            continue
+        fj = r.fathom_call_record
+        entries.append((dc, fj.meeting_at.isoformat() if fj and fj.meeting_at else None))
+
+    last_sales = (pipeline or {}).get("last_sales_call") if isinstance(pipeline, dict) else None
+    calendar_sales_at = (last_sales or {}).get("start_time") if isinstance(last_sales, dict) else None
+    if not entries and not calendar_sales_at:
+        return None
+
+    sales_entries = [e for e in entries if e[0].get("call_type") in _SALES_CALL_TYPES]
+    primary, primary_at = (sales_entries or entries or [({}, None)])[0]
+    ordered = [primary] + [dc for dc, _ in entries if dc is not primary]
+
+    def first_str(key: str, sources: List[Dict[str, Any]]) -> str:
+        for dc in sources:
+            v = str(dc.get(key) or "").strip()
+            if v:
+                return v
+        return ""
+
+    def first_list(key: str) -> List[Any]:
+        for dc in ordered:
+            v = dc.get(key) or []
+            if v:
+                return list(v)[:_DEAL_LIST_CAP]
+        return []
+
+    newest = [dc for dc, _ in entries]
+    handoff = {"success_definition": "", "watch_outs": []}
+    for dc in newest:
+        h = dc.get("csm_handoff") if isinstance(dc.get("csm_handoff"), dict) else {}
+        if not handoff["success_definition"]:
+            handoff["success_definition"] = str(h.get("success_definition") or "").strip()
+        if not handoff["watch_outs"] and h.get("watch_outs"):
+            handoff["watch_outs"] = list(h["watch_outs"])[:_DEAL_LIST_CAP]
+
+    # Calendar check-in and Fathom recording of the same call differ by minutes — dedupe by day,
+    # preferring the calendar time (listed first).
+    by_day: Dict[str, str] = {}
+    for d in [calendar_sales_at, *[mat for _, mat in sales_entries]]:
+        if d and d[:10] not in by_day:
+            by_day[d[:10]] = d
+    sales_call_dates = sorted(by_day.values(), reverse=True)
+
+    return {
+        "outcome": str((newest[0] if newest else primary).get("outcome") or "not_applicable"),
+        "source_meeting_at": primary_at or "",
+        "sales_call_at": sales_call_dates[0] if sales_call_dates else "",
+        "sales_call_count": len(sales_call_dates),
+        "sale_closed": (last_sales or {}).get("sale_closed") if isinstance(last_sales, dict) else None,
+        "situation": first_str("situation", ordered),
+        "struggles": first_list("struggles"),
+        "objections": first_list("objections"),
+        "decision_drivers": first_list("decision_drivers"),
+        "why_not_closed": first_str("why_not_closed", newest),
+        "next_move": first_str("next_move", newest),
+        "csm_handoff": handoff,
+    }
+
+
+def _build_call_insights_rollup(
+    db: Session,
+    client: Client,
+    rows: List[ClientCallInsight],
+    pipeline: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Aggregate priorities, suggestions, clips, wins across completed insights (no per-call drill-down in UI)."""
     open_priorities: List[str] = []
     open_suggestions: List[Dict[str, str]] = []
@@ -791,6 +885,7 @@ def _build_call_insights_rollup(db: Session, client: Client, rows: List[ClientCa
         "latest_referral_signal": latest_referral,
         "latest_revive_playbook": latest_revive_playbook,
         "latest_framework_review": latest_framework_review or None,
+        "deal_brief": _build_deal_brief(rows, pipeline),
         "prospect_voice_profile": prof,
         "org_validated_theme_keys": [],
     }
@@ -858,7 +953,7 @@ def get_client_insights_response(db: Session, org_id: uuid.UUID, client_id: uuid
             }
         )
 
-    rollup = _build_call_insights_rollup(db, client, rows)
+    rollup = _build_call_insights_rollup(db, client, rows, pipeline=pipeline)
 
     roi_state_out: Optional[Dict[str, Any]] = None
     if isinstance(client.meta, dict):

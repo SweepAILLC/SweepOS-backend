@@ -105,7 +105,7 @@ def _client_state_synthesis_rules(lifecycle: str) -> str:
     return base + "Match tone to lifecycle in DATA.lifecycle."
 
 
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v1.1"
 
 # Extracts structured coaching/ROI signals from a transcript into internal JSON —
 # never shown to the client — exempt from LLM.md's "generative calls" persona
@@ -148,6 +148,31 @@ SYSTEM_PROMPT = (
     "If the call only says vague timing ('soon', 'next week' without a date), or no follow-up date was agreed, "
     "set confirmed_on_call false and due_date_iso null. Never invent dates; evidence_quote must be from the transcript when confirmed. "
     "For active, offboarding, or dead lifecycle, output lead_follow_up with confirmed_on_call false and nulls. "
+    '"deal_context": { '
+    '"call_type": "sales_call"|"sales_follow_up"|"onboarding"|"coaching"|"other", '
+    '"outcome": "closed"|"not_closed"|"pending_decision"|"not_applicable", '
+    '"situation": string (MAX 2 short sentences of hard facts: role/business, the numbers they gave, '
+    "what is forcing the decision now), "
+    '"struggles": string[] (max 3, each under 12 words, their words), '
+    '"objections": array (max 3) of { "objection": string (under 10 words), '
+    '"category": "price"|"time"|"partner_or_spouse"|"trust"|"timing"|"fit"|"self_doubt"|"other", '
+    '"quote": string (short verbatim transcript line or empty), "resolved": boolean }, '
+    '"why_not_closed": string (ONE sentence: the real blocker, not just the stated one; empty when closed), '
+    '"decision_drivers": string[] (max 3, under 12 words each: why they bought / why they would buy), '
+    '"next_move": string (ONE sentence: for an unclosed lead, the exact hook + ask for the next setter/closer touch; '
+    "for a client, the single most important thing the client manager should do now), "
+    '"csm_handoff": { "success_definition": string (one sentence, measurable when possible), '
+    '"watch_outs": string[] (max 3, under 12 words: churn/refund risks, promises made on the sales call) } '
+    "(only when closed or lifecycle active/offboarding; else empty) "
+    "}, "
+    "DEAL_CONTEXT RULES (critical): a setter, closer, or client manager must grasp this person in 10 seconds. "
+    "Brevity is mandatory—no filler, no restating the obvious, no adjectives without facts. Prefer concrete "
+    "numbers, dates, names, and amounts from the transcript AND from DATA.context (pipeline dates, engagement, "
+    "lifetime_revenue_usd, program dates, check_in.booking_fields_excerpt, client.prospect_excerpt, notes_excerpt). "
+    "Reflect where they stand TODAY: if CRM data shows they since paid, booked, went quiet, or progressed, say so "
+    "rather than repeating stale call content. Empty string/array when not evidenced—never invent. "
+    "Outcome: lifecycle active/offboarding or pipeline.last_sales_call.sale_closed true → closed; a sales call that "
+    "ended without payment → not_closed, or pending_decision only when a concrete decision date/next call was set. "
     '"low_signal": boolean, '
     '"low_signal_reason": string, '
     '"framework_review": string (1-3 sentences; only when DATA.sales_lens is present and the call had sales-relevant content — see SALES_LENS rules; otherwise empty string), '
@@ -275,9 +300,10 @@ def validate_and_normalize_insight_json(raw: Dict[str, Any]) -> Dict[str, Any]:
         "framework_review": "",
         "roi_signals": _normalize_roi_signals_raw(raw.get("roi_signals")),
         "lead_follow_up": _normalize_lead_follow_up_raw(raw.get("lead_follow_up")),
+        "deal_context": normalize_deal_context(raw.get("deal_context")),
     }
 
-    css = str(raw.get("client_state_synthesis") or "").strip()
+    css =str(raw.get("client_state_synthesis") or "").strip()
     if css and not out["low_signal"]:
         out["client_state_synthesis"] = css[:2200]
 
@@ -367,8 +393,76 @@ def validate_and_normalize_insight_json(raw: Dict[str, Any]) -> Dict[str, Any]:
             "revive_playbook": {"rationale": "", "offer_angles": [], "outreach_hooks": []},
         }
         out["lead_follow_up"] = {"confirmed_on_call": False, "due_date_iso": None, "evidence_quote": None}
+        out["deal_context"] = normalize_deal_context(None)
 
     return out
+
+
+DEAL_CALL_TYPES = frozenset({"sales_call", "sales_follow_up", "onboarding", "coaching", "other"})
+DEAL_OUTCOMES = frozenset({"closed", "not_closed", "pending_decision", "not_applicable"})
+OBJECTION_CATEGORIES = frozenset(
+    {"price", "time", "partner_or_spouse", "trust", "timing", "fit", "self_doubt", "other"}
+)
+
+
+def _str_list(val: Any, max_items: int, max_len: int) -> List[str]:
+    if not isinstance(val, list):
+        return []
+    out: List[str] = []
+    for x in val[:max_items]:
+        s = str(x or "").strip()
+        if s:
+            out.append(s[:max_len])
+    return out
+
+
+def normalize_deal_context(raw_dc: Any) -> Dict[str, Any]:
+    """Stable shape for the sales/CSM hand-off brief (situation, objections, why closed / not closed)."""
+    dc: Dict[str, Any] = raw_dc if isinstance(raw_dc, dict) else {}
+    call_type = str(dc.get("call_type") or "other").lower().strip()
+    if call_type not in DEAL_CALL_TYPES:
+        call_type = "other"
+    outcome = str(dc.get("outcome") or "not_applicable").lower().strip()
+    if outcome not in DEAL_OUTCOMES:
+        outcome = "not_applicable"
+
+    objections: List[Dict[str, Any]] = []
+    for item in (dc.get("objections") or [])[:3] if isinstance(dc.get("objections"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("objection") or "").strip()
+        if not text or any(o["objection"].lower() == text[:120].lower() for o in objections):
+            continue
+        cat = str(item.get("category") or "other").lower().strip()
+        if cat not in OBJECTION_CATEGORIES:
+            cat = "other"
+        objections.append(
+            {
+                "objection": text[:120],
+                "category": cat,
+                "quote": str(item.get("quote") or "").strip()[:240],
+                "resolved": bool(item.get("resolved")),
+            }
+        )
+
+    raw_handoff = dc.get("csm_handoff") if isinstance(dc.get("csm_handoff"), dict) else {}
+    handoff = {
+        "success_definition": str(raw_handoff.get("success_definition") or "").strip()[:240],
+        "watch_outs": _str_list(raw_handoff.get("watch_outs"), 3, 140),
+    }
+
+    closed = outcome == "closed"
+    return {
+        "call_type": call_type,
+        "outcome": outcome,
+        "situation": str(dc.get("situation") or "").strip()[:400],
+        "struggles": _str_list(dc.get("struggles"), 3, 140),
+        "objections": objections,
+        "why_not_closed": "" if closed else str(dc.get("why_not_closed") or "").strip()[:240],
+        "decision_drivers": _str_list(dc.get("decision_drivers"), 3, 140),
+        "next_move": str(dc.get("next_move") or "").strip()[:280],
+        "csm_handoff": handoff,
+    }
 
 
 def _normalize_lead_follow_up_raw(raw_lf: Any) -> Dict[str, Any]:
