@@ -3,7 +3,7 @@ Background processor for Stripe webhook events.
 Processes events and updates database records.
 """
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 from app.models.stripe_payment import StripePayment
 from app.models.stripe_subscription import StripeSubscription
 from app.models.client import Client
@@ -752,7 +752,7 @@ def _process_subscription_event(db: Session, data: Dict[str, Any], event_type: s
                 StripeSubscription.status.in_(["active", "trialing"])
             )
         ).with_entities(
-            db.func.sum(StripeSubscription.mrr)
+            func.sum(StripeSubscription.mrr)
         ).scalar() or Decimal(0)
         
         client.estimated_mrr = total_mrr
