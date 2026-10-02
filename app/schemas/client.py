@@ -185,6 +185,7 @@ class Client(ClientBase):
     id: uuid.UUID
     tenant_id: Optional[uuid.UUID] = None
     last_activity_at: Optional[datetime] = None
+    opted_in_at: Optional[datetime] = None  # read-only; set by funnel lead capture / GHL sync
     lifetime_revenue_cents: Optional[int] = 0
     notes: Optional[str] = None
     meta: Optional[dict] = None

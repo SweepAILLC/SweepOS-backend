@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String, DateTime, ForeignKey, Integer
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 import uuid
 from datetime import datetime
@@ -16,6 +16,10 @@ class Funnel(Base):
     slug = Column(String, nullable=True, unique=True)  # Optional unique slug for URL matching
     domain = Column(String, nullable=True)  # Domain for URL-based funnel detection
     env = Column(String, nullable=True)  # Environment: production, staging, etc.
+    # "sweep" (NULL on legacy rows) = Sweep-tracked page; "ghl" = paired to a GoHighLevel funnel.
+    source = Column(String(16), nullable=True, default="sweep")
+    # GHL pairing + sync state: ghl_funnel_id, name, domain, page paths, extra form ids, sync cursor.
+    ghl_config = Column(JSONB, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

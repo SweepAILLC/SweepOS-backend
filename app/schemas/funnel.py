@@ -56,6 +56,8 @@ class FunnelUpdate(BaseModel):
 class Funnel(FunnelBase):
     id: UUID
     org_id: UUID
+    source: Optional[str] = None
+    ghl_config: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
     steps: List[FunnelStep] = []
