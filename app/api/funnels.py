@@ -24,6 +24,7 @@ from app.models.client import Client
 from app.schemas.funnel import (
     Funnel as FunnelSchema,
     FunnelCreate,
+    FunnelGhlExtraFormsIn,
     FunnelGhlPairIn,
     FunnelUpdate,
     FunnelWithSteps,
@@ -391,6 +392,27 @@ def sync_funnel_ghl_leads(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Funnel is not paired with GoHighLevel")
     schedule_background_work(run_ghl_lead_sync_job, None, str(org_id), job_timeout=1800)
     return {"started": True}
+
+
+@router.put("/{funnel_id}/ghl/extra-forms", response_model=FunnelSchema)
+def set_funnel_ghl_extra_forms(
+    funnel_id: UUID,
+    body: FunnelGhlExtraFormsIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Forms outside the funnel's pages whose submissions count as this funnel's
+    opt-ins (admin/owner). Takes effect on the next lead pull."""
+    from app.services.ghl_funnels import GHL_SOURCE, set_extra_form_ids
+
+    org_id = getattr(current_user, 'selected_org_id', current_user.org_id)
+    _require_integration_manager(current_user, db)
+    funnel = db.query(Funnel).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).first()
+    if not funnel:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+    if funnel.source != GHL_SOURCE:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Funnel is not paired with GoHighLevel")
+    return set_extra_form_ids(db, funnel, body.form_ids)
 
 
 @router.delete("/{funnel_id}/ghl/pair", response_model=FunnelSchema)

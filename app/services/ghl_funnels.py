@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.funnel import Funnel, FunnelStep
 from app.services import ghl_client as gc
@@ -32,7 +33,22 @@ class GhlFunnelAlreadyPairedError(Exception):
 
 
 def step_event_name(path: str) -> str:
-    return f"{STEP_EVENT_PREFIX}{path}"
+    # Event names are capped at 100 chars (EventIn); the visitor snippet cuts the path
+    # at the same 95 so long paths still match their step.
+    return f"{STEP_EVENT_PREFIX}{path[:95]}"
+
+
+def set_extra_form_ids(db: Session, funnel: Funnel, form_ids: list[str]) -> Funnel:
+    """Forms outside the funnel's pages (popups, standalone links) whose submissions
+    count as this funnel's opt-ins in the reconcile pull."""
+    cfg = dict(funnel.ghl_config or {})
+    cfg["extra_form_ids"] = sorted({f.strip() for f in form_ids if f and f.strip()})
+    funnel.ghl_config = cfg
+    flag_modified(funnel, "ghl_config")
+    funnel.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(funnel)
+    return funnel
 
 
 def find_paired_funnel(db: Session, org_id: uuid.UUID, ghl_funnel_id: str) -> Optional[Funnel]:

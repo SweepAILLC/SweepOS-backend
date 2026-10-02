@@ -188,6 +188,23 @@ def list_calendars(
     }
 
 
+@router.get("/forms")
+def list_forms(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """GHL forms + surveys in the connected location, for a funnel's extra-forms picker."""
+    org_id = _org_id(current_user)
+    try:
+        headers, location_id = gc.get_ghl_connection(db, org_id, user_id=current_user.id)
+    except gc.GhlNotConnectedError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+    try:
+        return {"forms": gc.list_ghl_forms_and_surveys(headers, location_id)}
+    except gc.GhlApiError as e:
+        raise HTTPException(status_code=_upstream_status(e), detail=str(e)) from e
+
+
 @router.get("/funnels")
 def list_funnels(
     db: Session = Depends(get_db),

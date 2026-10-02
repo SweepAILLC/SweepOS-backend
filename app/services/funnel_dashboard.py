@@ -101,6 +101,26 @@ def _ratio(n: float, d: float, digits: int = 2) -> Optional[float]:
     return round(n / d, digits) if d else None
 
 
+def _ghl_activity_times(cfg: Any) -> List[datetime]:
+    """Last webhook lead and last pulled lead recorded in a funnel's ghl_config."""
+    if not isinstance(cfg, dict):
+        return []
+    raw = [
+        (cfg.get("webhook") or {}).get("last_received_at") if isinstance(cfg.get("webhook"), dict) else None,
+        (cfg.get("sync") or {}).get("last_lead_at") if isinstance(cfg.get("sync"), dict) else None,
+    ]
+    out: List[datetime] = []
+    for value in raw:
+        if not value:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(value))
+        except ValueError:
+            continue
+        out.append(ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc))
+    return out
+
+
 def _tracking_status(db: Session, funnel_ids: Set[uuid.UUID], now: datetime) -> Dict[str, Any]:
     if not funnel_ids:
         return {"status": "no_funnels", "last_event_at": None, "errors_24h": 0}
@@ -111,6 +131,12 @@ def _tracking_status(db: Session, funnel_ids: Set[uuid.UUID], now: datetime) -> 
     )
     if last is not None and last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)
+    # GHL-paired funnels are also live when leads arrive by webhook or pull, even
+    # before (or without) the visitor snippet.
+    for (cfg,) in db.query(Funnel.ghl_config).filter(Funnel.id.in_(list(funnel_ids)), Funnel.source == "ghl").all():
+        for ts in _ghl_activity_times(cfg):
+            if last is None or ts > last:
+                last = ts
     # EventError has no org/funnel column; attribute by payload funnel_id, 24h only.
     wanted = {str(f) for f in funnel_ids}
     errors = 0

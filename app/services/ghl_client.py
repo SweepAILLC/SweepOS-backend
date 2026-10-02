@@ -189,6 +189,25 @@ def verify_ghl_connection(headers: Dict[str, str], location_id: str) -> bool:
     return True
 
 
+def list_ghl_forms_and_surveys(headers: Dict[str, str], location_id: str) -> List[Dict[str, Any]]:
+    """[{id, name, kind: "form"|"survey"}] for the extra-forms picker (first 100 of each)."""
+    out: List[Dict[str, Any]] = []
+    with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
+        for kind, path, key in (("form", "/forms/", "forms"), ("survey", "/surveys/", "surveys")):
+            resp = client.get(
+                f"{GHL_API_BASE}{path}",
+                headers=headers,
+                params={"locationId": location_id, "limit": 100},
+            )
+            _raise_for_status(resp, action=f"list {key}")
+            data = resp.json() if resp.content else {}
+            rows = data.get(key) if isinstance(data, dict) else None
+            for row in rows if isinstance(rows, list) else []:
+                if isinstance(row, dict) and row.get("id"):
+                    out.append({"id": str(row["id"]), "name": str(row.get("name") or "Untitled"), "kind": kind})
+    return out
+
+
 def list_ghl_calendars(headers: Dict[str, str], location_id: str) -> List[Dict[str, Any]]:
     with httpx.Client(timeout=_REQUEST_TIMEOUT) as client:
         resp = client.get(

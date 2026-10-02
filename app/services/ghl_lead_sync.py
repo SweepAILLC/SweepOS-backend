@@ -21,7 +21,7 @@ import uuid
 import zlib
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 from pydantic import ValidationError
 from sqlalchemy import func, select
@@ -32,6 +32,9 @@ from app.models.funnel import Funnel
 from app.schemas.funnel import FunnelLeadIn
 from app.services import ghl_client as gc
 from app.services.ghl_funnels import GHL_SOURCE
+
+if TYPE_CHECKING:
+    from app.services.funnel_leads import FunnelLeadResult
 
 LOG = logging.getLogger(__name__)
 
@@ -119,6 +122,12 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _webhook_is_live(funnel: Funnel, now: datetime) -> bool:
+    webhook = (funnel.ghl_config or {}).get("webhook") or {}
+    last_hook = _parse_dt(webhook.get("last_received_at")) if isinstance(webhook, dict) else None
+    return bool(last_hook and now - last_hook <= WEBHOOK_FRESH_FOR)
+
+
 def is_due(funnels: List[Funnel], now: datetime, interval: timedelta) -> bool:
     """Daily when a paired funnel has a live webhook (seen within WEBHOOK_FRESH_FOR),
     else every `interval`. A funnel that never ran is always due."""
@@ -127,9 +136,7 @@ def is_due(funnels: List[Funnel], now: datetime, interval: timedelta) -> bool:
         last_run = _parse_dt(state.get("last_run_at"))
         if last_run is None:
             return True
-        webhook = (f.ghl_config or {}).get("webhook") or {}
-        last_hook = _parse_dt(webhook.get("last_received_at")) if isinstance(webhook, dict) else None
-        every = DAILY if last_hook and now - last_hook <= WEBHOOK_FRESH_FOR else interval
+        every = DAILY if _webhook_is_live(f, now) else interval
         if now - last_run >= every:
             return True
     return False
@@ -152,8 +159,9 @@ def window_for(funnels: List[Funnel], today: date) -> tuple[date, bool]:
 # --- inbox processor ----------------------------------------------------------------
 
 
-def process_submission_payload(db: Session, org_id: uuid.UUID, payload: Dict[str, Any]) -> None:
-    """Inbox processor (also used for retries): tag one submission's lead."""
+def process_submission_payload(db: Session, org_id: uuid.UUID, payload: Dict[str, Any]) -> Optional["FunnelLeadResult"]:
+    """Inbox processor (also used for retries): tag one submission's lead.
+    Returns the upsert result, or None when the submission was dropped."""
     from app.api.funnels import normalize_utm
     from app.services.funnel_leads import upsert_funnel_lead
 
@@ -161,17 +169,17 @@ def process_submission_payload(db: Session, org_id: uuid.UUID, payload: Dict[str
     try:
         funnel_id = uuid.UUID(str(payload.get("funnel_id")))
     except ValueError:
-        return
+        return None
     funnel = (
         db.query(Funnel)
         .filter(Funnel.id == funnel_id, Funnel.org_id == org_id, Funnel.source == GHL_SOURCE)
         .first()
     )
     if funnel is None:  # unpaired or deleted since the submission was recorded
-        return
+        return None
     if not (sub.get("email") or sub.get("phone") or sub.get("name") or sub.get("first_name")):
-        return  # nothing to identify a person by
-    upsert_funnel_lead(
+        return None  # nothing to identify a person by
+    return upsert_funnel_lead(
         db,
         funnel,
         lead_from_submission(sub, funnel.id),
@@ -207,10 +215,15 @@ def paired_funnels(db: Session, org_id: uuid.UUID) -> List[Funnel]:
     return db.query(Funnel).filter(Funnel.org_id == org_id, Funnel.source == GHL_SOURCE).all()
 
 
-def _save_state(db: Session, funnels: List[Funnel], update: Dict[str, Any]) -> None:
+def _save_state(
+    db: Session,
+    funnels: List[Funnel],
+    update: Dict[str, Any],
+    per_funnel: Optional[Dict[uuid.UUID, Dict[str, Any]]] = None,
+) -> None:
     for f in funnels:
         cfg = dict(f.ghl_config or {})
-        cfg["sync"] = {**_sync_state(f), **update}
+        cfg["sync"] = {**_sync_state(f), **update, **((per_funnel or {}).get(f.id) or {})}
         f.ghl_config = cfg
         flag_modified(f, "ghl_config")
     db.commit()
@@ -238,7 +251,7 @@ def sync_org(db: Session, org_id: uuid.UUID, *, now: Optional[datetime] = None) 
 
     now = now or datetime.now(timezone.utc)
     funnels = paired_funnels(db, org_id)
-    counts = {"seen": 0, "routed": 0, "processed": 0, "skipped": 0, "failed": 0}
+    counts = {"seen": 0, "routed": 0, "processed": 0, "skipped": 0, "failed": 0, "new": 0}
     if not funnels:
         return counts
     try:
@@ -249,6 +262,11 @@ def sync_org(db: Session, org_id: uuid.UUID, *, now: Optional[datetime] = None) 
 
     start, first_run = window_for(funnels, now.date())
     new_funnel_ids = {f.id for f in funnels if not _sync_state(f).get("cursor")}
+    live_webhook_ids = {f.id for f in funnels if _webhook_is_live(f, now)}
+    # Per funnel: leads this run created or tagged, and how many of those a live
+    # webhook should have delivered first (recent, past the funnel's first run).
+    new_leads: Dict[uuid.UUID, int] = {}
+    missed: Dict[uuid.UUID, int] = {}
     touched_days: set[date] = set()
     error: Optional[str] = None
     try:
@@ -275,10 +293,27 @@ def sync_org(db: Session, org_id: uuid.UUID, *, now: Optional[datetime] = None) 
                 )
                 if row.status == STATUS_DONE:
                     continue
-                if process_recorded_event(db, row, process_submission_payload):
+                outcome: List[Any] = []
+
+                def _capture(d: Session, o: uuid.UUID, p: Dict[str, Any], _out: List[Any] = outcome) -> None:
+                    _out.append(process_submission_payload(d, o, p))
+
+                if process_recorded_event(db, row, _capture):
                     counts["processed"] += 1
                     if sub.get("created_at"):
                         touched_days.add(sub["created_at"].date())
+                    result = outcome[0] if outcome else None
+                    if result is not None and not result.duplicate:
+                        counts["new"] += 1
+                        new_leads[funnel.id] = new_leads.get(funnel.id, 0) + 1
+                        created = sub.get("created_at")
+                        if (
+                            funnel.id in live_webhook_ids
+                            and funnel.id not in new_funnel_ids
+                            and created is not None
+                            and now - created <= WEBHOOK_FRESH_FOR
+                        ):
+                            missed[funnel.id] = missed.get(funnel.id, 0) + 1
                 else:
                     counts["failed"] += 1
     except gc.GhlApiError as e:
@@ -295,7 +330,13 @@ def sync_org(db: Session, org_id: uuid.UUID, *, now: Optional[datetime] = None) 
     if error is None:
         # Cursor only moves on a complete run, so a partial run is re-read next time.
         state.update({"cursor": now.date().isoformat(), "last_run_at": now.isoformat()})
-    _save_state(db, funnels, state)
+    per_funnel: Dict[uuid.UUID, Dict[str, Any]] = {}
+    for f in funnels:
+        extra: Dict[str, Any] = {"missed_by_webhook": missed.get(f.id, 0)}
+        if new_leads.get(f.id):
+            extra["last_lead_at"] = now.isoformat()
+        per_funnel[f.id] = extra
+    _save_state(db, funnels, state, per_funnel)
     _after_run_side_effects(db, org_id, touched_days)
     LOG.info("ghl lead sync org=%s first_run=%s %s", org_id, first_run, counts)
     return counts

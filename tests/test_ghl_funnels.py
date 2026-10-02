@@ -287,3 +287,46 @@ class TestCreateFunnelEndpoint:
         out = api.create_funnel(FunnelCreate(name="Quiz"), db, self._user())
         assert out.source is None or out.source == "sweep"
         db.commit.assert_called_once()
+
+
+class TestExtraFormsAndListing:
+    def test_step_event_name_is_capped_like_the_snippet(self):
+        long_path = "/" + "a" * 200
+        assert gf.step_event_name(long_path) == "view:" + long_path[:95]
+        assert len(gf.step_event_name(long_path)) <= 100
+
+    def test_set_extra_form_ids_dedupes_and_sorts(self):
+        f = Funnel(id=uuid.uuid4(), org_id=ORG, name="f", source="ghl", ghl_config={"ghl_funnel_id": "x", "extra_form_ids": []})
+        gf.set_extra_form_ids(MagicMock(), f, ["b", " a ", "b", ""])
+        assert f.ghl_config["extra_form_ids"] == ["a", "b"]
+        assert f.ghl_config["ghl_funnel_id"] == "x"
+
+    def test_extra_forms_schema_limits(self):
+        from app.schemas.funnel import FunnelGhlExtraFormsIn
+
+        with pytest.raises(ValueError):
+            FunnelGhlExtraFormsIn(form_ids=["x"] * 51)
+        with pytest.raises(ValueError):
+            FunnelGhlExtraFormsIn(form_ids=["x" * 256])
+
+    def test_extra_forms_endpoint_requires_ghl_funnel_in_org(self):
+        from app.api import funnels as api
+        from app.schemas.funnel import FunnelGhlExtraFormsIn
+
+        user = SimpleNamespace(id=uuid.uuid4(), org_id=ORG, selected_org_id=ORG)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = Funnel(id=uuid.uuid4(), org_id=ORG, name="f", source="sweep")
+        with patch("app.services.org_user_context.user_can_manage_org_integrations", return_value=True):
+            with pytest.raises(HTTPException) as exc:
+                api.set_funnel_ghl_extra_forms(uuid.uuid4(), FunnelGhlExtraFormsIn(form_ids=["a"]), db, user)
+        assert exc.value.status_code == 400
+
+    def test_list_forms_and_surveys(self):
+        def handler(req):
+            if req.url.path == "/forms/":
+                return httpx.Response(200, json={"forms": [{"id": "f1", "name": "Opt-in"}], "total": 1})
+            return httpx.Response(200, json={"surveys": [{"id": "s1", "name": "Quiz"}], "total": 1})
+
+        with _mock_http(handler):
+            out = gc.list_ghl_forms_and_surveys(HEADERS, "loc")
+        assert out == [{"id": "f1", "name": "Opt-in", "kind": "form"}, {"id": "s1", "name": "Quiz", "kind": "survey"}]

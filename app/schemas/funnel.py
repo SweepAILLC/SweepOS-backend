@@ -57,6 +57,16 @@ class FunnelGhlPairIn(BaseModel):
     ghl_funnel_id: str = Field(..., min_length=1, max_length=255)
 
 
+class FunnelGhlExtraFormsIn(BaseModel):
+    form_ids: List[str] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def _ids_are_short(self):
+        if any(len(f) > 255 for f in self.form_ids):
+            raise ValueError("form ids must be at most 255 characters")
+        return self
+
+
 class FunnelUpdate(BaseModel):
     name: Optional[str] = None
     client_id: Optional[UUID] = None

@@ -136,7 +136,7 @@ class TestSyncOrg:
     def test_routes_records_and_processes(self):
         f = _funnel(sync_state={"cursor": "2026-10-01", "last_run_at": "2026-10-01T00:00:00+00:00"})
         counts, recorded, proc, side = self._run([f], forms=_subs())
-        assert counts == {"seen": 2, "routed": 1, "processed": 1, "skipped": 1, "failed": 0}
+        assert counts == {"seen": 2, "routed": 1, "processed": 1, "skipped": 1, "failed": 0, "new": 0}
         assert recorded[0]["provider"] == "ghl_sync" and recorded[0]["event_id"] == "forms:sub_001"
         assert recorded[0]["payload"]["funnel_id"] == str(f.id)
         assert recorded[0]["payload"]["notify"] is True
@@ -227,3 +227,77 @@ def test_inbox_flush_knows_the_sync_provider():
         assert inbox.flush_due_inbound_webhooks(MagicMock()) == 1
     retry.assert_not_called()
     assert proc.call_args.args[2] is sync.process_submission_payload
+
+
+class TestNewAndMissedLeads:
+    """Per-funnel `last_lead_at` feeds the tracking dot; `missed_by_webhook` feeds the
+    drawer's "webhook missed N leads" hint."""
+
+    def _run(self, funnel, results, now=NOW):
+        recorded_rows = []
+
+        def record(db, **kw):
+            row = SimpleNamespace(status="pending", **kw)
+            recorded_rows.append(row)
+            return row, True
+
+        def process(db, row, fn):
+            fn(db, ORG, row.payload)
+            return True
+
+        results = iter(results)
+        with patch.object(sync, "paired_funnels", return_value=[funnel]), patch.object(
+            gc, "get_ghl_connection", return_value=({}, "loc")
+        ), patch.dict(sync._ITERATORS, {"forms": lambda *a: iter(_subs()[:1]), "surveys": lambda *a: iter([])}), patch(
+            "app.services.inbound_webhook_inbox.record_inbound_event", side_effect=record
+        ), patch("app.services.inbound_webhook_inbox.process_recorded_event", side_effect=process), patch.object(
+            sync, "process_submission_payload", side_effect=lambda *a: next(results)
+        ), patch.object(sync, "_after_run_side_effects"):
+            return sync.sync_org(MagicMock(), ORG, now=now)
+
+    def test_new_lead_is_missed_only_when_recent_and_webhook_live(self):
+        # The fixture submission is from 2026-09-14: more than 7 days before NOW, so a
+        # live webhook isn't blamed for it, but it still counts as a new lead.
+        hook = {"last_received_at": (NOW - timedelta(days=1)).isoformat()}
+        f = _funnel(sync_state={"cursor": "2026-09-01"}, webhook=hook)
+        counts = self._run(f, [SimpleNamespace(duplicate=False)])
+        assert counts["new"] == 1
+        assert f.ghl_config["sync"]["missed_by_webhook"] == 0
+        assert f.ghl_config["sync"]["last_lead_at"] == NOW.isoformat()
+
+        # Two days after the submission, with the webhook live: the pull found a lead
+        # the webhook should have delivered.
+        fresh_now = datetime(2026, 9, 16, tzinfo=timezone.utc)
+        f2 = _funnel(sync_state={"cursor": "2026-09-01"}, webhook={"last_received_at": "2026-09-15T00:00:00+00:00"})
+        self._run(f2, [SimpleNamespace(duplicate=False)], now=fresh_now)
+        assert f2.ghl_config["sync"]["missed_by_webhook"] == 1
+
+    def test_duplicate_is_neither_new_nor_missed(self):
+        fresh_now = datetime(2026, 9, 16, tzinfo=timezone.utc)
+        f = _funnel(sync_state={"cursor": "2026-09-01"}, webhook={"last_received_at": "2026-09-15T00:00:00+00:00"})
+        counts = self._run(f, [SimpleNamespace(duplicate=True)], now=fresh_now)
+        assert counts["new"] == 0
+        assert f.ghl_config["sync"]["missed_by_webhook"] == 0
+        assert "last_lead_at" not in f.ghl_config["sync"]
+
+    def test_first_run_backfill_is_never_missed(self):
+        fresh_now = datetime(2026, 9, 16, tzinfo=timezone.utc)
+        f = _funnel(webhook={"last_received_at": "2026-09-15T00:00:00+00:00"})  # no cursor: first run
+        self._run(f, [SimpleNamespace(duplicate=False)], now=fresh_now)
+        assert f.ghl_config["sync"]["missed_by_webhook"] == 0
+
+
+def test_tracking_status_counts_ghl_lead_activity():
+    from app.services import funnel_dashboard as fd
+
+    now = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    cfg = {"webhook": {"last_received_at": "2026-10-02T11:00:00+00:00"}, "sync": {"last_lead_at": "2026-10-01T00:00:00+00:00"}}
+    db = MagicMock()
+    event_q, ghl_q, err_q = MagicMock(), MagicMock(), MagicMock()
+    event_q.filter.return_value.scalar.return_value = None  # no page views at all
+    ghl_q.filter.return_value.all.return_value = [(cfg,)]
+    err_q.filter.return_value.all.return_value = []
+    db.query.side_effect = [event_q, ghl_q, err_q]
+    out = fd._tracking_status(db, {uuid.uuid4()}, now)
+    assert out["status"] == "live"
+    assert out["last_event_at"] == datetime(2026, 10, 2, 11, tzinfo=timezone.utc)
