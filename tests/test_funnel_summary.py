@@ -20,10 +20,14 @@ def _query_mock(
     manual_rows=(),
 ):
     checkin_calls = iter([checkins, all_checkins if all_checkins is not None else checkins])
-    # Collector reads (id, channel, funnel_id, created_at); fixtures give (id, channel).
+    # Collector reads (id, channel, funnel_id, created_at, opted_in_at); fixtures give
+    # (id, channel), (id, channel, funnel_id, created_at) or the full 5-tuple.
     in_window = datetime(2026, 1, 15, tzinfo=timezone.utc)
     client_rows = [
-        tuple(c) if len(c) == 4 else (c[0], c[1], None, in_window) for c in clients
+        tuple(c) if len(c) == 5
+        else (*c, None) if len(c) == 4
+        else (c[0], c[1], None, in_window, None)
+        for c in clients
     ]
     # Shape like real org rows (the collector folds them through kpi_org_totals).
     fixture_org = uuid.uuid4()
@@ -138,3 +142,56 @@ class TestComputeFunnelSummary:
         result = compute_funnel_summary(db, org_id, ws, we, "all")
         assert result["closed"] == 0
         assert result["cash_per_close_usd"] is None
+
+
+class TestOptedInAt:
+    """GHL-3: an opt-in counts on coalesce(opted_in_at, created_at)."""
+
+    ws, we = date(2026, 1, 1), date(2026, 1, 31)
+
+    def test_opted_in_at_moves_an_old_row_into_the_window(self):
+        # Row created in 2025 by the manual GHL contact sync, tagged to a funnel in January.
+        cid = uuid.uuid4()
+        created = datetime(2025, 11, 3, tzinfo=timezone.utc)
+        opted = datetime(2026, 1, 20, 15, 0, tzinfo=timezone.utc)
+        db = _query_mock(clients=[(cid, "paid", None, created, opted)])
+        assert compute_funnel_summary(db, uuid.uuid4(), self.ws, self.we, "paid")["opt_ins"] == 1
+
+    def test_opted_in_at_moves_a_new_row_out_of_the_window(self):
+        # 90-day backfill: row created today, but the person opted in long before.
+        cid = uuid.uuid4()
+        created = datetime(2026, 1, 20, tzinfo=timezone.utc)
+        opted = datetime(2025, 12, 2, tzinfo=timezone.utc)
+        db = _query_mock(clients=[(cid, "paid", None, created, opted)])
+        assert compute_funnel_summary(db, uuid.uuid4(), self.ws, self.we, "paid")["opt_ins"] == 0
+
+    def test_without_opted_in_at_created_at_still_decides(self):
+        inside = (uuid.uuid4(), "paid", None, datetime(2026, 1, 9, tzinfo=timezone.utc), None)
+        outside = (uuid.uuid4(), "paid", None, datetime(2025, 12, 9, tzinfo=timezone.utc), None)
+        db = _query_mock(clients=[inside, outside])
+        assert compute_funnel_summary(db, uuid.uuid4(), self.ws, self.we, "paid")["opt_ins"] == 1
+
+    def test_funnel_scope_uses_opted_in_at(self):
+        funnel = uuid.uuid4()
+        other = uuid.uuid4()
+        opted = datetime(2026, 1, 20, tzinfo=timezone.utc)
+        old = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        rows = [
+            (uuid.uuid4(), "paid", funnel, old, opted),
+            (uuid.uuid4(), "paid", other, old, opted),
+        ]
+        db = _query_mock(clients=rows)
+        result = compute_funnel_summary(db, uuid.uuid4(), self.ws, self.we, None, funnel)
+        assert result["opt_ins"] == 1
+
+    def test_paid_leads_by_day_buckets_on_opted_in_at(self):
+        from unittest.mock import patch
+        from zoneinfo import ZoneInfo
+
+        from app.services.kpi_integration_sync import paid_leads_by_day
+
+        cid = uuid.uuid4()
+        rows = [(cid, "paid", None, datetime(2025, 10, 1, tzinfo=timezone.utc), datetime(2026, 1, 20, 18, tzinfo=timezone.utc))]
+        db = _query_mock(clients=rows)
+        with patch("app.services.date_window.org_tz", return_value=ZoneInfo("UTC")):
+            assert paid_leads_by_day(db, uuid.uuid4(), self.ws, self.we) == {date(2026, 1, 20): 1}

@@ -325,7 +325,7 @@ class FunnelFacts:
 
     window_start: date
     window_end: date
-    # client_id -> created_at (paid / funnel-scoped opt-ins created in window)
+    # client_id -> opt-in time, coalesce(opted_in_at, created_at) (paid / funnel-scoped, in window)
     opt_ins: Dict[uuid.UUID, datetime]
     # client_id -> first sales-call start in window (booked) / first attended call (showed)
     booked: Dict[uuid.UUID, datetime]
@@ -360,14 +360,20 @@ def collect_funnel_facts(
 
     # One narrow scan of the org's clients drives both the scope set and opt-ins.
     client_rows = (
-        db.query(Client.id, Client.source_channel, Client.source_funnel_id, Client.created_at)
+        db.query(
+            Client.id,
+            Client.source_channel,
+            Client.source_funnel_id,
+            Client.created_at,
+            Client.opted_in_at,
+        )
         .filter(Client.org_id == org_id)
         .all()
     )
     scope_ids: Optional[Set[uuid.UUID]] = None
     if channel in ("organic", "paid") or funnel_id is not None:
         scope_ids = set()
-        for cid, ch, fid, _created in client_rows:
+        for cid, ch, fid, _created, _opted in client_rows:
             if funnel_id is not None and fid != funnel_id:
                 continue
             if channel == "paid" and ch != "paid":
@@ -381,12 +387,14 @@ def collect_funnel_facts(
 
     opt_ins: Dict[uuid.UUID, datetime] = {}
     if channel != "organic":
-        for cid, ch, _fid, created in client_rows:
-            created_utc = _ensure_utc(created)
-            if ch != "paid" or created_utc is None or not (start <= created_utc <= end):
+        for cid, ch, _fid, created, opted in client_rows:
+            # A lead tagged after its row existed (GHL sync, re-attribution) opted in at
+            # opted_in_at, not when the row was created.
+            opted_utc = _ensure_utc(opted or created)
+            if ch != "paid" or opted_utc is None or not (start <= opted_utc <= end):
                 continue
             if _in_scope(cid):
-                opt_ins[cid] = created_utc
+                opt_ins[cid] = opted_utc
 
     include_organic_outreach = funnel_id is None and channel != "paid"
     outreach_rows: List[Tuple[date, int, int]] = []
