@@ -8,6 +8,7 @@ Fields:
   - offer enrollment + balance due
   - call analysis profile + ROI tags
   - workspace (org) info
+  - attribution (channel, source funnel, UTM, funnel answers) + latest sales-call booking
 """
 from __future__ import annotations
 
@@ -34,6 +35,66 @@ def _offer_public(raw: Any) -> Optional[Dict[str, Any]]:
         out = dict(raw)
         out["balance_cents"] = total - paid
         return out
+
+
+def _enum_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return value.value if hasattr(value, "value") else str(value)
+
+
+def funnel_names_for_org(db: Session, org_id: uuid.UUID) -> Dict[str, str]:
+    from app.models.funnel import Funnel
+
+    return {str(fid): name for fid, name in db.query(Funnel.id, Funnel.name).filter(Funnel.org_id == org_id).all()}
+
+
+def client_attribution(
+    client: Client,
+    funnel_names: Dict[str, str],
+    *,
+    include_answers: bool = False,
+) -> Dict[str, Any]:
+    """Pipeline-card attribution: channel tag, source funnel, UTM, and (optionally) funnel answers."""
+    from app.api.funnels import _flatten_answers, normalize_utm
+
+    meta = client.meta if isinstance(client.meta, dict) else {}
+    prospect = meta.get("prospect") if isinstance(meta.get("prospect"), dict) else {}
+    funnel_id = client.source_funnel_id or prospect.get("funnel_id")
+    funnel_key = str(funnel_id) if funnel_id else None
+    out: Dict[str, Any] = {
+        "source_channel": client.source_channel,
+        "source_funnel_id": funnel_key,
+        "source_funnel_name": funnel_names.get(funnel_key) if funnel_key else None,
+        "lead_source": prospect.get("source"),
+        "funnel_step_reached": prospect.get("funnel_step_reached"),
+        "captured_at": prospect.get("captured_at"),
+        "utm": normalize_utm(prospect.get("utm")),
+    }
+    if include_answers:
+        out["answers"] = _flatten_answers(prospect) if prospect else {}
+    return out
+
+
+def _latest_sales_calls(db: Session, org_id: uuid.UUID, client_id: Optional[uuid.UUID] = None) -> Dict[Any, Any]:
+    from app.models.client_checkin import ClientCheckIn
+
+    q = db.query(ClientCheckIn).filter(ClientCheckIn.org_id == org_id, ClientCheckIn.is_sales_call.is_(True))
+    if client_id is not None:
+        q = q.filter(ClientCheckIn.client_id == client_id)
+    latest: Dict[Any, Any] = {}
+    for c in q.order_by(ClientCheckIn.start_time.asc()).all():
+        latest[c.client_id] = c  # ascending order, so the last write is the most recent
+    return latest
+
+
+def _booking(checkin: Any) -> Dict[str, Any]:
+    from app.api.clients.grid import booking_status_for_checkin
+
+    return {
+        "booking_status": booking_status_for_checkin(checkin),
+        "booking_at": checkin.start_time.isoformat() if checkin is not None and checkin.start_time else None,
+    }
 
 
 def _trim_insight_json(insight: Any, max_chars: int = 12000) -> Any:
@@ -246,6 +307,9 @@ def build_client_profile_bundle(
 
     notes = (client.notes or "")[:4000] if client.notes else None
 
+    attribution = client_attribution(client, funnel_names_for_org(db, org_id), include_answers=True)
+    attribution.update(_booking(_latest_sales_calls(db, org_id, client.id).get(client.id)))
+
     return {
         "client_id": str(client.id),
         "contact": contact,
@@ -254,6 +318,7 @@ def build_client_profile_bundle(
         "offer": offer,
         "call_analysis": call_analysis,
         "workspace": workspace,
+        "attribution": attribution,
         "notes": notes,
         "meta": {
             "roi_state": (client.meta or {}).get("roi_state") if isinstance(client.meta, dict) else None,
@@ -263,17 +328,22 @@ def build_client_profile_bundle(
     }
 
 
-def list_clients_for_mcp(
+def _filtered_clients_query(
     db: Session,
     org_id: uuid.UUID,
     *,
     query: Optional[str] = None,
     lifecycle_state: Optional[str] = None,
-    limit: int = 50,
-) -> List[Dict[str, Any]]:
+    source_channel: Optional[str] = None,
+    funnel_id: Optional[uuid.UUID] = None,
+):
     q = db.query(Client).filter(Client.org_id == org_id)
     if lifecycle_state:
         q = q.filter(Client.lifecycle_state == lifecycle_state)
+    if source_channel:
+        q = q.filter(Client.source_channel == source_channel)
+    if funnel_id:
+        q = q.filter(Client.source_funnel_id == funnel_id)
     if query:
         like = f"%{query.strip()}%"
         q = q.filter(
@@ -282,24 +352,99 @@ def list_clients_for_mcp(
             | (Client.last_name.ilike(like))
             | (Client.phone.ilike(like))
         )
-    rows = q.order_by(Client.updated_at.desc()).limit(min(limit, 100)).all()
+    return q.order_by(Client.updated_at.desc())
+
+
+def list_clients_for_mcp(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    query: Optional[str] = None,
+    lifecycle_state: Optional[str] = None,
+    source_channel: Optional[str] = None,
+    funnel_id: Optional[uuid.UUID] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    rows = (
+        _filtered_clients_query(
+            db,
+            org_id,
+            query=query,
+            lifecycle_state=lifecycle_state,
+            source_channel=source_channel,
+            funnel_id=funnel_id,
+        )
+        .limit(min(limit, 100))
+        .all()
+    )
+    funnel_names = funnel_names_for_org(db, org_id)
     out = []
     for c in rows:
+        attribution = client_attribution(c, funnel_names)
         out.append(
             {
                 "client_id": str(c.id),
                 "first_name": c.first_name,
                 "last_name": c.last_name,
                 "email": c.email,
-                "lifecycle_state": (
-                    c.lifecycle_state.value
-                    if hasattr(c.lifecycle_state, "value")
-                    else str(c.lifecycle_state)
-                ),
+                "lifecycle_state": _enum_value(c.lifecycle_state),
                 "lifetime_revenue_cents": c.lifetime_revenue_cents or 0,
+                "source_channel": attribution["source_channel"],
+                "source_funnel_name": attribution["source_funnel_name"],
+                "utm": attribution["utm"],
             }
         )
     return out
+
+
+BOOKING_STATUSES = ("booked", "not_yet", "closed", "canceled", "no_show")
+
+
+def list_pipeline_grid_for_mcp(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    query: Optional[str] = None,
+    lifecycle_state: Optional[str] = None,
+    source_channel: Optional[str] = None,
+    funnel_id: Optional[uuid.UUID] = None,
+    booking_status: Optional[str] = None,
+    include_answers: bool = True,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Pipeline Grid view rows: contact + stage + channel/funnel tag + UTM + funnel answers + booking."""
+    clients = _filtered_clients_query(
+        db,
+        org_id,
+        query=query,
+        lifecycle_state=lifecycle_state,
+        source_channel=source_channel,
+        funnel_id=funnel_id,
+    ).all()
+    latest_call = _latest_sales_calls(db, org_id)
+    funnel_names = funnel_names_for_org(db, org_id)
+    rows: List[Dict[str, Any]] = []
+    for c in clients:
+        booking = _booking(latest_call.get(c.id))
+        if booking_status and booking["booking_status"] != booking_status:
+            continue
+        rows.append(
+            {
+                "client_id": str(c.id),
+                "name": " ".join(p for p in ((c.first_name or "").strip(), (c.last_name or "").strip()) if p) or None,
+                "email": c.email,
+                "phone": c.phone,
+                "instagram": c.instagram,
+                "lifecycle_state": _enum_value(c.lifecycle_state),
+                "created_at": c.created_at.isoformat() if getattr(c, "created_at", None) else None,
+                "lifetime_revenue_cents": c.lifetime_revenue_cents or 0,
+                **client_attribution(c, funnel_names, include_answers=include_answers),
+                **booking,
+            }
+        )
+    total = len(rows)
+    limit = max(1, min(limit, 500))
+    return {"clients": rows[:limit], "count": min(total, limit), "total_matching": total}
 
 
 def search_clients_by_email(db: Session, org_id: uuid.UUID, email: str) -> List[Dict[str, Any]]:

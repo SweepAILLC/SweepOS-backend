@@ -534,11 +534,25 @@ def delete_user(
             detail="Cannot delete your own account"
         )
     
-    # Clear audit_logs references so FK does not block delete (user_id is nullable)
-    from sqlalchemy import text
+    # Clear nullable "who did this" references so FKs (no ON DELETE rule) don't block the delete
+    for table, column in (
+        ("audit_logs", "user_id"),
+        ("portal_todos", "created_by"),
+        ("portal_shared_pads", "updated_by"),
+        ("portal_shared_pad_defaults", "updated_by"),
+        ("funnel_simulator_scenarios", "created_by"),
+        ("funnel_ad_spend", "entered_by_user_id"),
+        ("owner_org_notices", "created_by"),
+        ("manual_payments", "created_by"),
+    ):
+        db.execute(
+            text(f"UPDATE {table} SET {column} = NULL WHERE {column} = :user_id"),
+            {"user_id": user_id},
+        )
+    # Removed member loses Claude/ChatGPT connector access
     db.execute(
-        text("UPDATE audit_logs SET user_id = NULL WHERE user_id = :user_id"),
-        {"user_id": user_id}
+        text("DELETE FROM mcp_oauth_grants WHERE user_id = :user_id"),
+        {"user_id": user_id},
     )
     # Now delete the user
     result = db.execute(

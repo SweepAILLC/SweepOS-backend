@@ -29,6 +29,21 @@ def _set_statement_timeout(dbapi_conn, connection_record):
     cursor.execute("SET statement_timeout = '120s'")
     cursor.close()
 
+
+def _reset_pool_in_forked_child() -> None:
+    """
+    RQ forks a work-horse per job. A forked child must never reuse the parent's pooled
+    connections: both processes would then drive one SSL session (the worker's automation
+    dispatcher thread keeps using it), which corrupts it — "SSL error: bad record mac" /
+    "SSL SYSCALL error: EOF". close=False drops the child's references without closing the
+    parent's sockets; the child opens fresh connections on first use.
+    """
+    engine.dispose(close=False)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_pool_in_forked_child)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

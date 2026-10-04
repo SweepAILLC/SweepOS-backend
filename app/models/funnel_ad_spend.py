@@ -28,6 +28,6 @@ class FunnelAdSpend(Base):
     # Weekly creative-velocity counts (sheet: "New Ads Deployed" / "New Angles Deployed").
     ads_deployed = Column(Integer, nullable=True)
     angles_deployed = Column(Integer, nullable=True)
-    entered_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    entered_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
