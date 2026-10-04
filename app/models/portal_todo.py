@@ -21,6 +21,6 @@ class PortalTodo(Base):
     description = Column(Text, nullable=True)
     completed = Column(Boolean, default=False, nullable=False)
     due_date = Column(Date, nullable=True)
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

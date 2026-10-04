@@ -878,6 +878,63 @@ def _resolve_bench_by_token(db: Session, token: str) -> OrgKpiBenchmark:
     return bench
 
 
+# Labels for the EOD Discord message (field order = display order).
+_EOD_DISCORD_LABELS = (
+    ("outreach_sent", "Outreach sent"),
+    ("respondents", "Replies"),
+    ("followups_sent", "Follow-ups sent"),
+    ("new_conversations", "New conversations"),
+    ("conversations_nurtured", "Conversations nurtured"),
+    ("inbound_icp_leads", "Inbound ICP leads"),
+    ("calls_pitched", "Calls pitched"),
+    ("inbound_bookings", "Inbound bookings"),
+    ("outbound_bookings", "Outbound bookings"),
+    ("calls_booked", "Calls booked"),
+    ("calls_taken", "Calls taken"),
+    ("no_shows", "No-shows"),
+    ("closes", "Closes"),
+    ("cash_collected", "Cash collected"),
+    ("revenue", "Revenue"),
+    ("new_followers", "New followers"),
+    ("content_posted", "Content posted"),
+)
+
+
+def build_eod_discord_message(rep_label: str, entry_day: date, submitted: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Title / description / fields for an EOD form Discord post. Numbers go in compact
+    fields; the setter's own words (content attracting ICP, setter context) go in the
+    description so long notes aren't truncated into a 1024-char inline field.
+    """
+    lines = [f"Submitted by: **{rep_label}**"]
+    content = (submitted.get("best_content_type") or "").strip()
+    if content:
+        lines.append(f"\n**Content attracting ICP:** {content}")
+    context = (submitted.get("setter_context") or "").strip()
+    if context:
+        quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in context.splitlines())
+        lines.append(f"\n**Setter context**\n{quoted}")
+    booked = submitted.get("setter_booked_client_ids") or []
+
+    fields = []
+    for key, label in _EOD_DISCORD_LABELS:
+        value = submitted.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "Yes" if value else "No"
+        elif key in ("cash_collected", "revenue"):
+            value = f"${float(value):,.0f}"
+        fields.append((label, str(value)))
+    if booked:
+        fields.append(("Booked clients tagged", str(len(booked))))
+
+    description = "\n".join(lines)
+    if len(description) > 3900:  # Discord embed description limit is 4096
+        description = description[:3900].rstrip() + "…"
+    return {"title": f"EOD form submitted — {entry_day.isoformat()}", "description": description, "fields": fields[:25]}
+
+
 def _notify_discord_eod_form(
     db: Session,
     org_id: uuid.UUID,
@@ -894,16 +951,8 @@ def _notify_discord_eod_form(
             rep = db.query(User).filter(User.id == rep_user_id).first()
             rep_label = (getattr(rep, "name", None) or getattr(rep, "email", None) or str(rep_user_id)) if rep else str(rep_user_id)
 
-        submitted = body.model_dump(exclude_unset=True)
-        fields = [(k.replace("_", " ").title(), str(v)) for k, v in list(submitted.items())[:10]]
-
-        discord_notify.send_discord_event_background(
-            org_id,
-            "eod_form",
-            title=f"EOD form submitted — {entry_day.isoformat()}",
-            description=f"Submitted by: {rep_label}",
-            fields=fields,
-        )
+        msg = build_eod_discord_message(rep_label, entry_day, body.model_dump(exclude_unset=True))
+        discord_notify.send_discord_event_background(org_id, "eod_form", **msg)
     except Exception:
         pass
 
