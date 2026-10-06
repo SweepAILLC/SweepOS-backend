@@ -26,6 +26,8 @@ class FathomCallRecord(Base):
     sentiment_score = Column(Float, nullable=True)
     sentiment_label = Column(String(32), nullable=True)  # positive, neutral, negative
     sentiment_snippet = Column(String(512), nullable=True)
+    # Jev confidence (0-1) for the sentiment read; null for LLM-era rows (Jev PRD, issue 5).
+    sentiment_confidence = Column(Float, nullable=True)
 
     meeting_at = Column(DateTime(timezone=True), nullable=True)
     meeting_title = Column(Text, nullable=True)  # Fathom meeting_title / title snapshot
