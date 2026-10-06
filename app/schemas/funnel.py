@@ -191,6 +191,9 @@ class StepCount(BaseModel):
     event_name: str
     count: int
     conversion_rate: Optional[float] = None  # Percentage from previous step
+    # Distinct visitor_id that fired this step; refreshes and repeat visits count once.
+    unique_visitors: int = 0
+    unique_conversion_rate: Optional[float] = None  # Percentage of previous step's unique visitors
 
 
 class FunnelHealth(BaseModel):
