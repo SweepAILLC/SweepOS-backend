@@ -20,6 +20,7 @@ _MODEL_RATES_USD_PER_1M = {
     "gemini-2.0-flash": (0.10, 0.40),
     "gemini-1.5-flash": (0.075, 0.30),
     "gemini-1.5-pro": (1.25, 5.00),
+    "jev": (0.042, 0.0),  # TypeSafe Jev: input tokens only, output free
 }
 
 

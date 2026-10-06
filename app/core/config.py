@@ -211,6 +211,23 @@ class Settings(BaseSettings):
     LLM_SLOT_WAIT_SEC: float = 45.0
     LLM_MAX_INPUT_CHARS_TOTAL: int = 48000  # Hard cap on system+user prompt size sent to providers
 
+    # Jev (TypeSafe) decision model: typed Choice/Score/Noul questions, no text generation.
+    # Own in-flight cap so judgments never take one of the LLM_MAX_INFLIGHT generation slots.
+    # Per-feature modes are off | shadow | on; nothing calls Jev while every mode is off.
+    JEV_API_KEY: Optional[str] = None
+    JEV_BASE_URL: str = "https://api.typesafe.ai/v1"
+    JEV_MODEL: str = "jev-1.13.0"  # pinned, not jev-latest, so answers stay reproducible
+    JEV_TIMEOUT_SEC: float = 15.0
+    JEV_MAX_RETRIES: int = 2  # on 429 / 529 / 5xx / network errors
+    JEV_MAX_INFLIGHT: int = 8
+    JEV_SLOT_WAIT_SEC: float = 20.0
+    JEV_MAX_STATE_CHARS: int = 110000  # ~28k tokens; model limit is 32k state + longest question
+    JEV_SENTIMENT_MODE: str = "off"
+    JEV_CALL_INSIGHT_MODE: str = "off"
+    JEV_CALL_LIBRARY_MODE: str = "off"
+    JEV_PICKER_MODE: str = "off"
+    JEV_SHADOW_SAMPLE_RATE: float = 1.0
+
     # Fathom sentiment: skip LLM when combined input is too small (saves calls; default neutral locally)
     FATHOM_SENTIMENT_MIN_INPUT_CHARS: int = 80
 
