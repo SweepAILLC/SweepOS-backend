@@ -233,12 +233,16 @@ def ask(
     org_id: Optional[uuid.UUID],
     feature: str,
     question_set_version: str,
-    identity: Optional[Identity] = None,
+    identity: Identity,
 ) -> JevResult:
     """Evaluate `questions` against `state` in one request.
 
-    Raises JevUnavailableError on any failure; callers fall back to their LLM path.
+    `identity` is required so every caller decides who gets redacted; pass `Identity()`
+    only when the state names no one. Raises JevUnavailableError on any failure; callers
+    fall back to their LLM path.
     """
+    if not isinstance(identity, Identity):
+        raise TypeError("ask() needs an Identity; pass Identity() if the state names no one")
     if not jev_available():
         raise JevUnavailableError("JEV_API_KEY not configured")
     if not questions:
@@ -256,8 +260,14 @@ def ask(
         sem.release()
 
     if response.status_code != 200:
-        # 401/403/422 are our bug or config, not transient — log the head, never the state.
-        logger.warning("Jev HTTP %s feature=%s body=%s", response.status_code, feature, response.text[:300])
+        # 401/403/422 are our bug or config, not transient. Never log the body: a validation
+        # error can echo the state back. The request id is enough for TypeSafe to trace it.
+        logger.warning(
+            "Jev HTTP %s feature=%s request_id=%s",
+            response.status_code,
+            feature,
+            response.headers.get("x-typesafe-request-id"),
+        )
         raise JevUnavailableError(f"Jev HTTP {response.status_code}")
 
     try:
