@@ -16,6 +16,7 @@ from app.models.user import User, UserRole, parse_user_role_from_api, parse_user
 from app.models.organization import Organization
 from app.models.organization_tab_permission import OrganizationTabPermission
 from app.models.user_tab_permission import UserTabPermission
+from app.services.kpi_org_totals import fold_rep_rows_into_org
 from app.core.security import get_password_hash
 from app.schemas.user import User as UserSchema, UserCreate, UserUpdate
 from app.schemas.organization import Organization as OrganizationSchema, OrganizationUpdate
@@ -534,12 +535,26 @@ def delete_user(
             detail="Cannot delete your own account"
         )
     
-    # Clear audit_logs references so FK does not block delete (user_id is nullable)
-    from sqlalchemy import text
-    db.execute(
-        text("UPDATE audit_logs SET user_id = NULL WHERE user_id = :user_id"),
-        {"user_id": user_id}
-    )
+    # Fold the member's per-rep KPI rows into the org rows first. Left alone, the
+    # FK's SET NULL turns them into duplicate org rows and the delete 500s.
+    fold_rep_rows_into_org(db, user_id)
+    # Clear nullable "who did this" references; several FKs have no ON DELETE rule.
+    for table, column in (
+        ("audit_logs", "user_id"),
+        ("manual_payments", "created_by"),
+        ("portal_todos", "created_by"),
+        ("portal_shared_pads", "updated_by"),
+        ("portal_shared_pad_defaults", "updated_by"),
+        ("funnel_simulator_scenarios", "created_by"),
+        ("funnel_ad_spend", "entered_by_user_id"),
+        ("owner_org_notices", "created_by"),
+    ):
+        db.execute(
+            text(f"UPDATE {table} SET {column} = NULL WHERE {column} = :user_id"),
+            {"user_id": user_id},
+        )
+    # A removed member loses Claude/ChatGPT connector access.
+    db.execute(text("DELETE FROM mcp_oauth_grants WHERE user_id = :user_id"), {"user_id": user_id})
     # Now delete the user
     result = db.execute(
         text("""

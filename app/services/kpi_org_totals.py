@@ -99,3 +99,41 @@ def fold_org_daily_totals(rows: Iterable[Any]) -> List[OrgDay]:
         day.created_at = day.created_at or now
         day.updated_at = day.updated_at or day.created_at
     return sorted(days.values(), key=lambda d: (str(d.org_id), d.entry_date))
+
+
+def fold_rep_rows_into_org(db: Any, rep_user_id: uuid.UUID) -> int:
+    """Move a departing rep's EOD activity onto the org rows, then drop their rows.
+
+    Deleting a user would otherwise SET NULL rep_user_id, turning each per-rep row
+    into a second org row for that date (unique violation) or, on a day without an
+    org row, promoting the rep's org-only fields into org totals. Adding only the
+    activity fields keeps every org total from fold_org_daily_totals unchanged.
+    Returns the number of rep rows folded; the caller commits.
+    """
+    from app.models.org_kpi_daily_entry import OrgKpiDailyEntry
+
+    rep_rows = db.query(OrgKpiDailyEntry).filter(OrgKpiDailyEntry.rep_user_id == rep_user_id).all()
+    for rep in rep_rows:
+        org_row = (
+            db.query(OrgKpiDailyEntry)
+            .filter(
+                OrgKpiDailyEntry.org_id == rep.org_id,
+                OrgKpiDailyEntry.entry_date == rep.entry_date,
+                OrgKpiDailyEntry.rep_user_id.is_(None),
+            )
+            .first()
+        )
+        if org_row is None:
+            org_row = OrgKpiDailyEntry(org_id=rep.org_id, entry_date=rep.entry_date)
+            db.add(org_row)
+        for f in ACTIVITY_FIELDS:
+            v = getattr(rep, f, None)
+            if v is not None:
+                base = getattr(org_row, f, None)
+                setattr(org_row, f, (int(base) if base is not None else 0) + int(v))
+        org_row.updated_at = datetime.utcnow()
+        db.delete(rep)
+        # Flush per row so the rep row is gone before the caller deletes the user
+        # (the session doesn't autoflush ahead of raw SQL).
+        db.flush()
+    return len(rep_rows)
