@@ -1,5 +1,6 @@
 """Jev (TypeSafe) shared client: requests, parsing, retries, fallback contract, redaction, usage."""
 import json
+import logging
 import uuid
 
 import httpx
@@ -61,6 +62,7 @@ def _transport(monkeypatch, responses):
 
 
 def _ask(**kw):
+    kw.setdefault("identity", ts.Identity())
     return ts.ask("I was charged twice.", QUESTIONS, org_id=ORG, feature="test", question_set_version="jev-v1.0", **kw)
 
 
@@ -135,6 +137,15 @@ def test_auth_error_is_not_retried(monkeypatch, usage_calls):
     assert len(seen) == 1
 
 
+def test_error_body_never_logged(monkeypatch, usage_calls, caplog):
+    echo = {"detail": [{"loc": ["state"], "input": "I was charged twice."}]}
+    _transport(monkeypatch, [httpx.Response(422, json=echo, headers={"x-typesafe-request-id": "req_123"})])
+    with caplog.at_level(logging.WARNING, logger=ts.__name__), pytest.raises(ts.JevUnavailableError, match="422"):
+        _ask()
+    assert "charged twice" not in caplog.text
+    assert "req_123" in caplog.text
+
+
 def test_missing_answer_raises(monkeypatch, usage_calls):
     body = {**OK_BODY, "answers": {"billing": OK_BODY["answers"]["billing"]}}
     _transport(monkeypatch, [httpx.Response(200, json=body)])
@@ -157,6 +168,15 @@ def test_no_key_raises_without_calling(monkeypatch, usage_calls):
 
 
 # ----------------------------------------------------------------------------- redaction
+
+
+def test_identity_is_required(monkeypatch, usage_calls):
+    seen = _transport(monkeypatch, [])
+    with pytest.raises(TypeError):
+        ts.ask("Jane said hi.", QUESTIONS, org_id=ORG, feature="test", question_set_version="jev-v1.0")
+    with pytest.raises(TypeError, match="Identity"):
+        _ask(identity=None)
+    assert seen == []
 
 
 def test_state_sent_is_redacted(monkeypatch, usage_calls):
