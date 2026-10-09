@@ -274,10 +274,23 @@ def _onboarding_form_flags(db: Session, user_id: UUID) -> tuple[bool, bool, bool
     row = db.query(User).filter(User.id == user_id).first()
     if not row:
         return False, False, False, False
+    call_booked = getattr(row, "onboarding_call_booked_at", None) is not None
+    if not call_booked and row.email:
+        # Extra org rows (system owner / member added later) inherit skip from
+        # any sibling users row that already booked or was grandfathered.
+        call_booked = (
+            db.query(User.id)
+            .filter(
+                func.lower(User.email) == row.email.lower(),
+                User.onboarding_call_booked_at.isnot(None),
+            )
+            .first()
+            is not None
+        )
     return (
         getattr(row, "onboarding_csa_completed_at", None) is not None,
         getattr(row, "onboarding_intake_completed_at", None) is not None,
-        getattr(row, "onboarding_call_booked_at", None) is not None,
+        call_booked,
         getattr(row, "onboarding_tour_completed_at", None) is not None,
     )
 
@@ -815,6 +828,7 @@ def accept_invitation(
         consume_invitation,
         ensure_invite_organization,
         is_multi_use,
+        onboarding_call_booked_at_for_join,
         resolve_invitation_email,
     )
 
@@ -865,8 +879,14 @@ def accept_invitation(
         org_user_id = uuid.uuid4()
         db.execute(
             text("""
-                INSERT INTO users (id, org_id, email, hashed_password, role, is_admin, created_at)
-                VALUES (:id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW())
+                INSERT INTO users (
+                    id, org_id, email, hashed_password, role, is_admin, created_at,
+                    onboarding_call_booked_at
+                )
+                VALUES (
+                    :id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW(),
+                    :onboarding_call_booked_at
+                )
             """),
             {
                 "id": org_user_id,
@@ -875,6 +895,11 @@ def accept_invitation(
                 "hashed_password": existing_user.hashed_password,
                 "role": userrole_bind_value(user_role),
                 "is_admin": user_role in (UserRole.ADMIN, UserRole.OWNER),
+                "onboarding_call_booked_at": onboarding_call_booked_at_for_join(
+                    invitation_type=inv.invitation_type,
+                    existing_user=True,
+                    source_booked_at=getattr(existing_user, "onboarding_call_booked_at", None),
+                ),
             },
         )
         db.add(
@@ -937,8 +962,14 @@ def accept_invitation(
     new_user_id = uuid.uuid4()
     db.execute(
         text("""
-            INSERT INTO users (id, org_id, email, hashed_password, role, is_admin, created_at)
-            VALUES (:id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW())
+            INSERT INTO users (
+                id, org_id, email, hashed_password, role, is_admin, created_at,
+                onboarding_call_booked_at
+            )
+            VALUES (
+                :id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW(),
+                :onboarding_call_booked_at
+            )
         """),
         {
             "id": new_user_id,
@@ -947,6 +978,10 @@ def accept_invitation(
             "hashed_password": get_password_hash(password),
             "role": userrole_bind_value(user_role),
             "is_admin": (user_role in (UserRole.ADMIN, UserRole.OWNER)),
+            "onboarding_call_booked_at": onboarding_call_booked_at_for_join(
+                invitation_type=inv.invitation_type,
+                existing_user=False,
+            ),
         },
     )
     uo = UserOrganization(

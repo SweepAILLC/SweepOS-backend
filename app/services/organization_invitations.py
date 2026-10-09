@@ -214,3 +214,20 @@ def create_user_invitation(
     db.commit()
     db.refresh(inv)
     return inv
+
+
+def onboarding_call_booked_at_for_join(
+    *,
+    invitation_type: Optional[str] = None,
+    existing_user: bool = False,
+    source_booked_at: Optional[datetime] = None,
+) -> Optional[datetime]:
+    """Cal onboarding is for first-time ORG_ADMIN signup only.
+
+    Members and extra org rows (system owner added to a client account, existing
+    user joining another org) must not be gated.
+    """
+    is_org_admin_signup = (invitation_type or "").strip().upper() == "ORG_ADMIN"
+    if is_org_admin_signup and not existing_user:
+        return None
+    return source_booked_at or datetime.utcnow()
