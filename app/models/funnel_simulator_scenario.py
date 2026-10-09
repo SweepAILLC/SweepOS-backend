@@ -27,6 +27,6 @@ class FunnelSimulatorScenario(Base):
     funnel_id = Column(UUID(as_uuid=True), ForeignKey("funnels.id", ondelete="SET NULL"), nullable=True)
     lookback_days = Column(String(16), nullable=False, default="90")
     inputs = Column(JSONB, nullable=False, default=dict)
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

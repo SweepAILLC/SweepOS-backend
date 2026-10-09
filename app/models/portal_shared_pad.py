@@ -24,7 +24,7 @@ class PortalSharedPadDefault(Base):
     id = Column(Integer, primary_key=True)
     title = Column(String(120), nullable=False, default=DEFAULT_SHARED_PAD_TITLE)
     content = Column(Text, nullable=False, default=DEFAULT_SHARED_PAD_CONTENT)
-    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     updated_by_name = Column(String(255), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -45,7 +45,7 @@ class PortalSharedPad(Base):
     sort_order = Column(Integer, nullable=False, default=0)
     content = Column(Text, nullable=False, default=DEFAULT_SHARED_PAD_CONTENT)
     revision = Column(Integer, nullable=False, default=1)
-    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     updated_by_name = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

@@ -196,14 +196,21 @@ def create_user(
     # Use raw SQL to insert role value directly to avoid SQLAlchemy enum name conversion
     from sqlalchemy import text
     import uuid as uuid_lib
+    from app.services.organization_invitations import onboarding_call_booked_at_for_join
     user_id = uuid_lib.uuid4()
     
     role_db_value = user_role.value
 
     db.execute(
         text("""
-            INSERT INTO users (id, org_id, email, hashed_password, role, is_admin, created_at)
-            VALUES (:id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW())
+            INSERT INTO users (
+                id, org_id, email, hashed_password, role, is_admin, created_at,
+                onboarding_call_booked_at
+            )
+            VALUES (
+                :id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW(),
+                :onboarding_call_booked_at
+            )
         """),
         {
             "id": user_id,
@@ -211,7 +218,8 @@ def create_user(
             "email": user_data.email,
             "hashed_password": get_password_hash(password),
             "role": role_db_value,
-            "is_admin": (user_role in [UserRole.ADMIN, UserRole.OWNER])
+            "is_admin": (user_role in [UserRole.ADMIN, UserRole.OWNER]),
+            "onboarding_call_booked_at": onboarding_call_booked_at_for_join(existing_user=False),
         }
     )
     db.commit()

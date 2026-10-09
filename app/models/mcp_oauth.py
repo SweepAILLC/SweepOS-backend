@@ -30,7 +30,7 @@ class McpOAuthGrant(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     client_id = Column(String, nullable=False, index=True)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True)
     redirect_uri = Column(Text, nullable=False)
     scope = Column(String, nullable=True)

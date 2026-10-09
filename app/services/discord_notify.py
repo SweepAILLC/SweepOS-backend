@@ -116,12 +116,16 @@ def build_sample_event(
     samples: Dict[str, Dict[str, Any]] = {
         "eod_form": {
             "title": f"[TEST] EOD form submitted — {today}",
-            "description": "Submitted by: Jordan (sample rep)",
+            "description": (
+                "Submitted by: **Jordan (sample rep)**\n"
+                "\n**Content attracting ICP:** Reels — client transformation stories\n"
+                "\n**Setter context**\n> Warm leads from the webinar replay; two asked about payment plans."
+            ),
             "fields": [
-                ("Outreach Sent", "42"),
-                ("Respondents", "11"),
-                ("Calls Booked", "3"),
-                ("Cash Collected", "1500.0"),
+                ("Outreach sent", "42"),
+                ("Replies", "11"),
+                ("New conversations", "6"),
+                ("Calls booked", "3"),
             ],
         },
         "post_call": {

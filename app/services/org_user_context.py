@@ -221,7 +221,15 @@ def materialize_org_user_row_if_missing(
         return row
 
     pwd_row = db.execute(
-        text("SELECT hashed_password FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1"),
+        text(
+            """
+            SELECT hashed_password, onboarding_call_booked_at
+            FROM users
+            WHERE LOWER(email) = LOWER(:email)
+            ORDER BY onboarding_call_booked_at NULLS LAST
+            LIMIT 1
+            """
+        ),
         {"email": email.strip()},
     ).fetchone()
     if not pwd_row:
@@ -230,12 +238,20 @@ def materialize_org_user_row_if_missing(
     role_str = _latest_used_invitation_role(db, email, org_id) or "member"
     user_role = parse_user_role_from_api(role_str)
     new_user_id = uuid.uuid4()
+    from app.services.organization_invitations import onboarding_call_booked_at_for_join
+
     try:
         db.execute(
             text(
                 """
-                INSERT INTO users (id, org_id, email, hashed_password, role, is_admin, created_at)
-                VALUES (:id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW())
+                INSERT INTO users (
+                    id, org_id, email, hashed_password, role, is_admin, created_at,
+                    onboarding_call_booked_at
+                )
+                VALUES (
+                    :id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW(),
+                    :onboarding_call_booked_at
+                )
                 """
             ),
             {
@@ -245,6 +261,10 @@ def materialize_org_user_row_if_missing(
                 "hashed_password": pwd_row[0],
                 "role": userrole_bind_value(user_role),
                 "is_admin": user_role in (UserRole.ADMIN, UserRole.OWNER),
+                "onboarding_call_booked_at": onboarding_call_booked_at_for_join(
+                    existing_user=True,
+                    source_booked_at=pwd_row[1],
+                ),
             },
         )
         db.commit()

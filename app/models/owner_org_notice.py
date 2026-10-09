@@ -18,7 +18,7 @@ class OwnerOrgNotice(Base):
     )
     title = Column(String(200), nullable=False)
     body = Column(Text, nullable=False)
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
