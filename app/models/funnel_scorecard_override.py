@@ -15,7 +15,7 @@ class FunnelScorecardOverride(Base):
 
     `funnel_id` NULL = the "All funnels" view. `channel` is "all", "paid" or
     "organic". One row per (org, funnel, channel, week, metric), enforced by a
-    unique index over COALESCE(funnel_id) in migration 100.
+    unique index over COALESCE(funnel_id) in migration 101.
     """
 
     __tablename__ = "funnel_scorecard_overrides"
