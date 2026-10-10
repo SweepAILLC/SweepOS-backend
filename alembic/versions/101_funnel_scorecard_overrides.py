@@ -2,8 +2,8 @@
 
 New table only; nothing existing is touched.
 
-Revision ID: 100
-Revises: 099
+Revision ID: 101
+Revises: 100
 """
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "100"
-down_revision = "099"
+revision = "101"
+down_revision = "100"
 branch_labels = None
 depends_on = None
 

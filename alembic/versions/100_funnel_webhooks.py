@@ -9,8 +9,8 @@ The inbound_webhook_events indexes serve the per-org delivery log and the
 retention prune of done funnel-webhook rows. Built CONCURRENTLY: the inbox is
 written by every inbound webhook and must not be locked during deploy.
 
-Revision ID: 099
-Revises: 098
+Revision ID: 100
+Revises: 099
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "099"
-down_revision = "098"
+revision = "100"
+down_revision = "099"
 branch_labels = None
 depends_on = None
 
