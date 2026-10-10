@@ -10,6 +10,7 @@ from app.models.stripe_event import StripeEvent
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction
 from app.models.manual_payment import ManualPayment
 from app.models.funnel_ad_spend import FunnelAdSpend
+from app.models.funnel_scorecard_override import FunnelScorecardOverride
 from app.models.team_kpi import TeamKpiNotification, TeamKpiSettings
 from app.models.client_checkin import ClientCheckIn
 from app.models.organization import Organization
@@ -61,7 +62,7 @@ from app.models.integration_event_dispatch import IntegrationEventDispatch
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
     "StripePayment", "StripeSubscription", "StripeEvent", "StripeTreasuryTransaction",
-    "ManualPayment", "FunnelAdSpend", "TeamKpiSettings", "TeamKpiNotification", "ClientCheckIn", "Organization", "Feature",
+    "ManualPayment", "FunnelAdSpend", "FunnelScorecardOverride", "TeamKpiSettings", "TeamKpiNotification", "ClientCheckIn", "Organization", "Feature",
     "Funnel", "FunnelStep", "Session", "EventError",
     "OrganizationTabPermission", "UserTabPermission", "UserOrganization",
     "AuditLog", "AuditEventType",

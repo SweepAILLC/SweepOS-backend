@@ -19,7 +19,7 @@ class InboundWebhookEvent(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     org_id = Column(UUID(as_uuid=True), nullable=False, index=True)
-    provider = Column(String(32), nullable=False)  # stripe | whop | calcom | calendly
+    provider = Column(String(32), nullable=False)  # stripe | whop | calcom | calendly | ghl | funnel_webhook
     event_id = Column(String(255), nullable=False)
     event_type = Column(String(128), nullable=True)
     payload = Column(JSONB, nullable=False)

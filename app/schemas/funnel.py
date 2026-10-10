@@ -80,6 +80,8 @@ class Funnel(FunnelBase):
     org_id: UUID
     source: Optional[str] = None
     ghl_config: Optional[Dict[str, Any]] = None
+    # True when a custom webhook URL is live (Settings -> Integrations -> Funnel webhooks).
+    webhook_enabled: bool = False
     created_at: datetime
     updated_at: datetime
     steps: List[FunnelStep] = []
@@ -279,6 +281,18 @@ class FunnelScorecardMetric(BaseModel):
     better: str  # "up" | "down" | "neutral"
     values: List[Optional[float]] = []  # one per FunnelScorecard.weeks entry
     benchmark: Optional[float] = None  # average of the complete weeks' values
+    editable: bool = False  # count row a person can type over per week
+    overridden: List[bool] = []  # per week: value was hand-edited
+    original: List[Optional[float]] = []  # per week: computed value an edit replaced (else null)
+
+
+class FunnelScorecardOverrideIn(BaseModel):
+    """Set (or with value null, revert) one week's count in the scorecard grid for one view."""
+    funnel_id: Optional[UUID] = None  # None = "All funnels" view
+    channel: Optional[Literal["all", "paid", "organic"]] = None
+    week_start: date = Field(..., description="Any day in the week; normalized to its Monday")
+    metric_key: str = Field(..., min_length=1, max_length=32)
+    value: Optional[float] = Field(None, ge=0, le=1_000_000_000)
 
 
 class FunnelScorecardWeek(BaseModel):

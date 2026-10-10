@@ -166,6 +166,20 @@ class Settings(BaseSettings):
     # e.g. https://api.sweepai.site or http://localhost:8000 for local dev
     BACKEND_PUBLIC_URL: Optional[str] = None
 
+    # Custom funnel webhooks (POST /webhooks/funnels/{token}); see app.services.funnel_webhooks.
+    # Per-funnel ceiling; bursts above it get 429 + Retry-After so senders back off and retry.
+    FUNNEL_WEBHOOK_RATE_LIMIT_PER_MINUTE: int = 600
+    # False (default): web acks only; worker drainer threads process (~1s to the Client Board).
+    # True: the web process upserts the lead right after the 202 (no worker needed, more web load).
+    FUNNEL_WEBHOOK_INLINE_PROCESSING: bool = False
+    # Drainer threads per worker process (SKIP LOCKED, so more threads/instances = more throughput).
+    FUNNEL_WEBHOOK_DRAIN_THREADS: int = 2
+    FUNNEL_WEBHOOK_MAX_BODY_BYTES: int = 262144
+    # Done funnel-webhook inbox rows older than this are pruned by the worker (failed rows kept).
+    FUNNEL_WEBHOOK_RETENTION_DAYS: int = 30
+    # Rows per worker tick for the inbound webhook retry/drain loop (all providers).
+    INBOUND_WEBHOOK_FLUSH_LIMIT: int = 50
+
     # Fathom (optional — omit for logic-only health score; sync/webhook no-op).
     # AI health score overlay is skipped until FATHOM_API_KEY is set; scoring stays logic-based.
     FATHOM_API_KEY: Optional[str] = None

@@ -400,12 +400,16 @@ def update_client(
             try:
                 from datetime import date as date_cls
                 from app.api.kpi import _upsert_kpi_entry_for_org
+                from app.services.kpi_integration_sync import first_payment_date_for_client
                 from app.services.terminal_metrics_service import invalidate_terminal_monthly_trends_cache
 
+                # Book revenue on the day the client paid, not the day the deal value
+                # was typed in, so the Terminal revenue spike lines up with the payment.
+                revenue_day = first_payment_date_for_client(db, org_id, client.id) or date_cls.today()
                 _upsert_kpi_entry_for_org(
                     db,
                     org_id,
-                    date_cls.today(),
+                    revenue_day,
                     {"revenue": contract_delta_usd},
                     additive=True,
                 )
