@@ -13,6 +13,11 @@ counts don't drag the average down.
 Three rows are typed in weekly (ad spend, ads deployed, angles deployed — stored on
 funnel_ad_spend); the other twenty are computed from pipeline data via the same
 collect_funnel_facts pass the dashboard uses.
+
+Manual edits: any count row (EDITABLE_FIELDS) can be typed over per week, per view
+(funnel + channel), stored in funnel_scorecard_overrides. An override replaces that
+week's base count before the metrics compute, so rates, costs and ROAS follow it.
+Rate/cost rows themselves are never edited directly.
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ from sqlalchemy.orm import Session
 from app.models.client_checkin import ClientCheckIn
 from app.models.event import Event
 from app.models.funnel_ad_spend import FunnelAdSpend
+from app.models.funnel_scorecard_override import FunnelScorecardOverride
 from app.services.kpi_integration_sync import FunnelFacts, collect_funnel_facts, count_sales_calls
 
 
@@ -124,6 +130,114 @@ METRICS: List[MetricDef] = [
 
 # Ad-side rows have no meaning for organic (no landing page, no spend).
 _PAID_ONLY_KEYS = {"new_ads", "new_angles", "ad_spend", "visitors", "cost_per_lpv", "lp_conv_rate"}
+
+
+# Count rows a person can type over, mapped to the WeekBase field each replaces.
+EDITABLE_FIELDS: Dict[str, str] = {
+    "new_ads": "ads_deployed",
+    "new_angles": "angles_deployed",
+    "ad_spend": "spend",
+    "visitors": "visitors",
+    "leads": "leads",
+    "booked_calls": "booked_calls",
+    "calls_on_calendar": "calls_on_calendar",
+    "live_calls": "live_calls",
+    "deals_closed": "deals_closed",
+    "cash_collected": "cash",
+}
+_MONEY_FIELDS = {"spend", "cash"}
+OverrideMap = Dict[Tuple[date, str], float]
+
+
+def view_channel(channel: Optional[str]) -> str:
+    return channel or "all"
+
+
+def _override_scope(q, org_id: uuid.UUID, funnel_id: Optional[uuid.UUID], channel: Optional[str]):
+    return q.filter(
+        FunnelScorecardOverride.org_id == org_id,
+        FunnelScorecardOverride.funnel_id == funnel_id
+        if funnel_id is not None
+        else FunnelScorecardOverride.funnel_id.is_(None),
+        FunnelScorecardOverride.channel == view_channel(channel),
+    )
+
+
+def load_overrides(
+    db: Session,
+    org_id: uuid.UUID,
+    funnel_id: Optional[uuid.UUID],
+    channel: Optional[str],
+    first_week: date,
+    last_week: date,
+) -> OverrideMap:
+    rows = _override_scope(db.query(FunnelScorecardOverride), org_id, funnel_id, channel).filter(
+        FunnelScorecardOverride.week_start >= first_week,
+        FunnelScorecardOverride.week_start <= last_week,
+    )
+    return {(r.week_start, r.metric_key): float(r.value) for r in rows.all() if r.metric_key in EDITABLE_FIELDS}
+
+
+def _base_value(b: WeekBase, field_name: str) -> Optional[float]:
+    if field_name == "spend":
+        return b.spend if b.has_spend_row else None
+    return getattr(b, field_name)
+
+
+def apply_overrides(
+    bases: Dict[date, WeekBase], overrides: OverrideMap, keys: Optional[Set[str]] = None
+) -> Dict[Tuple[date, str], Optional[float]]:
+    """Write overrides into the week bases in place. Returns the computed values they replaced."""
+    replaced: Dict[Tuple[date, str], Optional[float]] = {}
+    for (wk, key), value in overrides.items():
+        b = bases.get(wk)
+        if b is None or (keys is not None and key not in keys):
+            continue
+        field_name = EDITABLE_FIELDS[key]
+        replaced[(wk, key)] = _base_value(b, field_name)
+        setattr(b, field_name, float(value) if field_name in _MONEY_FIELDS else int(round(value)))
+        if field_name == "spend":
+            b.has_spend_row = True
+    return replaced
+
+
+def set_override(
+    db: Session,
+    org_id: uuid.UUID,
+    funnel_id: Optional[uuid.UUID],
+    channel: Optional[str],
+    week_start: date,
+    metric_key: str,
+    value: Optional[float],
+    user_id: Optional[uuid.UUID],
+) -> None:
+    """Upsert one cell; value None reverts it to the computed number. Commits."""
+    if metric_key not in EDITABLE_FIELDS:
+        raise ValueError(f"'{metric_key}' is calculated from other rows and can't be edited")
+    week = _monday(week_start)
+    row = (
+        _override_scope(db.query(FunnelScorecardOverride), org_id, funnel_id, channel)
+        .filter(FunnelScorecardOverride.week_start == week, FunnelScorecardOverride.metric_key == metric_key)
+        .first()
+    )
+    if value is None:
+        if row is not None:
+            db.delete(row)
+            db.commit()
+        return
+    if row is None:
+        row = FunnelScorecardOverride(
+            org_id=org_id,
+            funnel_id=funnel_id,
+            channel=view_channel(channel),
+            week_start=week,
+            metric_key=metric_key,
+        )
+        db.add(row)
+    row.value = round(float(value), 2)
+    row.updated_by_user_id = user_id
+    row.updated_at = datetime.now(timezone.utc)
+    db.commit()
 
 
 def _mean(values: List[Optional[float]]) -> Optional[float]:
@@ -260,27 +374,35 @@ def compute_scorecard(
     complete = [not week_in_progress(wk, today) for wk in weeks]
     show_ads = channel != "organic"
 
-    def _weekly_by_metric(wks: List[date]) -> Dict[str, List[Optional[float]]]:
+    def _weekly_by_metric(
+        wks: List[date],
+    ) -> Tuple[Dict[str, List[Optional[float]]], Dict[Tuple[date, str], Optional[float]]]:
         span_start, span_end = wks[0], wks[-1] + timedelta(days=6)
         facts = collect_funnel_facts(db, org_id, span_start, span_end, channel, funnel_id)
         bases = _week_bases(db, org_id, wks, facts, funnel_ids, funnel_id, include_ads=show_ads)
+        overrides = load_overrides(db, org_id, funnel_id, channel, wks[0], wks[-1])
+        replaced = apply_overrides(bases, overrides)
         # Economics rows follow the dashboard's money rule: with channel "all", spend is
         # only divided against paid leads/bookings/closes/cash, never organic ones.
         econ_bases = bases
         if channel is None and funnel_id is None:
             paid_facts = collect_funnel_facts(db, org_id, span_start, span_end, "paid", None)
             econ_bases = _week_bases(db, org_id, wks, paid_facts, funnel_ids, None, include_ads=True)
-        return {
+            # Spend is shared; edited lead/close/cash counts in this view include organic,
+            # so the paid-only economics bases keep their computed counts.
+            apply_overrides(econ_bases, overrides, keys={"ad_spend"})
+        values = {
             m.key: [m.compute((econ_bases if m.group == "economics" else bases)[wk]) for wk in wks] for m in METRICS
         }
+        return values, replaced
 
-    current = _weekly_by_metric(weeks)
+    current, replaced = _weekly_by_metric(weeks)
     compare_weeks = (
         [wk for wk in scorecard_weeks(compare[0], compare[1], today) if not week_in_progress(wk, today)]
         if compare is not None
         else []
     )
-    baseline = _weekly_by_metric(compare_weeks) if compare_weeks else None
+    baseline = _weekly_by_metric(compare_weeks)[0] if compare_weeks else None
 
     def _r(v: Optional[float]) -> Optional[float]:
         return None if v is None else round(v, 4)
@@ -303,6 +425,10 @@ def compute_scorecard(
                 "better": m.better,
                 "values": [_r(v) for v in weekly],
                 "benchmark": _r(benchmark),
+                "editable": m.key in EDITABLE_FIELDS,
+                # Hand-edited cells, and the computed value each one replaced.
+                "overridden": [(wk, m.key) in replaced for wk in weeks],
+                "original": [_r(replaced.get((wk, m.key))) for wk in weeks],
             }
         )
     return {

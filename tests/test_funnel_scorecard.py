@@ -5,8 +5,17 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from app.services import funnel_scorecard as sc
 from app.services.kpi_integration_sync import count_sales_calls, sales_call_booked_at
+
+
+@pytest.fixture(autouse=True)
+def _no_overrides():
+    """compute_scorecard reads hand edits from the DB; tests run with db=None."""
+    with patch.object(sc, "load_overrides", return_value={}) as m:
+        yield m
 
 
 def test_month_weeks_are_mondays_inside_month_up_to_today():
@@ -161,3 +170,40 @@ def test_shared_counter_is_the_one_definition_for_both_tabs():
         "calls_taken": 1,  # b (deduped)
         "no_shows": 1,  # c
     }
+
+
+def test_overrides_replace_counts_and_derived_rows_follow(_no_overrides):
+    weeks = [date(2026, 9, 7), date(2026, 9, 14)]
+    bases = {
+        weeks[0]: sc.WeekBase(leads=10, calls_on_calendar=4, live_calls=2, spend=100.0, has_spend_row=True),
+        weeks[1]: sc.WeekBase(leads=30, calls_on_calendar=4, live_calls=0),
+    }
+    _no_overrides.return_value = {(weeks[0], "live_calls"): 4, (weeks[1], "ad_spend"): 60}
+    with patch.object(sc, "collect_funnel_facts", return_value=SimpleNamespace()), patch.object(
+        sc, "_week_bases", return_value=bases
+    ):
+        out = sc.compute_scorecard(
+            None, uuid.uuid4(), date(2026, 9, 1), date(2026, 9, 30), "paid", None, set(), today=date(2026, 9, 20)
+        )
+    rows = {m["key"]: m for m in out["metrics"]}
+    assert rows["live_calls"]["values"] == [4, 0]
+    assert rows["live_calls"]["overridden"] == [True, False]
+    assert rows["live_calls"]["original"] == [2, None]
+    assert rows["show_rate"]["values"][0] == 1.0  # 4 live / 4 on calendar, from the edit
+    assert rows["show_rate"]["editable"] is False
+    assert rows["ad_spend"]["values"] == [100.0, 60.0]
+    assert rows["ad_spend"]["original"] == [None, None]  # week 2 had no spend row before the edit
+    assert rows["cost_per_lead"]["values"][1] == 2.0  # $60 / 30 leads
+
+
+def test_set_override_rejects_derived_rows():
+    with pytest.raises(ValueError):
+        sc.set_override(None, uuid.uuid4(), None, None, date(2026, 9, 9), "close_rate", 0.5, None)
+
+
+def test_apply_overrides_respects_key_filter():
+    wk = date(2026, 9, 7)
+    bases = {wk: sc.WeekBase(leads=5, spend=10.0, has_spend_row=True)}
+    replaced = sc.apply_overrides(bases, {(wk, "leads"): 9, (wk, "ad_spend"): 25}, keys={"ad_spend"})
+    assert bases[wk].leads == 5 and bases[wk].spend == 25.0
+    assert replaced == {(wk, "ad_spend"): 10.0}

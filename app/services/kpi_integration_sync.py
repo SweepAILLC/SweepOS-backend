@@ -140,7 +140,11 @@ def count_conversions_on_day(conversion_dates: Dict[uuid.UUID, date], entry_day:
     return sum(1 for day in conversion_dates.values() if day == entry_day)
 
 
-def _first_payment_dates_by_client(db: Session, org_id: uuid.UUID) -> Dict[uuid.UUID, date]:
+def _first_payment_dates_by_client(
+    db: Session, org_id: uuid.UUID, client_id: Optional[uuid.UUID] = None
+) -> Dict[uuid.UUID, date]:
+    """Earliest paid date per client across Stripe, Whop and manual payments (UTC day).
+    `client_id` narrows every query to one client."""
     out: Dict[uuid.UUID, date] = {}
 
     def add(cid: Optional[uuid.UUID], ts: Optional[datetime]) -> None:
@@ -154,32 +158,37 @@ def _first_payment_dates_by_client(db: Session, org_id: uuid.UUID) -> Dict[uuid.
         if prev is None or day < prev:
             out[cid] = day
 
-    for p in (
-        db.query(StripePayment.client_id, StripePayment.created_at)
-        .filter(
-            StripePayment.org_id == org_id,
-            StripePayment.status == "succeeded",
-            StripePayment.client_id.isnot(None),
-            StripePayment.amount_cents > 0,
-        )
-        .all()
-    ):
+    stripe_q = db.query(StripePayment.client_id, StripePayment.created_at).filter(
+        StripePayment.org_id == org_id,
+        StripePayment.status == "succeeded",
+        StripePayment.client_id.isnot(None),
+        StripePayment.amount_cents > 0,
+    )
+    whop_q = db.query(WhopPayment.client_id, WhopPayment.created_at, WhopPayment.status).filter(
+        WhopPayment.org_id == org_id, WhopPayment.client_id.isnot(None)
+    )
+    manual_q = db.query(ManualPayment.client_id, ManualPayment.payment_date, ManualPayment.created_at).filter(
+        ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None)
+    )
+    if client_id is not None:
+        stripe_q = stripe_q.filter(StripePayment.client_id == client_id)
+        whop_q = whop_q.filter(WhopPayment.client_id == client_id)
+        manual_q = manual_q.filter(ManualPayment.client_id == client_id)
+
+    for p in stripe_q.all():
         add(p.client_id, p.created_at)
-    for p in (
-        db.query(WhopPayment.client_id, WhopPayment.created_at, WhopPayment.status)
-        .filter(WhopPayment.org_id == org_id, WhopPayment.client_id.isnot(None))
-        .all()
-    ):
+    for p in whop_q.all():
         if (p.status or "").lower() not in _WHOP_PAID:
             continue
         add(p.client_id, p.created_at)
-    for p in (
-        db.query(ManualPayment.client_id, ManualPayment.payment_date, ManualPayment.created_at)
-        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
-        .all()
-    ):
+    for p in manual_q.all():
         add(p.client_id, p.payment_date or p.created_at)
     return out
+
+
+def first_payment_date_for_client(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> Optional[date]:
+    """Day this client first paid (any source), or None if they haven't."""
+    return _first_payment_dates_by_client(db, org_id, client_id).get(client_id)
 
 
 def _first_sale_closed_dates(checkins: Iterable[ClientCheckIn]) -> Dict[uuid.UUID, date]:

@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey, ghl, ghl_webhooks, team
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey, ghl, ghl_webhooks, team, funnel_webhooks
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -138,6 +138,8 @@ app.include_router(outreach.router, prefix="/outreach", tags=["outreach"])
 app.include_router(content_studio.router, prefix="/content-studio", tags=["content-studio"])
 app.include_router(call_library.router, prefix="/call-library", tags=["call-library"])
 app.include_router(events.router, prefix="/events", tags=["events"])
+# Before funnels.router: /funnels/{id}/webhook* must not fall to a generic /{funnel_id} handler.
+app.include_router(funnel_webhooks.admin_router, prefix="/funnels", tags=["funnels"])
 app.include_router(funnels.router, prefix="/funnels", tags=["funnels"])
 app.include_router(users.router, prefix="/users", tags=["users"])
 app.include_router(organizations.router, prefix="/organizations", tags=["organizations"])
@@ -151,6 +153,7 @@ app.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 app.include_router(fathom_webhooks.router, prefix="/webhooks", tags=["fathom"])
 app.include_router(calendar_webhooks.router, prefix="/webhooks", tags=["calendar-webhooks"])
 app.include_router(ghl_webhooks.router, prefix="/webhooks", tags=["ghl-webhooks"])
+app.include_router(funnel_webhooks.router, prefix="/webhooks", tags=["funnel-webhooks"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
 app.include_router(encryption.router, prefix="/admin", tags=["encryption"])
 app.include_router(email_ingestion.router, prefix="/webhooks", tags=["brevo-webhooks"])

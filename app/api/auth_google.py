@@ -131,10 +131,11 @@ def _create_user_from_invite(
     hashed_password: Optional[str] = None,
     org: Optional[Organization] = None,
     email: Optional[str] = None,
+    existing_user: bool = False,
 ) -> User:
     """Create a users row for an invitation (Google-only or copy of existing password)."""
     from app.models.user import parse_user_role_from_api as _parse
-    from app.services.organization_invitations import consume_invitation
+    from app.services.organization_invitations import consume_invitation, onboarding_call_booked_at_for_join
 
     email_normalized = (email or inv.invitee_email or "").strip().lower()
     org_id = org.id if org is not None else inv.org_id
@@ -151,8 +152,14 @@ def _create_user_from_invite(
     db.execute(
         text(
             """
-            INSERT INTO users (id, org_id, email, hashed_password, role, is_admin, created_at, google_id, google_email)
-            VALUES (:id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW(), :google_id, :google_email)
+            INSERT INTO users (
+                id, org_id, email, hashed_password, role, is_admin, created_at,
+                google_id, google_email, onboarding_call_booked_at
+            )
+            VALUES (
+                :id, :org_id, :email, :hashed_password, CAST(:role AS userrole), :is_admin, NOW(),
+                :google_id, :google_email, :onboarding_call_booked_at
+            )
             """
         ),
         {
@@ -164,6 +171,10 @@ def _create_user_from_invite(
             "is_admin": user_role in (UserRole.ADMIN, UserRole.OWNER),
             "google_id": google_id,
             "google_email": google_email,
+            "onboarding_call_booked_at": onboarding_call_booked_at_for_join(
+                invitation_type=inv.invitation_type,
+                existing_user=existing_user,
+            ),
         },
     )
     db.add(
@@ -247,6 +258,7 @@ def _accept_invite_with_google(
             hashed_password=existing.hashed_password,
             org=org,
             email=invite_email,
+            existing_user=True,
         )
         for u in existing_users:
             if not u.google_id:

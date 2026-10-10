@@ -26,6 +26,7 @@ from app.schemas.funnel import (
     FunnelCreate,
     FunnelGhlExtraFormsIn,
     FunnelGhlPairIn,
+    FunnelScorecardOverrideIn,
     FunnelUpdate,
     FunnelWithSteps,
     FunnelStep as FunnelStepSchema,
@@ -272,6 +273,33 @@ def put_funnel_ad_spend(
         ads_deployed=row.ads_deployed,
         angles_deployed=row.angles_deployed,
     )
+
+
+@router.put("/scorecard/override", status_code=status.HTTP_204_NO_CONTENT)
+def put_funnel_scorecard_override(
+    body: FunnelScorecardOverrideIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Hand-edit one week's count in the scorecard grid for one view (funnel + channel).
+    value null reverts the cell to the computed number."""
+    from app.services.funnel_scorecard import set_override
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    _require_org_funnel(db, org_id, body.funnel_id)
+    try:
+        set_override(
+            db,
+            org_id,
+            body.funnel_id,
+            _parse_channel(body.channel),
+            body.week_start,
+            body.metric_key,
+            body.value,
+            getattr(current_user, "id", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/{funnel_id}", response_model=FunnelWithSteps)
@@ -1301,6 +1329,34 @@ def get_funnel_health(
     )
 
 
+def _pct(n: int, d: Optional[int]) -> Optional[float]:
+    return (n / d) * 100.0 if d else None
+
+
+def build_step_counts(steps: List[Any], totals: dict) -> List[StepCount]:
+    """Ordered steps + {event_name: (events, unique_visitors)} → StepCount rows.
+
+    Rates compare each step with the previous one: `conversion_rate` on raw events
+    (unchanged contract), `unique_conversion_rate` on distinct visitors.
+    """
+    out: List[StepCount] = []
+    prev_events: Optional[int] = None
+    prev_uniques: Optional[int] = None
+    for step in steps:
+        events, uniques = totals.get(step.event_name, (0, 0))
+        out.append(StepCount(
+            step_order=step.step_order,
+            label=step.label,
+            event_name=step.event_name,
+            count=events,
+            conversion_rate=_pct(events, prev_events),
+            unique_visitors=uniques,
+            unique_conversion_rate=_pct(uniques, prev_uniques),
+        ))
+        prev_events, prev_uniques = events, uniques
+    return out
+
+
 @router.get("/{funnel_id}/analytics", response_model=FunnelAnalytics)
 def get_funnel_analytics(
     funnel_id: UUID,
@@ -1356,34 +1412,22 @@ def get_funnel_analytics(
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=range_days)
     
-    # Get step counts
-    step_counts = []
-    previous_count = None
-    
-    for step in steps:
-        count = db.query(func.count(Event.id)).filter(
-            Event.funnel_id == funnel_id,
-            Event.org_id == org_id,
-            Event.event_name == step.event_name,
-            Event.occurred_at >= start_date,
-            Event.occurred_at <= end_date
-        ).scalar() or 0
-        
-        # Calculate conversion rate from previous step
-        conversion_rate = None
-        if previous_count is not None and previous_count > 0:
-            conversion_rate = (count / previous_count) * 100.0
-        
-        step_counts.append(StepCount(
-            step_order=step.step_order,
-            label=step.label,
-            event_name=step.event_name,
-            count=count,
-            conversion_rate=conversion_rate
-        ))
-        
-        previous_count = count
-    
+    # Get step counts: one grouped query instead of one per step
+    totals_rows = db.query(
+        Event.event_name,
+        func.count(Event.id),
+        func.count(func.distinct(Event.visitor_id)),
+    ).filter(
+        Event.funnel_id == funnel_id,
+        Event.org_id == org_id,
+        Event.event_name.in_({s.event_name for s in steps}),
+        Event.occurred_at >= start_date,
+        Event.occurred_at <= end_date
+    ).group_by(Event.event_name).all()
+    step_counts = build_step_counts(
+        steps, {name: (int(events), int(uniques)) for name, events, uniques in totals_rows}
+    )
+
     # Get total unique visitors (visitors who triggered the first step)
     first_step = steps[0] if steps else None
     total_visitors = 0

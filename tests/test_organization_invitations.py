@@ -2,7 +2,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services.organization_invitations import invitation_accept_link, resolve_invitation_email
+from datetime import datetime
+
+from app.services.organization_invitations import (
+    invitation_accept_link,
+    onboarding_call_booked_at_for_join,
+    resolve_invitation_email,
+)
 
 
 def test_invitation_accept_link_uses_frontend_url(monkeypatch):
@@ -55,3 +61,17 @@ def test_resolve_bound_invite_rejects_mismatch():
     assert resolve_invitation_email(inv, None) == "bound@example.com"
     with pytest.raises(Exception):
         resolve_invitation_email(inv, "other@example.com")
+
+
+def test_member_and_existing_user_skip_onboarding_call():
+    now = datetime(2026, 1, 15, 12, 0, 0)
+    assert onboarding_call_booked_at_for_join(invitation_type="USER") is not None
+    assert onboarding_call_booked_at_for_join(
+        invitation_type="ORG_ADMIN",
+        existing_user=True,
+        source_booked_at=now,
+    ) == now
+    assert (
+        onboarding_call_booked_at_for_join(invitation_type="ORG_ADMIN", existing_user=False)
+        is None
+    )

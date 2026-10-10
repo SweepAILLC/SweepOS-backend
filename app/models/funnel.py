@@ -20,8 +20,16 @@ class Funnel(Base):
     source = Column(String(16), nullable=True, default="sweep")
     # GHL pairing + sync state: ghl_funnel_id, name, domain, page paths, extra form ids, sync cursor.
     ghl_config = Column(JSONB, nullable=True)
+    # Custom webhook: sha256 of the secret URL token (lookup key) + config
+    # (encrypted token, display prefix, field_map). See app.services.funnel_webhooks.
+    webhook_token_hash = Column(String(64), nullable=True)
+    webhook_config = Column(JSONB, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    @property
+    def webhook_enabled(self) -> bool:
+        return bool(self.webhook_token_hash)
 
 
 class FunnelStep(Base):
