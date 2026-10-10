@@ -22,6 +22,7 @@ STATUS_PROCESSING = "processing"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 MAX_ATTEMPTS = 8
+PROCESS_LEASE_SEC = 300
 
 
 def _backoff_seconds(attempts: int) -> int:
@@ -117,6 +118,9 @@ def process_recorded_event(
     payload = row.payload if isinstance(row.payload, dict) else {}
     row.status = STATUS_PROCESSING
     row.updated_at = datetime.utcnow()
+    # Lease: claim_due_inbound_events re-selects "processing" rows once due, so a
+    # second worker instance must not grab this row while it is being processed.
+    row.next_attempt_at = datetime.utcnow() + timedelta(seconds=PROCESS_LEASE_SEC)
     db.commit()
     try:
         processor(db, row.org_id, payload)
@@ -139,31 +143,37 @@ def process_recorded_event(
         return False
 
 
-def claim_due_inbound_events(db: Session, *, limit: int = 20) -> list:
+def claim_due_inbound_events(db: Session, *, limit: int = 20, exclude_providers: Tuple[str, ...] = ()) -> list:
     now = datetime.utcnow()
+    q = db.query(InboundWebhookEvent).filter(
+        InboundWebhookEvent.status.in_((STATUS_PENDING, STATUS_PROCESSING)),
+        (InboundWebhookEvent.next_attempt_at.is_(None))
+        | (InboundWebhookEvent.next_attempt_at <= now),
+    )
+    if exclude_providers:
+        q = q.filter(~InboundWebhookEvent.provider.in_(exclude_providers))
     return (
-        db.query(InboundWebhookEvent)
-        .filter(
-            InboundWebhookEvent.status.in_((STATUS_PENDING, STATUS_PROCESSING)),
-            (InboundWebhookEvent.next_attempt_at.is_(None))
-            | (InboundWebhookEvent.next_attempt_at <= now),
-        )
-        .order_by(InboundWebhookEvent.received_at.asc())
+        q.order_by(InboundWebhookEvent.received_at.asc())
         .limit(limit)
         .with_for_update(skip_locked=True)
         .all()
     )
 
 
-def flush_due_inbound_webhooks(db: Session, *, limit: int = 20) -> int:
+def flush_due_inbound_webhooks(db: Session, *, limit: Optional[int] = None) -> int:
     """Worker entry: retry due calendar/payment inbox rows."""
+    from app.core.config import settings
     from app.api.calendar_webhooks import (
         process_calcom_webhook_payload,
         process_calendly_webhook_payload,
     )
     from app.api.ghl_webhooks import process_ghl_webhook_payload
     from app.api.webhooks import process_whop_webhook_payload
+    from app.services.funnel_webhooks import PROVIDER as FUNNEL_WEBHOOK_PROVIDER
     from app.services.ghl_lead_sync import PROVIDER as GHL_SYNC_PROVIDER, process_submission_payload
+
+    if limit is None:
+        limit = int(getattr(settings, "INBOUND_WEBHOOK_FLUSH_LIMIT", 50) or 50)
 
     processors = {
         "calcom": process_calcom_webhook_payload,
@@ -175,7 +185,9 @@ def flush_due_inbound_webhooks(db: Session, *, limit: int = 20) -> int:
     }
     attempted = 0
     try:
-        rows = claim_due_inbound_events(db, limit=limit)
+        # Funnel webhooks have their own drainer threads (funnel_webhooks.drain_due)
+        # so a lead burst never stalls this dispatcher tick.
+        rows = claim_due_inbound_events(db, limit=limit, exclude_providers=(FUNNEL_WEBHOOK_PROVIDER,))
     except Exception:
         LOG.exception("claim due inbound webhooks failed")
         db.rollback()

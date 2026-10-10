@@ -115,6 +115,7 @@ def _dispatcher_loop() -> None:
     last_calendar_catchup = 0.0
     last_whop_catchup = 0.0
     last_ghl_lead_catchup = 0.0
+    last_funnel_webhook_prune = 0.0
     # Catch-ups run off-thread (calendar sync can take a while); never overlap one with itself.
     catchup_running: dict = {}
 
@@ -197,6 +198,20 @@ def _dispatcher_loop() -> None:
                         db.rollback()
                     except Exception:
                         pass
+                if time.time() - last_funnel_webhook_prune >= 3600:
+                    try:
+                        from app.services.funnel_webhooks import prune_done_deliveries
+
+                        pruned = prune_done_deliveries(db)
+                        if pruned:
+                            LOG.info("funnel webhook inbox: pruned %d done row(s)", pruned)
+                    except Exception:
+                        LOG.exception("funnel webhook inbox prune failed")
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                    last_funnel_webhook_prune = time.time()
                 now = time.time()
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     try:
@@ -297,6 +312,31 @@ def _dispatcher_loop() -> None:
             time.sleep(TICK_INTERVAL - elapsed)
 
 
+def _funnel_webhook_drain_loop() -> None:
+    """Drain custom funnel webhook deliveries (app.services.funnel_webhooks).
+
+    Claims use FOR UPDATE SKIP LOCKED, so several threads here and in other worker
+    instances drain in parallel. Polls every second when idle, immediately when a
+    full batch came back (backlog).
+    """
+    from app.services.funnel_webhooks import drain_due
+
+    batch = 25
+    while not _SHUTDOWN:
+        claimed = 0
+        try:
+            with SessionLocal() as db:
+                claimed = drain_due(db, limit=batch)
+        except Exception:
+            LOG.exception("funnel webhook drain failed; backing off briefly")
+            time.sleep(2.0)
+            continue
+        if claimed:
+            LOG.info("funnel webhooks: processed %d delivery(ies)", claimed)
+        if claimed < batch and not _SHUTDOWN:
+            time.sleep(1.0)
+
+
 def _rq_child_entry() -> None:
     """Spawned RQ process: one job at a time, no automation dispatcher."""
     os.environ["SWEEP_PROCESS_ROLE"] = "worker"
@@ -347,6 +387,9 @@ def main() -> None:
         daemon=True,
     )
     dispatcher_thread.start()
+
+    for i in range(max(0, int(getattr(settings, "FUNNEL_WEBHOOK_DRAIN_THREADS", 2) or 0))):
+        threading.Thread(target=_funnel_webhook_drain_loop, name=f"funnel-webhook-drain-{i + 1}", daemon=True).start()
 
     extra_procs: List[object] = []
     try:

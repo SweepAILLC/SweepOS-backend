@@ -26,6 +26,7 @@ from app.schemas.funnel import (
     FunnelCreate,
     FunnelGhlExtraFormsIn,
     FunnelGhlPairIn,
+    FunnelScorecardOverrideIn,
     FunnelUpdate,
     FunnelWithSteps,
     FunnelStep as FunnelStepSchema,
@@ -272,6 +273,33 @@ def put_funnel_ad_spend(
         ads_deployed=row.ads_deployed,
         angles_deployed=row.angles_deployed,
     )
+
+
+@router.put("/scorecard/override", status_code=status.HTTP_204_NO_CONTENT)
+def put_funnel_scorecard_override(
+    body: FunnelScorecardOverrideIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Hand-edit one week's count in the scorecard grid for one view (funnel + channel).
+    value null reverts the cell to the computed number."""
+    from app.services.funnel_scorecard import set_override
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    _require_org_funnel(db, org_id, body.funnel_id)
+    try:
+        set_override(
+            db,
+            org_id,
+            body.funnel_id,
+            _parse_channel(body.channel),
+            body.week_start,
+            body.metric_key,
+            body.value,
+            getattr(current_user, "id", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/{funnel_id}", response_model=FunnelWithSteps)
