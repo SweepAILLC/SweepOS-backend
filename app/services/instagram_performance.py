@@ -23,7 +23,8 @@ from app.services.instagram_sync_service import (
 )
 
 MIN_SAMPLE = 3
-REACH_FLOOR = 50  # ignore tiny-sample posts when ranking
+REACH_FLOOR = 50  # minimum trustworthy exposure; also floors the shrinkage prior weight below
+MIN_EXPOSURE = 10  # below this reach/views a post has no reliable signal — excluded from ranking entirely
 
 # Human labels for Performance UI / verdicts (avoid raw enum keys).
 _DIMENSION_LABELS = {
@@ -194,7 +195,60 @@ def _pct_delta(cur: Optional[float], prev: Optional[float]) -> Optional[float]:
     return round(((cur - prev) / abs(prev)) * 100.0, 1)
 
 
-def _post_card(m: InstagramMedia) -> Dict[str, Any]:
+def _exposure(m: InstagramMedia) -> Optional[int]:
+    """Best available denominator for how many people actually saw this post."""
+    if m.reach is not None and m.reach > 0:
+        return int(m.reach)
+    if m.views is not None and m.views > 0:
+        return int(m.views)
+    return None
+
+
+def _exposure_prior(posts: Sequence[InstagramMedia]) -> Tuple[float, float]:
+    """(prior_rate_pct, prior_weight) for Bayesian-shrinking raw engagement rates.
+
+    ``prior_weight`` is the account's median exposure among posts with enough reach/views to
+    trust outright — how much exposure a post needs before its own rate dominates the shrunk
+    score, floored at REACH_FLOOR so low-activity accounts still shrink meaningfully.
+    ``prior_rate_pct`` is the median raw engagement rate among those same trustworthy posts.
+    """
+    exposures: List[int] = []
+    rates: List[float] = []
+    for p in posts:
+        exp = _exposure(p)
+        if exp is None or exp < MIN_EXPOSURE or p.engagement_rate_pct is None:
+            continue
+        exposures.append(exp)
+        rates.append(float(p.engagement_rate_pct))
+    prior_weight = max(_median(exposures) or 0.0, REACH_FLOOR)
+    prior_rate = _median(rates)
+    if prior_rate is None or prior_rate <= 0:
+        prior_rate = 1.0
+    return prior_rate, prior_weight
+
+
+def _rank_score(
+    engagement_rate_pct: Optional[float],
+    exposure: Optional[int],
+    *,
+    prior_rate_pct: float,
+    prior_weight: float,
+) -> Optional[float]:
+    """Exposure-weighted (Bayesian-shrunk) engagement rate used for all ranking/bucketing.
+
+    A post with 3 views and 3 likes is a 100% raw engagement_rate_pct but is pure noise —
+    great rate, terrible reach. Pulling it toward the account's typical rate in proportion to
+    how far its exposure sits below ``prior_weight`` means a post needs exposure comparable to
+    a typical post before its raw rate is trusted outright; a post with exposure well above
+    the prior keeps essentially its raw rate, one at/under MIN_EXPOSURE is excluded entirely.
+    """
+    if engagement_rate_pct is None or exposure is None or exposure < MIN_EXPOSURE:
+        return None
+    raw_rate = float(engagement_rate_pct)
+    return (exposure * raw_rate + prior_weight * prior_rate_pct) / (exposure + prior_weight)
+
+
+def _post_card(m: InstagramMedia, *, rank_score: Optional[float] = None) -> Dict[str, Any]:
     thumb = m.thumbnail_url
     if isinstance(thumb, str):
         lower = thumb.lower().split("?", 1)[0]
@@ -202,6 +256,7 @@ def _post_card(m: InstagramMedia) -> Dict[str, Any]:
             thumb = None
     return {
         "ig_media_id": m.ig_media_id,
+        "rank_score": round(rank_score, 3) if rank_score is not None else None,
         "permalink": m.permalink,
         "thumbnail_url": thumb,
         "caption": (m.caption or "")[:280],
@@ -253,24 +308,19 @@ def _what_works(posts: Sequence[InstagramMedia]) -> List[Dict[str, Any]]:
     Always returns hook/awareness(format/funnel) options when data exists, even when
     sample size is thin. Low-sample rows are marked confidence='low'.
     """
-    eng_all = [
-        float(p.engagement_rate_pct)
-        for p in posts
-        if p.engagement_rate_pct is not None
-        and (p.reach is None or p.reach >= REACH_FLOOR or p.insights_status == "unavailable")
-    ]
-    org_med = _median(eng_all)
-    if org_med is None or org_med <= 0:
-        org_med = 1.0
+    prior_rate, prior_weight = _exposure_prior(posts)
+    org_med = prior_rate
 
     target_dims = ("hook_pattern", "funnel_stage", "format_bucket")
     buckets: Dict[Tuple[str, str], List[float]] = defaultdict(list)
     hook_examples: Dict[Tuple[str, str], List[Tuple[float, str]]] = defaultdict(list)
 
     for p in posts:
-        if p.engagement_rate_pct is None:
+        rate = _rank_score(
+            p.engagement_rate_pct, _exposure(p), prior_rate_pct=prior_rate, prior_weight=prior_weight
+        )
+        if rate is None:
             continue
-        rate = float(p.engagement_rate_pct)
         hook = (p.hook_text or "").strip()
         for dim in target_dims:
             val = _dimension_value(p, dim)
@@ -640,20 +690,29 @@ def build_instagram_performance(
         "prev_range_end": range_start.date().isoformat(),
     }
 
-    # Rank posts
-    rankable = [
-        p
-        for p in posts
-        if p.engagement_rate_pct is not None
-        and (p.reach is None or p.reach >= REACH_FLOOR or p.insights_status != "ok")
-    ]
-    rankable.sort(key=lambda p: float(p.engagement_rate_pct or 0), reverse=True)
-    top = [_post_card(p) for p in rankable[:5]]
+    # Rank posts by exposure-weighted (Bayesian-shrunk) engagement rate, not raw rate — a post
+    # with e.g. 3 views and 3 likes is a 100% raw rate but has no real reach behind it. Shrinking
+    # toward the account's typical rate in proportion to exposure keeps those from topping (or
+    # bottoming) the list while leaving well-exposed posts close to their actual rate.
+    prior_rate, prior_weight = _exposure_prior(posts)
+    scored_posts: List[Tuple[float, InstagramMedia]] = []
+    for p in posts:
+        score = _rank_score(
+            p.engagement_rate_pct, _exposure(p), prior_rate_pct=prior_rate, prior_weight=prior_weight
+        )
+        if score is not None:
+            scored_posts.append((score, p))
+    scored_posts.sort(key=lambda t: t[0], reverse=True)
+    top = [_post_card(p, rank_score=score) for score, p in scored_posts[:5]]
     # Always surface up to 5 underperformers when enough rankable posts exist.
-    bottom_src = list(reversed(rankable[-5:])) if len(rankable) >= 2 else []
+    bottom_src = list(reversed(scored_posts[-5:])) if len(scored_posts) >= 2 else []
     # Avoid overlapping with top when the set is small
     top_ids = {p["ig_media_id"] for p in top}
-    bottom = [p for p in [_post_card(x) for x in bottom_src] if p["ig_media_id"] not in top_ids][:5]
+    bottom = [
+        p
+        for p in [_post_card(x, rank_score=score) for score, x in bottom_src]
+        if p["ig_media_id"] not in top_ids
+    ][:5]
 
     what = _what_works(posts)
     trend = _weekly_trend(posts, days)
@@ -695,9 +754,12 @@ def build_instagram_performance(
             if needs_reconnect
             else (
                 "summary.*_delta_pct and prev_* compare the selected window to the immediately "
-                "preceding window of equal length. top_posts/bottom_posts are ranked by engagement "
-                "rate with a reach floor. Prefer top_posts hooks and period deltas for ideation; "
-                "what_works/verdicts are secondary analytics, not primary UI advice."
+                "preceding window of equal length. top_posts/bottom_posts are ranked by an "
+                "exposure-weighted engagement score (rank_score) — raw engagement_rate_pct is "
+                "shrunk toward the account's typical rate when a post's reach/views are low, so a "
+                "tiny-reach post with a freak high rate can't look like a top performer. Prefer "
+                "top_posts hooks and period deltas for ideation; what_works/verdicts are secondary "
+                "analytics, not primary UI advice."
             )
         ),
     }
