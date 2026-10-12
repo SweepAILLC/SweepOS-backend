@@ -371,6 +371,21 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # Unlike the web process (which imports every app.api.* router, and so every
+    # ORM class, at startup), this process only imports models on demand via
+    # whichever services the dispatcher/drain loops happen to pull in. SQLAlchemy
+    # configures ALL mappers together the first time any one of them is queried,
+    # so a class registered without something it string-references elsewhere
+    # (e.g. a relationship target never imported in this process) blows up the
+    # *first query of any kind* -- which previously surfaced as a silent,
+    # permanently-repeating failure inside the funnel webhook drain loop instead
+    # of a loud boot crash. Import every model up front and configure now so a
+    # broken mapper fails here, visibly, before any thread starts.
+    import app.models  # noqa: F401
+    from sqlalchemy.orm import configure_mappers
+
+    configure_mappers()
+
     rq_enabled = bool(settings.REDIS_URL and settings.USE_RQ_LONG_JOBS)
     rq_count = max(1, int(getattr(settings, "RQ_WORKER_COUNT", 1) or 1))
     LOG.info(
