@@ -398,7 +398,7 @@ def _fallback_plain(
 # AI-generated mode
 # ---------------------------------------------------------------------------
 
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v1.1"
 
 # Drafts an outbound email a coach sends to their client — generative, client-facing
 # per LLM.md, so it carries the required SweepBot persona ahead of the task rules.
@@ -446,15 +446,73 @@ def _referral_natural_voice_append(rule: AutomationRule, chosen_names: List[str]
     return ""
 
 
+# Each playbook fires from a different trigger and must stay in its lane — without
+# this, the LLM only sees `playbook` as a bare string inside DATA.task and regularly
+# bleeds another type's content in (e.g. "welcome aboard" onboarding copy on a
+# pre-sale post-booking email, or a referral/testimonial ask on first-payment
+# onboarding). One explicit, mutually-exclusive instruction block per playbook.
+_PLAYBOOK_TASK_INSTRUCTIONS: Dict[str, str] = {
+    Playbook.PRE_SALE_POST_BOOKING.value: (
+        "THIS EMAIL'S PURPOSE: the recipient just booked a sales call and has NOT bought anything yet. "
+        "Write a pre-call note only: confirm excitement for the upcoming call, set expectations, and ask "
+        "for context that helps the operator prepare. "
+        "Do NOT welcome them as a client, do NOT reference onboarding steps or a program they've started, "
+        "and do NOT ask for a referral, upsell, or testimonial — they are not a paying client yet."
+    ),
+    Playbook.PRE_SALE_PRE_MEETING.value: (
+        "THIS EMAIL'S PURPOSE: a reminder shortly before the sales call they already booked. The recipient "
+        "has NOT bought anything yet. Keep it short: confirm the call is coming up and build anticipation. "
+        "Do NOT welcome them as a client, reference onboarding, or ask for a referral, upsell, or testimonial."
+    ),
+    Playbook.FIRST_PAYMENT_ONBOARDING.value: (
+        "THIS EMAIL'S PURPOSE: the recipient just made their first payment. Welcome them as a new client and "
+        "give concrete first steps to get started in the program. "
+        "Do NOT ask for a referral, upsell, or testimonial in this email — that is a separate automation. "
+        "Do NOT write as if a sales call is still upcoming or recap a 'win' from a call."
+    ),
+    Playbook.FIRST_PAYMENT_REFERRAL.value: (
+        "THIS EMAIL'S PURPOSE: a short, separate follow-up after their first payment, inviting them to refer "
+        "others using DATA.intel.referral_offer. "
+        "Do NOT repeat onboarding/first-steps content — assume a separate onboarding email already covered that. "
+        "Do NOT reference a specific win or call insight unless present in DATA."
+    ),
+    Playbook.WIN_COMBINED_ASK.value: (
+        "THIS EMAIL'S PURPOSE: the recipient is an existing, active client who just had a win surfaced from a "
+        "call (see DATA.call_insight). Open by congratulating them on that specific win, then weave in ONLY the "
+        "asks listed in DATA.task.combined_asks (referral/upsell/testimonial — never asks not in that list). "
+        "Do NOT welcome them as a brand-new client or describe onboarding/first steps — they are already "
+        "mid-program."
+    ),
+    Playbook.OFFBOARDING_RECAP_ASK.value: (
+        "THIS EMAIL'S PURPOSE: the client's program is ending. Recap their wins/progress (use DATA.call_insight "
+        "and DATA.client if present) and close out warmly, then weave in ONLY the asks listed in "
+        "DATA.task.combined_asks (referral/upsell/testimonial). "
+        "Do NOT welcome them as a new client or write as if their program is just starting or a call is still "
+        "upcoming."
+    ),
+}
+
+
 def _compose_automation_ai_system_prompt(rule: AutomationRule) -> str:
-    """Base automation prompt plus optional per-rule operator instructions (AI content mode)."""
+    """Base automation prompt plus playbook task framing plus optional per-rule operator instructions.
+
+    The playbook-specific block is what keeps each automation type's email on-task —
+    without it the LLM infers purpose only from the bare ``playbook`` string buried in
+    DATA.task and drifts into another type's content.
+    """
+    system = _AI_SYSTEM
+    pb = getattr(rule, "playbook", None) or ""
+    task_instructions = _PLAYBOOK_TASK_INSTRUCTIONS.get(pb)
+    if task_instructions:
+        system += "\n\n---\n" + task_instructions
+
     extra = (getattr(rule, "ai_content_system_prompt", None) or "").strip()
     if not extra:
-        return _AI_SYSTEM
+        return system
     if len(extra) > _MAX_OPERATOR_AI_PROMPT_LEN:
         extra = extra[:_MAX_OPERATOR_AI_PROMPT_LEN].rstrip() + "\n… [truncated]"
     return (
-        _AI_SYSTEM
+        system
         + "\n\n---\nOPERATOR_PLAYBOOK_SYSTEM_PROMPT (highest priority for this automation — tone, "
         "structure, CTAs, resources to emphasize, compliance, or voice constraints):\n"
         + extra
