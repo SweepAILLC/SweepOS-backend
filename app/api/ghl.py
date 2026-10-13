@@ -35,6 +35,7 @@ class GhlConnectIn(BaseModel):
 
 class GhlStatusResponse(BaseModel):
     connected: bool
+    org_id: Optional[str] = None
     location_id: Optional[str] = None
     last_sync_at: Optional[str] = None
     needs_reconnect: bool = False
@@ -139,6 +140,7 @@ def get_ghl_status(
 
     return GhlStatusResponse(
         connected=True,
+        org_id=str(org_id),
         location_id=token_row.account_id,
         last_sync_at=token_row.last_sync_at.isoformat() if token_row.last_sync_at else None,
         webhook_secret_set=bool(token_row.webhook_secret),
