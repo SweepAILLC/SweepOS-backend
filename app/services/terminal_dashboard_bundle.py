@@ -180,7 +180,7 @@ def _upcoming_appointments(
         .options(joinedload(ClientCheckIn.client))
         .filter(
             ClientCheckIn.org_id == org_id,
-            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+            ClientCheckIn.provider.in_(["calcom", "calendly", "ghl"]),
             effective_end >= now,
         )
         .order_by(ClientCheckIn.start_time.asc())

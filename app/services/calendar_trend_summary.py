@@ -87,7 +87,7 @@ def _past_sales_calls_in_window(
         db.query(ClientCheckIn)
         .filter(
             ClientCheckIn.org_id == org_id,
-            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+            ClientCheckIn.provider.in_(["calcom", "calendly", "ghl"]),
             ClientCheckIn.is_sales_call == True,  # noqa: E712
             ClientCheckIn.cancelled == False,  # noqa: E712
             ClientCheckIn.start_time >= ps,
@@ -115,7 +115,7 @@ def _count_meetings_in_window(
 
     q = db.query(ClientCheckIn).filter(
         ClientCheckIn.org_id == org_id,
-        ClientCheckIn.provider.in_(["calcom", "calendly"]),
+        ClientCheckIn.provider.in_(["calcom", "calendly", "ghl"]),
     )
     if upcoming:
         q = q.filter(

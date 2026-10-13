@@ -3542,7 +3542,7 @@ def get_calendar_last_updated(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Lightweight marker for when Cal.com / Calendly check-ins last changed (webhook or sync).
+    Lightweight marker for when Cal.com / Calendly / GHL check-ins last changed (webhook or sync).
     Terminal polls this to refetch bookings, KPIs, and trend charts without a manual refresh.
     """
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
@@ -3550,7 +3550,7 @@ def get_calendar_last_updated(
         db.query(func.max(ClientCheckIn.updated_at))
         .filter(
             ClientCheckIn.org_id == org_id,
-            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+            ClientCheckIn.provider.in_(["calcom", "calendly", "ghl"]),
         )
         .scalar()
     )
@@ -3577,13 +3577,13 @@ def get_calendar_synced_bookings(
     ),
     provider: Optional[str] = Query(
         None,
-        description="If set, only rows for this provider (calcom or calendly). Omit to return both.",
+        description="If set, only rows for this provider (calcom, calendly, or ghl). Omit to return all.",
     ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Canonical calendar rows from `client_check_ins` (Cal.com / Calendly) after sync.
+    Canonical calendar rows from `client_check_ins` (Cal.com / Calendly / GHL) after sync.
     Use this for the Calendar tab instead of calling provider list APIs directly, so UI matches
     sales flags, close-rate data, and manual edits. Run `POST /clients/check-ins/sync` to refresh.
     """
@@ -3598,10 +3598,10 @@ def get_calendar_synced_bookings(
 
     if provider is not None:
         p = provider.strip().lower()
-        if p not in ("calcom", "calendly"):
+        if p not in ("calcom", "calendly", "ghl"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="provider must be calcom or calendly",
+                detail="provider must be calcom, calendly, or ghl",
             )
         provider_filter = p
     else:
@@ -3612,7 +3612,7 @@ def get_calendar_synced_bookings(
         .options(joinedload(ClientCheckIn.client))
         .filter(
             ClientCheckIn.org_id == org_id,
-            ClientCheckIn.provider.in_(["calcom", "calendly"]),
+            ClientCheckIn.provider.in_(["calcom", "calendly", "ghl"]),
         )
     )
     if provider_filter is not None:
@@ -3759,13 +3759,13 @@ def get_calendar_sales_close_rate(
         now = datetime.now(timezone.utc)
         start_30d = now - timedelta(days=30)
 
-        # Sales close rate should align with the Past table (Cal.com/Calendly events),
+        # Sales close rate should align with the Past table (Cal.com/Calendly/GHL events),
         # so exclude "manual" check-ins from the computation.
         base_filter = (
             (ClientCheckIn.org_id == org_id) &
             (ClientCheckIn.is_sales_call == True) &
             (ClientCheckIn.cancelled == False) &
-            (ClientCheckIn.provider.in_(["calcom", "calendly"]))
+            (ClientCheckIn.provider.in_(["calcom", "calendly", "ghl"]))
         )
         # Close-rate should be based on past sales calls (matches the "Past" table).
         past_filter = base_filter & (ClientCheckIn.start_time < now)
@@ -3865,7 +3865,7 @@ def get_platform_calendar_sales_close_rate(
         base_filter = (
             (ClientCheckIn.is_sales_call == True)  # noqa: E712
             & (ClientCheckIn.cancelled == False)  # noqa: E712
-            & (ClientCheckIn.provider.in_(["calcom", "calendly"]))
+            & (ClientCheckIn.provider.in_(["calcom", "calendly", "ghl"]))
         )
         past_filter = base_filter & (ClientCheckIn.start_time < now)
 
