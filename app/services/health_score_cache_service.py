@@ -346,17 +346,38 @@ def resolve_health_score(
     now = datetime.now(timezone.utc)
     factors_to_store = json.loads(json.dumps(factors, default=str))
 
-    if not cache_row:
-        cache_row = ClientHealthScoreCache(client_id=client_id, org_id=org_id)
-        db.add(cache_row)
-    cache_row.org_id = org_id
-    cache_row.score = final_score
-    cache_row.grade = final_grade
-    cache_row.source = source
-    cache_row.explanation = explanation
-    cache_row.factors_json = factors_to_store
-    cache_row.input_hash = h
-    cache_row.computed_at = now
+    # Upsert, not read-then-write: two concurrent requests for the same client
+    # (e.g. the UI firing a logic + an AI health-score fetch together) both see
+    # no cache_row and both try to INSERT, so the second one's plain db.add +
+    # commit hits a UniqueViolation on client_id and 500s. ON CONFLICT makes
+    # the race resolve to "last write wins" instead of a crash.
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    stmt = pg_insert(ClientHealthScoreCache).values(
+        client_id=client_id,
+        org_id=org_id,
+        score=final_score,
+        grade=final_grade,
+        source=source,
+        explanation=explanation,
+        factors_json=factors_to_store,
+        input_hash=h,
+        computed_at=now,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[ClientHealthScoreCache.client_id],
+        set_={
+            "org_id": stmt.excluded.org_id,
+            "score": stmt.excluded.score,
+            "grade": stmt.excluded.grade,
+            "source": stmt.excluded.source,
+            "explanation": stmt.excluded.explanation,
+            "factors_json": stmt.excluded.factors_json,
+            "input_hash": stmt.excluded.input_hash,
+            "computed_at": stmt.excluded.computed_at,
+        },
+    )
+    db.execute(stmt)
 
     if record_outcome_snapshot:
         fb = build_feature_bucket(factors, fathom_sentiment)
