@@ -680,6 +680,6 @@ def process_calcom_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dict[
 
     LOG.info(
         "calcom webhook org=%s trigger=%s attendee=%s new=%s fired_jobs=%s",
-        org_id, trigger, normalize_email(attendee_email), is_new, len(fired_jobs),
+        org_uuid, trigger, normalize_email(attendee_email), is_new, len(fired_jobs),
     )
     return {"ok": True, "is_new": is_new, "fired_jobs": fired_jobs}
