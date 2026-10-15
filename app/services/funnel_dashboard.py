@@ -261,6 +261,11 @@ def compute_funnel_dashboard(
     summary["closed"] = int(sum(v or 0 for v in sc_values["deals_closed"]))
 
     money: Optional[Dict[str, Any]] = None
+    # The chart pairs spend against cash — like the money row, ad_spend/cash_collected
+    # there are always the paid subset, even on an "all channels" view where plain
+    # cash_collected (a "close"-group metric) would otherwise include organic cash
+    # and read as way more than the ad spend it's plotted against.
+    weekly_values = sc_values
     if channel != "organic":
         # Same override-applied basis the scorecard's economics rows use: reuse sc_values
         # outright when this view is already paid-only (channel "paid" or one funnel
@@ -272,6 +277,9 @@ def compute_funnel_dashboard(
             money_values, _ = weekly_metric_values(
                 db, org_id, sc_weeks, "paid", None, scope_funnel_ids, include_ads=True
             )
+            weekly_values = dict(sc_values)
+            weekly_values["ad_spend"] = money_values["ad_spend"]
+            weekly_values["cash_collected"] = money_values["cash_collected"]
         spend = sum(v or 0 for v in money_values["ad_spend"])
         paid_cash = sum(v or 0 for v in money_values["cash_collected"])
         paid_opt_ins = sum(v or 0 for v in money_values["leads"])
@@ -298,7 +306,7 @@ def compute_funnel_dashboard(
         "visitors": None if channel == "organic" else int(sum(v or 0 for v in sc_values["visitors"])),
         "summary": summary,
         "money": money,
-        "weekly": _weekly_from_scorecard(sc_weeks, sc_values),
+        "weekly": _weekly_from_scorecard(sc_weeks, weekly_values),
         "sources": _utm_sources(db, org_id, facts),
         # Sheet-style scorecard: last full week vs the average week in range.
         "scorecard": compute_scorecard(

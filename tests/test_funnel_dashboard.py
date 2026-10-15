@@ -174,6 +174,9 @@ def test_all_channel_money_uses_paid_subset():
     # through cac/roas), not a second collect_funnel_facts call like the removed
     # money_facts path — only the top-level "all channel" facts pass shows up here.
     assert calls == [(None, None)]
+    # The chart pairs spend against cash the same way the money row does: paid cash
+    # (3000), not the all-channel cash_collected (4000) that includes organic.
+    assert out["weekly"][0]["cash_usd"] == 3000.0
 
 
 def test_no_spend_leaves_ratios_empty():
