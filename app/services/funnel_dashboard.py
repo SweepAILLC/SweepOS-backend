@@ -31,6 +31,15 @@ from app.services.kpi_integration_sync import (
 NO_UTM_SOURCE = "(no UTM)"
 TRACKING_SILENT_AFTER = timedelta(hours=24)
 
+# Which UTM field the "UTM sources" panel can be grouped by, and the label shown
+# for a row where that field wasn't set on the lead.
+UTM_GROUP_FIELDS = {
+    "source": "(no UTM)",
+    "medium": "(no medium)",
+    "campaign": "(no campaign)",
+    "content": "(no ad)",
+}
+
 
 def week_start_for(d: date) -> date:
     """Monday of d's ISO week — the one spend bucket key used everywhere."""
@@ -158,8 +167,13 @@ def _tracking_status(db: Session, funnel_ids: Set[uuid.UUID], now: datetime) -> 
     return {"status": status, "last_event_at": last, "errors_24h": errors}
 
 
-def _utm_sources(db: Session, org_id: uuid.UUID, facts: FunnelFacts) -> List[Dict[str, Any]]:
-    """One row per utm_source over the clients in this window's facts, ranked by cash then opt-ins."""
+def _utm_sources(
+    db: Session, org_id: uuid.UUID, facts: FunnelFacts, group_by: str = "source"
+) -> List[Dict[str, Any]]:
+    """One row per UTM `group_by` field (source/medium/campaign/content) over the clients
+    in this window's facts, ranked by cash then opt-ins."""
+    group_by = group_by if group_by in UTM_GROUP_FIELDS else "source"
+    no_value_label = UTM_GROUP_FIELDS[group_by]
     client_ids = set(facts.opt_ins) | set(facts.booked) | set(facts.closed)
     client_ids |= {cid for cid, _ts, _c in facts.cash if cid is not None}
     if not client_ids:
@@ -170,20 +184,20 @@ def _utm_sources(db: Session, org_id: uuid.UUID, facts: FunnelFacts) -> List[Dic
     ):
         prospect = meta.get("prospect") if isinstance(meta, dict) else None
         utm = prospect.get("utm") if isinstance(prospect, dict) else None
-        src = str(utm.get("source") or "").strip() if isinstance(utm, dict) else ""
-        source_by_client[cid] = src or NO_UTM_SOURCE
+        src = str(utm.get(group_by) or "").strip() if isinstance(utm, dict) else ""
+        source_by_client[cid] = src or no_value_label
 
     rows: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {"opt_ins": 0, "booked": 0, "closed": 0, "cash_cents": 0}
     )
     for cid in facts.opt_ins:
-        rows[source_by_client.get(cid, NO_UTM_SOURCE)]["opt_ins"] += 1
+        rows[source_by_client.get(cid, no_value_label)]["opt_ins"] += 1
     for cid in facts.booked:
-        rows[source_by_client.get(cid, NO_UTM_SOURCE)]["booked"] += 1
+        rows[source_by_client.get(cid, no_value_label)]["booked"] += 1
     for cid in facts.closed:
-        rows[source_by_client.get(cid, NO_UTM_SOURCE)]["closed"] += 1
+        rows[source_by_client.get(cid, no_value_label)]["closed"] += 1
     for cid, _ts, cents in facts.cash:
-        rows[source_by_client.get(cid, NO_UTM_SOURCE) if cid else NO_UTM_SOURCE]["cash_cents"] += cents
+        rows[source_by_client.get(cid, no_value_label) if cid else no_value_label]["cash_cents"] += cents
 
     out = [
         {
@@ -195,7 +209,7 @@ def _utm_sources(db: Session, org_id: uuid.UUID, facts: FunnelFacts) -> List[Dic
         }
         for src, r in rows.items()
     ]
-    out.sort(key=lambda r: (r["source"] == NO_UTM_SOURCE, -r["cash_usd"], -r["opt_ins"]))
+    out.sort(key=lambda r: (r["source"] == no_value_label, -r["cash_usd"], -r["opt_ins"]))
     return out
 
 
@@ -234,12 +248,14 @@ def compute_funnel_dashboard(
     *,
     now: Optional[datetime] = None,
     compare: Optional[Tuple[date, date]] = None,
+    utm_group_by: str = "source",
 ) -> Dict[str, Any]:
     """
     Whole Funnels dashboard in one call. `channel` None/"all" | "organic" | "paid";
     `funnel_id` narrows to one funnel (implicitly paid). The money row (spend,
     CPL, CAC, ROAS, profit) is paid-only: hidden for organic, and computed over
-    the paid subset when channel is "all".
+    the paid subset when channel is "all". `utm_group_by` picks which UTM field
+    the "sources" rows are grouped by: "source" | "medium" | "campaign" | "content" (ad).
     """
     now = now or datetime.now(timezone.utc)
 
@@ -309,7 +325,7 @@ def compute_funnel_dashboard(
         "summary": summary,
         "money": money,
         "weekly": _weekly_from_scorecard(sc_weeks, weekly_values),
-        "sources": _utm_sources(db, org_id, facts),
+        "sources": _utm_sources(db, org_id, facts, group_by=utm_group_by),
         # Sheet-style scorecard: last full week vs the average week in range.
         "scorecard": compute_scorecard(
             db, org_id, window_start, window_end, channel, funnel_id, scope_funnel_ids, today=now.date(), compare=compare

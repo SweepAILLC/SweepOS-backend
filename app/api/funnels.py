@@ -193,16 +193,21 @@ def get_funnel_dashboard(
     funnel_id: Optional[UUID] = Query(None, description="Omit for all funnels"),
     compare_start: Optional[str] = Query(None, description="Compare range (benchmark = its average week)"),
     compare_end: Optional[str] = Query(None),
+    utm_group_by: Optional[str] = Query(
+        None, description="UTM sources panel grouping: 'source' (default), 'medium', 'campaign', or 'content' (ad)"
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Whole Funnels dashboard in one call — see services/funnel_dashboard.py."""
-    from app.services.funnel_dashboard import compute_funnel_dashboard
+    from app.services.funnel_dashboard import UTM_GROUP_FIELDS, compute_funnel_dashboard
 
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
     window_start, window_end = _parse_ymd(start, "start"), _parse_ymd(end, "end")
     if window_end < window_start:
         raise HTTPException(status_code=400, detail="end must be on or after start")
+    if utm_group_by is not None and utm_group_by not in UTM_GROUP_FIELDS:
+        raise HTTPException(status_code=400, detail="utm_group_by must be 'source', 'medium', 'campaign', or 'content'")
     _require_org_funnel(db, org_id, funnel_id)
     compare = None
     if compare_start and compare_end:
@@ -211,7 +216,14 @@ def get_funnel_dashboard(
             raise HTTPException(status_code=400, detail="compare_end must be on or after compare_start")
     return FunnelDashboardResponse(
         **compute_funnel_dashboard(
-            db, org_id, window_start, window_end, _parse_channel(channel), funnel_id, compare=compare
+            db,
+            org_id,
+            window_start,
+            window_end,
+            _parse_channel(channel),
+            funnel_id,
+            compare=compare,
+            utm_group_by=utm_group_by or "source",
         )
     )
 
