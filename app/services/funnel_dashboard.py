@@ -21,7 +21,7 @@ from app.models.event import Event
 from app.models.event_error import EventError
 from app.models.funnel import Funnel
 from app.models.funnel_ad_spend import FunnelAdSpend
-from app.services.funnel_scorecard import compute_scorecard
+from app.services.funnel_scorecard import compute_scorecard, scorecard_weeks, weekly_metric_values
 from app.services.kpi_integration_sync import (
     FunnelFacts,
     collect_funnel_facts,
@@ -156,27 +156,6 @@ def _tracking_status(db: Session, funnel_ids: Set[uuid.UUID], now: datetime) -> 
     return {"status": status, "last_event_at": last, "errors_24h": errors}
 
 
-def _visitors(
-    db: Session,
-    funnel_ids: Set[uuid.UUID],
-    start: datetime,
-    end: datetime,
-) -> int:
-    if not funnel_ids:
-        return 0
-    return (
-        db.query(func.count(func.distinct(Event.visitor_id)))
-        .filter(
-            Event.funnel_id.in_(list(funnel_ids)),
-            Event.visitor_id.isnot(None),
-            Event.occurred_at >= start.replace(tzinfo=None),
-            Event.occurred_at <= end.replace(tzinfo=None),
-        )
-        .scalar()
-        or 0
-    )
-
-
 def _utm_sources(db: Session, org_id: uuid.UUID, facts: FunnelFacts) -> List[Dict[str, Any]]:
     """One row per utm_source over the clients in this window's facts, ranked by cash then opt-ins."""
     client_ids = set(facts.opt_ins) | set(facts.booked) | set(facts.closed)
@@ -218,56 +197,29 @@ def _utm_sources(db: Session, org_id: uuid.UUID, facts: FunnelFacts) -> List[Dic
     return out
 
 
-def _weekly(
-    window_start: date,
-    window_end: date,
-    facts: FunnelFacts,
-    money_facts: Optional[FunnelFacts],
-    spend_rows: List[FunnelAdSpend],
+def _weekly_from_scorecard(
+    weeks: List[date], values: Dict[str, List[Optional[float]]]
 ) -> List[Dict[str, Any]]:
-    weeks: Dict[date, Dict[str, Any]] = {}
-    cursor = week_start_for(window_start)
-    while cursor <= window_end:
-        weeks[cursor] = {"week_start": cursor, "spend_cents": 0, "cash_cents": 0, "opt_ins": 0, "closed": 0}
-        cursor += timedelta(days=7)
-
-    def _bucket(d: date) -> Optional[Dict[str, Any]]:
-        return weeks.get(week_start_for(d))
-
-    for created in facts.opt_ins.values():
-        b = _bucket(created.date())
-        if b:
-            b["opt_ins"] += 1
-    for d, _o, respondents in facts.outreach_rows:
-        b = _bucket(d)
-        if b:
-            b["opt_ins"] += respondents
-    for d in facts.closed.values():
-        b = _bucket(d)
-        if b:
-            b["closed"] += 1
-    # Cash on the spend graph is paid cash when the money row is shown, so the
-    # bars and the line compare like with like.
-    for _cid, ts, cents in (money_facts or facts).cash:
-        b = _bucket(ts.date())
-        if b:
-            b["cash_cents"] += cents
-    for row in spend_rows:
-        b = weeks.get(row.week_start)
-        if b:
-            b["spend_cents"] += row.amount_cents or 0
-
-    return [
-        {
-            "week_start": w["week_start"],
-            "spend_usd": round(w["spend_cents"] / 100.0, 2),
-            "cash_usd": round(w["cash_cents"] / 100.0, 2),
-            "opt_ins": w["opt_ins"],
-            "closed": w["closed"],
-            "cac_usd": _ratio(w["spend_cents"] / 100.0, w["closed"]),
-        }
-        for w in weeks.values()
-    ]
+    """The two graphs' weekly buckets, built from the same override-applied values as the
+    scorecard grid (ad_spend, cash_collected, leads, deals_closed) instead of a second,
+    override-blind pass over raw facts — so a hand-edited scorecard cell shows up here too."""
+    out = []
+    for i, wk in enumerate(weeks):
+        spend = values["ad_spend"][i] or 0.0
+        cash = values["cash_collected"][i] or 0.0
+        opt_ins = int(values["leads"][i] or 0)
+        closed = int(values["deals_closed"][i] or 0)
+        out.append(
+            {
+                "week_start": wk,
+                "spend_usd": round(spend, 2),
+                "cash_usd": round(cash, 2),
+                "opt_ins": opt_ins,
+                "closed": closed,
+                "cac_usd": _ratio(spend, closed) if spend else None,
+            }
+        )
+    return out
 
 
 def compute_funnel_dashboard(
@@ -288,8 +240,6 @@ def compute_funnel_dashboard(
     the paid subset when channel is "all".
     """
     now = now or datetime.now(timezone.utc)
-    start = datetime.combine(window_start, datetime.min.time(), tzinfo=timezone.utc)
-    end = datetime.combine(window_end, datetime.max.time(), tzinfo=timezone.utc)
 
     org_funnel_ids = {fid for (fid,) in db.query(Funnel.id).filter(Funnel.org_id == org_id).all()}
     scope_funnel_ids = {funnel_id} & org_funnel_ids if funnel_id is not None else org_funnel_ids
@@ -297,20 +247,35 @@ def compute_funnel_dashboard(
     facts = collect_funnel_facts(db, org_id, window_start, window_end, channel, funnel_id)
     summary = summarize_funnel_facts(facts, channel)
 
+    # "Where it leaks" and "Is spend paying back" read the same override-applied weekly
+    # values as the scorecard grid, so a hand-edited cell shows up on both graphs instead
+    # of only the table.
+    show_ads = channel != "organic"
+    sc_weeks = scorecard_weeks(window_start, window_end)
+    sc_values, _sc_replaced = weekly_metric_values(
+        db, org_id, sc_weeks, channel, funnel_id, scope_funnel_ids, include_ads=show_ads
+    )
+    summary["opt_ins"] = int(sum(v or 0 for v in sc_values["leads"]))
+    summary["booked"] = int(sum(v or 0 for v in sc_values["booked_calls"]))
+    summary["showed"] = int(sum(v or 0 for v in sc_values["live_calls"]))
+    summary["closed"] = int(sum(v or 0 for v in sc_values["deals_closed"]))
+
     money: Optional[Dict[str, Any]] = None
-    money_facts: Optional[FunnelFacts] = None
-    spend_rows: List[FunnelAdSpend] = []
     if channel != "organic":
-        money_facts = (
-            facts
-            if channel == "paid" or funnel_id is not None
-            else collect_funnel_facts(db, org_id, window_start, window_end, "paid", None)
-        )
-        spend_rows = list_ad_spend(db, org_id, window_start, window_end, funnel_id)
-        spend = sum(r.amount_cents or 0 for r in spend_rows) / 100.0
-        paid_cash = sum(c for _cid, _ts, c in money_facts.cash) / 100.0
-        paid_opt_ins = len(money_facts.opt_ins)
-        paid_closed = len(money_facts.closed)
+        # Same override-applied basis the scorecard's economics rows use: reuse sc_values
+        # outright when this view is already paid-only (channel "paid" or one funnel
+        # selected implies paid); otherwise re-run paid-only, mirroring compute_scorecard's
+        # own econ_bases branch, so the money row can never disagree with the grid.
+        if channel == "paid" or funnel_id is not None:
+            money_values = sc_values
+        else:
+            money_values, _ = weekly_metric_values(
+                db, org_id, sc_weeks, "paid", None, scope_funnel_ids, include_ads=True
+            )
+        spend = sum(v or 0 for v in money_values["ad_spend"])
+        paid_cash = sum(v or 0 for v in money_values["cash_collected"])
+        paid_opt_ins = sum(v or 0 for v in money_values["leads"])
+        paid_closed = sum(v or 0 for v in money_values["deals_closed"])
         has_spend = spend > 0
         # No spend logged = no cost metrics at all; a $0 CPL/CAC would read as "free leads".
         money = {
@@ -330,10 +295,10 @@ def compute_funnel_dashboard(
         "funnel_id": funnel_id,
         "tracking": _tracking_status(db, scope_funnel_ids, now),
         # Organic has no landing page, so visitors only exist for paid/funnel scope.
-        "visitors": None if channel == "organic" else _visitors(db, scope_funnel_ids, start, end),
+        "visitors": None if channel == "organic" else int(sum(v or 0 for v in sc_values["visitors"])),
         "summary": summary,
         "money": money,
-        "weekly": _weekly(window_start, window_end, facts, money_facts if money else None, spend_rows),
+        "weekly": _weekly_from_scorecard(sc_weeks, sc_values),
         "sources": _utm_sources(db, org_id, facts),
         # Sheet-style scorecard: last full week vs the average week in range.
         "scorecard": compute_scorecard(

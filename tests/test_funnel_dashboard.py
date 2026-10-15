@@ -58,23 +58,23 @@ def test_upsert_creates_row_on_monday():
     db.add.assert_called_once()
 
 
-def test_weekly_buckets_spend_cash_opt_ins_and_closes():
-    a, b = uuid.uuid4(), uuid.uuid4()
-    facts = _facts(
-        opt_ins={a: _at(date(2026, 9, 2)), b: _at(date(2026, 9, 15))},
-        closed={a: date(2026, 9, 16)},
-        cash=[(a, _at(date(2026, 9, 16)), 300_000)],
-    )
-    spend = [
-        SimpleNamespace(week_start=date(2026, 8, 31), amount_cents=50_000),
-        SimpleNamespace(week_start=date(2026, 9, 14), amount_cents=100_000),
-    ]
-    weeks = {w["week_start"]: w for w in fd._weekly(WS, WE, facts, facts, spend)}
-    assert list(weeks) == [date(2026, 8, 31), date(2026, 9, 7), date(2026, 9, 14), date(2026, 9, 21)]
-    assert weeks[date(2026, 8, 31)]["opt_ins"] == 1 and weeks[date(2026, 8, 31)]["spend_usd"] == 500.0
-    wk = weeks[date(2026, 9, 14)]
+def test_weekly_from_scorecard_maps_override_applied_values_by_week():
+    """The graph's weekly buckets are a pure mapping over whatever weekly_metric_values
+    returns — i.e. the same override-applied numbers the scorecard grid renders, not a
+    second independent pass over raw facts."""
+    weeks = [date(2026, 9, 7), date(2026, 9, 14), date(2026, 9, 21)]
+    values = {
+        "ad_spend": [None, 1000.0, None],
+        "cash_collected": [0.0, 3000.0, 0.0],
+        "leads": [0, 1, 0],
+        "deals_closed": [0, 1, 0],
+    }
+    out = {w["week_start"]: w for w in fd._weekly_from_scorecard(weeks, values)}
+    wk = out[date(2026, 9, 14)]
     assert (wk["opt_ins"], wk["closed"], wk["cash_usd"], wk["spend_usd"], wk["cac_usd"]) == (1, 1, 3000.0, 1000.0, 1000.0)
-    assert weeks[date(2026, 9, 7)]["cac_usd"] is None
+    # No ad_spend logged that week (None, not 0) → no CAC, not a misleading $0.
+    assert out[date(2026, 9, 7)]["cac_usd"] is None
+    assert out[date(2026, 9, 7)]["spend_usd"] == 0.0
 
 
 def test_utm_sources_group_and_rank_no_utm_last():
@@ -104,11 +104,33 @@ def _run_dashboard(channel, funnel_id=None, *, facts, paid_facts=None, spend_row
         calls.append((ch, fid))
         return paid_facts if (ch == "paid" and paid_facts is not None and fid is None and channel is None) else facts
 
+    def fake_weekly_values(_db, _org, weeks, ch, fid, _scope, *, include_ads):
+        # Same dispatch as fake_collect: the "all channel" dashboard view's money row
+        # re-fetches the paid-only subset (channel "paid") itself, mirroring
+        # compute_scorecard's own econ_bases branch instead of the removed money_facts path.
+        f = paid_facts if (ch == "paid" and paid_facts is not None and fid is None and channel is None) else facts
+        n = len(weeks)
+
+        def _col(total):
+            return ([total] + [0] * (n - 1)) if n else []
+
+        leads = len(f.opt_ins) + sum(r for _d, _o, r in f.outreach_rows)
+        spend = sum(r.amount_cents or 0 for r in spend_rows) / 100.0
+        return {
+            "leads": _col(leads),
+            "booked_calls": _col(0),
+            "live_calls": _col(0),
+            "deals_closed": _col(len(f.closed)),
+            "visitors": _col(400) if include_ads else [None] * n,
+            "ad_spend": _col(spend) if spend else [None] * n,
+            "cash_collected": _col(sum(c for _cid, _ts, c in f.cash) / 100.0),
+        }, {}
+
     with patch.object(fd, "collect_funnel_facts", side_effect=fake_collect), patch.object(
-        fd, "list_ad_spend", return_value=list(spend_rows)
-    ), patch.object(fd, "_tracking_status", return_value={"status": "live", "last_event_at": None, "errors_24h": 0}), patch.object(
-        fd, "_visitors", return_value=400
-    ), patch.object(fd, "_utm_sources", return_value=[]), patch.object(
+        fd, "_tracking_status", return_value={"status": "live", "last_event_at": None, "errors_24h": 0}
+    ), patch.object(fd, "weekly_metric_values", side_effect=fake_weekly_values), patch.object(
+        fd, "_utm_sources", return_value=[]
+    ), patch.object(
         fd, "compute_scorecard", return_value={"weeks": [], "benchmark_weeks": 0, "metrics": []}
     ):
         out = fd.compute_funnel_dashboard(db, uuid.uuid4(), WS, WE, channel, funnel_id)
@@ -148,7 +170,10 @@ def test_all_channel_money_uses_paid_subset():
     assert out["summary"]["closed"] == 2  # stage row covers both channels
     assert out["money"]["cac_usd"] == 1500.0  # CAC only over the paid close
     assert out["money"]["roas"] == 2.0
-    assert calls == [(None, None), ("paid", None)]
+    # The paid-only subset is now re-fetched via weekly_metric_values (asserted above
+    # through cac/roas), not a second collect_funnel_facts call like the removed
+    # money_facts path — only the top-level "all channel" facts pass shows up here.
+    assert calls == [(None, None)]
 
 
 def test_no_spend_leaves_ratios_empty():
