@@ -1,7 +1,7 @@
 from datetime import datetime
 import uuid
 
-from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer
+from sqlalchemy import Column, Date, DateTime, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.db.session import Base
@@ -29,5 +29,7 @@ class FunnelAdSpend(Base):
     ads_deployed = Column(Integer, nullable=True)
     angles_deployed = Column(Integer, nullable=True)
     entered_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # "human_ui" (default) or "mcp_agent" - which caller wrote this row.
+    source = Column(String(16), nullable=False, default="human_ui", server_default="human_ui")
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

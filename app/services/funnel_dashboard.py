@@ -46,6 +46,7 @@ def upsert_ad_spend(
     user_id: Optional[uuid.UUID],
     ads_deployed: Optional[int] = None,
     angles_deployed: Optional[int] = None,
+    source: str = "human_ui",
 ) -> Optional[FunnelAdSpend]:
     """
     Set one (funnel, week) row: spend plus the sheet's "New Ads/Angles Deployed"
@@ -72,6 +73,7 @@ def upsert_ad_spend(
     row.ads_deployed = ads_deployed
     row.angles_deployed = angles_deployed
     row.entered_by_user_id = user_id
+    row.source = source
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(row)

@@ -285,6 +285,7 @@ class FunnelScorecardMetric(BaseModel):
     editable: bool = False  # count row a person can type over per week
     overridden: List[bool] = []  # per week: value was hand-edited
     original: List[Optional[float]] = []  # per week: computed value an edit replaced (else null)
+    source: List[Optional[str]] = []  # per week: "human_ui" | "mcp_agent" who wrote the override (else null)
 
 
 class FunnelScorecardOverrideIn(BaseModel):

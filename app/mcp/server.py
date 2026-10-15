@@ -490,6 +490,63 @@ TOOLS = [
         },
     },
     {
+        "name": "update_funnel_ad_spend",
+        "description": (
+            "WRITE. Set one week's ad spend + creative-velocity counts for a funnel (same as the "
+            "'Log spend & ads' popover). amount_usd=0 with no counts clears the week. Requires the "
+            "org to have enabled automated scorecard writes, and the connection to hold the "
+            "'funnels:write' scope."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "funnel_id": {"type": "string", "description": "Funnel UUID; omit for the 'All funnels' view"},
+                "week_start": {"type": "string", "description": "YYYY-MM-DD, any day in the week"},
+                "amount_usd": {"type": "number", "minimum": 0, "maximum": 10000000},
+                "ads_deployed": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "angles_deployed": {"type": "integer", "minimum": 0, "maximum": 10000},
+            },
+            "required": ["week_start", "amount_usd"],
+        },
+    },
+    {
+        "name": "set_funnel_scorecard_metric",
+        "description": (
+            "WRITE. Hand-edit one count row of the Funnels scorecard grid for one week (visitors, "
+            "leads, booked_calls, calls_on_calendar, live_calls, deals_closed, or cash_collected). "
+            "value=null reverts the cell to the computed number. For ad spend / ads / angles, use "
+            "update_funnel_ad_spend instead. Requires the org to have enabled automated scorecard "
+            "writes, and the connection to hold the 'funnels:write' scope."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "funnel_id": {"type": "string", "description": "Funnel UUID; omit for the 'All funnels' view"},
+                "channel": {"type": "string", "enum": ["all", "paid", "organic"]},
+                "week_start": {"type": "string", "description": "YYYY-MM-DD, any day in the week"},
+                "metric_key": {
+                    "type": "string",
+                    "enum": [
+                        "visitors",
+                        "leads",
+                        "booked_calls",
+                        "calls_on_calendar",
+                        "live_calls",
+                        "deals_closed",
+                        "cash_collected",
+                    ],
+                },
+                "value": {
+                    "type": ["number", "null"],
+                    "minimum": 0,
+                    "maximum": 1000000000,
+                    "description": "null reverts the cell to the computed value",
+                },
+            },
+            "required": ["week_start", "metric_key"],
+        },
+    },
+    {
         "name": "get_kpi_funnel_summary",
         "description": (
             "Opt-ins -> Booked -> Showed -> Closed -> Cash stage strip for a date range, split "
@@ -899,8 +956,9 @@ TOOLS = [
 
 
 # Tool annotations: ChatGPT (and Claude) skip the write-confirmation prompt for read-only
-# tools. Everything is read-only except send_client_email, which emails a real client.
-_WRITE_TOOLS = {"send_client_email"}
+# tools. Everything is read-only except send_client_email (emails a real client) and the
+# two funnel-scorecard write tools (mutate scorecard numbers; gated by org opt-in + scope).
+_WRITE_TOOLS = {"send_client_email", "update_funnel_ad_spend", "set_funnel_scorecard_metric"}
 for _tool in TOOLS:
     _tool["annotations"] = {
         "title": _tool["name"].replace("_", " ").capitalize(),
@@ -1039,6 +1097,46 @@ def _require_system_owner(db: Session, user_id: Optional[uuid.UUID]):
     return user, None
 
 
+# Scope required for the funnel-scorecard write tools. Deliberately NOT part of the
+# server's default mcp_scopes() list — a connecting client must explicitly request it
+# in its OAuth `scope` param, so existing Claude/ChatGPT connections never get it for free.
+FUNNEL_WRITE_SCOPE = "funnels:write"
+
+
+def _require_funnel_write_access(db: Session, org_id: uuid.UUID, auth_ctx: Optional[dict]):
+    """
+    Gate for the funnel-scorecard write tools. Returns an error result unless BOTH:
+    the token's scope includes FUNNEL_WRITE_SCOPE, and the org has opted in via
+    Organization.mcp_scorecard_write_enabled (off by default; a human flips it on
+    in Integrations settings). Returns None when the write is allowed.
+    """
+    from app.models.organization import Organization
+
+    granted_scopes = ((auth_ctx or {}).get("scope") or "").split()
+    if FUNNEL_WRITE_SCOPE not in granted_scopes:
+        return _text_result(
+            {
+                "error": "insufficient_scope",
+                "message": (
+                    f"This tool requires the '{FUNNEL_WRITE_SCOPE}' MCP scope. "
+                    "Reconnect with that scope granted."
+                ),
+            }
+        )
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org or not org.mcp_scorecard_write_enabled:
+        return _text_result(
+            {
+                "error": "scorecard_writes_disabled",
+                "message": (
+                    "Automated scorecard writes are off for this org. A human must enable "
+                    "them in Integrations settings before this tool can write."
+                ),
+            }
+        )
+    return None
+
+
 def _run_tool(
     name: str,
     arguments: dict,
@@ -1109,6 +1207,11 @@ def _run_tool(
         )
     if name in FUNNEL_TEAM_TOOLS:
         return _run_funnel_team_tool(name, args, org_id, db, user_id=user_id)
+    if name in _FUNNEL_WRITE_TOOLS:
+        denial = _require_funnel_write_access(db, org_id, auth_ctx)
+        if denial:
+            return denial
+        return _run_funnel_write_tool(name, args, org_id, db, user_id=user_id)
     if name == "get_client_profile":
         cid = args.get("client_id")
         if not cid:
@@ -1713,6 +1816,117 @@ def _run_funnel_team_tool(
 
     if name == "get_kpi_benchmarks":
         return _text_result(_call_api(db, kpi_api.get_kpi_benchmarks, current_user=user))
+
+    return _text_result({"error": f"Unknown tool: {name}"})
+
+
+_FUNNEL_WRITE_TOOLS = {"update_funnel_ad_spend", "set_funnel_scorecard_metric"}
+
+# metric_keys that belong to the dedicated ad-spend table, not the generic override
+# table. set_funnel_scorecard_metric rejects these so there is exactly one write path
+# per metric; use update_funnel_ad_spend for them instead.
+_AD_SPEND_METRIC_KEYS = {"new_ads", "new_angles", "ad_spend"}
+
+
+def _run_funnel_write_tool(
+    name: str,
+    args: dict,
+    org_id: uuid.UUID,
+    db: Session,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+) -> dict:
+    """
+    The two funnel-scorecard write tools. Calls _require_org_funnel (the same 404
+    check the human-edit REST endpoints run) and the same service functions those
+    endpoints call (upsert_ad_spend / set_override), tagged source="mcp_agent" so
+    an automated write is distinguishable from a human's edit. Caller must have
+    already passed _require_funnel_write_access.
+    """
+    from pydantic import ValidationError
+
+    from app.api.funnels import _parse_channel, _require_org_funnel
+    from app.schemas.funnel import FunnelAdSpendIn, FunnelScorecardOverrideIn
+    from app.services.funnel_dashboard import upsert_ad_spend
+    from app.services.funnel_scorecard import EDITABLE_FIELDS, set_override
+
+    if name == "update_funnel_ad_spend":
+        try:
+            body = FunnelAdSpendIn(**{k: v for k, v in args.items() if k in FunnelAdSpendIn.model_fields})
+        except ValidationError as exc:
+            return _text_result({"error": "invalid_input", "detail": str(exc)})
+        try:
+            _require_org_funnel(db, org_id, body.funnel_id)
+        except HTTPException as exc:
+            return _text_result({"error": exc.detail})
+        row = upsert_ad_spend(
+            db,
+            org_id,
+            body.funnel_id,
+            body.week_start,
+            int(round(body.amount_usd * 100)),
+            user_id,
+            ads_deployed=body.ads_deployed,
+            angles_deployed=body.angles_deployed,
+            source="mcp_agent",
+        )
+        logger.info(
+            "mcp scorecard write tool=update_funnel_ad_spend org=%s user=%s funnel=%s week=%s amount_usd=%s",
+            org_id, user_id, body.funnel_id, body.week_start, body.amount_usd,
+        )
+        if row is None:
+            return _text_result({"cleared": True, "funnel_id": str(body.funnel_id) if body.funnel_id else None})
+        return _text_result(
+            {
+                "funnel_id": str(row.funnel_id) if row.funnel_id else None,
+                "week_start": row.week_start.isoformat(),
+                "amount_usd": row.amount_cents / 100.0,
+                "ads_deployed": row.ads_deployed,
+                "angles_deployed": row.angles_deployed,
+                "source": row.source,
+            }
+        )
+
+    if name == "set_funnel_scorecard_metric":
+        try:
+            body = FunnelScorecardOverrideIn(
+                **{k: v for k, v in args.items() if k in FunnelScorecardOverrideIn.model_fields}
+            )
+        except ValidationError as exc:
+            return _text_result({"error": "invalid_input", "detail": str(exc)})
+        if body.metric_key in _AD_SPEND_METRIC_KEYS:
+            return _text_result(
+                {
+                    "error": "wrong_tool",
+                    "message": f"'{body.metric_key}' is set via update_funnel_ad_spend, not this tool.",
+                }
+            )
+        try:
+            _require_org_funnel(db, org_id, body.funnel_id)
+        except HTTPException as exc:
+            return _text_result({"error": exc.detail})
+        try:
+            channel = _parse_channel(body.channel)
+        except HTTPException as exc:
+            return _text_result({"error": exc.detail})
+        try:
+            set_override(db, org_id, body.funnel_id, channel, body.week_start, body.metric_key, body.value, user_id, source="mcp_agent")
+        except ValueError as exc:
+            return _text_result({"error": str(exc)})
+        logger.info(
+            "mcp scorecard write tool=set_funnel_scorecard_metric org=%s user=%s funnel=%s week=%s metric=%s value=%s",
+            org_id, user_id, body.funnel_id, body.week_start, body.metric_key, body.value,
+        )
+        return _text_result(
+            {
+                "funnel_id": str(body.funnel_id) if body.funnel_id else None,
+                "channel": channel or "all",
+                "week_start": body.week_start.isoformat(),
+                "metric_key": body.metric_key,
+                "value": body.value,
+                "editable": body.metric_key in EDITABLE_FIELDS,
+            }
+        )
 
     return _text_result({"error": f"Unknown tool: {name}"})
 

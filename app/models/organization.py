@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Date, String, DateTime, Integer, Text
+from sqlalchemy import Boolean, Column, Date, String, DateTime, Integer, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 import uuid
 from datetime import datetime
@@ -31,6 +31,9 @@ class Organization(Base):
     # IANA tz name (e.g. "America/New_York") used to localize notification timestamps
     # (currently: Discord new_booking "When" field). Defaults to UTC when unset.
     timezone = Column(String(64), nullable=False, default="UTC", server_default="UTC")
+    # Off by default; a human must opt the org in before any MCP agent can write
+    # scorecard numbers (ad spend / scorecard override tools).
+    mcp_scorecard_write_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
