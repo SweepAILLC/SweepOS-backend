@@ -59,10 +59,12 @@ def lookback_window(
     mtd: bool = False,
     today: Optional[date] = None,
 ) -> Tuple[datetime, datetime, int]:
-    end_d = today or date.today()
+    """Window ends yesterday, not today — today is still in progress, so its partial
+    counts would drag the average down (e.g. a half-day of leads reads as a bad day)."""
+    end_d = (today or date.today()) - timedelta(days=1)
     end = datetime.combine(end_d, time.max, tzinfo=timezone.utc)
     if mtd:
-        start_d = end_d.replace(day=1)
+        start_d = end_d.replace(day=1) if end_d.day > 1 else end_d
     else:
         n = max(1, min(int(days or 90), 365))
         start_d = end_d - timedelta(days=n - 1)

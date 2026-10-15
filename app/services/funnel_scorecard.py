@@ -9,9 +9,10 @@ on the Funnels tab), so each week belongs to exactly one month and is never
 double-counted across months. Every such week is shown, including ones that
 haven't started yet, so the grid's column count matches the month regardless of
 the calendar date. The current week and any future week are returned as
-`in_progress` and excluded from the benchmark so partial (or nonexistent) counts
-don't drag the average down; future weeks are additionally flagged `not_started`
-so the UI can render them distinctly from the week actually in progress.
+`in_progress` (a UI label only); future weeks are additionally flagged
+`not_started`. The benchmark averages every week with real data — in progress
+counts as-is, and a future week counts too once it's been hand-edited — and
+skips only a future week nobody has touched yet.
 
 Three rows are typed in weekly (ad spend, ads deployed, angles deployed — stored on
 funnel_ad_spend); the other twenty are computed from pipeline data via the same
@@ -361,6 +362,44 @@ def _week_bases(
     return bases
 
 
+def weekly_metric_values(
+    db: Session,
+    org_id: uuid.UUID,
+    weeks: List[date],
+    channel: Optional[str],
+    funnel_id: Optional[uuid.UUID],
+    funnel_ids: Set[uuid.UUID],
+    *,
+    include_ads: bool,
+) -> Tuple[Dict[str, List[Optional[float]]], Dict[Tuple[date, str], Optional[float]]]:
+    """
+    Override-applied value of every sheet metric for each week in `weeks` — the same
+    bases/overrides machinery compute_scorecard renders into the grid. Shared with the
+    rest of the Funnels dashboard (the trend graphs, the stage totals) so a hand-edited
+    scorecard cell is reflected everywhere that number appears, not just the grid.
+    """
+    if not weeks:
+        return {m.key: [] for m in METRICS}, {}
+    span_start, span_end = weeks[0], weeks[-1] + timedelta(days=6)
+    facts = collect_funnel_facts(db, org_id, span_start, span_end, channel, funnel_id)
+    bases = _week_bases(db, org_id, weeks, facts, funnel_ids, funnel_id, include_ads=include_ads)
+    overrides = load_overrides(db, org_id, funnel_id, channel, weeks[0], weeks[-1])
+    replaced = apply_overrides(bases, overrides)
+    # Economics rows follow the dashboard's money rule: with channel "all", spend is
+    # only divided against paid leads/bookings/closes/cash, never organic ones.
+    econ_bases = bases
+    if channel is None and funnel_id is None:
+        paid_facts = collect_funnel_facts(db, org_id, span_start, span_end, "paid", None)
+        econ_bases = _week_bases(db, org_id, weeks, paid_facts, funnel_ids, None, include_ads=True)
+        # Spend is shared; edited lead/close/cash counts in this view include organic,
+        # so the paid-only economics bases keep their computed counts.
+        apply_overrides(econ_bases, overrides, keys={"ad_spend"})
+    values = {
+        m.key: [m.compute((econ_bases if m.group == "economics" else bases)[wk]) for wk in weeks] for m in METRICS
+    }
+    return values, replaced
+
+
 def compute_scorecard(
     db: Session,
     org_id: uuid.UUID,
@@ -374,47 +413,38 @@ def compute_scorecard(
     compare: Optional[Tuple[date, date]] = None,
 ) -> Dict[str, Any]:
     """
-    Every sheet metric for every week in range (the grid), plus its benchmark:
-    the average of the weekly values across the *complete* weeks shown — or, when
-    the shared date-range filter has compare on, across the weeks of the compare range.
+    Every sheet metric for every week in range (the grid), plus its benchmark: the
+    average of the weekly values across weeks that have real data — started (in
+    progress or complete) or hand-edited ahead of time — skipping only a future,
+    never-touched week. Or, when the shared date-range filter has compare on,
+    across the weeks of the compare range (same rule).
     """
     today = today or datetime.now(timezone.utc).date()
     weeks = scorecard_weeks(window_start, window_end)
     if not weeks:
         return {"weeks": [], "benchmark_weeks": 0, "benchmark_source": "range", "metrics": []}
-    complete = [not week_in_progress(wk, today) for wk in weeks]
+    in_progress_flags = [week_in_progress(wk, today) for wk in weeks]  # UI column labels only
     not_started = [week_not_started(wk, today) for wk in weeks]
     show_ads = channel != "organic"
 
-    def _weekly_by_metric(
-        wks: List[date],
-    ) -> Tuple[Dict[str, List[Optional[float]]], Dict[Tuple[date, str], Optional[float]]]:
-        span_start, span_end = wks[0], wks[-1] + timedelta(days=6)
-        facts = collect_funnel_facts(db, org_id, span_start, span_end, channel, funnel_id)
-        bases = _week_bases(db, org_id, wks, facts, funnel_ids, funnel_id, include_ads=show_ads)
-        overrides = load_overrides(db, org_id, funnel_id, channel, wks[0], wks[-1])
-        replaced = apply_overrides(bases, overrides)
-        # Economics rows follow the dashboard's money rule: with channel "all", spend is
-        # only divided against paid leads/bookings/closes/cash, never organic ones.
-        econ_bases = bases
-        if channel is None and funnel_id is None:
-            paid_facts = collect_funnel_facts(db, org_id, span_start, span_end, "paid", None)
-            econ_bases = _week_bases(db, org_id, wks, paid_facts, funnel_ids, None, include_ads=True)
-            # Spend is shared; edited lead/close/cash counts in this view include organic,
-            # so the paid-only economics bases keep their computed counts.
-            apply_overrides(econ_bases, overrides, keys={"ad_spend"})
-        values = {
-            m.key: [m.compute((econ_bases if m.group == "economics" else bases)[wk]) for wk in wks] for m in METRICS
-        }
-        return values, replaced
+    current, replaced = weekly_metric_values(db, org_id, weeks, channel, funnel_id, funnel_ids, include_ads=show_ads)
+    overridden_weeks = {wk for (wk, _key) in replaced}
+    # A column counts toward the average once it has real data: it has started
+    # (in progress or complete), or it was hand-edited ahead of time.
+    include = [(not future) or (wk in overridden_weeks) for wk, future in zip(weeks, not_started)]
 
-    current, replaced = _weekly_by_metric(weeks)
-    compare_weeks = (
-        [wk for wk in scorecard_weeks(compare[0], compare[1]) if not week_in_progress(wk, today)]
-        if compare is not None
-        else []
-    )
-    baseline = _weekly_by_metric(compare_weeks)[0] if compare_weeks else None
+    compare_weeks = scorecard_weeks(compare[0], compare[1]) if compare is not None else []
+    baseline: Optional[Dict[str, List[Optional[float]]]] = None
+    baseline_include: List[bool] = []
+    if compare_weeks:
+        baseline, baseline_replaced = weekly_metric_values(
+            db, org_id, compare_weeks, channel, funnel_id, funnel_ids, include_ads=show_ads
+        )
+        baseline_overridden_weeks = {wk for (wk, _key) in baseline_replaced}
+        baseline_not_started = [week_not_started(wk, today) for wk in compare_weeks]
+        baseline_include = [
+            (not future) or (wk in baseline_overridden_weeks) for wk, future in zip(compare_weeks, baseline_not_started)
+        ]
 
     def _r(v: Optional[float]) -> Optional[float]:
         return None if v is None else round(v, 4)
@@ -424,10 +454,15 @@ def compute_scorecard(
         if not show_ads and (m.group == "economics" or m.key in _PAID_ONLY_KEYS):
             continue
         weekly = current[m.key]
-        if baseline is not None:
-            benchmark = _mean(baseline[m.key])
-        else:
-            benchmark = _mean([v for v, done in zip(weekly, complete) if done])
+        # Always available regardless of compare: this range's own average, so a
+        # Model column can fall back to it even when the compare toggle has
+        # swapped `benchmark` for the (possibly data-less) compare period.
+        range_average = _mean([v for v, done in zip(weekly, include) if done])
+        benchmark = (
+            _mean([v for v, done in zip(baseline[m.key], baseline_include) if done])
+            if baseline is not None
+            else range_average
+        )
         out.append(
             {
                 "key": m.key,
@@ -437,6 +472,7 @@ def compute_scorecard(
                 "better": m.better,
                 "values": [_r(v) for v in weekly],
                 "benchmark": _r(benchmark),
+                "range_average": _r(range_average),
                 "editable": m.key in EDITABLE_FIELDS,
                 # Hand-edited cells, and the computed value each one replaced.
                 "overridden": [(wk, m.key) in replaced for wk in weeks],
@@ -445,10 +481,10 @@ def compute_scorecard(
         )
     return {
         "weeks": [
-            {"week_start": wk, "in_progress": not done, "not_started": future}
-            for wk, done, future in zip(weeks, complete, not_started)
+            {"week_start": wk, "in_progress": prog, "not_started": future}
+            for wk, prog, future in zip(weeks, in_progress_flags, not_started)
         ],
-        "benchmark_weeks": len(compare_weeks) if baseline is not None else sum(complete),
+        "benchmark_weeks": sum(baseline_include) if baseline is not None else sum(include),
         # "compare" = benchmark is the compare range's average week; else this range's.
         "benchmark_source": "compare" if baseline is not None else "range",
         "metrics": out,
