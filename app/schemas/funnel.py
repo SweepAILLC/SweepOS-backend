@@ -297,7 +297,8 @@ class FunnelScorecardOverrideIn(BaseModel):
 
 class FunnelScorecardWeek(BaseModel):
     week_start: date  # Monday
-    in_progress: bool = False  # current week: shown, but excluded from the benchmark
+    in_progress: bool = False  # not a complete week yet (current or future): shown, but excluded from the benchmark
+    not_started: bool = False  # Monday is still in the future: no data exists for it yet
 
 
 class FunnelScorecard(BaseModel):
