@@ -18,14 +18,18 @@ def _no_overrides():
         yield m
 
 
-def test_month_weeks_are_mondays_inside_month_up_to_today():
-    # September 2026, today Thu Sep 24: Mondays Sep 7, 14, 21 (Aug 31 belongs to August).
-    weeks = sc.scorecard_weeks(date(2026, 9, 1), date(2026, 9, 30), date(2026, 9, 24))
-    assert weeks == [date(2026, 9, 7), date(2026, 9, 14), date(2026, 9, 21)]
+def test_month_weeks_are_every_monday_inside_the_month():
+    # September 2026, regardless of today: Mondays Sep 7, 14, 21, 28 (Aug 31 belongs to August).
+    weeks = sc.scorecard_weeks(date(2026, 9, 1), date(2026, 9, 30))
+    assert weeks == [date(2026, 9, 7), date(2026, 9, 14), date(2026, 9, 21), date(2026, 9, 28)]
+    # Today Thu Sep 24: Sep 21 is in progress (current week), Sep 28 hasn't started yet.
     assert sc.week_in_progress(date(2026, 9, 21), date(2026, 9, 24)) is True
     assert sc.week_in_progress(date(2026, 9, 14), date(2026, 9, 24)) is False
+    assert sc.week_in_progress(date(2026, 9, 28), date(2026, 9, 24)) is True
+    assert sc.week_not_started(date(2026, 9, 28), date(2026, 9, 24)) is True
+    assert sc.week_not_started(date(2026, 9, 21), date(2026, 9, 24)) is False
     # August owns the week of Mon Aug 31, so it is never double-counted.
-    assert sc.scorecard_weeks(date(2026, 8, 1), date(2026, 8, 31), date(2026, 9, 24))[-1] == date(2026, 8, 31)
+    assert sc.scorecard_weeks(date(2026, 8, 1), date(2026, 8, 31))[-1] == date(2026, 8, 31)
 
 
 def test_booking_date_prefers_provider_timestamp_then_row_created_then_call_time():
@@ -91,10 +95,11 @@ def test_compute_scorecard_grid_and_benchmark_over_complete_weeks():
         sc, "_week_bases", return_value=bases
     ):
         out = sc.compute_scorecard(
-            None, uuid.uuid4(), date(2026, 9, 1), date(2026, 9, 30), "organic", None, set(), today=date(2026, 9, 24)
+            None, uuid.uuid4(), date(2026, 9, 1), date(2026, 9, 27), "organic", None, set(), today=date(2026, 9, 24)
         )
     rows = {m["key"]: m for m in out["metrics"]}
     assert [w["in_progress"] for w in out["weeks"]] == [False, False, True]
+    assert [w["not_started"] for w in out["weeks"]] == [False, False, False]  # current week, not a future one
     assert out["benchmark_weeks"] == 2
     assert rows["leads"]["values"] == [10, 30, 1]
     assert rows["leads"]["benchmark"] == 20  # in-progress week excluded
@@ -104,10 +109,23 @@ def test_compute_scorecard_grid_and_benchmark_over_complete_weeks():
     assert "ad_spend" not in rows and "cac" not in rows and "visitors" not in rows
 
 
-def test_no_complete_weeks_returns_empty():
-    # A month that hasn't started yet has no weeks.
-    out = sc.compute_scorecard(None, uuid.uuid4(), date(2026, 10, 1), date(2026, 10, 31), None, None, set(), today=date(2026, 9, 24))
-    assert out == {"weeks": [], "benchmark_weeks": 0, "benchmark_source": "range", "metrics": []}
+def test_future_month_still_shows_every_week_column():
+    # October 2026 hasn't started yet (today is Sep 24) — the grid still shows every
+    # Monday in it, each flagged not_started and excluded from the benchmark.
+    future_weeks = sc.scorecard_weeks(date(2026, 10, 1), date(2026, 10, 31))
+    bases = {wk: sc.WeekBase() for wk in future_weeks}
+    with patch.object(sc, "collect_funnel_facts", return_value=SimpleNamespace()), patch.object(
+        sc, "_week_bases", return_value=bases
+    ):
+        out = sc.compute_scorecard(
+            None, uuid.uuid4(), date(2026, 10, 1), date(2026, 10, 31), None, None, set(), today=date(2026, 9, 24)
+        )
+    assert [w["week_start"] for w in out["weeks"]] == future_weeks
+    assert all(w["in_progress"] and w["not_started"] for w in out["weeks"])
+    assert out["benchmark_weeks"] == 0
+    rows = {m["key"]: m for m in out["metrics"]}
+    assert rows["leads"]["values"] == [0] * len(future_weeks)
+    assert rows["leads"]["benchmark"] is None
 
 
 def test_compare_range_sets_the_benchmark():
@@ -183,7 +201,7 @@ def test_overrides_replace_counts_and_derived_rows_follow(_no_overrides):
         sc, "_week_bases", return_value=bases
     ):
         out = sc.compute_scorecard(
-            None, uuid.uuid4(), date(2026, 9, 1), date(2026, 9, 30), "paid", None, set(), today=date(2026, 9, 20)
+            None, uuid.uuid4(), date(2026, 9, 1), date(2026, 9, 20), "paid", None, set(), today=date(2026, 9, 20)
         )
     rows = {m["key"]: m for m in out["metrics"]}
     assert rows["live_calls"]["values"] == [4, 0]

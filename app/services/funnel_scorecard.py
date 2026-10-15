@@ -6,9 +6,12 @@ Mon-Sun weeks, and a Benchmark column holds the plain average of the weekly valu
 
 Weeks in scope = every week whose Monday falls inside the selected range (a month
 on the Funnels tab), so each week belongs to exactly one month and is never
-double-counted across months. Weeks that haven't started are omitted; the current
-week is returned as `in_progress` and excluded from the benchmark so its partial
-counts don't drag the average down.
+double-counted across months. Every such week is shown, including ones that
+haven't started yet, so the grid's column count matches the month regardless of
+the calendar date. The current week and any future week are returned as
+`in_progress` and excluded from the benchmark so partial (or nonexistent) counts
+don't drag the average down; future weeks are additionally flagged `not_started`
+so the UI can render them distinctly from the week actually in progress.
 
 Three rows are typed in weekly (ad spend, ads deployed, angles deployed — stored on
 funnel_ad_spend); the other twenty are computed from pipeline data via the same
@@ -40,20 +43,28 @@ def _monday(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
-def scorecard_weeks(window_start: date, window_end: date, today: date) -> List[date]:
-    """Mondays inside [window_start, window_end] for weeks that have started by today, oldest first."""
+def scorecard_weeks(window_start: date, window_end: date) -> List[date]:
+    """Every Monday inside [window_start, window_end], oldest first — including weeks that
+    haven't started yet. Callers mark incomplete/future weeks via week_in_progress /
+    week_not_started rather than omitting their columns."""
     weeks: List[date] = []
     cursor = _monday(window_start)
     if cursor < window_start:
         cursor += timedelta(days=7)
-    while cursor <= window_end and cursor <= today:
+    while cursor <= window_end:
         weeks.append(cursor)
         cursor += timedelta(days=7)
     return weeks
 
 
 def week_in_progress(week_start: date, today: date) -> bool:
+    """True for the current week (partial counts) and any week that hasn't started yet."""
     return week_start + timedelta(days=6) >= today
+
+
+def week_not_started(week_start: date, today: date) -> bool:
+    """True only for a week whose Monday is still in the future — no data can exist for it."""
+    return week_start > today
 
 
 @dataclass
@@ -368,10 +379,11 @@ def compute_scorecard(
     the shared date-range filter has compare on, across the weeks of the compare range.
     """
     today = today or datetime.now(timezone.utc).date()
-    weeks = scorecard_weeks(window_start, window_end, today)
+    weeks = scorecard_weeks(window_start, window_end)
     if not weeks:
         return {"weeks": [], "benchmark_weeks": 0, "benchmark_source": "range", "metrics": []}
     complete = [not week_in_progress(wk, today) for wk in weeks]
+    not_started = [week_not_started(wk, today) for wk in weeks]
     show_ads = channel != "organic"
 
     def _weekly_by_metric(
@@ -398,7 +410,7 @@ def compute_scorecard(
 
     current, replaced = _weekly_by_metric(weeks)
     compare_weeks = (
-        [wk for wk in scorecard_weeks(compare[0], compare[1], today) if not week_in_progress(wk, today)]
+        [wk for wk in scorecard_weeks(compare[0], compare[1]) if not week_in_progress(wk, today)]
         if compare is not None
         else []
     )
@@ -432,7 +444,10 @@ def compute_scorecard(
             }
         )
     return {
-        "weeks": [{"week_start": wk, "in_progress": not done} for wk, done in zip(weeks, complete)],
+        "weeks": [
+            {"week_start": wk, "in_progress": not done, "not_started": future}
+            for wk, done, future in zip(weeks, complete, not_started)
+        ],
         "benchmark_weeks": len(compare_weeks) if baseline is not None else sum(complete),
         # "compare" = benchmark is the compare range's average week; else this range's.
         "benchmark_source": "compare" if baseline is not None else "range",

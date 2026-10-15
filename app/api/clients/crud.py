@@ -262,6 +262,20 @@ def update_client(
     try:
         update_data = client_update.model_dump(exclude_unset=True)
 
+        # Hand-editing attribution: a funnel_id must belong to this org (cross-tenant
+        # mislabeling otherwise), and clearing the channel away from "paid" drops any
+        # funnel attribution so a lead can't show paid-channel UTM/funnel it no longer has.
+        if "source_funnel_id" in update_data and update_data["source_funnel_id"] is not None:
+            from app.models.funnel import Funnel
+
+            if not db.query(Funnel.id).filter(
+                Funnel.id == update_data["source_funnel_id"], Funnel.org_id == org_id
+            ).first():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found")
+        if "source_channel" in update_data and update_data["source_channel"] != "paid" and "source_funnel_id" not in update_data:
+            if client.source_funnel_id is not None:
+                update_data["source_funnel_id"] = None
+
         # Manual kanban / drawer column moves: persist to DB and reset follow-up clock
         # so the next calendar sync does not auto-revert the card.
         entered_dead = False
