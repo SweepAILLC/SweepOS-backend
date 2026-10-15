@@ -84,7 +84,7 @@ def test_benchmark_is_average_of_weekly_values_skipping_undefined():
     assert sc._mean([None, None]) is None
 
 
-def test_compute_scorecard_grid_and_benchmark_over_complete_weeks():
+def test_compute_scorecard_grid_and_benchmark_includes_in_progress_week():
     weeks = [date(2026, 9, 7), date(2026, 9, 14), date(2026, 9, 21)]
     bases = {
         weeks[0]: sc.WeekBase(leads=10, calls_on_calendar=4, live_calls=2),
@@ -100,18 +100,20 @@ def test_compute_scorecard_grid_and_benchmark_over_complete_weeks():
     rows = {m["key"]: m for m in out["metrics"]}
     assert [w["in_progress"] for w in out["weeks"]] == [False, False, True]
     assert [w["not_started"] for w in out["weeks"]] == [False, False, False]  # current week, not a future one
-    assert out["benchmark_weeks"] == 2
+    assert out["benchmark_weeks"] == 3  # the in-progress week counts too
     assert rows["leads"]["values"] == [10, 30, 1]
-    assert rows["leads"]["benchmark"] == 20  # in-progress week excluded
-    # Average of weekly ratios (0.5, 0.0), not recomputed from totals (2/8).
-    assert rows["show_rate"]["benchmark"] == 0.25
+    assert rows["leads"]["benchmark"] == pytest.approx(13.6667, rel=1e-3)
+    assert rows["leads"]["range_average"] == pytest.approx(13.6667, rel=1e-3)
+    # Average of weekly ratios (0.5, 0.0, 1.0), not recomputed from totals (3/9).
+    assert rows["show_rate"]["benchmark"] == 0.5
     # Organic hides ad-side and economics rows.
     assert "ad_spend" not in rows and "cac" not in rows and "visitors" not in rows
 
 
 def test_future_month_still_shows_every_week_column():
     # October 2026 hasn't started yet (today is Sep 24) — the grid still shows every
-    # Monday in it, each flagged not_started and excluded from the benchmark.
+    # Monday in it, each flagged not_started and excluded from the average, since
+    # nobody has touched them yet.
     future_weeks = sc.scorecard_weeks(date(2026, 10, 1), date(2026, 10, 31))
     bases = {wk: sc.WeekBase() for wk in future_weeks}
     with patch.object(sc, "collect_funnel_facts", return_value=SimpleNamespace()), patch.object(
@@ -126,6 +128,27 @@ def test_future_month_still_shows_every_week_column():
     rows = {m["key"]: m for m in out["metrics"]}
     assert rows["leads"]["values"] == [0] * len(future_weeks)
     assert rows["leads"]["benchmark"] is None
+
+
+def test_hand_edited_future_week_counts_toward_the_average():
+    # A future week nobody has touched is skipped, but once it's hand-edited ahead
+    # of time (a planned spend, a projected lead count) it has real data and counts.
+    weeks = [date(2026, 9, 7), date(2026, 9, 14)]  # both after today: not started
+    bases = {
+        weeks[0]: sc.WeekBase(leads=10),
+        weeks[1]: sc.WeekBase(leads=40),  # hand-edited ahead of time
+    }
+    with patch.object(sc, "collect_funnel_facts", return_value=SimpleNamespace()), patch.object(
+        sc, "_week_bases", return_value=bases
+    ), patch.object(sc, "load_overrides", return_value={(weeks[1], "leads"): 40.0}):
+        out = sc.compute_scorecard(
+            None, uuid.uuid4(), date(2026, 9, 1), date(2026, 9, 14), "organic", None, set(), today=date(2026, 8, 20)
+        )
+    rows = {m["key"]: m for m in out["metrics"]}
+    assert [w["not_started"] for w in out["weeks"]] == [True, True]
+    assert out["benchmark_weeks"] == 1  # only the edited week
+    assert rows["leads"]["benchmark"] == 40
+    assert rows["leads"]["overridden"] == [False, True]
 
 
 def test_compare_range_sets_the_benchmark():
@@ -146,6 +169,9 @@ def test_compare_range_sets_the_benchmark():
     assert leads["values"] == [10, 30]
     assert leads["benchmark"] == 3  # compare weeks' average, not this range's (20)
     assert (out["benchmark_source"], out["benchmark_weeks"]) == ("compare", 2)
+    # range_average ignores compare — a Model column falls back to it so "no data
+    # in the model" doesn't read as "no data" when this range actually has some.
+    assert leads["range_average"] == 20
 
 
 def _call(event_id, *, start, booked=None, cancelled=False, completed=False, no_show=False, provider="calcom"):

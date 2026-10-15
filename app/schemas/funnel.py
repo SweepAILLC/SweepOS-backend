@@ -280,7 +280,8 @@ class FunnelScorecardMetric(BaseModel):
     format: str  # "int" | "usd" | "pct" (fraction) | "ratio"
     better: str  # "up" | "down" | "neutral"
     values: List[Optional[float]] = []  # one per FunnelScorecard.weeks entry
-    benchmark: Optional[float] = None  # average of the complete weeks' values
+    benchmark: Optional[float] = None  # average of the complete weeks' values (compare range's average when compare is on)
+    range_average: Optional[float] = None  # this range's own complete-week average, regardless of compare
     editable: bool = False  # count row a person can type over per week
     overridden: List[bool] = []  # per week: value was hand-edited
     original: List[Optional[float]] = []  # per week: computed value an edit replaced (else null)
