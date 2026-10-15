@@ -28,5 +28,7 @@ class FunnelScorecardOverride(Base):
     metric_key = Column(String(32), nullable=False)
     value = Column(Numeric(14, 2), nullable=False)
     updated_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # "human_ui" (default) or "mcp_agent" - which caller wrote this row.
+    source = Column(String(16), nullable=False, default="human_ui", server_default="human_ui")
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

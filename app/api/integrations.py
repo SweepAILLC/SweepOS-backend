@@ -4600,3 +4600,43 @@ async def receive_fathom_webhook(
 
     return {"success": True, "status": status_str, "fathom_call_record_id": str(fathom_row_id) if fathom_row_id else None}
 
+
+@router.get("/mcp/scorecard-write")
+def get_mcp_scorecard_write_enabled(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Whether this org allows the funnels:write MCP tools to write scorecard numbers."""
+    from app.models.organization import Organization
+
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return {"enabled": bool(org.mcp_scorecard_write_enabled)}
+
+
+@router.patch("/mcp/scorecard-write")
+def set_mcp_scorecard_write_enabled(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Admin/owner only. Body: {"enabled": bool}. Off by default — see PRD's org opt-in gate."""
+    from app.models.organization import Organization
+    from app.services.org_user_context import user_can_manage_org_integrations
+
+    if not user_can_manage_org_integrations(current_user, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only organization admins and owners can change this setting.",
+        )
+    org_id = getattr(current_user, "selected_org_id", current_user.org_id)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    org.mcp_scorecard_write_enabled = bool(body.get("enabled"))
+    org.updated_at = datetime.utcnow()
+    db.commit()
+    return {"enabled": org.mcp_scorecard_write_enabled}
+

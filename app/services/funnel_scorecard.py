@@ -190,6 +190,22 @@ def load_overrides(
     return {(r.week_start, r.metric_key): float(r.value) for r in rows.all() if r.metric_key in EDITABLE_FIELDS}
 
 
+def load_override_sources(
+    db: Session,
+    org_id: uuid.UUID,
+    funnel_id: Optional[uuid.UUID],
+    channel: Optional[str],
+    first_week: date,
+    last_week: date,
+) -> Dict[Tuple[date, str], str]:
+    """Same scope as load_overrides: which caller ("human_ui" / "mcp_agent") wrote each cell."""
+    rows = _override_scope(db.query(FunnelScorecardOverride), org_id, funnel_id, channel).filter(
+        FunnelScorecardOverride.week_start >= first_week,
+        FunnelScorecardOverride.week_start <= last_week,
+    )
+    return {(r.week_start, r.metric_key): r.source for r in rows.all() if r.metric_key in EDITABLE_FIELDS}
+
+
 def _base_value(b: WeekBase, field_name: str) -> Optional[float]:
     if field_name == "spend":
         return b.spend if b.has_spend_row else None
@@ -222,6 +238,7 @@ def set_override(
     metric_key: str,
     value: Optional[float],
     user_id: Optional[uuid.UUID],
+    source: str = "human_ui",
 ) -> None:
     """Upsert one cell; value None reverts it to the computed number. Commits."""
     if metric_key not in EDITABLE_FIELDS:
@@ -248,6 +265,7 @@ def set_override(
         db.add(row)
     row.value = round(float(value), 2)
     row.updated_by_user_id = user_id
+    row.source = source
     row.updated_at = datetime.now(timezone.utc)
     db.commit()
 
@@ -428,6 +446,7 @@ def compute_scorecard(
     show_ads = channel != "organic"
 
     current, replaced = weekly_metric_values(db, org_id, weeks, channel, funnel_id, funnel_ids, include_ads=show_ads)
+    override_sources = load_override_sources(db, org_id, funnel_id, channel, weeks[0], weeks[-1])
     overridden_weeks = {wk for (wk, _key) in replaced}
     # A column counts toward the average once it has real data: it has started
     # (in progress or complete), or it was hand-edited ahead of time.
@@ -477,6 +496,8 @@ def compute_scorecard(
                 # Hand-edited cells, and the computed value each one replaced.
                 "overridden": [(wk, m.key) in replaced for wk in weeks],
                 "original": [_r(replaced.get((wk, m.key))) for wk in weeks],
+                # Who wrote the override ("human_ui" / "mcp_agent"); null when not overridden.
+                "source": [override_sources.get((wk, m.key)) for wk in weeks],
             }
         )
     return {

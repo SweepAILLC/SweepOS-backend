@@ -14,7 +14,9 @@ from app.services.kpi_integration_sync import count_sales_calls, sales_call_book
 @pytest.fixture(autouse=True)
 def _no_overrides():
     """compute_scorecard reads hand edits from the DB; tests run with db=None."""
-    with patch.object(sc, "load_overrides", return_value={}) as m:
+    with patch.object(sc, "load_overrides", return_value={}) as m, patch.object(
+        sc, "load_override_sources", return_value={}
+    ):
         yield m
 
 
