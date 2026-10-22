@@ -83,6 +83,72 @@ class TestDefaultsMatchFunnelsLeadsEndpoint:
         assert exc.value.status_code == 400
 
 
+class TestPartialSubmitDedupe:
+    """Direct POST /funnels/leads path (no opted_in_at, no GHL) — a visitor
+    completing a multi-step funnel resends the lead with more answers filled
+    in each time. Each arrival must merge data, but only the first should
+    queue a notification."""
+
+    def test_second_partial_submit_same_funnel_is_deduped_but_merges_answers(self):
+        f = _funnel()
+        with _env() as notify1:
+            r1 = fl.upsert_funnel_lead(
+                MagicMock(),
+                f,
+                _lead(f, email="partial@example.com", quiz_answers={"step1": "yes"}),
+            )
+        assert r1.created and not r1.duplicate
+        notify1.assert_called_once()
+        assert notify1.call_args.kwargs["is_new_client"] is True
+
+        client = r1.client
+        with _env(by_email=client) as notify2:
+            r2 = fl.upsert_funnel_lead(
+                MagicMock(),
+                f,
+                _lead(
+                    f,
+                    email="partial@example.com",
+                    quiz_answers={"step1": "yes", "step2": "no"},
+                ),
+            )
+        assert not r2.created and r2.duplicate
+        notify2.assert_not_called()
+        assert client.meta["prospect"]["quiz_answers"] == {"step1": "yes", "step2": "no"}
+        assert client.meta["prospect"]["funnel_id"] == str(f.id)
+
+    def test_third_partial_submit_keeps_first_captured_at(self):
+        f = _funnel()
+        with _env() as notify:
+            r1 = fl.upsert_funnel_lead(MagicMock(), f, _lead(f, email="p2@example.com"))
+        first_captured_at = r1.client.meta["prospect"]["captured_at"]
+
+        client = r1.client
+        for step in ("step2", "step3"):
+            with _env(by_email=client) as notify_n:
+                fl.upsert_funnel_lead(
+                    MagicMock(), f, _lead(f, email="p2@example.com", quiz_answers={step: "ok"})
+                )
+            notify_n.assert_not_called()
+
+        assert client.meta["prospect"]["captured_at"] == first_captured_at
+        assert client.meta["prospect"]["quiz_answers"] == {"step3": "ok"}
+
+    def test_different_funnel_for_same_client_is_not_deduped(self):
+        """A client who already completed funnel A gets a fresh notification
+        when they separately opt in to unrelated funnel B."""
+        f_a, f_b = _funnel(), _funnel()
+        with _env() as notify_a:
+            r1 = fl.upsert_funnel_lead(MagicMock(), f_a, _lead(f_a, email="multi@example.com"))
+        notify_a.assert_called_once()
+
+        client = r1.client
+        with _env(by_email=client) as notify_b:
+            r2 = fl.upsert_funnel_lead(MagicMock(), f_b, _lead(f_b, email="multi@example.com"))
+        assert not r2.duplicate
+        notify_b.assert_called_once()
+
+
 class TestGhlOptions:
     def test_match_prefers_ghl_contact_id_over_email(self):
         f, by_id, by_email = _funnel(), _client(), _client(email="other@example.com")
