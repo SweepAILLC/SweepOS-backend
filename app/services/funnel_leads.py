@@ -11,9 +11,15 @@ Default arguments reproduce POST /funnels/leads exactly. GHL callers pass
 - Re-attribution: a client with no funnel and no recorded opt-in (typically made
   by the manual GHL contact sync or by a booking webhook before the opt-in
   arrived) is tagged to this funnel. Anyone already tagged keeps first touch.
-- Idempotent per funnel: when the client already opted in to this funnel, a
-  second arrival (webhook and pull both delivering one submission) only merges
-  answers/UTM; it never moves the opt-in date or sends another notification.
+- Idempotent per funnel: once a client has prospect metadata recorded for this
+  funnel (``meta.prospect.funnel_id``), any further arrival — a retried
+  webhook delivery, the GHL reconcile pull, or a legitimate partial/staged
+  form submission as the visitor completes more of a multi-step funnel —
+  only merges answers/UTM; it never moves the opt-in date or re-queues the
+  lead notification. The dedupe key is ``meta.prospect.funnel_id`` (stamped
+  by every capture, public endpoint included), not ``opted_in_at``/timestamp,
+  so this holds for POST /funnels/leads directly as well as the GHL/webhook
+  paths.
 """
 from __future__ import annotations
 
@@ -111,8 +117,19 @@ def _apply_prospect_meta(
     flag_modified(client, "meta")
 
 
-def _already_opted_in_here(client: Client, funnel: Funnel) -> bool:
-    return client.source_funnel_id == funnel.id and client.opted_in_at is not None
+def _already_captured_for_funnel(client: Client, funnel: Funnel) -> bool:
+    """True once this client already has prospect metadata for this exact funnel.
+
+    Set by every prior call to ``_apply_prospect_meta`` for this {client, funnel}
+    pair, regardless of which caller made it (public endpoint, GHL webhook, or
+    the GHL reconcile pull) or whether it passed ``opted_in_at``. This is the
+    dedupe signal for ``duplicate`` below — deliberately independent of
+    ``source_funnel_id``/``opted_in_at``, which track first-touch *attribution*
+    (locked to the client's first funnel ever) and can diverge from "has this
+    exact funnel already captured this client."
+    """
+    prospect = client.meta.get("prospect") if isinstance(client.meta, dict) else None
+    return isinstance(prospect, dict) and prospect.get("funnel_id") == str(funnel.id)
 
 
 def _can_reattribute(client: Client) -> bool:
@@ -174,7 +191,10 @@ def upsert_funnel_lead(
         client = find_client_by_phone(db, org_id, phone)
 
     if client is not None:
-        duplicate = opted_in_at is not None and _already_opted_in_here(client, funnel)
+        # Computed before _apply_prospect_meta below overwrites meta.prospect,
+        # so this reads the PRIOR capture's funnel_id, not the one we're about
+        # to stamp for this arrival.
+        duplicate = _already_captured_for_funnel(client, funnel)
 
         if first_name is not None and first_name:
             client.first_name = first_name
