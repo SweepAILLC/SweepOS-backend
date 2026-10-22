@@ -262,9 +262,14 @@ def enqueue_funnel_lead_notification(
                     ("Instagram", row.lead_instagram),
                     ("Funnel", row.funnel_name),
                     ("Source", row.source),
+                    ("Funnel step", row.funnel_step_reached),
                 ]
                 if value
             ]
+            fields.extend(discord_notify.flatten_discord_fields("UTM", getattr(lead, "utm", None)))
+            fields.extend(discord_notify.flatten_discord_fields("Opt-in", getattr(lead, "opt_in_data", None)))
+            fields.extend(discord_notify.flatten_discord_fields("Quiz", getattr(lead, "quiz_answers", None)))
+            fields = fields[:25]  # Discord embed field cap
             discord_notify.send_discord_event_background(
                 org_id,
                 "new_lead",

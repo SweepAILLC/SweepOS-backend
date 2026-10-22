@@ -259,6 +259,50 @@ def _upsert_check_in(
     return row, True
 
 
+def _calendly_form_answers(invitee: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten Calendly's invitee.questions_and_answers into {question: answer}."""
+    qa = invitee.get("questions_and_answers")
+    if not isinstance(qa, list):
+        return {}
+    out: Dict[str, Any] = {}
+    for item in qa:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        answer = item.get("answer")
+        if question and answer not in (None, ""):
+            out[question] = answer
+    return out
+
+
+# Core identity fields already shown elsewhere in the embed (name/email) or not
+# useful as a "form answer" (location/guests/title/notes) — skip these so the
+# booking-form fields are the custom questions, not a restatement of the above.
+_CALCOM_SKIP_RESPONSE_KEYS = {"name", "email", "location", "guests", "title", "notes"}
+
+
+def _calcom_form_answers(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten Cal.com's payload.responses (or bookingFieldsResponses) into {label: value}."""
+    responses = payload.get("responses")
+    if not isinstance(responses, dict):
+        responses = payload.get("bookingFieldsResponses")
+    if not isinstance(responses, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key, value in responses.items():
+        if str(key).strip().lower() in _CALCOM_SKIP_RESPONSE_KEYS:
+            continue
+        if isinstance(value, dict):
+            label = str(value.get("label") or key)
+            answer = value.get("value")
+        else:
+            label = str(key)
+            answer = value
+        if answer not in (None, ""):
+            out[label] = answer
+    return out
+
+
 def _run_pipeline_after_webhook(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> None:
     try:
         from app.services.client_automation import process_pipeline_lifecycle_for_client
@@ -456,6 +500,7 @@ def process_calendly_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dic
                 attendee_email=invitee_email,
                 event_type_label=event_type_label,
                 start_time=start_time,
+                form_answers=_calendly_form_answers(invitee),
             )
         except Exception as e:
             LOG.warning("discord_notify new_booking (calendly) skipped: %s", e)
@@ -654,6 +699,7 @@ def process_calcom_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dict[
                 attendee_email=attendee_email,
                 event_type_label=event_type_label,
                 start_time=start_time,
+                form_answers=_calcom_form_answers(payload),
             )
         except Exception as e:
             LOG.warning("discord_notify new_booking (calcom) skipped: %s", e)

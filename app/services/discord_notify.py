@@ -157,6 +157,8 @@ def build_sample_event(
                 ("Provider", "Calendly"),
                 ("When", sample_when),
                 ("Email", "alex@example.com"),
+                ("Form · Budget", "$5k-$10k/mo"),
+                ("Form · How did you hear about us?", "Instagram"),
             ],
         },
         "new_transaction": {
@@ -186,6 +188,34 @@ _EMBED_COLOR_BY_EVENT = {
     "automation_failure": 0xEF4444,  # red
 }
 _DEFAULT_EMBED_COLOR = 0x9CA3AF  # gray, for any unlisted event_type
+
+
+def flatten_discord_fields(
+    prefix: str,
+    data: Any,
+    *,
+    _depth: int = 0,
+) -> List[Tuple[str, str]]:
+    """Flatten a quiz/opt-in/UTM/booking-form-answers dict into embed (name, value) fields.
+
+    Shared by funnel lead notifications and booking notifications so both surface
+    every captured answer the same way. Field name/value length caps are enforced
+    by send_discord_event; this just keeps keys readable and skips empty leaves.
+    """
+    if not isinstance(data, dict) or not data or _depth > 2:
+        return []
+    out: List[Tuple[str, str]] = []
+    for key, value in data.items():
+        label = f"{prefix} · {key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.extend(flatten_discord_fields(label, value, _depth=_depth + 1))
+        elif isinstance(value, (list, tuple)):
+            joined = ", ".join(str(v) for v in value if v not in (None, "")).strip()
+            if joined:
+                out.append((label, joined))
+        elif value not in (None, ""):
+            out.append((label, str(value)))
+    return out
 
 
 def is_event_type_known(event_type: str) -> bool:

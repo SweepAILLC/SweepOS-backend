@@ -74,6 +74,7 @@ def emit_new_booking_discord(
     event_type_label: Optional[str] = None,
     start_time: Optional[datetime] = None,
     require_recent: bool = False,
+    form_answers: Optional[dict] = None,
 ) -> bool:
     """Fire Discord new_booking once. Returns True if sent (or queued)."""
     if require_recent and start_time is not None:
@@ -94,6 +95,8 @@ def emit_new_booking_discord(
             fields.append(("When", discord_notify.format_org_local_datetime(db, org_id, start_time)))
         if attendee_email:
             fields.append(("Email", attendee_email))
+        fields.extend(discord_notify.flatten_discord_fields("Form", form_answers))
+        fields = fields[:25]  # Discord embed field cap
         discord_notify.send_discord_event_background(
             org_id,
             "new_booking",
