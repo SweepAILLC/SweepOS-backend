@@ -214,7 +214,14 @@ def get_org_intelligence_for_mcp(
             "advice in these fields; ai_profile is a marketing-trimmed subset kept for "
             "backward compatibility. signals is always populated from call-derived data "
             "(objections, wins, stories, themes) independent of whether the Intelligence "
-            "tab has been filled in — use it even when intelligence_profile is empty."
+            "tab has been filled in — use it even when intelligence_profile is empty. "
+            "Never default a content angle to a generic business model (e.g. 'B2B', 'SaaS', "
+            "'enterprise') that isn't explicitly stated in intelligence_profile or signals — "
+            "derive the actual audience/offer from these fields even when they're sparse. "
+            "If a BOF/case-study idea quotes or references a testimonial or win, you must "
+            "name the real person (signals.insights[].source.client_name) and cite the "
+            "Fathom call (source.fathom_transcript_url, else fathom_recording_id/meeting_at) "
+            "— never attribute it to an anonymous 'a client'."
         ),
     }
     intelligence_empty = not out["intelligence_profile"] and not out["offer_ladder"]
@@ -269,6 +276,13 @@ def get_org_sales_signals_for_mcp(db: Session, org_id: uuid.UUID) -> Dict[str, A
             "insights[].wins": "Documented wins / outcomes from calls.",
             "insights[].testimonial_stories": "Story-shaped proof for content and BOF.",
             "insights[].phrases_that_resonated / avoid_phrasing": "Prospect voice guidance.",
+            "insights[].source": (
+                "Attribution for every quote/win/testimonial on this row — client_name, meeting_at, "
+                "fathom_recording_id, fathom_transcript_url. REQUIRED citation: if a BOF/case-study "
+                "content idea quotes or references a win or testimonial_story, name the real person "
+                "from source.client_name and cite the Fathom call via fathom_transcript_url (or "
+                "fathom_recording_id / meeting_at if no URL) — never present it as an anonymous 'a client'."
+            ),
             "active_client_insights": "Delivery/retention friction from ACTIVE clients.",
         },
     }

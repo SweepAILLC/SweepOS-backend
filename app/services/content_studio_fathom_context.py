@@ -84,6 +84,38 @@ def _themes_payload(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
     return out[:25]
 
 
+def _insight_source(r: "ClientCallInsight") -> Dict[str, Any]:
+    """Attribution for every quote/win/testimonial on this call insight row — who said it
+    and which Fathom call it came from, so BOF content can cite a real person + transcript
+    instead of an anonymized 'a client said'."""
+    client_name = None
+    try:
+        client_name = r.client.name if r.client else None
+    except Exception:
+        client_name = None
+
+    fcr = None
+    try:
+        fcr = r.fathom_call_record
+    except Exception:
+        fcr = None
+
+    meeting_at = None
+    recording_id = None
+    transcript_url = None
+    if fcr is not None:
+        meeting_at = fcr.meeting_at.isoformat() if fcr.meeting_at else None
+        recording_id = fcr.fathom_recording_id
+        transcript_url = fcr.recording_url or fcr.share_url or fcr.video_url
+
+    return {
+        "client_name": client_name or "Unnamed client",
+        "meeting_at": meeting_at,
+        "fathom_recording_id": recording_id,
+        "fathom_transcript_url": transcript_url,
+    }
+
+
 def _recent_call_insights(db: Session, org_id: uuid.UUID, limit: int = 22) -> List[Dict[str, Any]]:
     rows = (
         db.query(ClientCallInsight)
@@ -119,6 +151,9 @@ def _recent_call_insights(db: Session, org_id: uuid.UUID, limit: int = 22) -> Li
                 "avoid_phrasing": [str(x)[:220] for x in (pv.get("avoid_phrasing") or [])[:4] if x],
                 "wins": [str(x)[:320] for x in (ij.get("wins") or [])[:4] if x],
                 "testimonial_stories": [str(x)[:400] for x in (ij.get("testimonial_stories") or [])[:3] if x],
+                # Attribution for the wins/testimonial_stories/objection_quotes above — required
+                # citation when BOF content quotes or references them.
+                "source": _insight_source(r),
             }
         )
     return out
@@ -161,6 +196,7 @@ def _active_client_insights(db: Session, org_id: uuid.UUID, limit: int = 14) -> 
                 "priorities": [str(x)[:320] for x in (ij.get("priorities") or [])[:5] if x],
                 "next_steps": nsl,
                 "wins": [str(x)[:320] for x in (ij.get("wins") or [])[:4] if x],
+                "source": _insight_source(r),
             }
         )
     return out

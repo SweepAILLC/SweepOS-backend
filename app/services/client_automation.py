@@ -27,6 +27,10 @@ META_FOLLOW_UP_DUE_AT = "follow_up_due_at"
 META_FOLLOW_UP_ANCHOR_AT = "follow_up_anchor_at"
 META_LIFECYCLE_MANUAL_AT = "lifecycle_manual_at"
 META_LIFECYCLE_MANUAL_STAGE = "lifecycle_manual_stage"
+# When client entered OFFBOARDING/DEAD (auto or manual) — lets payment-based
+# win-back require a payment newer than the terminal transition, instead of
+# reactivating on any payment the client has ever had (see move_client_to_active_on_payment).
+META_LIFECYCLE_TERMINAL_AT = "lifecycle_terminal_at"
 
 LEGACY_LIFECYCLE_ALIASES = {
     "warm_lead": LifecycleState.BOOKED,
@@ -89,6 +93,8 @@ def apply_manual_lifecycle_change(client: Client, new_state: LifecycleState) -> 
     meta[META_FOLLOW_UP_DUE_AT] = due.isoformat() + "Z"
     meta[META_LIFECYCLE_MANUAL_AT] = now.isoformat() + "Z"
     meta[META_LIFECYCLE_MANUAL_STAGE] = _lifecycle_str(new_state)
+    if new_state in (LifecycleState.OFFBOARDING, LifecycleState.DEAD):
+        meta[META_LIFECYCLE_TERMINAL_AT] = now.isoformat() + "Z"
     client.meta = meta
     flag_modified(client, "meta")
 
@@ -669,6 +675,10 @@ def update_client_lifecycle_state(db: Session, client: Client, force: bool = Fal
         f"(progress: {progress:.1f}%)"
     )
     client.lifecycle_state = target_state
+    meta = dict(client.meta) if isinstance(client.meta, dict) else {}
+    meta[META_LIFECYCLE_TERMINAL_AT] = datetime.utcnow().isoformat() + "Z"
+    client.meta = meta
+    flag_modified(client, "meta")
     db.flush()
     db.refresh(client)
 
@@ -1059,18 +1069,102 @@ def enqueue_close_survey_kpi_sync(
     )
 
 
+def _latest_payment_at(db: Session, org_id: uuid.UUID, client_id: uuid.UUID) -> Optional[datetime]:
+    """Most recent succeeded/paid-like payment date across Stripe, Whop, and manual rows."""
+    from sqlalchemy import func
+
+    from app.models.manual_payment import ManualPayment
+    from app.models.stripe_payment import StripePayment
+    from app.models.whop_payment import WhopPayment
+
+    dates: list[datetime] = []
+
+    stripe_latest = (
+        db.query(func.max(StripePayment.created_at))
+        .filter(
+            StripePayment.org_id == org_id,
+            StripePayment.client_id == client_id,
+            StripePayment.status == "succeeded",
+        )
+        .scalar()
+    )
+    if stripe_latest:
+        dates.append(stripe_latest)
+
+    whop_latest = (
+        db.query(func.max(WhopPayment.created_at))
+        .filter(
+            WhopPayment.org_id == org_id,
+            WhopPayment.client_id == client_id,
+            WhopPayment.status.in_(("paid", "succeeded", "completed", "successful")),
+        )
+        .scalar()
+    )
+    if whop_latest:
+        dates.append(whop_latest)
+
+    manual_latest = (
+        db.query(func.max(ManualPayment.payment_date))
+        .filter(
+            ManualPayment.org_id == org_id,
+            ManualPayment.client_id == client_id,
+        )
+        .scalar()
+    )
+    if manual_latest:
+        dates.append(_as_naive_utc(manual_latest) or manual_latest)
+
+    if not dates:
+        return None
+    return max(_as_naive_utc(d) or d for d in dates)
+
+
 def move_client_to_active_on_payment(db: Session, client: Client) -> bool:
     """
     Move client to active when they have recorded payment.
     Applies to any pre-payment pipeline stage plus offboarding/dead win-backs.
+
+    Offboarding/dead win-backs require a payment newer than the client's
+    terminal-state transition (META_LIFECYCLE_TERMINAL_AT) — not merely "has ever
+    paid". Without this, every graduated/churned client (who by definition has a
+    historical payment) gets silently flipped back to ACTIVE the next time this
+    runs, e.g. on every GET /clients/{id} (see api/clients/crud.py), which is what
+    produced dead/offboarding cards reverting to Active on page refresh.
     """
     if not client_has_recorded_payment(db, client.org_id, client.id):
         return False
     state = client.lifecycle_state
-    if state in PRE_PAYMENT_LIFECYCLE_STATES or state in (
-        LifecycleState.OFFBOARDING,
-        LifecycleState.DEAD,
-    ):
+    if state in (LifecycleState.OFFBOARDING, LifecycleState.DEAD):
+        meta = client.meta if isinstance(client.meta, dict) else {}
+        raw_terminal_at = meta.get(META_LIFECYCLE_TERMINAL_AT)
+        terminal_at: Optional[datetime] = None
+        if isinstance(raw_terminal_at, str):
+            try:
+                s = raw_terminal_at.replace("Z", "+00:00") if raw_terminal_at.endswith("Z") else raw_terminal_at
+                terminal_at = _as_naive_utc(datetime.fromisoformat(s))
+            except (ValueError, TypeError):
+                terminal_at = None
+        if terminal_at is None:
+            # No recorded transition instant (legacy row) — can't tell a genuine new
+            # payment from the client's original historical one, so don't reactivate.
+            return False
+        latest_payment_at = _latest_payment_at(db, client.org_id, client.id)
+        if not latest_payment_at or latest_payment_at <= terminal_at:
+            return False
+        print(
+            f"[CLIENT_AUTOMATION] Moving client {client.id} to ACTIVE due to payment "
+            f"(was {_lifecycle_str(state)}, win-back payment {latest_payment_at.isoformat()} "
+            f"after terminal transition {terminal_at.isoformat()})"
+        )
+        client.lifecycle_state = LifecycleState.ACTIVE
+        client.last_activity_at = datetime.utcnow()
+        meta = dict(meta)
+        meta.pop(META_LIFECYCLE_TERMINAL_AT, None)
+        client.meta = meta
+        flag_modified(client, "meta")
+        db.flush()
+        return True
+    if state in PRE_PAYMENT_LIFECYCLE_STATES:
         print(
             f"[CLIENT_AUTOMATION] Moving client {client.id} to ACTIVE due to payment "
             f"(was {_lifecycle_str(state)})"

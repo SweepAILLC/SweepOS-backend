@@ -23,8 +23,17 @@ logger = logging.getLogger(__name__)
 
 # Bumped to invalidate every previously-generated bundle when grounding shape changes.
 # v7: ideas grounded in top/bottom post performance + period deltas (not advice dims).
-BUNDLE_VERSION = 7
-PROMPT_VERSION = "v1.0"  # LLM.md prompt-versioning/logging — distinct from BUNDLE_VERSION above
+# v8: banned generic business-model assumptions (e.g. defaulting to "B2B"); BOF quotes/
+# testimonials now require a named-person + Fathom-transcript citation.
+# v9: TOF/MOF concepts now require a "Fathom signal:" citation traceable to a real theme/
+# objection/phrase/meeting excerpt; ungrounded concepts are flagged [Unverified] instead of
+# silently shipping invented content.
+# v10: BOF now recognizes two concept shapes — (a) client testimonial/case-study replay (named
+# person + Fathom transcript citation) and (b) operator-narrated belief-shift/objection-prehandle
+# replay (Fathom signal citation, no client name) — and no longer misattributes shape (b)
+# concepts to a client just because they mention quote-shaped language.
+BUNDLE_VERSION = 10
+PROMPT_VERSION = "v1.3"  # LLM.md prompt-versioning/logging — distinct from BUNDLE_VERSION above
 
 # Each entry: (stage, default title, default intro hint shown when LLM cannot run).
 STAGE_SPECS: List[Tuple[str, str, str]] = [
@@ -346,12 +355,33 @@ def _normalize_stage(raw: Dict[str, Any], stage: str, fallback_title: str, fallb
     }
 
 
-def _collect_bof_call_library_examples(signals: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Real BOF proof snippets extracted from call-library derived insights."""
-    out: List[Dict[str, str]] = []
+def _format_citation(source: Dict[str, Any]) -> str:
+    """Human-readable attribution: who said it + which Fathom call it's from."""
+    if not isinstance(source, dict):
+        return "Source: Fathom call (recording unlinked)."
+    name = str(source.get("client_name") or "Unnamed client").strip()
+    when = str(source.get("meeting_at") or "").strip()
+    url = str(source.get("fathom_transcript_url") or "").strip()
+    rid = source.get("fathom_recording_id")
+    bits = [f"Source: {name}"]
+    if when:
+        bits.append(f"call on {when[:10]}")
+    if url:
+        bits.append(f"Fathom transcript: {url}")
+    elif rid:
+        bits.append(f"Fathom recording ID {rid}")
+    else:
+        bits.append("Fathom transcript unlinked")
+    return ", ".join(bits) + "."
+
+
+def _collect_bof_call_library_examples(signals: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Real BOF proof snippets extracted from call-library derived insights, each carrying
+    the attribution (who said it + Fathom call) required to cite it in BOF content."""
+    out: List[Dict[str, Any]] = []
     seen: set[str] = set()
 
-    def _push(kind: str, text: Any) -> None:
+    def _push(kind: str, text: Any, source: Optional[Dict[str, Any]]) -> None:
         s = str(text or "").strip()
         if not s:
             return
@@ -359,31 +389,34 @@ def _collect_bof_call_library_examples(signals: Dict[str, Any]) -> List[Dict[str
         if key in seen:
             return
         seen.add(key)
-        out.append({"kind": kind, "text": s[:360]})
+        out.append({"kind": kind, "text": s[:360], "source": source or {}})
 
     insights = signals.get("insights") if isinstance(signals, dict) else []
     if isinstance(insights, list):
         for ins in insights[:12]:
             if not isinstance(ins, dict):
                 continue
+            source = ins.get("source") if isinstance(ins.get("source"), dict) else None
             for t in (ins.get("testimonial_stories") or [])[:4]:
-                _push("testimonial_story", t)
+                _push("testimonial_story", t, source)
             for w in (ins.get("wins") or [])[:4]:
-                _push("win", w)
+                _push("win", w, source)
 
     active = signals.get("active_client_insights") if isinstance(signals, dict) else []
     if isinstance(active, list):
         for ins in active[:12]:
             if not isinstance(ins, dict):
                 continue
+            source = ins.get("source") if isinstance(ins.get("source"), dict) else None
             for w in (ins.get("wins") or [])[:4]:
-                _push("active_client_win", w)
+                _push("active_client_win", w, source)
     return out[:8]
 
 
-def _build_prescribed_bof_concept(example: Dict[str, str], idx: int) -> Dict[str, Any]:
+def _build_prescribed_bof_concept(example: Dict[str, Any], idx: int) -> Dict[str, Any]:
     quote = str(example.get("text") or "").strip()
     kind = str(example.get("kind") or "call_library_example").replace("_", " ")
+    citation = _format_citation(example.get("source") or {})
     hook_seed = quote[:120]
     if len(quote) > 120:
         hook_seed = hook_seed.rstrip() + "..."
@@ -393,14 +426,14 @@ def _build_prescribed_bof_concept(example: Dict[str, str], idx: int) -> Dict[str
         "title": f"Prescribed BOF Case Study: {quote[:80]}",
         "hook": f"Client result replay: {hook_seed}",
         "bullets": [
-            f"Proof: paraphrase this real call-library {kind} — {quote}",
+            f"Proof: quote this real call-library {kind} — \"{quote}\" — {citation}",
             "Mechanism: explain what changed and why it worked in plain language.",
             "Re-hook: connect this outcome back to the viewer's current problem.",
             "CTA: invite the viewer to book/apply if they want the same transformation path.",
         ],
         "why_for_icp": (
             "This BOF idea is pulled from a real call-library example and should be presented as a concrete "
-            "testimonial/case-study replay that builds trust with your ICP."
+            f"testimonial/case-study replay that builds trust with your ICP. {citation}"
         ),
         "funnel_path_to_sale": (
             "Shows believable proof from a real client story so warm viewers trust the method and take the next buying step."
@@ -441,6 +474,204 @@ def _enforce_bof_prescribed_case_studies(
     if marker not in intro:
         joined = f"{intro} {marker}".strip()
         bof_stage["intro"] = joined[:1200]
+
+
+_CITATION_MARKERS = ("fathom transcript", "fathom recording", "fathom call")
+_QUOTE_REFERENCE_MARKERS = (
+    "testimonial", "case stud", "client said", "client result", "quote", "transformation",
+    '"', "“", "’s words",
+)
+
+
+def _enforce_bof_citation_requirement(
+    stages_out: List[Dict[str, Any]],
+    examples: List[Dict[str, Any]],
+) -> None:
+    """Guarantee every BOF concept that references/quotes a CLIENT testimonial or case study
+    (shape (a)) names who said it and cites the Fathom transcript it came from — never an
+    anonymized 'a client said'. Concepts already built by `_build_prescribed_bof_concept`
+    already carry this; this catches LLM-authored BOF concepts that referenced a win/testimonial
+    without citing it.
+
+    Requires real word-overlap evidence (`_best_pool_match`, strict — no arbitrary fallback)
+    against the actual win/testimonial examples before attaching a name. This deliberately does
+    NOT fire on shape (b) operator belief-shift/objection-prehandle concepts just because they
+    mention quote-shaped words ('client said', quotation marks) — those have no real overlap with
+    a client win/testimonial and are correctly left for `_enforce_stage_signal_grounding`'s
+    Fathom-signal citation instead, which doesn't name a client."""
+    if not examples:
+        return
+    bof_stage = None
+    for stage in stages_out:
+        if str(stage.get("id") or "").upper().strip() == "BOF":
+            bof_stage = stage
+            break
+    if not isinstance(bof_stage, dict):
+        return
+
+    for concept in bof_stage.get("concepts") or []:
+        blob = " ".join(
+            [
+                str(concept.get("hook") or ""),
+                " ".join(str(b) for b in (concept.get("bullets") or [])),
+                str(concept.get("why_for_icp") or ""),
+            ]
+        ).lower()
+        references_quote = any(marker in blob for marker in _QUOTE_REFERENCE_MARKERS)
+        already_cited = any(marker in blob for marker in _CITATION_MARKERS)
+        if not references_quote or already_cited:
+            continue
+        match, score = _best_pool_match(concept, examples)
+        if not match or score <= 0:
+            continue
+        citation = _format_citation(match.get("source") or {})
+        why = str(concept.get("why_for_icp") or "").strip()
+        concept["why_for_icp"] = (f"{why} {citation}".strip())[:1200]
+
+
+_STAGE_GROUNDING_MARKER = "fathom signal:"
+_STAGE_UNVERIFIED_MARKER = "[unverified:"
+
+
+def _collect_stage_grounding_pool(signals: Dict[str, Any], stage: str) -> List[Dict[str, str]]:
+    """Real Fathom-derived snippets concepts must be traceable to — themes/priorities/resonant
+    phrases/meeting excerpts for TOF/MOF, plus objection-quote/belief-shift conversation language
+    for BOF's non-testimonial concept type (see below). This is the non-named-person analog of
+    `_collect_bof_call_library_examples`: these stages stay anonymized/niche-agnostic per the
+    ideation SOP, so no client name is attached here.
+
+    BOF has two legitimate concept shapes:
+    1. Testimonial/case-study replay (a client's own result/words) — grounded + cited by
+       `_enforce_bof_citation_requirement` using `_collect_bof_call_library_examples` (named
+       person + Fathom transcript required).
+    2. Operator-narrated belief-shift / objection-prehandle replay ("here's what I told a client
+       who believed X") — the operator's own words/reframe from a real call, not a client quote.
+       This pool (`stage == "BOF"`) supplies that grounding: objection_quotes, phrases_that_resonated,
+       client_state_synthesis, and active-client priorities — cited via the same `Fathom signal:`
+       marker as TOF/MOF (no client name, since it's the operator speaking, not a testimonial).
+    """
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _push(kind: str, text: Any) -> None:
+        s = str(text or "").strip()
+        if not s or len(s) < 12:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"kind": kind, "text": s[:320]})
+
+    themes = signals.get("themes") if isinstance(signals, dict) else []
+    insights = signals.get("insights") if isinstance(signals, dict) else []
+    active = signals.get("active_client_insights") if isinstance(signals, dict) else []
+    summaries = signals.get("meeting_summaries") if isinstance(signals, dict) else []
+
+    if stage in ("TOF", "MOF") and isinstance(themes, list):
+        for t in themes[:15]:
+            if not isinstance(t, dict):
+                continue
+            label = str(t.get("label") or t.get("theme_key") or "").strip()
+            if label:
+                _push("theme", label)
+            for q in (t.get("sample_quotes") or [])[:2]:
+                _push("theme_quote", q)
+
+    if isinstance(insights, list):
+        for ins in insights[:15]:
+            if not isinstance(ins, dict):
+                continue
+            if stage == "TOF":
+                for p in (ins.get("priorities") or [])[:3]:
+                    _push("priority", p)
+                _push("client_state_synthesis", ins.get("client_state_synthesis"))
+            elif stage == "MOF":
+                for p in (ins.get("phrases_that_resonated") or [])[:3]:
+                    _push("phrase_that_resonated", p)
+                for p in (ins.get("priorities") or [])[:3]:
+                    _push("priority", p)
+                _push("client_state_synthesis", ins.get("client_state_synthesis"))
+            elif stage == "BOF":
+                for q in (ins.get("objection_quotes") or [])[:3]:
+                    _push("objection_quote", q)
+                for p in (ins.get("phrases_that_resonated") or [])[:3]:
+                    _push("phrase_that_resonated", p)
+                _push("client_state_synthesis", ins.get("client_state_synthesis"))
+
+    if stage == "BOF" and isinstance(active, list):
+        for ins in active[:15]:
+            if not isinstance(ins, dict):
+                continue
+            for p in (ins.get("priorities") or [])[:3]:
+                _push("active_priority", p)
+
+    if stage == "TOF" and isinstance(summaries, list):
+        for s in summaries[:8]:
+            _push("meeting_summary", s)
+
+    return out[:40]
+
+
+def _best_pool_match(concept: Dict[str, Any], pool: List[Dict[str, str]]) -> Tuple[Optional[Dict[str, str]], int]:
+    """Word-overlap match with an explicit score — unlike `_best_matching_example`, this never
+    falls back to an arbitrary pool item, so a true score of 0 means genuinely ungrounded."""
+    blob = " ".join(
+        [
+            str(concept.get("hook") or ""),
+            " ".join(str(b) for b in (concept.get("bullets") or [])),
+            str(concept.get("why_for_icp") or ""),
+            str(concept.get("title") or ""),
+        ]
+    ).lower()
+    best = None
+    best_score = 0
+    for item in pool:
+        text = str(item.get("text") or "").lower()
+        if not text:
+            continue
+        words = {w for w in text.split() if len(w) > 4}
+        score = sum(1 for w in words if w in blob)
+        if score > best_score:
+            best_score = score
+            best = item
+    return best, best_score
+
+
+def _enforce_stage_signal_grounding(stages_out: List[Dict[str, Any]], signals: Dict[str, Any]) -> None:
+    """Guarantee every concept is traceable to a real Fathom theme/objection/phrase, not
+    invented — the non-named-person counterpart to the BOF testimonial citation guarantee.
+    Covers TOF, MOF, and BOF's operator-narrated belief-shift/objection-prehandle concepts
+    (BOF's testimonial/case-study concepts are already covered by name+transcript citation via
+    `_enforce_bof_citation_requirement`, which runs first — this skips anything already carrying
+    that citation). When data is present (`has_any`) but a concept doesn't overlap with any real
+    signal, flag it for human review instead of fabricating a citation, per LLM.md's 'flag
+    uncertainty' rule."""
+    if not isinstance(signals, dict) or not signals.get("has_any"):
+        return  # no-data fallback already discloses this honestly in the stage intro
+    for stage in stages_out:
+        sid = str(stage.get("id") or "").upper().strip()
+        if sid not in ("TOF", "MOF", "BOF"):
+            continue
+        pool = _collect_stage_grounding_pool(signals, sid)
+        if not pool:
+            continue
+        for concept in stage.get("concepts") or []:
+            why = str(concept.get("why_for_icp") or "").strip()
+            why_lower = why.lower()
+            if _STAGE_GROUNDING_MARKER in why_lower or _STAGE_UNVERIFIED_MARKER in why_lower:
+                continue
+            if sid == "BOF" and any(marker in why_lower for marker in _CITATION_MARKERS):
+                continue  # already has a named-person + Fathom-transcript citation (testimonial type)
+            match, score = _best_pool_match(concept, pool)
+            if match and score > 0:
+                snippet = match["text"][:160]
+                concept["why_for_icp"] = f"{why} Fathom signal: \"{snippet}\".".strip()[:1200]
+            else:
+                concept["why_for_icp"] = (
+                    f"{why} [Unverified: no matching Fathom signal found for this concept — "
+                    "review before publishing.]"
+                ).strip()[:1200]
 
 
 def draft_content_studio_bundle_llm(
@@ -492,14 +723,34 @@ HARD RULES:
 - Each stage gives 4-6 concepts. Mix `format`: at least one "long" and at least one "short" per stage when data supports it.
 - `hook` is the ONLY verbatim/scripted line allowed — exactly ONE line per concept. NEVER write full scripts, captions, voiceover lines, or social copy. `bullets` stay directional (structure/beats), never scripted.
 - Concepts must be PURELY grounded in Fathom signals + INTELLIGENCE_PROFILE. Do not invent facts, names, numbers, or claims.
+- NO ASSUMED BUSINESS MODEL: never default to a generic vertical, buyer type, or deal shape (e.g. "B2B", "SaaS", "enterprise", "agency") unless that exact framing is explicitly present in INTELLIGENCE_PROFILE (business_description, target_audience, unique_selling_proposition, offer_ladder) or in the Fathom SIGNALS language itself. If INTELLIGENCE_PROFILE is sparse, mine SIGNALS harder (themes, client_state_synthesis, meeting_summaries) for the operator's actual audience and offer before writing a single concept — do not fall back on a stock business-strategist template. Every concept's `why_for_icp` must point to a specific field or quote you pulled this from, not a category assumption.
 - CONVERSION MANDATE (CONVERSION IDEATION METHOD): every concept must be reverse-engineered from the sales process. Build each around a real objection, bottleneck, pain, or converting goal found in the Fathom SIGNALS so the content pre-handles objections BEFORE the prospect reaches a call. No generic content that does not pre-sell the offer.
 - Stage purpose:
   - TOF: trending, scroll-stopping concepts that mine the most attention-grabbing pains/shocks/beliefs from Fathom data and tie back to the ICP's surface-level pain.
   - MOF: education concepts the operator already teaches on sales calls (frameworks, reframes, decision rules, myth-busts). Pre-handles objections.
-  - BOF: client wins & case study breakdowns from `insights[].wins`, `insights[].testimonial_stories`, `active_client_insights[].wins`. If those are empty, return fewer or 0 BOF concepts and say so in the stage intro — never fabricate.
+  - BOF: proof that converts warm viewers — TWO legitimate concept shapes, mix both when data supports it:
+    (a) CLIENT WINS & CASE STUDIES from `insights[].wins`, `insights[].testimonial_stories`,
+        `active_client_insights[].wins` — the client's own result/words, replayed as a case study.
+    (b) BELIEF-SHIFT / OBJECTION-PREHANDLE REPLAYS — the OPERATOR narrating a real moment from a call
+        where THEY spoke to a prospect/client about a concept, reframe, or answer that shifted a belief
+        or pre-handled an objection (e.g. "Here's exactly what I tell someone who thinks X..."). Ground
+        these in `insights[].objection_quotes`, `insights[].phrases_that_resonated`,
+        `insights[].client_state_synthesis`, or `active_client_insights[].priorities` — this is the
+        operator's own words/approach from a real call, NOT a client testimonial quote, so it does not
+        need a named client (see TOF/MOF/BOF SIGNAL CITATION below instead of the BOF CITATION MANDATE).
+    If both (a) and (b)'s source data are empty, return fewer or 0 BOF concepts and say so in the stage
+    intro — never fabricate either shape.
   - BOF must include at least one concept whose title starts with "Prescribed BOF Case Study:" and is directly based on a real call-library example from SIGNALS.
 - Every concept MUST include `hook` (1 scripted line), `bullets` (proof → re-hook → body → CTA beats), `why_for_icp`, and `funnel_path_to_sale`.
 - `why_for_icp` MUST reference the ICP fields in INTELLIGENCE_PROFILE (target_audience, business_description, unique_selling_proposition, personal_story, mission_statement, pipeline_priorities, offer_ladder) AND name the specific objection/goal from the Fathom SIGNALS the concept dissolves.
+- TOF/MOF/BOF SIGNAL CITATION: every TOF concept, every MOF concept, and every BOF belief-shift/
+  objection-prehandle concept (BOF shape (b) above — i.e. any BOF concept that is NOT a client
+  testimonial/case-study quote) MUST have a `why_for_icp` that includes one explicit clause starting
+  with "Fathom signal:" followed by the exact theme label, objection/priority phrase, resonant phrase,
+  client_state_synthesis fragment, or meeting-summary fragment from SIGNALS that this concept is built
+  on (paraphrase is fine, but it must be traceable to a real SIGNALS entry — not a label you invented).
+  If you cannot point to a real SIGNALS entry for a concept, do not write that concept — replace it with
+  one you can source.
 - KNOWLEDGE_BASE (CONTENT_IDEATION_SOP + OFFER_BUILDING_SOP + CONVERSION IDEATION METHOD) is a MANDATORY creative constraint:
   - 3-layer funnel: the `hook` behaves as the HOOK (widest relevant audience, ZERO niche terms, one universal driver, passes the swap test); niche/ICP specificity only enters in the amplifier beats (context → symptom → system); the final beat is the CTA (one ask tied to the amplifier's specific promise). Pick hook types from the SOP's 13 that fit each stage's goal.
   - Reinforce the OFFER: where relevant, echo the operator's positioning levers (owned category, named enemy/wrong-cause, named mechanism, proof) and move the value equation (raise believable outcome/likelihood, lower perceived time/effort).
@@ -512,7 +763,17 @@ HARD RULES:
 - If INSTAGRAM_PERFORMANCE.connected=true, every concept's why_for_icp MUST include one explicit line that starts
   with "Instagram performance signal", references a real top-post hook/format or a period delta from summary,
   AND includes that post's `permalink` so the citation is verifiable, not just a caption echo.
-- No PII (no full names). Paraphrase any quotes."""
+- BOF CITATION MANDATE (overrides the general anonymization rule below, for BOF shape (a) only — client
+  testimonials/wins/case studies, NOT shape (b) operator belief-shift replays, which use the Fathom
+  signal citation above instead): any BOF concept that quotes or references a client's testimonial, win,
+  or case study MUST name the real person it came from (`source.client_name` on the matching
+  CALL_LIBRARY_BOF_EXAMPLES / SIGNALS entry) and cite the Fathom call it's from, using
+  `source.fathom_transcript_url` when present, else `source.fathom_recording_id`, else the call date
+  (`source.meeting_at`). Put this citation explicitly in `bullets` (the proof beat) and in `why_for_icp`,
+  in the form: "Source: <name>, call on <date>, Fathom transcript: <url>". Never present a BOF client
+  testimonial/case-study quote as coming from an unnamed/anonymous "a client".
+- Outside of BOF shape (a) (TOF, MOF, and BOF shape (b) operator belief-shift replays): no PII (no full
+  names), paraphrase quotes rather than reproducing them verbatim."""
 
     ig_perf = _instagram_perf_block_for_llm(db, org_id)
     bof_examples = _collect_bof_call_library_examples(signals)
@@ -533,7 +794,9 @@ GROUNDING (mandatory stage → Fathom field mapping):
 SIGNALS (Fathom meeting summaries, org themes, call insights, active-client insights):
 {data_block}
 
-CALL_LIBRARY_BOF_EXAMPLES (real snippets for prescribed BOF case-study concepts):
+CALL_LIBRARY_BOF_EXAMPLES (real snippets for prescribed BOF case-study concepts — each item's
+`source` field has the exact attribution required by the BOF CITATION MANDATE: client_name,
+meeting_at, fathom_recording_id, fathom_transcript_url):
 {bof_block}
 
 INSTAGRAM_PERFORMANCE (observed results — top_posts, underperformers, period deltas; empty if not connected):
@@ -570,6 +833,8 @@ Fingerprint (opaque): {fingerprint}
         stages_out.append(_normalize_stage(src, stage, default_title, default_intro))
     _enforce_instagram_grounding(stages_out, ig_perf)
     _enforce_bof_prescribed_case_studies(stages_out, signals)
+    _enforce_bof_citation_requirement(stages_out, bof_examples)
+    _enforce_stage_signal_grounding(stages_out, signals)
 
     batch_id = str(uuid.uuid4())
     return {
