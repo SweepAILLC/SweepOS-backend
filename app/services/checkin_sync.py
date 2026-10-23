@@ -89,25 +89,32 @@ def _calendly_fetch_invitees_threadsafe(event_uri: str, headers: dict) -> tuple:
         return (event_uri, None, -1)
 
 
-def _fetch_calendly_scheduled_events(http: httpx.Client, headers: dict, user_uri: str) -> List[dict]:
+def _fetch_calendly_scheduled_events_window(
+    http: httpx.Client,
+    headers: dict,
+    user_uri: str,
+    *,
+    min_start: str,
+    max_start: str,
+    sort: str,
+    max_pages: int,
+    label: str,
+) -> List[dict]:
     """
-    Paginate Calendly scheduled_events with microsecond-precision datetimes.
+    Paginate Calendly scheduled_events within one time window, microsecond-precision datetimes.
     Uses page_token for follow-up pages (next_page URLs can 400 when first-page times lack precision).
     """
     events: List[dict] = []
-    now_utc = datetime.now(timezone.utc)
-    min_start = format_calendly_api_time(now_utc - timedelta(days=365))
-    max_start = format_calendly_api_time(now_utc + timedelta(days=365))
     page_token: Optional[str] = None
 
-    for page_idx in range(25):
+    for page_idx in range(max_pages):
         if page_idx == 0:
             params: Dict[str, Any] = {
                 "user": user_uri,
                 "count": 100,
                 "min_start_time": min_start,
                 "max_start_time": max_start,
-                "sort": "start_time:asc",
+                "sort": sort,
             }
             r = http.get("https://api.calendly.com/scheduled_events", headers=headers, params=params)
         elif page_token:
@@ -120,7 +127,7 @@ def _fetch_calendly_scheduled_events(http: httpx.Client, headers: dict, user_uri
             break
 
         if r.status_code != 200:
-            print(f"[CHECKIN SYNC] [CALENDLY] ❌ scheduled_events page={page_idx + 1} error: {r.status_code}")
+            print(f"[CHECKIN SYNC] [CALENDLY] ❌ scheduled_events({label}) page={page_idx + 1} error: {r.status_code}")
             print(f"[CHECKIN SYNC] [CALENDLY] Response: {r.text[:500]}")
             break
 
@@ -131,6 +138,48 @@ def _fetch_calendly_scheduled_events(http: httpx.Client, headers: dict, user_uri
         page_token = pagination.get("next_page_token")
         if not batch or not page_token:
             break
+
+    return events
+
+
+def _fetch_calendly_scheduled_events(http: httpx.Client, headers: dict, user_uri: str) -> List[dict]:
+    """
+    Fetch future and past scheduled_events in separate windows/page budgets, so a
+    high-volume past (sorted ascending from -365d) never starves out upcoming events
+    before the page cap is hit.
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    future_events = _fetch_calendly_scheduled_events_window(
+        http,
+        headers,
+        user_uri,
+        min_start=format_calendly_api_time(now_utc - timedelta(minutes=5)),
+        max_start=format_calendly_api_time(now_utc + timedelta(days=365)),
+        sort="start_time:asc",
+        max_pages=15,
+        label="future",
+    )
+    past_events = _fetch_calendly_scheduled_events_window(
+        http,
+        headers,
+        user_uri,
+        min_start=format_calendly_api_time(now_utc - timedelta(days=365)),
+        max_start=format_calendly_api_time(now_utc - timedelta(minutes=5)),
+        sort="start_time:desc",
+        max_pages=15,
+        label="past",
+    )
+
+    seen_uris = set()
+    events: List[dict] = []
+    for event in future_events + past_events:
+        uri = event.get("uri")
+        if uri and uri in seen_uris:
+            continue
+        if uri:
+            seen_uris.add(uri)
+        events.append(event)
 
     return events
 
