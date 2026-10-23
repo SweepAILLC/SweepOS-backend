@@ -11,22 +11,23 @@ Default arguments reproduce POST /funnels/leads exactly. GHL callers pass
 - Re-attribution: a client with no funnel and no recorded opt-in (typically made
   by the manual GHL contact sync or by a booking webhook before the opt-in
   arrived) is tagged to this funnel. Anyone already tagged keeps first touch.
-- Idempotent per funnel: once a client has prospect metadata recorded for this
-  funnel (``meta.prospect.funnel_id``), any further arrival — a retried
-  webhook delivery, the GHL reconcile pull, or a legitimate partial/staged
-  form submission as the visitor completes more of a multi-step funnel —
-  only merges answers/UTM; it never moves the opt-in date or re-queues the
-  lead notification. The dedupe key is ``meta.prospect.funnel_id`` (stamped
-  by every capture, public endpoint included), not ``opted_in_at``/timestamp,
-  so this holds for POST /funnels/leads directly as well as the GHL/webhook
-  paths.
+- Idempotent per funnel within a short window: once a client has prospect
+  metadata recorded for this funnel (``meta.prospect.funnel_id``), a further
+  arrival within _DUPLICATE_SUBMISSION_WINDOW — a retried webhook delivery,
+  the GHL reconcile pull, or a legitimate partial/staged form submission as
+  the visitor completes more of a multi-step funnel — only merges
+  answers/UTM; it never moves the opt-in date or re-queues the lead
+  notification. An arrival for the same funnel outside that window is a
+  genuine returning-lead opt-in: it does move the captured-at timestamp and
+  does queue a notification. This holds for POST /funnels/leads directly as
+  well as the GHL/webhook paths.
 """
 from __future__ import annotations
 
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, status
@@ -52,7 +53,10 @@ class FunnelLeadResult:
     created: bool
     # True when this call set source_funnel_id (new client or re-attribution).
     tagged_now: bool = False
-    # True when the client had already opted in to this funnel (no notification sent).
+    # True when this arrival is the same submission re-delivered within
+    # _DUPLICATE_SUBMISSION_WINDOW of a prior capture for this funnel (no
+    # notification sent). A later, genuine returning-lead opt-in outside that
+    # window is NOT a duplicate.
     duplicate: bool = False
 
 
@@ -117,8 +121,18 @@ def _apply_prospect_meta(
     flag_modified(client, "meta")
 
 
-def _already_captured_for_funnel(client: Client, funnel: Funnel) -> bool:
-    """True once this client already has prospect metadata for this exact funnel.
+# How close two arrivals for the same funnel have to land to count as the same
+# underlying submission (retried webhook, GHL reconcile pull, or a multi-step
+# partial form resending with more answers filled in) rather than a genuine
+# later opt-in. Without this bound, a lead who already captured for this funnel
+# once reads as a duplicate forever, so a real returning opt-in weeks or months
+# later silently drops its notification even though the capture itself
+# succeeds — that's the funnel-opt-in/Discord-notify bug this guards against.
+_DUPLICATE_SUBMISSION_WINDOW = timedelta(hours=24)
+
+
+def _already_captured_for_funnel(client: Client, funnel: Funnel, captured_at: datetime) -> bool:
+    """True when this arrival is the same submission as a recent one for this exact funnel.
 
     Set by every prior call to ``_apply_prospect_meta`` for this {client, funnel}
     pair, regardless of which caller made it (public endpoint, GHL webhook, or
@@ -127,9 +141,22 @@ def _already_captured_for_funnel(client: Client, funnel: Funnel) -> bool:
     ``source_funnel_id``/``opted_in_at``, which track first-touch *attribution*
     (locked to the client's first funnel ever) and can diverge from "has this
     exact funnel already captured this client."
+
+    Bounded by _DUPLICATE_SUBMISSION_WINDOW: an arrival for the same funnel
+    well outside that window (no ``captured_at`` on record counts as outside)
+    is a genuine returning-lead opt-in, not the same submission re-delivered.
     """
     prospect = client.meta.get("prospect") if isinstance(client.meta, dict) else None
-    return isinstance(prospect, dict) and prospect.get("funnel_id") == str(funnel.id)
+    if not isinstance(prospect, dict) or prospect.get("funnel_id") != str(funnel.id):
+        return False
+    prev_captured_raw = prospect.get("captured_at")
+    if not isinstance(prev_captured_raw, str):
+        return False
+    try:
+        prev_captured = datetime.fromisoformat(prev_captured_raw)
+    except ValueError:
+        return False
+    return abs(_to_naive_utc(captured_at) - _to_naive_utc(prev_captured)) <= _DUPLICATE_SUBMISSION_WINDOW
 
 
 def _can_reattribute(client: Client) -> bool:
@@ -194,7 +221,7 @@ def upsert_funnel_lead(
         # Computed before _apply_prospect_meta below overwrites meta.prospect,
         # so this reads the PRIOR capture's funnel_id, not the one we're about
         # to stamp for this arrival.
-        duplicate = _already_captured_for_funnel(client, funnel)
+        duplicate = _already_captured_for_funnel(client, funnel, captured_at)
 
         if first_name is not None and first_name:
             client.first_name = first_name

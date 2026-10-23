@@ -4,7 +4,7 @@ Lookups, lifecycle, cache and notification side effects are patched so each
 test pins one attribution rule."""
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -223,6 +223,30 @@ class TestGhlOptions:
         assert existing.meta["prospect"]["captured_at"] == first_capture
         assert existing.meta["prospect"]["opt_in_data"] == {"goal": "scale"}
         assert existing.meta["prospect"]["utm"] == {"source": "facebook"}
+
+    def test_returning_lead_outside_dedupe_window_is_not_duplicate_and_notifies(self):
+        # A real returning opt-in weeks later must not be swallowed as the same
+        # submission re-delivered by the webhook/reconcile-pull pair.
+        f = _funnel()
+        first_capture = "2026-09-14T16:30:00+00:00"
+        existing = _client(
+            source_channel="paid",
+            source_funnel_id=f.id,
+            opted_in_at=OPTED,
+            meta={"ghl_contact_id": "ghl_5", "prospect": {"funnel_id": str(f.id), "captured_at": first_capture}},
+        )
+        much_later = OPTED + timedelta(days=30)
+        with _env(by_ghl=existing) as notify:
+            r = fl.upsert_funnel_lead(
+                MagicMock(),
+                f,
+                _lead(f),
+                ghl_contact_id="ghl_5",
+                opted_in_at=much_later,
+            )
+        assert not r.duplicate
+        notify.assert_called_once()
+        assert existing.meta["prospect"]["captured_at"] == much_later.isoformat()
 
     def test_notify_false_suppresses_notification(self):
         f = _funnel()
