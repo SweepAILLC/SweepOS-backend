@@ -316,6 +316,11 @@ class FunnelDashboardTracking(BaseModel):
     errors_24h: int = 0
 
 
+class FunnelDashboardVslWatch(BaseModel):
+    avg_seconds: float
+    sessions: int
+
+
 class FunnelDashboardMoney(BaseModel):
     has_spend: bool
     spend_usd: float
@@ -350,6 +355,7 @@ class FunnelDashboardResponse(BaseModel):
     funnel_id: Optional[UUID] = None
     tracking: FunnelDashboardTracking
     visitors: Optional[int] = None
+    vsl_watch: Optional[FunnelDashboardVslWatch] = None
     summary: "KpiFunnelSummaryResponse"
     money: Optional[FunnelDashboardMoney] = None
     weekly: List[FunnelDashboardWeek]

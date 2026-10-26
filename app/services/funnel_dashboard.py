@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import cast, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from app.models.client import Client
@@ -213,6 +214,58 @@ def _utm_sources(
     return out
 
 
+def _vsl_watch_time(
+    db: Session,
+    org_id: uuid.UUID,
+    scope_funnel_ids: Set[uuid.UUID],
+    window_start: date,
+    window_end: date,
+) -> Optional[Dict[str, Any]]:
+    """
+    Avg VSL/video watch time per watch session in this window. Identifies video events
+    by the `watched_seconds` metadata key (written by every event the video-tracking
+    snippet sends — play/milestones/heartbeat/complete) rather than by `event_name`,
+    since the prefix is coach-configurable per funnel. One watch session = one
+    session_id (fallback visitor_id); `watched_seconds` only grows within a session,
+    so the max value seen is that session's total watch time. Returns None when no
+    funnel in scope has the video snippet installed, so the UI can hide the stat
+    instead of showing a misleading 0:00.
+    """
+    if not scope_funnel_ids:
+        return None
+    start = datetime.combine(window_start, time.min)
+    end = datetime.combine(window_end, time.max)
+    rows = (
+        db.query(Event.session_id, Event.visitor_id, Event.event_metadata)
+        .filter(
+            Event.org_id == org_id,
+            Event.funnel_id.in_(list(scope_funnel_ids)),
+            Event.occurred_at >= start,
+            Event.occurred_at <= end,
+            cast(Event.event_metadata, JSONB).has_key("watched_seconds"),
+        )
+        .all()
+    )
+    best: Dict[str, float] = {}
+    for session_id, visitor_id, meta in rows:
+        key = session_id or visitor_id
+        if not key or not isinstance(meta, dict):
+            continue
+        try:
+            seconds = float(meta.get("watched_seconds") or 0)
+        except (TypeError, ValueError):
+            continue
+        if seconds > best.get(key, 0.0):
+            best[key] = seconds
+    if not best:
+        return None
+    sessions = len(best)
+    return {
+        "avg_seconds": round(sum(best.values()) / sessions, 1),
+        "sessions": sessions,
+    }
+
+
 def _weekly_from_scorecard(
     weeks: List[date], values: Dict[str, List[Optional[float]]]
 ) -> List[Dict[str, Any]]:
@@ -322,6 +375,7 @@ def compute_funnel_dashboard(
         "tracking": _tracking_status(db, scope_funnel_ids, now),
         # Organic has no landing page, so visitors only exist for paid/funnel scope.
         "visitors": None if channel == "organic" else int(sum(v or 0 for v in sc_values["visitors"])),
+        "vsl_watch": _vsl_watch_time(db, org_id, scope_funnel_ids, window_start, window_end),
         "summary": summary,
         "money": money,
         "weekly": _weekly_from_scorecard(sc_weeks, weekly_values),
