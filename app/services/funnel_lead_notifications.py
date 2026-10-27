@@ -266,8 +266,14 @@ def enqueue_funnel_lead_notification(
                 ]
                 if value
             ]
+            opt_in_data = getattr(lead, "opt_in_data", None)
+            if isinstance(opt_in_data, dict):
+                # "notes" is a free-text field some form tools auto-fill with a
+                # restatement of every quiz answer already sent below, structured —
+                # drop it here so each answer shows once instead of twice.
+                opt_in_data = {k: v for k, v in opt_in_data.items() if str(k).strip().lower() != "notes"}
             fields.extend(discord_notify.flatten_discord_fields("UTM", getattr(lead, "utm", None)))
-            fields.extend(discord_notify.flatten_discord_fields("Opt-in", getattr(lead, "opt_in_data", None)))
+            fields.extend(discord_notify.flatten_discord_fields("Opt-in", opt_in_data))
             fields.extend(discord_notify.flatten_discord_fields("Quiz", getattr(lead, "quiz_answers", None)))
             fields = fields[:25]  # Discord embed field cap
             discord_notify.send_discord_event_background(
