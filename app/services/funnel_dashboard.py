@@ -8,6 +8,7 @@ tracking-status dot.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
@@ -214,40 +215,30 @@ def _utm_sources(
     return out
 
 
-def _vsl_watch_time(
-    db: Session,
-    org_id: uuid.UUID,
-    scope_funnel_ids: Set[uuid.UUID],
-    window_start: date,
-    window_end: date,
-) -> Optional[Dict[str, Any]]:
+VIDEO_EVENT_SUFFIX_RE = re.compile(
+    r"_(?:play|pause|watch_heartbeat|complete|25|50|75|90|100)$",
+    re.IGNORECASE,
+)
+
+
+def is_video_tracking_event_name(event_name: Optional[str]) -> bool:
+    """True for snippet events (video_play, vsl_50, …). Those are KPIs, not funnel steps."""
+    if not event_name or not isinstance(event_name, str):
+        return False
+    return VIDEO_EVENT_SUFFIX_RE.search(event_name.strip()) is not None
+
+
+def summarize_vsl_watch(rows, visitors: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Aggregate avg watch time + play rate from video-snippet event rows.
+
+    rows: (session_id, visitor_id, event_name, event_metadata)
     """
-    Avg VSL/video watch time per watch session in this window. Identifies video events
-    by the `watched_seconds` metadata key (written by every event the video-tracking
-    snippet sends — play/milestones/heartbeat/complete) rather than by `event_name`,
-    since the prefix is coach-configurable per funnel. One watch session = one
-    session_id (fallback visitor_id); `watched_seconds` only grows within a session,
-    so the max value seen is that session's total watch time. Returns None when no
-    funnel in scope has the video snippet installed, so the UI can hide the stat
-    instead of showing a misleading 0:00.
-    """
-    if not scope_funnel_ids:
-        return None
-    start = datetime.combine(window_start, time.min)
-    end = datetime.combine(window_end, time.max)
-    rows = (
-        db.query(Event.session_id, Event.visitor_id, Event.event_metadata)
-        .filter(
-            Event.org_id == org_id,
-            Event.funnel_id.in_(list(scope_funnel_ids)),
-            Event.occurred_at >= start,
-            Event.occurred_at <= end,
-            cast(Event.event_metadata, JSONB).has_key("watched_seconds"),
-        )
-        .all()
-    )
     best: Dict[str, float] = {}
-    for session_id, visitor_id, meta in rows:
+    play_keys: set = set()
+    for row in rows:
+        if not isinstance(row, (tuple, list)) or len(row) < 4:
+            continue
+        session_id, visitor_id, event_name, meta = row[0], row[1], row[2], row[3]
         key = session_id or visitor_id
         if not key or not isinstance(meta, dict):
             continue
@@ -257,13 +248,56 @@ def _vsl_watch_time(
             continue
         if seconds > best.get(key, 0.0):
             best[key] = seconds
-    if not best:
+        name = str(event_name or "")
+        if name.lower().endswith("_play"):
+            play_keys.add(key)
+    if not best and not play_keys:
         return None
-    sessions = len(best)
+    sessions = len(best) if best else len(play_keys)
+    plays = len(play_keys) if play_keys else sessions
+    play_rate = None
+    if visitors and visitors > 0:
+        play_rate = round(min(plays / float(visitors), 1.0), 4)
+    avg = round(sum(best.values()) / len(best), 1) if best else 0.0
     return {
-        "avg_seconds": round(sum(best.values()) / sessions, 1),
+        "avg_seconds": avg,
         "sessions": sessions,
+        "plays": plays,
+        "play_rate": play_rate,
     }
+
+
+def _vsl_watch_time(
+    db: Session,
+    org_id: uuid.UUID,
+    scope_funnel_ids: Set[uuid.UUID],
+    window_start: date,
+    window_end: date,
+    visitors: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Avg VSL/video watch time and play rate for this window. Identifies video events
+    by the `watched_seconds` metadata key (written by every event the video-tracking
+    snippet sends) rather than by `event_name`, since the prefix is coach-configurable.
+    Play rate is unique play sessions / landing visitors. Returns None when no
+    funnel in scope has the video snippet installed, so the UI can hide the stat.
+    """
+    if not scope_funnel_ids:
+        return None
+    start = datetime.combine(window_start, time.min)
+    end = datetime.combine(window_end, time.max)
+    rows = (
+        db.query(Event.session_id, Event.visitor_id, Event.event_name, Event.event_metadata)
+        .filter(
+            Event.org_id == org_id,
+            Event.funnel_id.in_(list(scope_funnel_ids)),
+            Event.occurred_at >= start,
+            Event.occurred_at <= end,
+            cast(Event.event_metadata, JSONB).has_key("watched_seconds"),
+        )
+        .all()
+    )
+    return summarize_vsl_watch(rows, visitors)
 
 
 def _weekly_from_scorecard(
@@ -367,6 +401,7 @@ def compute_funnel_dashboard(
             "profit_usd": round(paid_cash - spend, 2) if has_spend else None,
         }
 
+    visitors = None if channel == "organic" else int(sum(v or 0 for v in sc_values["visitors"]))
     return {
         "window_start": window_start,
         "window_end": window_end,
@@ -374,8 +409,10 @@ def compute_funnel_dashboard(
         "funnel_id": funnel_id,
         "tracking": _tracking_status(db, scope_funnel_ids, now),
         # Organic has no landing page, so visitors only exist for paid/funnel scope.
-        "visitors": None if channel == "organic" else int(sum(v or 0 for v in sc_values["visitors"])),
-        "vsl_watch": _vsl_watch_time(db, org_id, scope_funnel_ids, window_start, window_end),
+        "visitors": visitors,
+        "vsl_watch": _vsl_watch_time(
+            db, org_id, scope_funnel_ids, window_start, window_end, visitors
+        ),
         "summary": summary,
         "money": money,
         "weekly": _weekly_from_scorecard(sc_weeks, weekly_values),

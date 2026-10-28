@@ -2,6 +2,7 @@
 from types import SimpleNamespace
 
 from app.api.funnels import build_step_counts
+from app.services.funnel_dashboard import is_video_tracking_event_name
 
 
 def _step(order, event_name, label=None):
@@ -10,7 +11,7 @@ def _step(order, event_name, label=None):
 
 STEPS = [
     _step(1, "page_view", "Landing"),
-    _step(2, "vsl_play", "Watched VSL"),
+    _step(2, "quiz_start", "Started quiz"),
     _step(3, "form_submit", "Applied"),
 ]
 
@@ -18,7 +19,7 @@ STEPS = [
 def test_counts_and_rates_from_previous_step():
     rows = build_step_counts(
         STEPS,
-        {"page_view": (500, 400), "vsl_play": (300, 200), "form_submit": (60, 50)},
+        {"page_view": (500, 400), "quiz_start": (300, 200), "form_submit": (60, 50)},
     )
     assert [r.count for r in rows] == [500, 300, 60]
     assert [r.unique_visitors for r in rows] == [400, 200, 50]
@@ -48,6 +49,29 @@ def test_labels_and_order_pass_through():
     rows = build_step_counts(STEPS, {})
     assert [(r.step_order, r.label, r.event_name) for r in rows] == [
         (1, "Landing", "page_view"),
-        (2, "Watched VSL", "vsl_play"),
+        (2, "Started quiz", "quiz_start"),
         (3, "Applied", "form_submit"),
     ]
+
+
+def test_video_tracking_names_are_detected():
+    assert is_video_tracking_event_name("vsl_play")
+    assert is_video_tracking_event_name("video_watch_heartbeat")
+    assert is_video_tracking_event_name("video_50")
+    assert not is_video_tracking_event_name("form_submit")
+    assert not is_video_tracking_event_name("page_view")
+
+
+def test_video_steps_are_omitted_from_dropoff():
+    steps = [
+        _step(1, "page_view", "Landing"),
+        _step(2, "vsl_play", "Watched VSL"),
+        _step(3, "video_50", "50%"),
+        _step(4, "form_submit", "Applied"),
+    ]
+    rows = build_step_counts(
+        steps,
+        {"page_view": (100, 80), "vsl_play": (70, 50), "video_50": (40, 30), "form_submit": (20, 16)},
+    )
+    assert [r.event_name for r in rows] == ["page_view", "form_submit"]
+    assert rows[1].unique_conversion_rate == 20.0  # 16 / 80, skipping video in between

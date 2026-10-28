@@ -48,6 +48,7 @@ from app.schemas.funnel import (
     FunnelDashboardResponse,
 )
 from sqlalchemy.orm.attributes import flag_modified
+from app.services.funnel_dashboard import is_video_tracking_event_name
 
 router = APIRouter()
 
@@ -1348,13 +1349,15 @@ def _pct(n: int, d: Optional[int]) -> Optional[float]:
 def build_step_counts(steps: List[Any], totals: dict) -> List[StepCount]:
     """Ordered steps + {event_name: (events, unique_visitors)} → StepCount rows.
 
-    Rates compare each step with the previous one: `conversion_rate` on raw events
+    Video/VSL snippet events (play, pause, % milestones, heartbeat, complete) are omitted — those are dashboard KPIs, not funnel steps. Rates compare each remaining step with the previous one: `conversion_rate` on raw events
     (unchanged contract), `unique_conversion_rate` on distinct visitors.
     """
     out: List[StepCount] = []
     prev_events: Optional[int] = None
     prev_uniques: Optional[int] = None
     for step in steps:
+        if is_video_tracking_event_name(getattr(step, "event_name", None)):
+            continue
         events, uniques = totals.get(step.event_name, (0, 0))
         out.append(StepCount(
             step_order=step.step_order,

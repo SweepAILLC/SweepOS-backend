@@ -185,3 +185,28 @@ def test_no_spend_leaves_ratios_empty():
     m = out["money"]
     assert m["has_spend"] is False
     assert (m["cpl_usd"], m["cac_usd"], m["roas"], m["profit_usd"]) == (None, None, None, None)
+
+
+
+def test_summarize_vsl_watch_avg_and_play_rate():
+    rows = [
+        ("s1", "v1", "vsl_play", {"watched_seconds": 10}),
+        ("s1", "v1", "vsl_watch_heartbeat", {"watched_seconds": 45}),
+        ("s2", "v2", "vsl_play", {"watched_seconds": 5}),
+        ("s2", "v2", "vsl_watch_heartbeat", {"watched_seconds": 15}),
+    ]
+    out = fd.summarize_vsl_watch(rows, visitors=10)
+    assert out["sessions"] == 2
+    assert out["plays"] == 2
+    assert out["avg_seconds"] == 30.0
+    assert out["play_rate"] == 0.2
+
+
+def test_summarize_vsl_watch_caps_play_rate_at_one():
+    rows = [("s1", "v1", "video_play", {"watched_seconds": 12})]
+    out = fd.summarize_vsl_watch(rows, visitors=1)
+    assert out["play_rate"] == 1.0
+
+
+def test_summarize_vsl_watch_empty_is_none():
+    assert fd.summarize_vsl_watch([], visitors=10) is None

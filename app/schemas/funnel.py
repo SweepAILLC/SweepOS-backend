@@ -319,6 +319,8 @@ class FunnelDashboardTracking(BaseModel):
 class FunnelDashboardVslWatch(BaseModel):
     avg_seconds: float
     sessions: int
+    plays: int = 0
+    play_rate: Optional[float] = None  # fraction 0–1; unique plays / visitors
 
 
 class FunnelDashboardMoney(BaseModel):
