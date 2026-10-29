@@ -81,6 +81,34 @@ def _require_content_studio(db: Session, user: User) -> None:
         )
 
 
+def _sync_single_campaign_on_demand(db: Session, org_id: uuid.UUID, meta_campaign_id: str):
+    """Fetch one campaign live from Meta and upsert its row, for the case
+    where the UI's live campaign list shows a campaign the periodic sync
+    hasn't written to MetaCampaign yet."""
+    from app.services.meta_ads_sync_service import _get_or_create_ad_account, _upsert_campaign
+
+    token = mac.get_meta_ads_token(db, org_id)
+    if token is None or not token.account_id:
+        return None
+    try:
+        access_token = decrypt_token(token.access_token)
+        campaigns = mac.list_campaigns(ad_account_id=token.account_id, token=access_token)
+    except Exception:
+        logger.exception(
+            "meta_ads funnel-link: on-demand list_campaigns failed org=%s campaign=%s", org_id, meta_campaign_id
+        )
+        return None
+    raw = next((c for c in campaigns if str(c.get("id")) == meta_campaign_id), None)
+    if raw is None:
+        return None
+    ad_account = _get_or_create_ad_account(
+        db, org_id, meta_ad_account_id=token.account_id, account_name=None, currency=None
+    )
+    campaign = _upsert_campaign(db, org_id, ad_account.id, raw)
+    db.flush()
+    return campaign
+
+
 def _callback_url() -> str:
     base = (settings.BACKEND_PUBLIC_URL or "http://localhost:8000").rstrip("/")
     return f"{base}/marketing-intel/ads/callback"
@@ -584,6 +612,11 @@ def set_campaign_funnel_link(
         .filter(MetaCampaign.org_id == org_id, MetaCampaign.meta_campaign_id == meta_campaign_id)
         .first()
     )
+    if campaign is None:
+        # Not synced yet — the link checkbox list comes from a live Graph API
+        # call, which can show a campaign before the periodic sync has
+        # written its row. Upsert it on demand instead of 404ing.
+        campaign = _sync_single_campaign_on_demand(db, org_id, meta_campaign_id)
     if campaign is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
