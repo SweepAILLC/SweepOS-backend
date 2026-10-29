@@ -137,6 +137,7 @@ def _dispatcher_loop() -> None:
         threading.Thread(target=_target, daemon=True, name=f"{name}-catchup").start()
 
     last_instagram_sync = 0.0
+    last_meta_ads_sync = 0.0
     # 0.0 so the first tick after boot runs it — a deploy applies the rule immediately.
     last_follow_up_sweep = 0.0
     follow_up_sweep_interval = float(
@@ -160,6 +161,14 @@ def _dispatcher_loop() -> None:
     if instagram_sync_check_interval <= 0:
         instagram_sync_check_interval = float(
             getattr(settings, "INSTAGRAM_SYNC_INTERVAL_SEC", 86400) or 86400
+        )
+    # Check hourly for due orgs; per-org freshness still uses META_ADS_SYNC_INTERVAL_SEC.
+    meta_ads_sync_check_interval = float(
+        getattr(settings, "META_ADS_SYNC_CHECK_INTERVAL_SEC", 3600) or 3600
+    )
+    if meta_ads_sync_check_interval <= 0:
+        meta_ads_sync_check_interval = float(
+            getattr(settings, "META_ADS_SYNC_INTERVAL_SEC", 86400) or 86400
         )
     while not _SHUTDOWN:
         loop_started = time.time()
@@ -300,6 +309,31 @@ def _dispatcher_loop() -> None:
                     except Exception:
                         LOG.exception("instagram sync enqueue failed")
                     last_instagram_sync = now
+                if (
+                    meta_ads_sync_check_interval > 0
+                    and now - last_meta_ads_sync >= meta_ads_sync_check_interval
+                ):
+                    try:
+                        from app.long_jobs import schedule_background_work
+                        from app.services.meta_ads_sync_service import sync_meta_ads_all_orgs_job
+
+                        # Offload so the automation dispatcher tick is never blocked by Composio.
+                        schedule_background_work(
+                            sync_meta_ads_all_orgs_job,
+                            None,
+                            prefer_rq=True,
+                            job_timeout=max(
+                                900,
+                                int(getattr(settings, "META_ADS_SYNC_BUDGET_SEC", 120) or 120) * 20,
+                            ),
+                        )
+                        LOG.info(
+                            "meta_ads sync check enqueued (check_interval=%ss)",
+                            int(meta_ads_sync_check_interval),
+                        )
+                    except Exception:
+                        LOG.exception("meta_ads sync enqueue failed")
+                    last_meta_ads_sync = now
                 if attempted:
                     LOG.info("dispatcher: processed %d job(s)", attempted)
         except Exception:

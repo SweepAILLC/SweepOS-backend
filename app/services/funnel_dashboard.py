@@ -336,6 +336,7 @@ def compute_funnel_dashboard(
     now: Optional[datetime] = None,
     compare: Optional[Tuple[date, date]] = None,
     utm_group_by: str = "source",
+    campaign_meta_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Whole Funnels dashboard in one call. `channel` None/"all" | "organic" | "paid";
@@ -419,6 +420,15 @@ def compute_funnel_dashboard(
         "sources": _utm_sources(db, org_id, facts, group_by=utm_group_by),
         # Sheet-style scorecard: last full week vs the average week in range.
         "scorecard": compute_scorecard(
-            db, org_id, window_start, window_end, channel, funnel_id, scope_funnel_ids, today=now.date(), compare=compare
+            db,
+            org_id,
+            window_start,
+            window_end,
+            channel,
+            funnel_id,
+            scope_funnel_ids,
+            today=now.date(),
+            compare=compare,
+            campaign_meta_id=campaign_meta_id,
         ),
     }

@@ -37,6 +37,7 @@ from app.models.client_checkin import ClientCheckIn
 from app.models.event import Event
 from app.models.funnel_ad_spend import FunnelAdSpend
 from app.models.funnel_scorecard_override import FunnelScorecardOverride
+from app.models.meta_ad_insight_daily import MetaAdInsightDaily
 from app.services.kpi_integration_sync import FunnelFacts, collect_funnel_facts, count_sales_calls
 
 
@@ -285,6 +286,7 @@ def _week_bases(
     funnel_id: Optional[uuid.UUID],
     *,
     include_ads: bool,
+    campaign_meta_id: Optional[str] = None,
 ) -> Dict[date, WeekBase]:
     bases = {wk: WeekBase() for wk in weeks}
     if not weeks:
@@ -297,23 +299,47 @@ def _week_bases(
         return bases.get(_monday(d))
 
     if include_ads:
-        q = db.query(FunnelAdSpend).filter(
-            FunnelAdSpend.org_id == org_id,
-            FunnelAdSpend.week_start >= first,
-            FunnelAdSpend.week_start <= weeks[-1],
-        )
-        if funnel_id is not None:
-            q = q.filter(FunnelAdSpend.funnel_id == funnel_id)
-        for row in q.all():
-            b = bases.get(row.week_start)
-            if not b:
-                continue
-            b.has_spend_row = True
-            b.spend += (row.amount_cents or 0) / 100.0
-            if row.ads_deployed is not None:
-                b.ads_deployed = (b.ads_deployed or 0) + row.ads_deployed
-            if row.angles_deployed is not None:
-                b.angles_deployed = (b.angles_deployed or 0) + row.angles_deployed
+        if campaign_meta_id is not None:
+            # Toggled to one specific linked campaign: spend comes live from
+            # that campaign's synced insights (same source the creative grid
+            # below reads), not the funnel-wide FunnelAdSpend total — there's
+            # no per-campaign breakdown stored there. ads_deployed/angles_deployed
+            # stay unset in this scoped view; they're funnel-wide counts, not
+            # meaningfully split by one campaign.
+            for row in (
+                db.query(MetaAdInsightDaily)
+                .filter(
+                    MetaAdInsightDaily.org_id == org_id,
+                    MetaAdInsightDaily.level == "campaign",
+                    MetaAdInsightDaily.entity_id == campaign_meta_id,
+                    MetaAdInsightDaily.date >= first,
+                    MetaAdInsightDaily.date <= last_end,
+                )
+                .all()
+            ):
+                b = _b(row.date)
+                if not b:
+                    continue
+                b.has_spend_row = True
+                b.spend += (row.spend_cents or 0) / 100.0
+        else:
+            q = db.query(FunnelAdSpend).filter(
+                FunnelAdSpend.org_id == org_id,
+                FunnelAdSpend.week_start >= first,
+                FunnelAdSpend.week_start <= weeks[-1],
+            )
+            if funnel_id is not None:
+                q = q.filter(FunnelAdSpend.funnel_id == funnel_id)
+            for row in q.all():
+                b = bases.get(row.week_start)
+                if not b:
+                    continue
+                b.has_spend_row = True
+                b.spend += (row.amount_cents or 0) / 100.0
+                if row.ads_deployed is not None:
+                    b.ads_deployed = (b.ads_deployed or 0) + row.ads_deployed
+                if row.angles_deployed is not None:
+                    b.angles_deployed = (b.angles_deployed or 0) + row.angles_deployed
 
         if funnel_ids:
             week_col = func.date_trunc("week", Event.occurred_at)
@@ -389,29 +415,40 @@ def weekly_metric_values(
     funnel_ids: Set[uuid.UUID],
     *,
     include_ads: bool,
+    campaign_meta_id: Optional[str] = None,
 ) -> Tuple[Dict[str, List[Optional[float]]], Dict[Tuple[date, str], Optional[float]]]:
     """
     Override-applied value of every sheet metric for each week in `weeks` — the same
     bases/overrides machinery compute_scorecard renders into the grid. Shared with the
     rest of the Funnels dashboard (the trend graphs, the stage totals) so a hand-edited
     scorecard cell is reflected everywhere that number appears, not just the grid.
+
+    `campaign_meta_id` narrows `ad_spend` to one of the funnel's linked campaigns
+    (the aggregate table's campaign toggle) instead of the funnel-wide total —
+    overrides don't apply to that row in this scoped mode, since
+    FunnelScorecardOverride has no per-campaign dimension.
     """
     if not weeks:
         return {m.key: [] for m in METRICS}, {}
     span_start, span_end = weeks[0], weeks[-1] + timedelta(days=6)
     facts = collect_funnel_facts(db, org_id, span_start, span_end, channel, funnel_id)
-    bases = _week_bases(db, org_id, weeks, facts, funnel_ids, funnel_id, include_ads=include_ads)
+    bases = _week_bases(
+        db, org_id, weeks, facts, funnel_ids, funnel_id, include_ads=include_ads, campaign_meta_id=campaign_meta_id
+    )
     overrides = load_overrides(db, org_id, funnel_id, channel, weeks[0], weeks[-1])
-    replaced = apply_overrides(bases, overrides)
+    replaced = apply_overrides(bases, overrides) if campaign_meta_id is None else {}
     # Economics rows follow the dashboard's money rule: with channel "all", spend is
     # only divided against paid leads/bookings/closes/cash, never organic ones.
     econ_bases = bases
     if channel is None and funnel_id is None:
         paid_facts = collect_funnel_facts(db, org_id, span_start, span_end, "paid", None)
-        econ_bases = _week_bases(db, org_id, weeks, paid_facts, funnel_ids, None, include_ads=True)
+        econ_bases = _week_bases(
+            db, org_id, weeks, paid_facts, funnel_ids, None, include_ads=True, campaign_meta_id=campaign_meta_id
+        )
         # Spend is shared; edited lead/close/cash counts in this view include organic,
         # so the paid-only economics bases keep their computed counts.
-        apply_overrides(econ_bases, overrides, keys={"ad_spend"})
+        if campaign_meta_id is None:
+            apply_overrides(econ_bases, overrides, keys={"ad_spend"})
     values = {
         m.key: [m.compute((econ_bases if m.group == "economics" else bases)[wk]) for wk in weeks] for m in METRICS
     }
@@ -429,6 +466,7 @@ def compute_scorecard(
     *,
     today: Optional[date] = None,
     compare: Optional[Tuple[date, date]] = None,
+    campaign_meta_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Every sheet metric for every week in range (the grid), plus its benchmark: the
@@ -436,6 +474,10 @@ def compute_scorecard(
     progress or complete) or hand-edited ahead of time — skipping only a future,
     never-touched week. Or, when the shared date-range filter has compare on,
     across the weeks of the compare range (same rule).
+
+    `campaign_meta_id`: the aggregate table's campaign toggle — narrows `ad_spend`
+    to one of the funnel's linked campaigns instead of the funnel-wide total. See
+    weekly_metric_values/_week_bases.
     """
     today = today or datetime.now(timezone.utc).date()
     weeks = scorecard_weeks(window_start, window_end)
@@ -445,7 +487,9 @@ def compute_scorecard(
     not_started = [week_not_started(wk, today) for wk in weeks]
     show_ads = channel != "organic"
 
-    current, replaced = weekly_metric_values(db, org_id, weeks, channel, funnel_id, funnel_ids, include_ads=show_ads)
+    current, replaced = weekly_metric_values(
+        db, org_id, weeks, channel, funnel_id, funnel_ids, include_ads=show_ads, campaign_meta_id=campaign_meta_id
+    )
     override_sources = load_override_sources(db, org_id, funnel_id, channel, weeks[0], weeks[-1])
     overridden_weeks = {wk for (wk, _key) in replaced}
     # A column counts toward the average once it has real data: it has started
@@ -457,7 +501,7 @@ def compute_scorecard(
     baseline_include: List[bool] = []
     if compare_weeks:
         baseline, baseline_replaced = weekly_metric_values(
-            db, org_id, compare_weeks, channel, funnel_id, funnel_ids, include_ads=show_ads
+            db, org_id, compare_weeks, channel, funnel_id, funnel_ids, include_ads=show_ads, campaign_meta_id=campaign_meta_id
         )
         baseline_overridden_weeks = {wk for (wk, _key) in baseline_replaced}
         baseline_not_started = [week_not_started(wk, today) for wk in compare_weeks]

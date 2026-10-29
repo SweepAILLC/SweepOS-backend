@@ -17,6 +17,11 @@ class OAuthProvider(str, enum.Enum):
     COMPOSIO = "composio"
     DISCORD = "discord"
     GHL = "ghl"
+    # Direct Meta Marketing API connection (no Composio) — access_token is the
+    # org's long-lived user token or Business Manager System User token,
+    # account_id is the selected act_<id> ad account. See
+    # docs/features/META_ADS_PERFORMANCE_PRD.md.
+    META_ADS = "meta_ads"
 
 
 class OAuthToken(Base):

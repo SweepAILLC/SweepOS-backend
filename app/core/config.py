@@ -123,6 +123,39 @@ class Settings(BaseSettings):
     # Manual Sync sliding-window rate limit.
     INSTAGRAM_MANUAL_SYNC_MAX_PER_HOUR: int = 3
 
+    # Shared Meta Business app id/secret (currently doubles as the Instagram
+    # Login app too — see META_ADS_APP_ID below for the Ads-specific override).
+    META_APP_ID: Optional[str] = None
+    META_APP_SECRET: Optional[str] = None
+
+    # Meta Ads Performance Intel — direct Graph/Marketing API (no Composio).
+    # Falls back to META_APP_ID/SECRET above if unset — same app for now;
+    # split with its own values here once Ads gets a dedicated Meta app. See
+    # docs/features/META_ADS_PERFORMANCE_PRD.md "Core constraint".
+    META_ADS_APP_ID: Optional[str] = None
+    META_ADS_APP_SECRET: Optional[str] = None
+    META_ADS_API_VERSION: str = "v26.0"
+    # Required because this app uses "Facebook Login for Business" (not classic
+    # Facebook Login) — find under App Dashboard -> Facebook Login for Business
+    # -> Configurations. Without it the OAuth dialog rejects redirect_uri even
+    # when it's correctly whitelisted.
+    META_ADS_LOGIN_CONFIG_ID: Optional[str] = None
+    # Lead capture (leads_retrieval/pages_*) was removed — only performance +
+    # create/manage ads scopes remain.
+    META_ADS_OAUTH_SCOPES: str = "ads_management,ads_read,business_management"
+    META_ADS_SYNC_INTERVAL_SEC: int = 86400  # orgs older than this are due for sync
+    META_ADS_SYNC_CHECK_INTERVAL_SEC: int = 3600
+    # Soft wall-clock budget per org so Graph API round-trips cannot hang forever.
+    META_ADS_SYNC_BUDGET_SEC: int = 120
+    # Always re-pull this many trailing days — Meta revises insights for up to
+    # 28 days after the report date (attribution settling); a pure incremental
+    # sync would silently miss those revisions.
+    META_ADS_INSIGHTS_LOOKBACK_DAYS: int = 28
+    # Manual Sync button cooldown per org (seconds).
+    META_ADS_MANUAL_SYNC_COOLDOWN_SEC: int = 900
+    # Manual Sync sliding-window rate limit.
+    META_ADS_MANUAL_SYNC_MAX_PER_HOUR: int = 3
+
     # Stripe
     STRIPE_CLIENT_ID: Optional[str] = None
     STRIPE_SECRET_KEY: Optional[str] = None

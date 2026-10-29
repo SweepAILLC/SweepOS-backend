@@ -59,6 +59,12 @@ from app.models.discord_channel_mapping import DiscordChannelMapping
 from app.models.ghl_calendar_sync_setting import GhlCalendarSyncSetting
 from app.models.inbound_webhook_event import InboundWebhookEvent
 from app.models.integration_event_dispatch import IntegrationEventDispatch
+from app.models.meta_ad_account import MetaAdAccount
+from app.models.meta_campaign import MetaCampaign
+from app.models.meta_ad_set import MetaAdSet
+from app.models.meta_ad import MetaAd
+from app.models.meta_ad_insight_daily import MetaAdInsightDaily
+from app.models.meta_ad_alert import MetaAdAlert
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -102,5 +108,11 @@ __all__ = [
     "GhlCalendarSyncSetting",
     "InboundWebhookEvent",
     "IntegrationEventDispatch",
+    "MetaAdAccount",
+    "MetaCampaign",
+    "MetaAdSet",
+    "MetaAd",
+    "MetaAdInsightDaily",
+    "MetaAdAlert",
 ]
 

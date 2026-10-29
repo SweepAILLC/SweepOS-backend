@@ -24,6 +24,10 @@ class Funnel(Base):
     # (encrypted token, display prefix, field_map). See app.services.funnel_webhooks.
     webhook_token_hash = Column(String(64), nullable=True)
     webhook_config = Column(JSONB, nullable=True)
+    # When set, weekly ad spend auto-populates from meta_ad_insights_daily
+    # (campaign-level) instead of manual entry — see meta_ads_sync_service.
+    meta_campaign_id = Column(String(64), nullable=True)
+    meta_campaign_name = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

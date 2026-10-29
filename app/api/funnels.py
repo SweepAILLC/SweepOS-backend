@@ -197,10 +197,14 @@ def get_funnel_dashboard(
     utm_group_by: Optional[str] = Query(
         None, description="UTM sources panel grouping: 'source' (default), 'medium', 'campaign', or 'content' (ad)"
     ),
+    campaign_id: Optional[UUID] = Query(
+        None, description="Scorecard's campaign toggle: one of the funnel's linked MetaCampaign ids, or omit for all"
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Whole Funnels dashboard in one call — see services/funnel_dashboard.py."""
+    from app.models.meta_campaign import MetaCampaign
     from app.services.funnel_dashboard import UTM_GROUP_FIELDS, compute_funnel_dashboard
 
     org_id = getattr(current_user, "selected_org_id", current_user.org_id)
@@ -210,6 +214,16 @@ def get_funnel_dashboard(
     if utm_group_by is not None and utm_group_by not in UTM_GROUP_FIELDS:
         raise HTTPException(status_code=400, detail="utm_group_by must be 'source', 'medium', 'campaign', or 'content'")
     _require_org_funnel(db, org_id, funnel_id)
+    campaign_meta_id: Optional[str] = None
+    if campaign_id is not None:
+        campaign = (
+            db.query(MetaCampaign)
+            .filter(MetaCampaign.id == campaign_id, MetaCampaign.org_id == org_id, MetaCampaign.funnel_id == funnel_id)
+            .first()
+        )
+        if campaign is None:
+            raise HTTPException(status_code=404, detail="Campaign not found or not linked to this funnel")
+        campaign_meta_id = campaign.meta_campaign_id
     compare = None
     if compare_start and compare_end:
         compare = (_parse_ymd(compare_start, "compare_start"), _parse_ymd(compare_end, "compare_end"))
@@ -225,6 +239,7 @@ def get_funnel_dashboard(
             funnel_id,
             compare=compare,
             utm_group_by=utm_group_by or "source",
+            campaign_meta_id=campaign_meta_id,
         )
     )
 
