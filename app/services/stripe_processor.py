@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict
 import re
+import time
 import uuid
 
 
@@ -185,36 +186,76 @@ def _process_successful_payment(db: Session, data: Dict[str, Any], event: Dict[s
         Client.org_id == org_id
     ).first()
     
+    client_lookup_error = None
     if not client:
-        # Try to get customer email from Stripe to match existing clients
+        # Try to get customer email/name from Stripe to match or create a client
         try:
             import stripe
             from app.core.encryption import decrypt_token
             from app.models.oauth_token import OAuthToken, OAuthProvider
-            
+
             # Get the org's OAuth token to access their Stripe account
             oauth_token = db.query(OAuthToken).filter(
                 OAuthToken.provider == OAuthProvider.STRIPE,
                 OAuthToken.org_id == org_id
             ).first()
-            
-            if oauth_token:
+
+            if not oauth_token:
+                client_lookup_error = "org has no Stripe OAuth token on file"
+                print(f"[WEBHOOK] {client_lookup_error} -- cannot look up customer {customer_id}")
+            else:
                 decrypted_token = decrypt_token(oauth_token.access_token)
                 stripe.api_key = decrypted_token
-                
+
                 try:
-                    customer_data = stripe.Customer.retrieve(customer_id)
-                    from app.services.stripe_sync_v2 import upsert_client_with_retry
-                    client = upsert_client_with_retry(db, customer_data, org_id)
+                    # Transient network/rate-limit errors are common and fully recoverable --
+                    # retry a couple times with a short backoff rather than permanently orphaning
+                    # the payment over one blip. Permanent errors (bad customer id, auth, etc.)
+                    # raise immediately below and aren't worth retrying.
+                    customer_data = None
+                    for attempt in range(3):
+                        try:
+                            customer_data = stripe.Customer.retrieve(customer_id)
+                            break
+                        except (stripe.error.APIConnectionError, stripe.error.RateLimitError) as retry_err:
+                            if attempt < 2:
+                                print(f"[WEBHOOK] Stripe retrieve attempt {attempt + 1} failed for {customer_id}, retrying: {retry_err}")
+                                time.sleep(0.3 * (2 ** attempt))
+                                continue
+                            raise
+
+                    from app.services.stripe_sync_v2 import get_or_create_client_from_stripe_fields
+                    client = get_or_create_client_from_stripe_fields(
+                        db,
+                        org_id,
+                        customer_id=customer_data.id,
+                        email=getattr(customer_data, "email", None),
+                        name=getattr(customer_data, "name", None),
+                    )
                     if client:
                         print(f"[WEBHOOK] Upserted client {client.id} for Stripe customer {customer_id}")
+                    else:
+                        client_lookup_error = "Stripe customer has no name and no email"
                 except Exception as e:
+                    client_lookup_error = f"Stripe retrieve/upsert failed: {e}"
                     print(f"[WEBHOOK] Could not retrieve/upsert customer {customer_id} from Stripe: {e}")
         except Exception as e:
+            client_lookup_error = f"unexpected error matching customer: {e}"
             print(f"[WEBHOOK] Error matching customer by email: {e}")
-    
+
     if not client:
         print(f"[WEBHOOK] No client linked for Stripe customer {customer_id} (missing OAuth, Stripe customer, or identifiable email)")
+        from app.services.integration_side_effects import emit_automation_failure_discord
+        emit_automation_failure_discord(
+            org_id=org_id,
+            where="stripe_processor._process_successful_payment",
+            error=Exception(
+                f"Payment {payment_id} for Stripe customer {customer_id} has no client "
+                f"({client_lookup_error or 'not found by stripe_customer_id'}) -- "
+                f"no client card/onboarding will trigger"
+            ),
+            client_id=None,
+        )
     
     # If subscription_id is still None, try to find active subscription for this client
     if not subscription_id and client:
@@ -776,73 +817,31 @@ def _process_customer_created(db: Session, data: Dict[str, Any], org_id: uuid.UU
     if not customer_id:
         print("[WEBHOOK] customer.created: No customer ID in event data")
         return
-    
-    customer_email = data.get("email")
-    customer_name = data.get("name", "")
-    
-    # Parse name into first and last name
-    if customer_name:
-        name_parts = customer_name.split()
-        first_name = name_parts[0] if name_parts else "Stripe"
-        last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else "Customer"
+
+    from app.services.stripe_sync_v2 import get_or_create_client_from_stripe_fields
+
+    client = get_or_create_client_from_stripe_fields(
+        db,
+        org_id,
+        customer_id=customer_id,
+        email=data.get("email"),
+        name=data.get("name"),
+    )
+
+    if client:
+        print(f"[WEBHOOK] customer.created: client {client.id} ready for Stripe customer {customer_id}")
     else:
-        first_name = "Stripe"
-        last_name = f"Customer {customer_id[:8]}"
-    
-    email = customer_email or f"{customer_id}@stripe.test"
-    
-    # First, try to find existing client by stripe_customer_id
-    client = db.query(Client).filter(
-        Client.stripe_customer_id == customer_id,
-        Client.org_id == org_id
-    ).first()
-    
-    # If not found by stripe_customer_id, try to find by email (primary or emails list) to avoid duplicates
-    if not client and customer_email:
-        from app.models.client import find_client_by_email
-        client = find_client_by_email(db, org_id, customer_email)
-        
-        # If found by email, link the stripe_customer_id
-        if client:
-            if not client.stripe_customer_id:
-                client.stripe_customer_id = customer_id
-                print(f"[WEBHOOK] customer.created: Linked existing client {client.id} to Stripe customer {customer_id} by email {customer_email}")
-    
-    # If still not found, create only when Stripe provided a real name (do not create unnamed clients)
-    if not client:
-        if not customer_name or not str(customer_name).strip():
-            print(f"[WEBHOOK] customer.created: Skipping unnamed client for Stripe customer {customer_id}")
-        else:
-            client = Client(
-                org_id=org_id,
-                first_name=first_name,
-                last_name=last_name,
-                email=email,
-                stripe_customer_id=customer_id,
-                lifecycle_state="active"  # New Stripe customers start as active clients
-            )
-            db.add(client)
-            db.flush()  # Flush to get the client ID
-            print(f"[WEBHOOK] customer.created: ✅ Created new client {client.id} for Stripe customer {customer_id} ({email})")
-    else:
-        # Update existing client with latest info from Stripe
-        updated = False
-        if not client.email and customer_email:
-            client.email = customer_email
-            updated = True
-        if not client.stripe_customer_id:
-            client.stripe_customer_id = customer_id
-            updated = True
-        if not client.first_name or not client.last_name:
-            if customer_name:
-                if not client.first_name:
-                    client.first_name = first_name
-                if not client.last_name:
-                    client.last_name = last_name
-                updated = True
-        if updated:
-            print(f"[WEBHOOK] customer.created: Updated existing client {client.id} for Stripe customer {customer_id}")
-    
+        print(f"[WEBHOOK] customer.created: no client created for Stripe customer {customer_id} (no name/email)")
+        from app.services.integration_side_effects import emit_automation_failure_discord
+        emit_automation_failure_discord(
+            org_id=org_id,
+            where="stripe_processor._process_customer_created",
+            error=Exception(
+                f"Stripe customer {customer_id} has no name and no email -- no client card created"
+            ),
+            client_id=None,
+        )
+
     db.commit()
 
 
