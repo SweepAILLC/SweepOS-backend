@@ -222,61 +222,91 @@ def upsert_client_with_retry(db: Session, customer_data, org_id: uuid.UUID, max_
     return upsert_client(db, customer_data, org_id)
 
 
-def upsert_client(db: Session, customer_data, org_id: uuid.UUID) -> Client:
-    """Idempotently upsert a client from Stripe customer data."""
-    customer_id = customer_data.id
-    customer_email = getattr(customer_data, 'email', None)
-    
-    # Try to find existing client by stripe_customer_id first
+def get_or_create_client_from_stripe_fields(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    customer_id: str,
+    email: Optional[str] = None,
+    name: Optional[str] = None,
+) -> Optional[Client]:
+    """
+    Single source of truth for turning a Stripe customer (id/email/name) into a
+    Client row. Used by the customer.created webhook handler, the payment-success
+    fallback lookup, and the historical sync path -- previously each had its own
+    copy of this logic with different rules (one required a name, another didn't),
+    which let email-only Checkout customers fall through with no client card and
+    no onboarding. Lenient: creates a client from email alone if no name is present.
+    """
     client = db.query(Client).filter(
         Client.stripe_customer_id == customer_id,
         Client.org_id == org_id
     ).first()
-    
-    # If not found, try by email (primary or emails list)
-    if not client and customer_email:
-        client = find_client_by_email(db, org_id, customer_email)
-        
-        # Link stripe_customer_id to existing client
+
+    if not client and email:
+        client = find_client_by_email(db, org_id, email)
         if client and not client.stripe_customer_id:
             client.stripe_customer_id = customer_id
-    
-    # Create or update client
+
+    name_clean = (name or '').strip()
+
     if client:
         changed = False
-        if not client.email and customer_email:
-            client.email = customer_email
+        if not client.email and email:
+            client.email = email
             changed = True
         if not client.stripe_customer_id:
             client.stripe_customer_id = customer_id
             changed = True
+        if name_clean:
+            parts = name_clean.split()
+            if not client.first_name and parts:
+                client.first_name = parts[0]
+                changed = True
+            if not client.last_name and len(parts) > 1:
+                client.last_name = ' '.join(parts[1:])
+                changed = True
         if changed:
             client.updated_at = datetime.utcnow()
-    else:
-        # Create new when Stripe provides a display name and/or email (email-only payers get a card)
-        customer_name = (getattr(customer_data, 'name', None) or '').strip()
-        if not customer_name and not customer_email:
-            print(f"[SYNC] Skipping client with no name and no email for Stripe customer {customer_id}")
-            return None
-        first_name = None
-        last_name = None
-        if customer_name:
-            parts = customer_name.split()
-            first_name = parts[0] if parts else None
-            last_name = ' '.join(parts[1:]) if len(parts) > 1 else None
-        client = Client(
-            org_id=org_id,
-            stripe_customer_id=customer_id,
-            email=customer_email,
-            first_name=first_name,
-            last_name=last_name,
-            lifecycle_state='active',
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-        db.add(client)
-    
+        return client
+
+    # Create new when Stripe provides a display name and/or email (email-only payers get a card)
+    if not name_clean and not email:
+        print(f"[CLIENT_SYNC] Skipping client with no name and no email for Stripe customer {customer_id}")
+        return None
+
+    first_name = None
+    last_name = None
+    if name_clean:
+        parts = name_clean.split()
+        first_name = parts[0] if parts else None
+        last_name = ' '.join(parts[1:]) if len(parts) > 1 else None
+
+    client = Client(
+        org_id=org_id,
+        stripe_customer_id=customer_id,
+        email=email,
+        first_name=first_name,
+        last_name=last_name,
+        lifecycle_state='active',
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow()
+    )
+    db.add(client)
+    db.flush()
+    print(f"[CLIENT_SYNC] Created client {client.id} for Stripe customer {customer_id} (email={email!r}, name={name_clean!r})")
     return client
+
+
+def upsert_client(db: Session, customer_data, org_id: uuid.UUID) -> Client:
+    """Idempotently upsert a client from Stripe customer data."""
+    return get_or_create_client_from_stripe_fields(
+        db,
+        org_id,
+        customer_id=customer_data.id,
+        email=getattr(customer_data, 'email', None),
+        name=getattr(customer_data, 'name', None),
+    )
 
 
 def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: str = 'charge') -> StripePayment:
@@ -286,11 +316,17 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
     """
     payment_id = payment_data.id
     preexisting_sync_row = (
-        db.query(StripePayment.id)
+        db.query(StripePayment.id, StripePayment.client_id)
         .filter(StripePayment.stripe_id == payment_id, StripePayment.org_id == org_id)
         .first()
     )
     was_new_payment = preexisting_sync_row is None
+    # True when the webhook already wrote this payment but couldn't resolve a client at the
+    # time (e.g. OAuth token / Stripe API hiccup) -- see get_or_create_client_from_stripe_fields.
+    # The row exists, so `was_new_payment` is False and the catch-up side-effects below used to
+    # skip it entirely: client_id got silently backfilled next sync, but first-payment onboarding
+    # never fired because nothing re-checked it.
+    was_orphaned_payment = preexisting_sync_row is not None and preexisting_sync_row.client_id is None
 
     # Determine payment status
     if payment_type == 'charge':
@@ -635,11 +671,13 @@ def upsert_payment(db: Session, payment_data, org_id: uuid.UUID, payment_type: s
     if not payment:
         raise Exception(f"Failed to retrieve payment {payment_id} after upsert")
 
-    # Catch-up path: if the live webhook missed this charge, fire Discord + first-payment
-    # automations only for newly seen, recent succeeded payments (skip historical backfill).
+    # Catch-up path: if the live webhook missed this charge, or wrote it but couldn't resolve a
+    # client yet, fire Discord + first-payment automations only for newly seen (or newly linked)
+    # recent succeeded payments (skip historical backfill).
+    newly_linked_to_client = was_new_payment or (was_orphaned_payment and client is not None)
     try:
         if (
-            was_new_payment
+            newly_linked_to_client
             and (payment.status or status) == "succeeded"
             and created_at
             and (datetime.utcnow() - created_at) < timedelta(hours=36)
