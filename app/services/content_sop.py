@@ -19,7 +19,7 @@ Human-readable copies live at frontend/public/resources/*.md.
 from __future__ import annotations
 
 # Bump when any block below meaningfully changes so bundles regenerate.
-SOP_VERSION = 2
+SOP_VERSION = 3
 
 CONTENT_IDEATION_SOP = """HOOK & VIDEO CONCEPT IDEATION SOP (universal, niche-agnostic framework).
 This SOP governs the FIRST 3 SECONDS (the hook) and the IDEA a concept is built around.
@@ -130,30 +130,99 @@ widest relevant audience, ZERO niche terms, built on one universal driver, passe
 """
 
 
+OBJECTION_TAXONOMY = """OBJECTION TAXONOMY (for pre-handling objections in content — not live-call scripts).
+Every objection is FEAR or LOGISTICS. Fear is emotional/identity-level resistance (doubt, past
+failure, fear of wasting money/time, fear of judgment); logistics are practical blockers (timing,
+payment, partner approval) that only surface once the fear layer is resolved. Mixed objections
+("I need to talk to my partner") carry a fear layer underneath the stated logistics. Content should
+pre-handle the FEAR layer first — logistics rarely stop a sale on their own.
+
+FIVE RECURRING PATTERNS (map SIGNALS' real objection quotes to these before writing a concept):
+1. "I need to think about it" -> decision paralysis/avoidance. Angle: reframe inaction itself as
+   the real risk, not the purchase.
+2. "It's a lot of money" -> fear of wasted investment, not literal price. Angle: cost of staying
+   stuck vs. cost of the program; reframe as investment, not expense.
+3. "Bad timing / life is chaotic" -> fear of failure disguised as scheduling. Angle: there is never
+   a "right time"; the uncertainty of life argues FOR starting now, not waiting.
+4. "What if it doesn't work?" -> fear of a past failure repeating. Angle: proof + specificity of
+   mechanism beats a generic guarantee.
+5. "I need to talk to my partner/spouse" -> fear of accountability/judgment, not pure logistics.
+   Angle: ownership of one's own goals; rarely really about the partner.
+Use the real objection quotes already present in SIGNALS to pick which pattern to target — don't
+invent a generic objection when a specific one is already in evidence.
+"""
+
+
+CONTENT_FUNNEL_STAGES = """CONTENT FUNNEL STAGES (format choice across a content calendar — distinct from the
+per-video hook/amplifier/CTA structure above; this is WHICH FORMAT to use at WHICH awareness stage).
+TOF (top of funnel) — lowest awareness, cold viewers. Goal: reach/discovery.
+  Formats: trend-based reels, repurposed viral templates, trending audio, quick watch-throughs.
+MOF (middle of funnel) — warming up, existing followers evaluating credibility. Goal: trust/authority.
+  Formats: carousels, how-to/step-by-step videos, green-screen breakdowns, raw explanations,
+  personal story woven into educational value.
+BOF (bottom of funnel) — highest awareness, near-ready to buy. Goal: conversion.
+  Formats: client testimonials, clipped check-in/call moments, transformation proof, offer
+  breakdowns, direct results content — this is where CALL_LIBRARY_BOF_EXAMPLES belongs.
+A healthy content calendar represents all three stages regularly — don't only produce BOF because
+it converts, or only TOF because it reaches; the funnel stalls without the middle.
+"""
+
+
+FORMAT_LENGTH_GUIDE = """FORMAT LENGTH CHOICE (short-form vs. long-form — pick deliberately per concept's goal).
+SHORT-FORM (Reels/TikTok/Shorts, 15-60s): optimized for reach and virality. Use for TOF discovery,
+trend participation, single-idea hooks. Minimal commitment asked of a cold viewer.
+LONG-FORM (YouTube/podcast, 10+ min): optimized for trust and authority, not reach. Use for MOF/BOF
+depth — full frameworks, interviews, in-depth case studies. Don't force a BOF trust-building idea
+into a 30-second format just because short-form is the default; depth needs the longer format.
+"""
+
+
 def content_ideation_sop_block() -> str:
     """Return only the hook/concept ideation SOP text."""
     return CONTENT_IDEATION_SOP
 
 
+def _org_override_or_default(db, org_id, resource_id: str, default: str) -> str:
+    """The org's own saved edit when they've actually customized this doc (is_custom=True);
+    otherwise `default` — NEVER the raw public/resources/*.md file on disk. That file is a
+    human-readable copy for the Resource Library UI (5-8x longer: headers, bold, worked
+    examples) and get_document_content's fallback chain reaches it before any `fallback=`
+    kwarg we'd pass, so going through get_sop_content here would silently blow the prompt's
+    character budget for every org that hasn't customized the doc — i.e. almost all of them.
+    """
+    if db is None or org_id is None:
+        return default
+    from app.services.resource_documents import get_doc
+
+    doc = get_doc(db, org_id, resource_id)
+    if doc and doc.get("is_custom"):
+        content = str(doc.get("content") or "").strip()
+        if content:
+            return content
+    return default
+
+
 def marketing_intel_knowledge_block(db=None, org_id=None) -> str:
     """Combined SOP + method knowledge base for the Marketing Intel LLM user prompt."""
-    content_ideation = CONTENT_IDEATION_SOP
-    offer_building = OFFER_BUILDING_SOP
+    content_ideation = _org_override_or_default(db, org_id, "content-ideation-sop", CONTENT_IDEATION_SOP)
+    offer_building = _org_override_or_default(db, org_id, "building-an-offer-sop", OFFER_BUILDING_SOP)
+    # Only included when the org has actually filled in their own copy — the default file on
+    # disk is a blank fill-in-the-blank worksheet (empty bullets), not worth the prompt budget.
+    org_positioning_worksheet = _org_override_or_default(db, org_id, "messaging-and-storytelling", "")
 
-    if db is not None and org_id is not None:
-        from app.services.resource_documents import get_sop_content
+    blocks = [
+        content_ideation,
+        offer_building,
+        SHORTS_IDEATION_METHOD,
+        OBJECTION_TAXONOMY,
+        CONTENT_FUNNEL_STAGES,
+        FORMAT_LENGTH_GUIDE,
+    ]
+    if org_positioning_worksheet:
+        blocks.append(
+            "ORG POSITIONING WORKSHEET (this org's own messaging — named enemy, unique "
+            "mechanism, core contrasts, marketing angles. Use this language verbatim where "
+            "it's filled in):\n" + org_positioning_worksheet
+        )
 
-        content_ideation = get_sop_content(
-            db, org_id, "content-ideation-sop", fallback=CONTENT_IDEATION_SOP
-        )
-        offer_building = get_sop_content(
-            db, org_id, "building-an-offer-sop", fallback=OFFER_BUILDING_SOP
-        )
-
-    return "\n\n".join(
-        (
-            content_ideation,
-            offer_building,
-            SHORTS_IDEATION_METHOD,
-        )
-    )
+    return "\n\n".join(blocks)

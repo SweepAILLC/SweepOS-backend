@@ -770,6 +770,9 @@ def sync_instagram_for_org(
         ):
             # Clear previously stored video URLs that break <img> covers.
             row.thumbnail_url = None
+        raw_media_url = item.get("media_url") or item.get("url")
+        if isinstance(raw_media_url, str) and raw_media_url.strip().startswith("http"):
+            row.media_url = raw_media_url.strip()[:4000]
         if insights or existing is None:
             row.views = views
             row.reach = reach
@@ -854,6 +857,23 @@ def sync_instagram_for_org(
     except Exception:
         logger.exception("instagram concept linking failed org=%s", org_id)
 
+    transcribed = 0
+    try:
+        from app.services.instagram_transcript_service import auto_transcribe_top_performers
+
+        transcribed = auto_transcribe_top_performers(db, org_id)
+    except Exception:
+        logger.exception("instagram reel auto-transcribe failed org=%s", org_id)
+
+    try:
+        from app.services.instagram_transcript_service import (
+            auto_transcribe_priority_reference_posts,
+        )
+
+        transcribed += auto_transcribe_priority_reference_posts(db, org_id)
+    except Exception:
+        logger.exception("instagram reel auto-transcribe (priority reference) failed org=%s", org_id)
+
     caps = resolve_capabilities(
         followers_count=followers,
         insights_ok_count=insights_ok,
@@ -872,6 +892,7 @@ def sync_instagram_for_org(
         "insights_ok": insights_ok,
         "insights_attempted": insights_attempted,
         "concepts_linked": linked,
+        "transcribed": transcribed,
         "capabilities": caps,
         "last_synced_at": now.isoformat(),
         "full": full,

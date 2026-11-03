@@ -11,7 +11,7 @@ from app.services.offer_ladder import offer_ladder_for_llm
 ALLOWED_TAGS = frozenset(
     {"upsell", "testimonial", "referral", "conversion", "win_back", "revive", "deal_follow_up"}
 )
-CLIP_KINDS = frozenset({"testimonial", "win", "objection", "other"})
+CLIP_KINDS = frozenset({"testimonial", "win", "objection", "question", "other"})
 
 LEAD_PIPELINE_LIFECYCLES = frozenset({"cold_lead", "nurturing", "qualified", "booked"})
 
@@ -127,7 +127,7 @@ SYSTEM_PROMPT = (
     "must obey LIFECYCLE: for active clients never fill with generic lead objection handling unless upsell-related), "
     '"opportunity_tags": string[] subset of '
     '["upsell","testimonial","referral","conversion","win_back","revive","deal_follow_up"], '
-    '"clips": array of { "label": string, "kind": "testimonial"|"win"|"objection"|"other", '
+    '"clips": array of { "label": string, "kind": "testimonial"|"win"|"objection"|"question"|"other", '
     '"start_timestamp": string, "end_timestamp": string or null, "quote": string, "rationale": string }, '
     '"wins": string[], '
     '"testimonial_stories": string[], '
@@ -204,6 +204,9 @@ SYSTEM_PROMPT = (
     "CLIP RULES (critical): Each clips[].quote MUST be a verbatim substring copied from "
     "context.call_text.transcript in DATA—not from the summary. If the transcript is empty or too thin for a real quote, "
     "use an empty clips array. Never invent dialogue. "
+    "kind=\"question\" is for a genuine clarifying/confused question the client asked ('I don't understand X', "
+    "'how does Y actually work')—NOT a sales objection (a reason they hesitate to buy/continue) and not a "
+    "rhetorical question. If it is really pushback or hesitation, use kind=\"objection\" instead, never both. "
     "prospect_voice must also be grounded in the transcript (prospect/client/counterparty lines), not the summary alone. "
     "If the transcript/summary lacks enough substance for confident recommendations, set low_signal true, "
     "use empty next_steps and opportunity_tags, empty client_state_synthesis, and briefly explain in low_signal_reason. "

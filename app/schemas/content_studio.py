@@ -29,6 +29,17 @@ class KnowledgeOut(BaseModel):
     reframes: List[str] = Field(default_factory=list)
 
 
+class PriorityReferenceOut(BaseModel):
+    """Attached when a concept replicates a post clients picked most in the onboarding
+    survey's content-gallery step — see content_conversion_service.get_top_selected_content."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    rank: int
+    selection_count: Optional[int] = None
+    permalink: str
+
+
 class StageConceptOut(BaseModel):
     """Single video concept (long/short). Directional beats + one scripted hook — never a full script."""
 
@@ -41,6 +52,7 @@ class StageConceptOut(BaseModel):
     bullets: List[str] = Field(default_factory=list)
     why_for_icp: str = ""
     funnel_path_to_sale: str = ""
+    priority_reference: Optional[PriorityReferenceOut] = None
 
 
 class StageOut(BaseModel):

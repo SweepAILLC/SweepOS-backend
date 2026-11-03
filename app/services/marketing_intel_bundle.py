@@ -294,20 +294,29 @@ def list_org_sales_themes_for_mcp(
     *,
     validated_only: bool = False,
     limit: int = 25,
+    kind: str = "all",
 ) -> Dict[str, Any]:
+    """`kind`: "objection" | "question" | "all" (default). "question" surfaces real points of
+    client confusion mined from calls, separately from recurring objections — see issue 8 in
+    docs/prd/content-generation-signal-upgrades/ISSUES.md. When a specific kind is requested,
+    the unvalidated top-recurring-themes fallback below is skipped (it isn't kind-aware), so a
+    kind="question" call never silently leaks mixed-kind themes.
+    """
     try:
         ensure_org_sales_content_themes_table(db)
     except Exception:
         return {"org_id": str(org_id), "themes": [], "validated_only": validated_only}
 
-    themes = list_validated_themes_payload(db, org_id)
-    if not themes and not validated_only:
+    kind_filter = None if kind in (None, "all") else kind
+    themes = list_validated_themes_payload(db, org_id, kind=kind_filter)
+    if not themes and not validated_only and kind_filter is None:
         # Reuse collect path which already falls back to top recurring themes
         themes = collect_fathom_sales_signals(db, org_id).get("themes") or []
     lim = max(1, min(int(limit or 25), 50))
     return {
         "org_id": str(org_id),
         "validated_only": validated_only,
+        "kind": kind or "all",
         "themes": themes[:lim],
         "count": min(len(themes), lim),
     }

@@ -213,7 +213,7 @@ TRANSCRIPT:
 
     return chat_json(
         system, user, temperature=0.2, org_id=org_id,
-        feature="content_studio", prompt_version=PROMPT_VERSION,
+        feature="content_studio_transcript_analysis", prompt_version=PROMPT_VERSION,
     )
 
 

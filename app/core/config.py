@@ -122,6 +122,11 @@ class Settings(BaseSettings):
     INSTAGRAM_MANUAL_SYNC_COOLDOWN_SEC: int = 900
     # Manual Sync sliding-window rate limit.
     INSTAGRAM_MANUAL_SYNC_MAX_PER_HOUR: int = 3
+    # Cap on top-performing posts that get auto-transcribed (Whisper $) after each sync
+    # AND passed into the content-ideation prompt (LLM tokens) — same number for both,
+    # since "transcribe this many" and "ground ideation in this many" are the same cost
+    # lever. Independent of PerformanceTab's own display count (always top 5, free to show).
+    INSTAGRAM_TOP_POSTS_TRANSCRIBE_LIMIT: int = 5
 
     # Shared Meta Business app id/secret (currently doubles as the Instagram
     # Login app too — see META_ADS_APP_ID below for the Ads-specific override).

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.core.ai_persona import SWEEPBOT_SYSTEM
+from app.core.config import settings
 from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
 from app.models.user import User
 from app.services.content_sop import SOP_VERSION, marketing_intel_knowledge_block
@@ -32,8 +33,12 @@ logger = logging.getLogger(__name__)
 # person + Fathom transcript citation) and (b) operator-narrated belief-shift/objection-prehandle
 # replay (Fathom signal citation, no client name) — and no longer misattributes shape (b)
 # concepts to a client just because they mention quote-shaped language.
-BUNDLE_VERSION = 10
-PROMPT_VERSION = "v1.3"  # LLM.md prompt-versioning/logging — distinct from BUNDLE_VERSION above
+# v11: added PRIORITY_REFERENCE_POSTS — the Instagram posts clients picked most often in the
+# post-sale onboarding survey's content-gallery step (content_conversion_service), with their
+# transcripts. Distinct signal from INSTAGRAM_PERFORMANCE (engagement-ranked): this is a
+# client-self-selected "this converted me" signal, so concepts can cite it as a proven format.
+BUNDLE_VERSION = 12
+PROMPT_VERSION = "v1.4"  # LLM.md prompt-versioning/logging — distinct from BUNDLE_VERSION above
 
 # Each entry: (stage, default title, default intro hint shown when LLM cannot run).
 STAGE_SPECS: List[Tuple[str, str, str]] = [
@@ -81,6 +86,14 @@ def _stage_grounding_block(signals: Dict[str, Any]) -> str:
     n_obj = sum(len(i.get("objection_quotes") or []) for i in insights if isinstance(i, dict))
     n_wins = sum(len(i.get("wins") or []) for i in insights if isinstance(i, dict))
     n_test = sum(len(i.get("testimonial_stories") or []) for i in insights if isinstance(i, dict))
+    won_deal = signals.get("won_deal_objection_handling") or []
+    if not isinstance(won_deal, list):
+        won_deal = []
+    n_won_deal = len(won_deal)
+    faq_themes = signals.get("client_faq_themes") or []
+    if not isinstance(faq_themes, list):
+        faq_themes = []
+    n_faq = len(faq_themes)
 
     if not has_any:
         return (
@@ -111,7 +124,8 @@ def _stage_grounding_block(signals: Dict[str, Any]) -> str:
         "\n"
         f"Counts for calibration: themes={len(themes)}, insights={len(insights)}, "
         f"active_client_insights={len(active)}, meeting_summaries={len(summaries)}, "
-        f"objection_quotes≈{n_obj}, wins≈{n_wins}, testimonial_stories≈{n_test}."
+        f"objection_quotes≈{n_obj}, wins≈{n_wins}, testimonial_stories≈{n_test}, "
+        f"won_deal_objection_handling={n_won_deal}, client_faq_themes={n_faq}."
     )
 
 
@@ -138,7 +152,8 @@ def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, A
         return {"connected": False}
 
     summary = perf.get("summary") or {}
-    top_posts = list(perf.get("top_posts") or [])[:5]
+    top_limit = max(1, int(getattr(settings, "INSTAGRAM_TOP_POSTS_TRANSCRIBE_LIMIT", 5) or 5))
+    top_posts = list(perf.get("top_posts") or [])[:top_limit]
     bottom_posts = list(perf.get("bottom_posts") or [])[:5]
 
     # Observed format mix among top posts (counts), not "double down" verdicts.
@@ -175,6 +190,9 @@ def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, A
                 "saved": p.get("saved"),
                 "reach": p.get("reach"),
                 "caption_excerpt": (p.get("caption") or "")[:180],
+                # Whisper transcript of the reel's actual spoken content (not just the caption) —
+                # null when not yet transcribed; see instagram_transcript_service.
+                "transcript_excerpt": (p.get("transcript") or "")[:1200] or None,
             }
             for p in top_posts
         ],
@@ -192,6 +210,47 @@ def _instagram_perf_block_for_llm(db: Session, org_id: uuid.UUID) -> Dict[str, A
         "top_format_mix": format_counts,
         "capabilities": perf.get("capabilities"),
     }
+
+
+def _priority_reference_fingerprint(db: Session, org_id: uuid.UUID) -> str:
+    """Changes whenever the top-selected onboarding-survey posts or their tally shift,
+    so a cached bundle regenerates to pick up newly-proven content (same role as _instagram_perf_fingerprint)."""
+    try:
+        from app.services.content_conversion_service import get_top_selected_content
+
+        top = get_top_selected_content(db, org_id, limit=5)
+        return hashlib.sha256(
+            json.dumps(
+                [(p.get("instagram_media_id"), p.get("selection_count")) for p in top],
+                default=str,
+            ).encode()
+        ).hexdigest()
+    except Exception:
+        logger.exception("priority reference fingerprint failed org=%s", org_id)
+        return "pref:err"
+
+
+def _priority_reference_posts_block_for_llm(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
+    """Posts clients picked most often in the onboarding survey's
+    a client-self-selected "this is what convinced me" signal, distinct from engagement rank."""
+    try:
+        from app.services.content_conversion_service import get_top_selected_content
+
+        top = get_top_selected_content(db, org_id, limit=5)
+    except Exception:
+        logger.exception("priority reference posts block failed org=%s", org_id)
+        return []
+
+    return [
+        {
+            "permalink": p.get("permalink"),
+            "ig_media_id": p.get("ig_media_id"),
+            "selection_count": p.get("selection_count"),
+            "caption_excerpt": (p.get("caption") or "")[:180],
+            "transcript_excerpt": (p.get("transcript") or "")[:1200] or None,
+        }
+        for p in top
+    ]
 
 
 def _instagram_anchor_for_stage(stage_id: str, ig: Dict[str, Any]) -> str:
@@ -285,6 +344,18 @@ def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
     ic = len(insights)
     ac = len(sig.get("active_client_insights") or [])
     ms = len(sig.get("meeting_summaries") or [])
+    won_deal = sig.get("won_deal_objection_handling") or []
+    wk = sorted(
+        f"{(t.get('theme_key') or '')}:{int(t.get('closed_won_count') or 0)}"
+        for t in won_deal
+        if isinstance(t, dict)
+    )
+    faq_themes = sig.get("client_faq_themes") or []
+    fk = sorted(
+        f"{(t.get('theme_key') or '')}:{int(t.get('occurrence_count') or 0)}"
+        for t in faq_themes
+        if isinstance(t, dict)
+    )
     tail = hash(
         tuple(
             hash(json.dumps(x, sort_keys=True, default=str)[:400])
@@ -298,6 +369,8 @@ def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
             db, org_id, ["content-ideation-sop", "building-an-offer-sop"]
         ),
         "tk": tk[:50],
+        "wk": wk[:50],
+        "fk": fk[:50],
         "ic": ic,
         "ac": ac,
         "ms": ms,
@@ -305,6 +378,7 @@ def compute_signals_fingerprint(db: Session, org_id: uuid.UUID) -> str:
         "has_any": bool(sig.get("has_any")),
         "transcript_analyses": transcript_analyses_count,
         "ig_fp": _instagram_perf_fingerprint(db, org_id),
+        "priority_ref_fp": _priority_reference_fingerprint(db, org_id),
     }
     raw = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -337,6 +411,9 @@ def _normalize_concept(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "bullets": bullets,
         "why_for_icp": why,
         "funnel_path_to_sale": funnel,
+        # Set by _enforce_priority_reference_citation when this concept replicates a
+        # client-self-selected onboarding-survey post; None otherwise (no badge to show).
+        "priority_reference": None,
     }
 
 
@@ -578,6 +655,18 @@ def _collect_stage_grounding_pool(signals: Dict[str, Any], stage: str) -> List[D
             for q in (t.get("sample_quotes") or [])[:2]:
                 _push("theme_quote", q)
 
+    if stage in ("TOF", "MOF"):
+        faq_themes = signals.get("client_faq_themes") if isinstance(signals, dict) else None
+        if isinstance(faq_themes, list):
+            for t in faq_themes[:15]:
+                if not isinstance(t, dict):
+                    continue
+                label = str(t.get("label") or t.get("theme_key") or "").strip()
+                if label:
+                    _push("client_faq_theme", label)
+                for q in (t.get("sample_quotes") or [])[:2]:
+                    _push("client_faq_theme_quote", q)
+
     if isinstance(insights, list):
         for ins in insights[:15]:
             if not isinstance(ins, dict):
@@ -674,6 +763,60 @@ def _enforce_stage_signal_grounding(stages_out: List[Dict[str, Any]], signals: D
                 ).strip()[:1200]
 
 
+def _enforce_priority_reference_citation(
+    stages_out: List[Dict[str, Any]], priority_reference_posts: List[Dict[str, Any]]
+) -> None:
+    """Guarantee the structured `priority_reference` badge data is attached to a real concept
+    whenever PRIORITY_REFERENCE_POSTS is non-empty, instead of relying on the LLM's prose alone.
+
+    Prefers a concept whose why_for_icp already names a cited post's permalink (LLM followed the
+    hard rule); otherwise force-attaches the #1 post to the first MOF concept (falling back to
+    BOF then TOF) and appends the citation line so the UI and the prose agree.
+    """
+    if not priority_reference_posts:
+        return
+    by_permalink = {
+        p.get("permalink"): (idx, p) for idx, p in enumerate(priority_reference_posts) if p.get("permalink")
+    }
+
+    for stage in stages_out:
+        for concept in stage.get("concepts") or []:
+            why = str(concept.get("why_for_icp") or "")
+            for permalink, (idx, post) in by_permalink.items():
+                if permalink in why:
+                    concept["priority_reference"] = {
+                        "rank": idx + 1,
+                        "selection_count": post.get("selection_count"),
+                        "permalink": permalink,
+                    }
+                    return
+
+    top = priority_reference_posts[0]
+    permalink = top.get("permalink")
+    if not permalink:
+        return
+    for preferred_stage in ("MOF", "BOF", "TOF"):
+        for stage in stages_out:
+            if str(stage.get("id") or "").upper() != preferred_stage:
+                continue
+            concepts = stage.get("concepts") or []
+            if not concepts:
+                continue
+            concept = concepts[0]
+            why = str(concept.get("why_for_icp") or "").strip()
+            citation = (
+                f"Proven-conversion reference: {permalink} "
+                f"(selected by {top.get('selection_count')} client(s))."
+            )
+            concept["why_for_icp"] = f"{why} {citation}".strip()[:1200]
+            concept["priority_reference"] = {
+                "rank": 1,
+                "selection_count": top.get("selection_count"),
+                "permalink": permalink,
+            }
+            return
+
+
 def draft_content_studio_bundle_llm(
     db: Session,
     org_id: uuid.UUID,
@@ -759,10 +902,35 @@ HARD RULES:
   and period deltas in summary; avoid patterns from underperformers. Identify each cited post by its
   `permalink` (stable, unique) rather than by its caption or hook text alone — captions get edited,
   truncated, or duplicated across posts, so they are not reliable identifiers. Do not invent
-  funnel/format/hook "advice labels" — only cite values that appear in the Instagram payload.
+  funnel/format/hook "advice labels" — only cite values that appear in the Instagram payload. When a
+  top post has `transcript_excerpt`, prefer it over `caption_excerpt` for the actual phrasing/angle
+  that worked — it's what was said on camera, not just the caption; `transcript_excerpt` is null when
+  that reel hasn't been transcribed yet.
 - If INSTAGRAM_PERFORMANCE.connected=true, every concept's why_for_icp MUST include one explicit line that starts
   with "Instagram performance signal", references a real top-post hook/format or a period delta from summary,
   AND includes that post's `permalink` so the citation is verifiable, not just a caption echo.
+- CLIENT_FAQ_THEMES (a field inside SIGNALS), when non-empty, lists real points of client confusion mined
+  from calls (clarifying/confused questions, not objections) — worth building educational TOF/MOF content
+  around (turn a real point of confusion into a hook: "Most people don't realize X works like this..."). Do
+  NOT conflate these with OBJECTION_TAXONOMY or WON_DEAL_OBJECTION_HANDLING: a point of confusion isn't
+  necessarily a reason someone didn't buy. Ground TOF/MOF concepts here the same way you ground them in
+  `themes` — cite via the existing "Fathom signal:" clause.
+- WON_DEAL_OBJECTION_HANDLING (a field inside SIGNALS), when non-empty, is a stronger signal than a plain
+  `insights[].objection_quotes` entry for BOF belief-shift/objection-prehandle concepts: each entry is an
+  objection pattern that was raised on a real sales call AND actually led to a closed deal (`closed_won_count`),
+  not just evidence the objection exists. When non-empty, prefer grounding at least one BOF belief-shift
+  concept in a WON_DEAL_OBJECTION_HANDLING entry over a generic objection_quote, and that concept's
+  `why_for_icp` MUST include a line starting with "Won-deal objection signal:" naming the entry's `label`
+  and `closed_won_count` (e.g. "Won-deal objection signal: price/too_expensive, closed_won_count=4"). Never
+  invent a closed_won_count or theme not present in WON_DEAL_OBJECTION_HANDLING.
+- PRIORITY_REFERENCE_POSTS, when non-empty, is a stronger signal than INSTAGRAM_PERFORMANCE for format/angle
+  choice: these are posts actual clients told you (via the onboarding survey) made them want to work with you —
+  proven to convert, not just to perform. When PRIORITY_REFERENCE_POSTS is non-empty, at least one concept
+  across the three stages (prefer MOF or BOF) MUST replicate one of these posts' proven format/angle/structure —
+  use its `transcript_excerpt` (the actual spoken structure) over `caption_excerpt` when present — and that
+  concept's `why_for_icp` MUST include a line starting with "Proven-conversion reference:" naming the post's
+  `permalink` and its `selection_count` (e.g. "selected by 3 clients"). Never invent a selection count or post
+  not present in PRIORITY_REFERENCE_POSTS.
 - BOF CITATION MANDATE (overrides the general anonymization rule below, for BOF shape (a) only — client
   testimonials/wins/case studies, NOT shape (b) operator belief-shift replays, which use the Fathom
   signal citation above instead): any BOF concept that quotes or references a client's testimonial, win,
@@ -781,6 +949,11 @@ HARD RULES:
     if len(ig_block) > 12000:
         ig_block = ig_block[:12000] + "\n…[truncated]"
     bof_block = json.dumps(bof_examples[:6], ensure_ascii=False, default=str)
+
+    priority_reference_posts = _priority_reference_posts_block_for_llm(db, org_id)
+    priority_reference_block = json.dumps(priority_reference_posts, ensure_ascii=False, default=str)
+    if len(priority_reference_block) > 12000:
+        priority_reference_block = priority_reference_block[:12000] + "\n…[truncated]"
 
     user = f"""INTELLIGENCE_PROFILE (ICP, offer ladder, USP, voice — anchor every concept to this):
 {profile_block}
@@ -802,13 +975,19 @@ meeting_at, fathom_recording_id, fathom_transcript_url):
 INSTAGRAM_PERFORMANCE (observed results — top_posts, underperformers, period deltas; empty if not connected):
 {ig_block}
 
+PRIORITY_REFERENCE_POSTS (posts clients picked most often in the post-sale onboarding survey's
+content-gallery step — a client-self-selected "this is what convinced me" signal, ranked by
+`selection_count`; distinct from INSTAGRAM_PERFORMANCE's engagement ranking; empty if Instagram
+isn't connected or no survey responses yet have selections):
+{priority_reference_block}
+
 Fingerprint (opaque): {fingerprint}
 """
 
     try:
         raw = chat_json(
             system, user, temperature=0.4, org_id=org_id,
-            feature="content_studio", prompt_version=PROMPT_VERSION,
+            feature="content_studio_bundle", prompt_version=PROMPT_VERSION,
         )
     except Exception as e:
         logger.exception("content studio bundle LLM: %s", e)
@@ -835,6 +1014,7 @@ Fingerprint (opaque): {fingerprint}
     _enforce_bof_prescribed_case_studies(stages_out, signals)
     _enforce_bof_citation_requirement(stages_out, bof_examples)
     _enforce_stage_signal_grounding(stages_out, signals)
+    _enforce_priority_reference_citation(stages_out, priority_reference_posts)
 
     batch_id = str(uuid.uuid4())
     return {
