@@ -534,6 +534,39 @@ def get_performance(
     return payload
 
 
+class TranscriptResponse(BaseModel):
+    media_id: str
+    status: str  # ok | failed | unavailable
+    transcript: Optional[str] = None
+    error: Optional[str] = None
+
+
+@router.post("/media/{media_id}/transcript", response_model=TranscriptResponse)
+def transcribe_instagram_media(
+    media_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """On-demand Whisper transcript for one reel (UI 'Transcribe' button).
+
+    Top performers are auto-transcribed after each sync; this covers everything else.
+    """
+    from app.services.instagram_transcript_service import transcribe_media
+
+    _require_content_studio(db, current_user)
+    org_id = _org_id(current_user)
+    try:
+        media = transcribe_media(db, org_id, media_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Instagram post not found")
+    return TranscriptResponse(
+        media_id=str(media.id),
+        status=media.transcript_status,
+        transcript=media.transcript,
+        error=media.transcript_error,
+    )
+
+
 @router.delete("/disconnect")
 def disconnect_instagram(
     purge: bool = Query(True, description="Also delete cached media/snapshots"),

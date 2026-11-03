@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Rough published list prices (USD per 1M tokens). Used for owner estimates only.
 _MODEL_RATES_USD_PER_1M = {
+    "gpt-5.4-mini": (0.75, 4.50),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
     "gpt-4.1-mini": (0.40, 1.60),
@@ -54,20 +55,25 @@ def record_llm_usage(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     total_tokens: int = 0,
+    cost_usd_override: Optional[float] = None,
 ) -> None:
-    """Best-effort persist; never raises into the LLM path."""
+    """Best-effort persist; never raises into the LLM path.
+
+    cost_usd_override: for non-token-billed calls (e.g. Whisper audio transcription, billed
+    per minute) — pass the real cost instead of letting estimate_cost_usd guess from tokens.
+    """
     if org_id is None:
         return
     pt = max(0, int(prompt_tokens or 0))
     ct = max(0, int(completion_tokens or 0))
     tt = max(0, int(total_tokens or 0)) or (pt + ct)
-    if tt <= 0 and pt <= 0 and ct <= 0:
+    if tt <= 0 and pt <= 0 and ct <= 0 and cost_usd_override is None:
         return
     try:
         from app.db.session import SessionLocal
         from app.models.llm_usage_event import LlmUsageEvent
 
-        cost = estimate_cost_usd(model, pt, ct)
+        cost = cost_usd_override if cost_usd_override is not None else estimate_cost_usd(model, pt, ct)
         db = SessionLocal()
         try:
             db.add(

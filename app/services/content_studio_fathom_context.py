@@ -10,14 +10,18 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import desc
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.models.client import Client, LifecycleState
 from app.models.client_call_insight import ClientCallInsight
 from app.models.fathom_call_record import FathomCallRecord
 from app.models.org_sales_content_theme import OrgSalesContentTheme
 from app.services.llm_client import chat_json, llm_available
-from app.services.org_sales_theme_service import ensure_org_sales_content_themes_table, list_validated_themes_payload
+from app.services.org_sales_theme_service import (
+    ensure_org_sales_content_themes_table,
+    list_validated_themes_payload,
+    list_validated_win_themes_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +67,10 @@ def _themes_payload(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
         return validated[:25]
     rows = (
         db.query(OrgSalesContentTheme)
-        .filter(OrgSalesContentTheme.org_id == org_id)
+        .filter(
+            OrgSalesContentTheme.org_id == org_id,
+            OrgSalesContentTheme.source == "check_in",
+        )
         .order_by(desc(OrgSalesContentTheme.occurrence_count), desc(OrgSalesContentTheme.last_seen_at))
         .limit(18)
         .all()
@@ -84,20 +91,62 @@ def _themes_payload(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
     return out[:25]
 
 
+def _client_faq_themes_payload(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
+    """Validated kind="question" themes — real points of client confusion mined from calls,
+    distinct from objections (a point of confusion isn't necessarily a reason someone didn't
+    buy). See docs/prd/content-generation-signal-upgrades/ISSUES.md issue 7."""
+    try:
+        ensure_org_sales_content_themes_table(db)
+    except Exception as e:
+        logger.debug("content_studio client_faq_themes table: %s", e)
+        return []
+    return list_validated_themes_payload(db, org_id, kind="question")[:15]
+
+
+def _won_deal_objection_handling_payload(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
+    """Win-weighted objection themes from real sales calls (source="sales_call") that hit a
+    closed deal at least once — stronger than a plain objection_quote because it's evidence
+    the specific framing actually converted, not just that the objection exists. See
+    docs/prd/content-generation-signal-upgrades/ISSUES.md issue 4."""
+    try:
+        ensure_org_sales_content_themes_table(db)
+    except Exception as e:
+        logger.debug("content_studio won_deal_objection_handling table: %s", e)
+        return []
+    return list_validated_win_themes_payload(db, org_id)[:15]
+
+
 def _insight_source(r: "ClientCallInsight") -> Dict[str, Any]:
     """Attribution for every quote/win/testimonial on this call insight row — who said it
     and which Fathom call it came from, so BOF content can cite a real person + transcript
-    instead of an anonymized 'a client said'."""
+    instead of an anonymized 'a client said'.
+
+    Lazy-load failures here must roll back the session before returning: a caught DB error
+    leaves Postgres's transaction aborted, and every later query on this same session (there
+    are several more in collect_fathom_sales_signals) would otherwise fail with
+    InFailedSqlTransaction even though nothing about them was wrong.
+    """
     client_name = None
     try:
-        client_name = r.client.name if r.client else None
+        client = r.client
+        if client:
+            parts = [p.strip() for p in [client.first_name or "", client.last_name or ""] if p and str(p).strip()]
+            client_name = " ".join(parts) or None
     except Exception:
+        logger.exception("insight source: client lazy-load failed for insight=%s", r.id)
+        session = object_session(r)
+        if session is not None:
+            session.rollback()
         client_name = None
 
     fcr = None
     try:
         fcr = r.fathom_call_record
     except Exception:
+        logger.exception("insight source: fathom_call_record lazy-load failed for insight=%s", r.id)
+        session = object_session(r)
+        if session is not None:
+            session.rollback()
         fcr = None
 
     meeting_at = None
@@ -231,12 +280,19 @@ def collect_fathom_sales_signals(db: Session, org_id: uuid.UUID) -> Dict[str, An
     insights = _recent_call_insights(db, org_id)
     active_insights = _active_client_insights(db, org_id)
     summaries = _fathom_summaries(db, org_id)
-    has_any = bool(themes or insights or summaries or active_insights)
+    won_deal_objection_handling = _won_deal_objection_handling_payload(db, org_id)
+    client_faq_themes = _client_faq_themes_payload(db, org_id)
+    has_any = bool(
+        themes or insights or summaries or active_insights
+        or won_deal_objection_handling or client_faq_themes
+    )
     return {
         "themes": themes,
         "insights": insights,
         "active_client_insights": active_insights,
         "meeting_summaries": summaries,
+        "won_deal_objection_handling": won_deal_objection_handling,
+        "client_faq_themes": client_faq_themes,
         "has_any": has_any,
     }
 
@@ -371,7 +427,7 @@ No markdown. No bullet lists inside strings."""
     try:
         raw = chat_json(
             system, user, temperature=0.35, org_id=org_id,
-            feature="content_studio", prompt_version=PROMPT_VERSION,
+            feature="content_studio_strategy_brief", prompt_version=PROMPT_VERSION,
         )
         paras = raw.get("paragraphs")
         if not isinstance(paras, list):
