@@ -25,7 +25,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.ai_persona import SWEEPBOT_SYSTEM
-from app.core.config import settings as app_settings
 from app.models.automation import (
     AutomationEmailJob,
     AutomationRule,
@@ -316,14 +315,17 @@ def _fallback_plain(
     upsell = merge.get("upsell_name") or "next step"
 
     if playbook == Playbook.FIRST_PAYMENT_ONBOARDING.value:
+        steps = [
+            "1. Reply to this email with your top goal for the next 30 days.",
+            "2. Add me on your usual messaging channel so we can keep momentum.",
+            "3. Book your first check-in.",
+        ]
         return (
             f"Hi {fn},\n\n"
             "Welcome — really excited to have you on board.\n\n"
-            "Here are your first three steps:\n"
-            "1. Reply to this email with your top goal for the next 30 days.\n"
-            "2. Add me on your usual messaging channel so we can keep momentum.\n"
-            "3. Book your first check-in.\n\n"
-            f"Talk soon,\n{coach}"
+            "Here are your first steps:\n"
+            + "\n".join(steps)
+            + f"\n\nTalk soon,\n{coach}"
         )
     if playbook in (
         Playbook.PRE_SALE_POST_BOOKING.value,
@@ -398,7 +400,7 @@ def _fallback_plain(
 # AI-generated mode
 # ---------------------------------------------------------------------------
 
-PROMPT_VERSION = "v1.1"
+PROMPT_VERSION = "v1.2"
 
 # Drafts an outbound email a coach sends to their client — generative, client-facing
 # per LLM.md, so it carries the required SweepBot persona ahead of the task rules.
