@@ -48,6 +48,19 @@ def test_unwrap_leaves_other_failures_as_tool_error():
     assert not isinstance(ei.value, ComposioAuthError)
 
 
+def test_callback_org_id_prefers_path_over_missing_query():
+    import uuid
+
+    from app.api.instagram import _callback_url, _org_id_from_callback
+
+    org = "701c389d-26c6-4f5f-8c7f-1b62742aaee5"
+    url = _callback_url(uuid.UUID(org))
+    assert url.endswith(f"/instagram/callback/{org}")
+    assert _org_id_from_callback(None, org) == uuid.UUID(org)
+    assert _org_id_from_callback(None, None) is None
+    assert _org_id_from_callback("not-a-uuid", "also-bad") is None
+
+
 def test_username_parse_ignores_auth_invalid_marker():
     assert instagram_username_from_scope("instagram:k.ai.lb") == "k.ai.lb"
     assert (

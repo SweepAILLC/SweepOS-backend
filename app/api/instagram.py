@@ -92,11 +92,31 @@ def _require_content_studio(db: Session, user: User) -> None:
         )
 
 
-def _callback_url() -> str:
+def _callback_url(org_id: uuid.UUID) -> str:
+    """Org id lives in the path.
+
+    Composio rebuilds the callback query as status + connected_account_id and
+    does not forward a user_id param. A query-only org id is dropped, the
+    callback cannot bind the account, and the UI stays disconnected.
+    """
     base = (settings.BACKEND_PUBLIC_URL or settings.MCP_ISSUER_URL or "http://localhost:8000").rstrip(
         "/"
     )
-    return f"{base}/instagram/callback"
+    return f"{base}/instagram/callback/{org_id}"
+
+
+def _org_id_from_callback(
+    user_id: Optional[str],
+    path_org_id: Optional[str] = None,
+) -> Optional[uuid.UUID]:
+    for raw in (path_org_id, user_id):
+        if not raw:
+            continue
+        try:
+            return uuid.UUID(str(raw))
+        except ValueError:
+            continue
+    return None
 
 
 def _frontend_integrations_url(*, connected: bool = False, error: Optional[str] = None) -> str:
@@ -201,7 +221,7 @@ def connect_instagram(
             )
 
     try:
-        result = cc.start_instagram_link(db, org_id, callback_url=_callback_url())
+        result = cc.start_instagram_link(db, org_id, callback_url=_callback_url(org_id))
     except ComposioConfigError as e:
         msg = str(e)
         logger.warning("instagram connect config error org=%s: %s", org_id, msg)
@@ -231,34 +251,42 @@ def connect_instagram(
 
 
 @router.get("/callback")
+@router.get("/callback/{path_org_id}")
 def instagram_oauth_callback(
     db: Session = Depends(get_db),
+    path_org_id: Optional[str] = None,
     status_q: Optional[str] = Query(None, alias="status"),
     connected_account_id: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
 ):
     """
     Composio redirects here after Instagram OAuth.
 
-    We resolve the org from user_id (SweepOS org_id), persist the connected
-    account id, and kick off the first sync in the background.
+    Org id comes from the callback path (current links) or user_id (older
+    links). Persist the connected account id and kick off the first sync.
     """
-    ca_id = connected_account_id
-    if not ca_id:
-        pass
-
-    org_id: Optional[uuid.UUID] = None
-    if user_id:
-        try:
-            org_id = uuid.UUID(str(user_id))
-        except ValueError:
-            org_id = None
-
+    org_id = _org_id_from_callback(user_id, path_org_id)
     if org_id is None:
         return RedirectResponse(
             url=_frontend_integrations_url(connected=False, error="missing_org"),
             status_code=303,
         )
+
+    if (status_q or "").lower() == "failed":
+        reason = (error or "composio_rejected")[:120]
+        logger.warning(
+            "instagram callback status=failed org=%s account=%s error=%s",
+            org_id,
+            connected_account_id,
+            reason,
+        )
+        return RedirectResponse(
+            url=_frontend_integrations_url(connected=False, error=reason),
+            status_code=303,
+        )
+
+    ca_id = connected_account_id
 
     try:
         if not cc.composio_configured(db, org_id):
