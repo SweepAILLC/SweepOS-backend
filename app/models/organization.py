@@ -26,8 +26,15 @@ class Organization(Base):
     program_end_date = Column(Date, nullable=True)
     # Public post-sales close survey link token (no login)
     close_form_token = Column(UUID(as_uuid=True), unique=True, nullable=True, index=True)
+    # Public post-sale onboarding survey link token (no login) — one global
+    # link per org, shown in the Resources tab, not minted per client.
+    onboarding_survey_token = Column(UUID(as_uuid=True), unique=True, nullable=True, index=True)
     # Extensible notification prefs, e.g. {"funnel_leads": {...}}
     notification_settings = Column(JSONB, nullable=True)
+    # Customizable multiple-choice options for the onboarding survey's Q5
+    # (problem_to_solve) and Q10 (conversion_trigger), e.g.
+    # {"problem_to_solve": ["Lead gen", "Sales process", ...], "conversion_trigger": [...]}
+    onboarding_survey_options = Column(JSONB, nullable=True)
     # IANA tz name (e.g. "America/New_York") used to localize notification timestamps
     # (currently: Discord new_booking "When" field). Defaults to UTC when unset.
     timezone = Column(String(64), nullable=False, default="UTC", server_default="UTC")

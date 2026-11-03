@@ -65,6 +65,7 @@ from app.models.meta_ad_set import MetaAdSet
 from app.models.meta_ad import MetaAd
 from app.models.meta_ad_insight_daily import MetaAdInsightDaily
 from app.models.meta_ad_alert import MetaAdAlert
+from app.models.onboarding_survey_response import OnboardingSurveyResponse
 
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
@@ -114,5 +115,6 @@ __all__ = [
     "MetaAd",
     "MetaAdInsightDaily",
     "MetaAdAlert",
+    "OnboardingSurveyResponse",
 ]
 
