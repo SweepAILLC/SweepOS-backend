@@ -11,11 +11,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.user import (
+    User,
     UserRole,
     parse_user_role_from_api,
     parse_user_role_from_db,
     userrole_bind_value,
 )
+from app.models.user_organization import UserOrganization
 
 _logger = logging.getLogger(__name__)
 
@@ -90,6 +92,116 @@ def list_organizations_for_email(
             }
         )
     return result
+
+
+def revoke_email_org_access(
+    db: Session,
+    email: str,
+    org_id: uuid.UUID,
+    *,
+    keep_user_id: uuid.UUID,
+) -> bool:
+    """
+    Drop every way this email can still see `org_id`.
+
+    Settings lists orgs from both `users.org_id` and `user_organizations`.
+    Leaving used to delete only the link on the logged-in user id, so the
+    per-org `users` row (and links on sibling rows with the same email)
+    kept the org in Accounts. Login also rebuilds links from those rows.
+    """
+    normalized = (email or "").strip().lower()
+    if not normalized or not org_id:
+        return False
+
+    email_users = (
+        db.query(User)
+        .filter(func.lower(User.email) == normalized)
+        .all()
+    )
+    email_ids = [row.id for row in email_users]
+    if not email_ids:
+        return False
+
+    membership_rows = [
+        row
+        for row in email_users
+        if row.org_id == org_id and row.id != keep_user_id
+    ]
+    links = (
+        db.query(UserOrganization)
+        .filter(
+            UserOrganization.org_id == org_id,
+            UserOrganization.user_id.in_(email_ids),
+        )
+        .all()
+    )
+    if not links and not membership_rows:
+        return False
+
+    for link in links:
+        db.delete(link)
+    db.flush()
+
+    member_ids = [row.id for row in membership_rows]
+    if member_ids:
+        _null_nullable_user_refs(db, member_ids)
+        for row in membership_rows:
+            db.delete(row)
+    return True
+
+
+def _null_nullable_user_refs(db: Session, user_ids: list) -> None:
+    """Clear nullable FKs to users so the membership row can be deleted.
+
+    Several columns were added without ON DELETE SET NULL. Postgres would
+    otherwise reject the delete and the org would stay on the account list.
+    """
+    if not user_ids:
+        return
+    try:
+        refs = db.execute(
+            text(
+                """
+                SELECT nsp.nspname AS schema_name,
+                       rel.relname AS table_name,
+                       att.attname AS column_name
+                FROM pg_constraint con
+                JOIN pg_class rel ON rel.oid = con.conrelid
+                JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+                JOIN pg_attribute att
+                  ON att.attrelid = rel.oid
+                 AND att.attnum = con.conkey[1]
+                 AND NOT att.attisdropped
+                JOIN pg_class frel ON frel.oid = con.confrelid
+                WHERE con.contype = 'f'
+                  AND frel.relname = 'users'
+                  AND nsp.nspname = 'public'
+                  AND NOT att.attnotnull
+                  AND array_length(con.conkey, 1) = 1
+                """
+            )
+        ).fetchall()
+    except Exception:
+        _logger.exception("leave org: could not list user foreign keys")
+        return
+
+    id_strings = [str(user_id) for user_id in user_ids]
+    for schema_name, table_name, column_name in refs:
+        if not _safe_sql_ident(schema_name) or not _safe_sql_ident(table_name) or not _safe_sql_ident(column_name):
+            continue
+        for user_id in id_strings:
+            db.execute(
+                text(
+                    f'UPDATE "{schema_name}"."{table_name}" '
+                    f'SET "{column_name}" = NULL '
+                    f'WHERE "{column_name}"::text = :user_id'
+                ),
+                {"user_id": user_id},
+            )
+
+
+def _safe_sql_ident(name: str) -> bool:
+    return bool(name) and name.replace("_", "").isalnum()
 
 
 def ensure_user_organization_link(
