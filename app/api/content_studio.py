@@ -22,6 +22,7 @@ from app.schemas.content_studio import (
     ContentStudioBundleOut,
     KnowledgeOut,
     KnowledgePutBody,
+    PriorityReferenceOut,
     ReanalyzeResponse,
     SalesPlaybookOut,
     StageConceptOut,
@@ -103,6 +104,17 @@ def _parse_bundle_dict(raw: Dict[str, Any]) -> ContentStudioBundleOut:
                 for b in (concept.get("bullets") or [])
                 if isinstance(b, (str, int, float)) and str(b).strip()
             ]
+            priority_ref_raw = concept.get("priority_reference")
+            priority_ref = None
+            if isinstance(priority_ref_raw, dict) and priority_ref_raw.get("permalink"):
+                try:
+                    priority_ref = PriorityReferenceOut(
+                        rank=int(priority_ref_raw.get("rank") or 0),
+                        selection_count=priority_ref_raw.get("selection_count"),
+                        permalink=str(priority_ref_raw.get("permalink")),
+                    )
+                except (TypeError, ValueError):
+                    priority_ref = None
             concepts_out.append(
                 StageConceptOut(
                     id=cid,
@@ -112,6 +124,7 @@ def _parse_bundle_dict(raw: Dict[str, Any]) -> ContentStudioBundleOut:
                     bullets=bullets,
                     why_for_icp=str(concept.get("why_for_icp") or ""),
                     funnel_path_to_sale=str(concept.get("funnel_path_to_sale") or ""),
+                    priority_reference=priority_ref,
                 )
             )
         stages_out.append(

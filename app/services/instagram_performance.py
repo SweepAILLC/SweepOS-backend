@@ -255,6 +255,7 @@ def _post_card(m: InstagramMedia, *, rank_score: Optional[float] = None) -> Dict
         if lower.endswith((".mp4", ".mov", ".m3u8", ".webm")):
             thumb = None
     return {
+        "id": str(m.id),
         "ig_media_id": m.ig_media_id,
         "rank_score": round(rank_score, 3) if rank_score is not None else None,
         "permalink": m.permalink,
@@ -279,6 +280,8 @@ def _post_card(m: InstagramMedia, *, rank_score: Optional[float] = None) -> Dict
         "metrics_settled": m.metrics_settled,
         "linked_concept_id": m.linked_concept_id,
         "avg_watch_time_sec": m.avg_watch_time_sec,
+        "transcript": m.transcript,
+        "transcript_status": m.transcript_status,
     }
 
 

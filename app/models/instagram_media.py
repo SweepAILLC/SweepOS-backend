@@ -40,6 +40,11 @@ class InstagramMedia(Base):
     posted_at = Column(DateTime, nullable=True, index=True)
     caption = Column(Text, nullable=True)
     thumbnail_url = Column(Text, nullable=True)
+    # Raw video/CDN URL from the last sync — used only to download the reel for Whisper
+    # transcription (instagram_transcript_service.transcribe_media). Not for <img> display;
+    # thumbnail_url above is the display-safe still image. Refreshed every sync, so a
+    # stale/expired signed link self-heals on the next sync rather than needing a refetch.
+    media_url = Column(Text, nullable=True)
 
     # Raw metrics
     views = Column(Integer, nullable=True)
@@ -81,3 +86,9 @@ class InstagramMedia(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Whisper transcript (OpenAI) — fed into content_angle_map ideation for top performers.
+    transcript = Column(Text, nullable=True)
+    transcript_status = Column(String(16), nullable=False, default="unavailable")  # unavailable|pending|ok|failed
+    transcript_error = Column(Text, nullable=True)
+    transcribed_at = Column(DateTime, nullable=True)

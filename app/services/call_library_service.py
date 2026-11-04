@@ -647,6 +647,18 @@ def generate_and_persist_report(
 
     if analysis_kind == "sales":
         try:
+            from app.services.org_sales_theme_service import (
+                record_from_completed_call_library_report,
+            )
+
+            record_from_completed_call_library_report(db, library_row, rec.client_id)
+        except Exception as e:
+            logger.warning(
+                "org_sales_theme record_from_completed_call_library_report skipped: %s", e
+            )
+
+    if analysis_kind == "sales":
+        try:
             from app.services.call_library_auto_close import (
                 attempt_auto_close_from_call_library_report,
             )

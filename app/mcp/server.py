@@ -201,7 +201,11 @@ TOOLS = [
     },
     {
         "name": "list_org_sales_themes",
-        "description": "List recurring/validated sales content themes (objections) with sample prospect quotes.",
+        "description": (
+            "List recurring/validated sales content themes with sample prospect quotes — "
+            "objections (reasons someone hesitated) by default, or client FAQs (genuine points "
+            "of confusion, not objections) via kind=\"question\"."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -211,6 +215,16 @@ TOOLS = [
                     "description": "If true, only return themes that passed validation thresholds",
                 },
                 "limit": {"type": "integer", "default": 25, "minimum": 1, "maximum": 50},
+                "kind": {
+                    "type": "string",
+                    "enum": ["objection", "question", "all"],
+                    "default": "all",
+                    "description": (
+                        "Narrow to \"objection\" (reasons someone hesitated to buy) or "
+                        "\"question\" (genuine client confusion, not objections). Default "
+                        "\"all\" returns both kinds mixed, matching prior behavior."
+                    ),
+                },
             },
         },
     },
@@ -1249,6 +1263,7 @@ def _run_tool(
                 org_id,
                 validated_only=bool(args.get("validated_only") or False),
                 limit=int(args.get("limit") or 25),
+                kind=str(args.get("kind") or "all"),
             )
         )
     if name == "get_org_intelligence_profile":
