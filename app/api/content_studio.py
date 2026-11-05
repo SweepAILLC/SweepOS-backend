@@ -192,6 +192,16 @@ def _regenerate_bundle_outside_session(
                 logger.exception("Content studio bundle LLM failed for org %s", org_id)
                 bundle = None
         if not bundle:
+            existing_row = css.get_latest_generation_row(db2, org_id)
+            existing_raw = existing_row.ideas_json if existing_row else None
+            existing_source = existing_raw.get("source") if isinstance(existing_raw, dict) else None
+            if existing_source == "llm":
+                logger.warning(
+                    "Content studio bundle regen fell back to placeholder for org %s; "
+                    "keeping existing LLM-drafted bundle instead of overwriting it",
+                    org_id,
+                )
+                return
             bundle = default_bundle_placeholder(fingerprint)
         bid = uuid.UUID(str(bundle["batch_id"]))
         css.upsert_generation(db2, org_id, urow.id if urow else user_id, bid, bundle)
