@@ -9,7 +9,7 @@ import statistics
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -25,6 +25,15 @@ from app.services.instagram_sync_service import (
 MIN_SAMPLE = 3
 REACH_FLOOR = 50  # minimum trustworthy exposure; also floors the shrinkage prior weight below
 MIN_EXPOSURE = 10  # below this reach/views a post has no reliable signal — excluded from ranking entirely
+
+# Interaction weights for ranking only (top/bottom posts, what_works) — comments take more
+# effort than a like, so they count more toward "best performer." The displayed
+# engagement_rate_pct stays the true, unweighted interactions/reach figure; this weighting
+# never touches it.
+COMMENT_WEIGHT = 3.0
+LIKE_WEIGHT = 1.0
+SAVE_WEIGHT = 1.0
+SHARE_WEIGHT = 1.0
 
 # Human labels for Performance UI / verdicts (avoid raw enum keys).
 _DIMENSION_LABELS = {
@@ -204,13 +213,39 @@ def _exposure(m: InstagramMedia) -> Optional[int]:
     return None
 
 
-def _exposure_prior(posts: Sequence[InstagramMedia]) -> Tuple[float, float]:
-    """(prior_rate_pct, prior_weight) for Bayesian-shrinking raw engagement rates.
+def _weighted_rate_pct(m: InstagramMedia, exposure: Optional[int]) -> Optional[float]:
+    """Weighted-interaction rate used for ranking only (top/bottom posts, what_works).
+
+    Comments > saves/shares > likes, per COMMENT_WEIGHT etc above — a post that drives
+    comments is a stronger "best performer" signal than one that only racks up likes, even
+    at the same raw engagement_rate_pct. Returns None when exposure is missing/zero so
+    callers fall back the same way they would for a missing engagement_rate_pct.
+    """
+    if not exposure:
+        return None
+    weighted = (
+        (m.comments or 0) * COMMENT_WEIGHT
+        + (m.likes or 0) * LIKE_WEIGHT
+        + (m.saved or 0) * SAVE_WEIGHT
+        + (m.shares or 0) * SHARE_WEIGHT
+    )
+    return round((weighted / exposure) * 100.0, 3)
+
+
+def _exposure_prior(
+    posts: Sequence[InstagramMedia],
+    *,
+    rate_fn: "Optional[Callable[[InstagramMedia, Optional[int]], Optional[float]]]" = None,
+) -> Tuple[float, float]:
+    """(prior_rate_pct, prior_weight) for Bayesian-shrinking engagement rates.
 
     ``prior_weight`` is the account's median exposure among posts with enough reach/views to
     trust outright — how much exposure a post needs before its own rate dominates the shrunk
     score, floored at REACH_FLOOR so low-activity accounts still shrink meaningfully.
-    ``prior_rate_pct`` is the median raw engagement rate among those same trustworthy posts.
+    ``prior_rate_pct`` is the median rate among those same trustworthy posts, as computed by
+    ``rate_fn`` (defaults to raw engagement_rate_pct). Production ranking passes
+    ``_weighted_rate_pct`` to bias the prior toward comments over likes/saves/shares, matching
+    whatever rate ``_rank_score`` is fed for the same posts.
     """
     exposures: List[int] = []
     rates: List[float] = []
@@ -218,8 +253,11 @@ def _exposure_prior(posts: Sequence[InstagramMedia]) -> Tuple[float, float]:
         exp = _exposure(p)
         if exp is None or exp < MIN_EXPOSURE or p.engagement_rate_pct is None:
             continue
+        rate = rate_fn(p, exp) if rate_fn is not None else p.engagement_rate_pct
+        if rate is None:
+            continue
         exposures.append(exp)
-        rates.append(float(p.engagement_rate_pct))
+        rates.append(float(rate))
     prior_weight = max(_median(exposures) or 0.0, REACH_FLOOR)
     prior_rate = _median(rates)
     if prior_rate is None or prior_rate <= 0:
@@ -311,7 +349,7 @@ def _what_works(posts: Sequence[InstagramMedia]) -> List[Dict[str, Any]]:
     Always returns hook/awareness(format/funnel) options when data exists, even when
     sample size is thin. Low-sample rows are marked confidence='low'.
     """
-    prior_rate, prior_weight = _exposure_prior(posts)
+    prior_rate, prior_weight = _exposure_prior(posts, rate_fn=_weighted_rate_pct)
     org_med = prior_rate
 
     target_dims = ("hook_pattern", "funnel_stage", "format_bucket")
@@ -319,8 +357,9 @@ def _what_works(posts: Sequence[InstagramMedia]) -> List[Dict[str, Any]]:
     hook_examples: Dict[Tuple[str, str], List[Tuple[float, str]]] = defaultdict(list)
 
     for p in posts:
+        exp = _exposure(p)
         rate = _rank_score(
-            p.engagement_rate_pct, _exposure(p), prior_rate_pct=prior_rate, prior_weight=prior_weight
+            _weighted_rate_pct(p, exp), exp, prior_rate_pct=prior_rate, prior_weight=prior_weight
         )
         if rate is None:
             continue
@@ -693,15 +732,18 @@ def build_instagram_performance(
         "prev_range_end": range_start.date().isoformat(),
     }
 
-    # Rank posts by exposure-weighted (Bayesian-shrunk) engagement rate, not raw rate — a post
-    # with e.g. 3 views and 3 likes is a 100% raw rate but has no real reach behind it. Shrinking
-    # toward the account's typical rate in proportion to exposure keeps those from topping (or
-    # bottoming) the list while leaving well-exposed posts close to their actual rate.
-    prior_rate, prior_weight = _exposure_prior(posts)
+    # Rank posts by exposure-weighted (Bayesian-shrunk), comment-biased engagement rate, not
+    # raw rate — a post with e.g. 3 views and 3 likes is a 100% raw rate but has no real reach
+    # behind it. Shrinking toward the account's typical rate in proportion to exposure keeps
+    # those from topping (or bottoming) the list while leaving well-exposed posts close to
+    # their actual rate. The rate itself weights comments above likes/saves/shares (see
+    # _weighted_rate_pct) so higher-effort interactions count more toward "best performer."
+    prior_rate, prior_weight = _exposure_prior(posts, rate_fn=_weighted_rate_pct)
     scored_posts: List[Tuple[float, InstagramMedia]] = []
     for p in posts:
+        exp = _exposure(p)
         score = _rank_score(
-            p.engagement_rate_pct, _exposure(p), prior_rate_pct=prior_rate, prior_weight=prior_weight
+            _weighted_rate_pct(p, exp), exp, prior_rate_pct=prior_rate, prior_weight=prior_weight
         )
         if score is not None:
             scored_posts.append((score, p))
@@ -758,11 +800,12 @@ def build_instagram_performance(
             else (
                 "summary.*_delta_pct and prev_* compare the selected window to the immediately "
                 "preceding window of equal length. top_posts/bottom_posts are ranked by an "
-                "exposure-weighted engagement score (rank_score) — raw engagement_rate_pct is "
-                "shrunk toward the account's typical rate when a post's reach/views are low, so a "
-                "tiny-reach post with a freak high rate can't look like a top performer. Prefer "
-                "top_posts hooks and period deltas for ideation; what_works/verdicts are secondary "
-                "analytics, not primary UI advice."
+                "exposure-weighted engagement score (rank_score) that weights comments above "
+                "likes/saves/shares — raw engagement_rate_pct is shrunk toward the account's "
+                "typical rate when a post's reach/views are low, so a tiny-reach post with a "
+                "freak high rate can't look like a top performer. Prefer top_posts hooks and "
+                "period deltas for ideation; what_works/verdicts are secondary analytics, not "
+                "primary UI advice."
             )
         ),
     }
