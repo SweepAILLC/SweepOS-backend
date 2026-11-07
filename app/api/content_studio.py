@@ -149,18 +149,45 @@ def _parse_bundle_dict(raw: Dict[str, Any]) -> ContentStudioBundleOut:
     )
 
 
-def _needs_bundle_regeneration(gen_row: Any, fingerprint: str) -> bool:
+# Automatic (bootstrap-triggered) regen fires once the user has worked through this much of
+# any single stage's concepts, not on every signals change — regenerating on every fingerprint
+# diff burned an LLM call per bootstrap whenever Fathom/Instagram signals shifted, even when the
+# user hadn't touched most of the current batch yet. Manual "Reanalyze" (rate-limited, explicit
+# user action) is unaffected and always regenerates on demand.
+STAGE_DEPLETION_THRESHOLD = 0.7
+
+
+def _bundle_is_valid(gen_row: Any) -> bool:
+    """Whether gen_row holds a usable, current-version v3 bundle at all."""
     if not gen_row or not gen_row.ideas_json:
-        return True
+        return False
     raw = gen_row.ideas_json
-    if isinstance(raw, list):
-        return True
     if not isinstance(raw, dict):
-        return True
-    if int(raw.get("version") or 0) < BUNDLE_VERSION:
-        return True
-    stored = str(raw.get("signals_fingerprint") or "")
-    return stored != fingerprint
+        return False
+    return int(raw.get("version") or 0) >= BUNDLE_VERSION
+
+
+def _stage_depletion_trigger(gen_row: Any, completed_ids: list[str]) -> bool:
+    """True once the user has completed >= STAGE_DEPLETION_THRESHOLD of any stage's concepts
+    in the current bundle — i.e. they're close to running out of ideas in that section."""
+    if not _bundle_is_valid(gen_row):
+        return False
+    stages = gen_row.ideas_json.get("stages")
+    if not isinstance(stages, list):
+        return False
+    done = set(completed_ids)
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        concept_ids = [
+            str(c["id"]) for c in (stage.get("concepts") or []) if isinstance(c, dict) and c.get("id")
+        ]
+        if not concept_ids:
+            continue
+        done_count = sum(1 for cid in concept_ids if cid in done)
+        if done_count / len(concept_ids) >= STAGE_DEPLETION_THRESHOLD:
+            return True
+    return False
 
 
 def _get_org_regen_lock(org_id: uuid.UUID) -> threading.Lock:
@@ -239,10 +266,15 @@ def get_bootstrap(
     gen_row = css.get_latest_generation_row(db, org_id)
     urow = _user_orm(db, current_user)
 
-    # If underlying signals changed, trigger bundle regeneration in the background.
-    # Do not block the request; return the last known bundle (if any) so the UI can
-    # keep rendering while a fresh draft is generated.
-    if _needs_bundle_regeneration(gen_row, fingerprint):
+    prof = urow.ai_profile if isinstance(urow.ai_profile, dict) else {}
+    bid_prof, completed = css.content_studio_state_from_profile(prof)
+
+    # Regenerate in the background only when the stored bundle is unusable (missing/old
+    # version) or the user is close to running out of ideas in some stage — not on every
+    # signals change, so the current batch persists across bootstraps and we don't spend an
+    # LLM call per visit. Do not block the request; return the last known bundle (if any) so
+    # the UI can keep rendering while a fresh draft is generated.
+    if not _bundle_is_valid(gen_row) or _stage_depletion_trigger(gen_row, completed):
         lock = _get_org_regen_lock(org_id)
         if lock.acquire(blocking=False):
             try:
@@ -262,8 +294,6 @@ def get_bootstrap(
     if gen_row and isinstance(gen_row.ideas_json, dict) and int(gen_row.ideas_json.get("version") or 0) >= BUNDLE_VERSION:
         content_bundle = _parse_bundle_dict(gen_row.ideas_json)
 
-    prof = urow.ai_profile if isinstance(urow.ai_profile, dict) else {}
-    bid_prof, completed = css.content_studio_state_from_profile(prof)
     row_batch = str(gen_row.batch_id) if gen_row else None
 
     return BootstrapResponse(
