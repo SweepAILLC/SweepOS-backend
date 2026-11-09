@@ -24,6 +24,9 @@ _DEFAULT_CORS_ORIGINS = [
     # Claude.ai custom connector OAuth (browser DCR / token exchange)
     "https://claude.ai",
     "https://www.claude.ai",
+    # ChatGPT custom connector OAuth (browser DCR / token exchange)
+    "https://chatgpt.com",
+    "https://chat.openai.com",
 ]
 
 
