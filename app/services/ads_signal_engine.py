@@ -1433,3 +1433,212 @@ def build_funnel_creative_grid(
     ad_rows.sort(key=lambda r: r["spend_cents"] or 0, reverse=True)
     out_base["ads"] = ad_rows
     return out_base
+
+
+def build_adset_rows(
+    db: Session,
+    org_id: uuid.UUID,
+    days: int = 28,
+    *,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    campaign_ids: Optional[Sequence[uuid.UUID]] = None,
+) -> Dict[str, Any]:
+    """Account-wide ad-set rows for the Ads tab's Ad sets table — optionally
+    narrowed to a set of campaigns (cascading selection from the Campaigns
+    tab). One row per ad set with its own rollup + daily series, the flat
+    counterpart to build_campaign_breakdown's per-adset nesting."""
+    today = _utcnow().date()
+    if end is None:
+        days = max(7, min(int(days or 28), 90))
+        series_start: Optional[date] = today - timedelta(days=days - 1)
+        series_end = today
+    else:
+        series_start, series_end = start, end
+        days = (series_end - series_start).days + 1 if series_start is not None else 0
+
+    account = _account_for_org(db, org_id)
+    campaigns_q = db.query(MetaCampaign).filter(MetaCampaign.org_id == org_id)
+    if account is not None:
+        campaigns_q = campaigns_q.filter(MetaCampaign.ad_account_id == account.id)
+    if campaign_ids:
+        campaigns_q = campaigns_q.filter(MetaCampaign.id.in_(list(campaign_ids)))
+    campaigns = campaigns_q.all()
+    out_base = {
+        "ad_sets": [],
+        "currency": account.currency if account else None,
+        "days": days,
+        "start": series_start.isoformat() if series_start else None,
+        "end": series_end.isoformat(),
+    }
+    if not campaigns:
+        return out_base
+    campaign_by_id = {c.id: c for c in campaigns}
+
+    adsets = (
+        db.query(MetaAdSet)
+        .filter(MetaAdSet.org_id == org_id, MetaAdSet.campaign_id.in_(list(campaign_by_id.keys())))
+        .all()
+    )
+    if not adsets:
+        return out_base
+    adset_ids = [a.id for a in adsets]
+    ads = db.query(MetaAd).filter(MetaAd.org_id == org_id, MetaAd.ad_set_id.in_(adset_ids)).all()
+    ads_by_adset: Dict[Any, List[MetaAd]] = defaultdict(list)
+    for ad in ads:
+        ads_by_adset[ad.ad_set_id].append(ad)
+
+    insight_q = db.query(MetaAdInsightDaily).filter(
+        MetaAdInsightDaily.org_id == org_id,
+        MetaAdInsightDaily.date <= series_end,
+    )
+    if series_start is not None:
+        insight_q = insight_q.filter(MetaAdInsightDaily.date >= series_start)
+    grouped: Dict[Tuple[str, str], List[DayPoint]] = defaultdict(list)
+    for row in insight_q.all():
+        grouped[(row.level, row.entity_id)].append(_point_from_row(row))
+
+    alerts = _load_alerts(db, org_id)
+    types_by_adset: Dict[str, Set[str]] = defaultdict(set)
+    for alert in alerts:
+        if alert.level == "adset":
+            types_by_adset[alert.entity_id].add(alert.alert_type)
+
+    adset_out = []
+    for adset in adsets:
+        child = ads_by_adset.get(adset.id, [])
+        pts = [p for p in _adset_points(adset, child, grouped) if _in_span(p.day, series_start, series_end)]
+        totals = _rollup(pts)
+        camp = campaign_by_id.get(adset.campaign_id)
+        active_count = sum(1 for ad in child if _delivering(ad.effective_status))
+        adset_out.append(
+            {
+                "id": str(adset.id),
+                "meta_adset_id": adset.meta_adset_id,
+                "name": adset.name,
+                "campaign_id": str(camp.id) if camp else None,
+                "campaign_name": camp.name if camp else None,
+                "optimization_goal": adset.optimization_goal,
+                "effective_status": adset.effective_status,
+                "learning_stage": adset.learning_stage,
+                "daily_budget_cents": adset.daily_budget_cents,
+                "pill": campaign_pill(None, types_by_adset.get(adset.meta_adset_id, set())),
+                "spend_cents": totals["spend_cents"],
+                "results": totals["results"],
+                "cpr_cents": totals["cpr_cents"],
+                "ctr": totals["ctr"],
+                "frequency": totals["frequency"],
+                "active_ads": active_count,
+                "bench_target": int(THRESHOLDS["bench_min_active"]),
+                "series": _series(pts, series_start, series_end),
+            }
+        )
+    adset_out.sort(key=lambda r: r["spend_cents"] or 0, reverse=True)
+    out_base["ad_sets"] = adset_out
+    return out_base
+
+
+def build_ad_rows(
+    db: Session,
+    org_id: uuid.UUID,
+    days: int = 28,
+    *,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    ad_set_ids: Optional[Sequence[uuid.UUID]] = None,
+    campaign_ids: Optional[Sequence[uuid.UUID]] = None,
+) -> Dict[str, Any]:
+    """Account-wide ad (creative) rows for the Ads tab's Ads table — narrowed
+    to a set of ad sets, falling back to a set of campaigns, or the whole
+    connected account. Flat counterpart to build_funnel_creative_grid's ad
+    rows, without the funnel scoping."""
+    today = _utcnow().date()
+    if end is None:
+        days = max(7, min(int(days or 28), 90))
+        series_start: Optional[date] = today - timedelta(days=days - 1)
+        series_end = today
+    else:
+        series_start, series_end = start, end
+        days = (series_end - series_start).days + 1 if series_start is not None else 0
+
+    account = _account_for_org(db, org_id)
+    out_base = {
+        "ads": [],
+        "currency": account.currency if account else None,
+        "days": days,
+        "start": series_start.isoformat() if series_start else None,
+        "end": series_end.isoformat(),
+    }
+
+    adsets_q = db.query(MetaAdSet).filter(MetaAdSet.org_id == org_id)
+    if ad_set_ids:
+        adsets_q = adsets_q.filter(MetaAdSet.id.in_(list(ad_set_ids)))
+    elif campaign_ids:
+        adsets_q = adsets_q.filter(MetaAdSet.campaign_id.in_(list(campaign_ids)))
+    elif account is not None:
+        campaign_ids_for_account = [
+            row.id
+            for row in db.query(MetaCampaign.id).filter(
+                MetaCampaign.org_id == org_id, MetaCampaign.ad_account_id == account.id
+            )
+        ]
+        adsets_q = adsets_q.filter(MetaAdSet.campaign_id.in_(campaign_ids_for_account))
+    adsets = adsets_q.all()
+    if not adsets:
+        return out_base
+    adset_by_id = {a.id: a for a in adsets}
+    campaign_ids_needed = {a.campaign_id for a in adsets}
+    campaigns = db.query(MetaCampaign).filter(MetaCampaign.id.in_(list(campaign_ids_needed))).all()
+    campaign_by_id = {c.id: c for c in campaigns}
+
+    ads = db.query(MetaAd).filter(MetaAd.org_id == org_id, MetaAd.ad_set_id.in_(list(adset_by_id.keys()))).all()
+    if not ads:
+        return out_base
+
+    insight_q = db.query(MetaAdInsightDaily).filter(
+        MetaAdInsightDaily.org_id == org_id,
+        MetaAdInsightDaily.level == "ad",
+        MetaAdInsightDaily.entity_id.in_([a.meta_ad_id for a in ads]),
+        MetaAdInsightDaily.date <= series_end,
+    )
+    if series_start is not None:
+        insight_q = insight_q.filter(MetaAdInsightDaily.date >= series_start)
+    grouped: Dict[str, List[DayPoint]] = defaultdict(list)
+    for row in insight_q.all():
+        grouped[row.entity_id].append(_point_from_row(row))
+
+    alerts = _load_alerts(db, org_id)
+    fatigued_ads = {
+        a.entity_id for a in alerts if a.level == "ad" and a.alert_type == "creative_fatigue" and a.status == "open"
+    }
+
+    ad_rows = []
+    for ad in ads:
+        pts = [p for p in grouped.get(ad.meta_ad_id, []) if _in_span(p.day, series_start, series_end)]
+        totals = _rollup(pts)
+        adset = adset_by_id.get(ad.ad_set_id)
+        camp = campaign_by_id.get(adset.campaign_id) if adset else None
+        ad_rows.append(
+            {
+                "id": str(ad.id),
+                "meta_ad_id": ad.meta_ad_id,
+                "name": ad.name,
+                "thumbnail_url": ad.creative_thumbnail_url,
+                "effective_status": ad.effective_status,
+                "ad_set_id": str(adset.id) if adset else None,
+                "ad_set_name": adset.name if adset else None,
+                "campaign_id": str(camp.id) if camp else None,
+                "campaign_name": camp.name if camp else None,
+                "pill": "fatigued" if ad.meta_ad_id in fatigued_ads else "hold",
+                "spend_cents": totals["spend_cents"],
+                "results": totals["results"],
+                "cpr_cents": totals["cpr_cents"],
+                "ctr": totals["ctr"],
+                "frequency": totals["frequency"],
+                "fatigued": ad.meta_ad_id in fatigued_ads,
+                "series": _series(pts, series_start, series_end),
+            }
+        )
+    ad_rows.sort(key=lambda r: r["spend_cents"] or 0, reverse=True)
+    out_base["ads"] = ad_rows
+    return out_base

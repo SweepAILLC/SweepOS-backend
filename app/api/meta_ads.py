@@ -771,6 +771,67 @@ def ads_campaign_breakdown(
     return payload
 
 
+def _parse_uuid_list(raw: Optional[str], *, field: str) -> Optional[List[uuid.UUID]]:
+    if not raw:
+        return None
+    out = []
+    for piece in raw.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            out.append(uuid.UUID(piece))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid {field}: {piece}") from None
+    return out or None
+
+
+@router.get("/ad-sets")
+def list_ad_set_rows(
+    days: int = Query(28, ge=7, le=90),
+    start: Optional[date] = Query(None),
+    end: Optional[date] = Query(None),
+    campaign_ids: Optional[str] = Query(None, description="Comma-separated campaign ids, or omit for the whole account"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Account-wide ad-set rows for the Ads tab's Ad sets table, cascading off
+    whatever campaigns are checked on the Campaigns tab."""
+    from app.services.ads_signal_engine import build_adset_rows
+
+    _require_content_studio(db, current_user)
+    _ads_range(start, end, None, None)
+    org_id = _org_id(current_user)
+    cids = _parse_uuid_list(campaign_ids, field="campaign_id")
+    if end is None:
+        return build_adset_rows(db, org_id, days, campaign_ids=cids)
+    return build_adset_rows(db, org_id, start=start, end=end, campaign_ids=cids)
+
+
+@router.get("/ads")
+def list_ad_rows(
+    days: int = Query(28, ge=7, le=90),
+    start: Optional[date] = Query(None),
+    end: Optional[date] = Query(None),
+    ad_set_ids: Optional[str] = Query(None, description="Comma-separated ad set ids, or omit to fall back to campaign_ids"),
+    campaign_ids: Optional[str] = Query(None, description="Comma-separated campaign ids, used when ad_set_ids is omitted"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Account-wide ad (creative) rows for the Ads tab's Ads table, cascading
+    off whatever ad sets (or failing that, campaigns) are checked higher up."""
+    from app.services.ads_signal_engine import build_ad_rows
+
+    _require_content_studio(db, current_user)
+    _ads_range(start, end, None, None)
+    org_id = _org_id(current_user)
+    aids = _parse_uuid_list(ad_set_ids, field="ad_set_id")
+    cids = _parse_uuid_list(campaign_ids, field="campaign_id")
+    if end is None:
+        return build_ad_rows(db, org_id, days, ad_set_ids=aids, campaign_ids=cids)
+    return build_ad_rows(db, org_id, start=start, end=end, ad_set_ids=aids, campaign_ids=cids)
+
+
 @router.get("/funnels/{funnel_id}/creative-grid")
 def funnel_creative_grid(
     funnel_id: str,
