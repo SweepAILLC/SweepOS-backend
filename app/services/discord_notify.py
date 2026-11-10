@@ -83,7 +83,9 @@ EVENT_TYPES: List[Dict[str, str]] = [
     {"key": "eod_form", "label": "EOD / daily KPI form submissions"},
     {"key": "post_call", "label": "Post-call form submissions"},
     {"key": "new_lead", "label": "New leads (funnel captures)"},
-    {"key": "new_booking", "label": "New bookings (Cal.com / Calendly)"},
+    {"key": "new_booking", "label": "New bookings — all (fallback if a specific channel below is not set)"},
+    {"key": "new_booking_sales", "label": "New sales call bookings"},
+    {"key": "new_booking_nonsales", "label": "New non-sales bookings"},
     {"key": "new_transaction", "label": "New transactions (Stripe payments)"},
     {"key": "automation_failure", "label": "Pipeline automation failures (lifecycle/close-stamp errors)"},
 ]
@@ -161,6 +163,24 @@ def build_sample_event(
                 ("Form · How did you hear about us?", "Instagram"),
             ],
         },
+        "new_booking_sales": {
+            "title": "[TEST] New sales call: Alex Example",
+            "description": "Strategy Call",
+            "fields": [
+                ("Provider", "Calendly"),
+                ("When", sample_when),
+                ("Email", "alex@example.com"),
+            ],
+        },
+        "new_booking_nonsales": {
+            "title": "[TEST] New booking: Alex Example",
+            "description": "Check-in",
+            "fields": [
+                ("Provider", "Cal.com"),
+                ("When", sample_when),
+                ("Email", "alex@example.com"),
+            ],
+        },
         "new_transaction": {
             "title": "[TEST] New transaction: $497.00 USD",
             "description": "Alex Example",
@@ -184,6 +204,8 @@ _EMBED_COLOR_BY_EVENT = {
     "post_call": 0x22C55E,      # green
     "new_lead": 0xF59E0B,       # amber
     "new_booking": 0x8B5CF6,    # violet
+    "new_booking_sales": 0x8B5CF6,       # violet
+    "new_booking_nonsales": 0x3B82F6,    # blue
     "new_transaction": 0x10B981,  # emerald
     "automation_failure": 0xEF4444,  # red
 }
@@ -328,6 +350,18 @@ def set_channel_mapping(
     db.commit()
     db.refresh(row)
     return row
+
+
+def booking_discord_event_type(db: Session, org_id: uuid.UUID, *, is_sales_call: bool) -> str:
+    """Sales and non-sales bookings can each have a channel.
+
+    If that specific mapping is missing, fall back to new_booking so orgs that
+    already wired one channel keep receiving both until they split them.
+    """
+    specific = "new_booking_sales" if is_sales_call else "new_booking_nonsales"
+    if get_channel_mapping(db, org_id, specific):
+        return specific
+    return "new_booking"
 
 
 def delete_channel_mapping(db: Session, org_id: uuid.UUID, event_type: str) -> bool:

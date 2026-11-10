@@ -675,6 +675,7 @@ def sync_calcom_bookings(
                             "event_type_label": event_type_label,
                             "attendee_email": attendee_email,
                             "start_time": start_time,
+                            "is_sales_call": is_sales_call,
                         })
 
                 db.flush()
@@ -992,6 +993,7 @@ def sync_calendly_events(
                             "event_type_label": event_type_label_value,
                             "attendee_email": invitee_email,
                             "start_time": start_time,
+                            "is_sales_call": is_sales_call,
                         })
 
                 db.flush()
@@ -1175,6 +1177,8 @@ def sync_all_checkins(
                             event_type_label=row.get("event_type_label"),
                             start_time=row.get("start_time"),
                             require_recent=True,
+                            is_sales_call=bool(row.get("is_sales_call")),
+                            event_type_id=row.get("event_type_id"),
                         )
                         on_booking_created_pre_sale(
                             db,

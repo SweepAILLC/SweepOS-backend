@@ -456,7 +456,7 @@ def process_calendly_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dic
     if not client:
         return {"ok": True, "skipped": True, "reason": "no_matching_client"}
 
-    _, is_new = _upsert_check_in(
+    checkin, is_new = _upsert_check_in(
         db,
         org_id=org_uuid,
         client_id=client.id,
@@ -501,6 +501,8 @@ def process_calendly_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dic
                 event_type_label=event_type_label,
                 start_time=start_time,
                 form_answers=_calendly_form_answers(invitee),
+                is_sales_call=bool(checkin.is_sales_call),
+                event_type_id=event_type_uri,
             )
         except Exception as e:
             LOG.warning("discord_notify new_booking (calendly) skipped: %s", e)
@@ -655,7 +657,7 @@ def process_calcom_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dict[
     if not client:
         return {"ok": True, "skipped": True, "reason": "no_matching_client"}
 
-    _, is_new = _upsert_check_in(
+    checkin, is_new = _upsert_check_in(
         db,
         org_id=org_uuid,
         client_id=client.id,
@@ -700,6 +702,8 @@ def process_calcom_webhook_payload(db: Session, org_uuid: uuid.UUID, body: Dict[
                 event_type_label=event_type_label,
                 start_time=start_time,
                 form_answers=_calcom_form_answers(payload),
+                is_sales_call=bool(checkin.is_sales_call),
+                event_type_id=event_type_id,
             )
         except Exception as e:
             LOG.warning("discord_notify new_booking (calcom) skipped: %s", e)

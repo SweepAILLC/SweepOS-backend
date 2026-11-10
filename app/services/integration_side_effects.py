@@ -75,8 +75,15 @@ def emit_new_booking_discord(
     start_time: Optional[datetime] = None,
     require_recent: bool = False,
     form_answers: Optional[dict] = None,
+    is_sales_call: Optional[bool] = None,
+    event_type_id: Optional[str] = None,
 ) -> bool:
-    """Fire Discord new_booking once. Returns True if sent (or queued)."""
+    """Fire one Discord booking alert. Returns True if sent (or queued).
+
+    Sales calls go to new_booking_sales and everything else to
+    new_booking_nonsales when those channels are mapped. Otherwise both
+    still use new_booking.
+    """
     if require_recent and start_time is not None:
         st = start_time
         if st.tzinfo is None:
@@ -89,6 +96,15 @@ def emit_new_booking_discord(
         return False
     try:
         from app.services import discord_notify
+        from app.services.checkin_sync import get_sales_call_flags
+
+        if is_sales_call is None:
+            is_sales_call, _sale_closed = get_sales_call_flags(
+                db, org_id, provider, event_id, event_type_id
+            )
+        event_key = discord_notify.booking_discord_event_type(
+            db, org_id, is_sales_call=bool(is_sales_call)
+        )
 
         fields = [("Provider", "Cal.com" if provider == "calcom" else "Calendly")]
         if start_time is not None:
@@ -97,10 +113,11 @@ def emit_new_booking_discord(
             fields.append(("Email", attendee_email))
         fields.extend(discord_notify.flatten_discord_fields("Form", form_answers))
         fields = fields[:25]  # Discord embed field cap
+        title_prefix = "New sales call" if is_sales_call else "New booking"
         discord_notify.send_discord_event_background(
             org_id,
-            "new_booking",
-            title=f"New booking: {_client_display_name(client, attendee_name)}",
+            event_key,
+            title=f"{title_prefix}: {_client_display_name(client, attendee_name)}",
             description=event_type_label or f"{provider} booking",
             fields=fields,
         )

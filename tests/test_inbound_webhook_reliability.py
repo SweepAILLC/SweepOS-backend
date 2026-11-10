@@ -122,6 +122,54 @@ def test_emit_booking_claims_once():
     assert added.source_id == "evt_live"
 
 
+def test_sales_booking_uses_sales_channel_when_mapped():
+    db = MagicMock()
+    db.commit.side_effect = [None]
+    org = uuid.uuid4()
+    with patch("app.services.discord_notify.send_discord_event_background") as send, patch(
+        "app.services.discord_notify.format_org_local_datetime", return_value="19/09/2026 12:00 UTC"
+    ), patch(
+        "app.services.discord_notify.get_channel_mapping",
+        side_effect=lambda _db, _org, event_type: object() if event_type == "new_booking_sales" else None,
+    ):
+        ok = emit_new_booking_discord(
+            db,
+            org_id=org,
+            provider="calendly",
+            event_id="evt_sales",
+            attendee_name="Ada",
+            is_sales_call=True,
+            start_time=datetime.now(timezone.utc),
+        )
+    assert ok is True
+    assert send.call_args.args[1] == "new_booking_sales"
+    assert send.call_args.kwargs["title"].startswith("New sales call:")
+
+
+def test_nonsales_booking_falls_back_to_shared_channel():
+    db = MagicMock()
+    db.commit.side_effect = [None]
+    org = uuid.uuid4()
+    with patch("app.services.discord_notify.send_discord_event_background") as send, patch(
+        "app.services.discord_notify.format_org_local_datetime", return_value="19/09/2026 12:00 UTC"
+    ), patch(
+        "app.services.discord_notify.get_channel_mapping",
+        return_value=None,
+    ):
+        ok = emit_new_booking_discord(
+            db,
+            org_id=org,
+            provider="calcom",
+            event_id="evt_checkin",
+            attendee_name="Ada",
+            is_sales_call=False,
+            start_time=datetime.now(timezone.utc),
+        )
+    assert ok is True
+    assert send.call_args.args[1] == "new_booking"
+    assert send.call_args.kwargs["title"].startswith("New booking:")
+
+
 def test_emit_payment_second_claim_skipped():
     from sqlalchemy.exc import IntegrityError
 
