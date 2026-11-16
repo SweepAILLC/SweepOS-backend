@@ -154,6 +154,7 @@ class ClientUpdate(BaseModel):
     emails: Optional[List[str]] = None
     phone: Optional[str] = None
     instagram: Optional[str] = None
+    dialed_at: Optional[datetime] = None
     lifecycle_state: Optional[LifecycleState] = None
     source_channel: Optional[str] = None
     source_funnel_id: Optional[uuid.UUID] = None
@@ -175,7 +176,7 @@ class ClientUpdate(BaseModel):
     def parse_program_dates_update(cls, v):
         return parse_optional_program_datetime(v)
 
-    @field_validator("last_activity_at", mode="before")
+    @field_validator("last_activity_at", "dialed_at", mode="before")
     @classmethod
     def parse_last_activity_update(cls, v):
         return parse_optional_program_datetime(v)
@@ -185,6 +186,7 @@ class Client(ClientBase):
     id: uuid.UUID
     tenant_id: Optional[uuid.UUID] = None
     last_activity_at: Optional[datetime] = None
+    dialed_at: Optional[datetime] = None
     opted_in_at: Optional[datetime] = None  # read-only; set by funnel lead capture / GHL sync
     lifetime_revenue_cents: Optional[int] = 0
     notes: Optional[str] = None

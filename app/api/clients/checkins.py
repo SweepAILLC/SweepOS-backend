@@ -261,7 +261,9 @@ def update_check_in(
     if is_sales_call is not None:
         check_in.is_sales_call = is_sales_call
     if sale_closed is not None:
-        check_in.sale_closed = sale_closed
+        from app.services.sale_close_stamp import stamp_sale_closed
+
+        stamp_sale_closed(check_in, sale_closed)
 
     # Mirror sales flags to CalendarBookingSales so they survive provider
     # re-syncs (the sync reads from that table for new rows).

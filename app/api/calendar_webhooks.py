@@ -222,7 +222,9 @@ def _upsert_check_in(
         if not getattr(existing, "is_sales_call", False) and is_sales_call:
             existing.is_sales_call = True
         if getattr(existing, "sale_closed", None) is None and sale_closed is not None:
-            existing.sale_closed = sale_closed
+            from app.services.sale_close_stamp import stamp_sale_closed
+
+            stamp_sale_closed(existing, sale_closed)
         if host_email and not existing.host_email:
             existing.host_email = host_email
         if host_user_id and not existing.host_user_id:
@@ -251,6 +253,7 @@ def _upsert_check_in(
         no_show=False,
         is_sales_call=is_sales_call,
         sale_closed=sale_closed,
+        sale_closed_at=datetime.now(timezone.utc) if sale_closed is True else None,
         raw_event_data=json.dumps(raw_payload),
         host_email=host_email,
         host_user_id=host_user_id,

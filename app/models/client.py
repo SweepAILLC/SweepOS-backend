@@ -104,6 +104,7 @@ class Client(Base):
     emails = Column(JSON, nullable=True)  # Additional emails: list of strings, e.g. ["a@x.com", "b@x.com"]
     phone = Column(String, nullable=True)
     instagram = Column(String, nullable=True)
+    dialed_at = Column(DateTime, nullable=True)
     lifecycle_state = Column(
         PgLifecycleState(),
         default=LifecycleState.QUALIFIED,

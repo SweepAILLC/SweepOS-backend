@@ -33,6 +33,7 @@ class ClientGridDetail(BaseModel):
     # "booked" (booking_at is the call time), "not_yet", "closed", "canceled", "no_show"
     booking_status: str = "not_yet"
     booking_at: Optional[datetime] = None
+    closed_at: Optional[datetime] = None
 
 
 def booking_status_for_checkin(checkin: Optional[ClientCheckIn]) -> str:
@@ -78,6 +79,11 @@ def get_client_grid_details(
                 answers=_flatten_answers(prospect) if prospect else {},
                 booking_status=booking_status_for_checkin(checkin),
                 booking_at=checkin.start_time if checkin is not None else None,
+                closed_at=(
+                    (checkin.sale_closed_at or checkin.updated_at)
+                    if checkin is not None and checkin.sale_closed
+                    else None
+                ),
             )
         )
     return out

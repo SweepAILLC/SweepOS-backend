@@ -51,6 +51,7 @@ class ClientCheckIn(Base):
     # Sales call tracking (for close rate)
     is_sales_call = Column(Boolean, default=False, nullable=False)
     sale_closed = Column(Boolean, nullable=True)  # True=closed, False=open, None=not set
+    sale_closed_at = Column(DateTime(timezone=True), nullable=True)
     
     # Metadata
     raw_event_data = Column(Text, nullable=True)  # JSON string of full event data for reference

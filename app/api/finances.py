@@ -6,7 +6,7 @@ from __future__ import annotations
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -60,9 +60,8 @@ def _stripe_succeeded_cents_since(
     return total
 
 
-def _stripe_succeeded_in_window(
-    db: Session, org_id: uuid.UUID, since: datetime, until: datetime
-) -> List[StripePayment]:
+def _stripe_succeeded_all(db: Session, org_id: uuid.UUID) -> List[StripePayment]:
+    """Dedupe by stripe_id (latest row wins) across all time, no window filter."""
     rows = (
         db.query(StripePayment)
         .filter(StripePayment.org_id == org_id, StripePayment.status == "succeeded")
@@ -76,8 +75,14 @@ def _stripe_succeeded_in_window(
             continue
         if sid not in best:
             best[sid] = p
+    return list(best.values())
+
+
+def _stripe_succeeded_in_window(
+    db: Session, org_id: uuid.UUID, since: datetime, until: datetime
+) -> List[StripePayment]:
     out: List[StripePayment] = []
-    for p in best.values():
+    for p in _stripe_succeeded_all(db, org_id):
         ts = p.created_at
         if not ts or ts < since or ts > until:
             continue
@@ -89,13 +94,19 @@ def _stripe_order_count_since(db: Session, org_id: uuid.UUID, since: datetime, u
     return len(_stripe_succeeded_in_window(db, org_id, since, until))
 
 
+def _whop_paid_all(db: Session, org_id: uuid.UUID) -> List[WhopPayment]:
+    return [
+        p
+        for p in db.query(WhopPayment).filter(WhopPayment.org_id == org_id).all()
+        if (p.status or "").lower() == "paid"
+    ]
+
+
 def _whop_paid_in_window(
     db: Session, org_id: uuid.UUID, since: datetime, until: datetime
 ) -> List[WhopPayment]:
     out: List[WhopPayment] = []
-    for p in db.query(WhopPayment).filter(WhopPayment.org_id == org_id).all():
-        if (p.status or "").lower() != "paid":
-            continue
+    for p in _whop_paid_all(db, org_id):
         ts = p.created_at
         if not ts or ts < since or ts > until:
             continue
@@ -111,15 +122,19 @@ def _whop_order_count_since(db: Session, org_id: uuid.UUID, since: datetime, unt
     return len(_whop_paid_in_window(db, org_id, since, until))
 
 
+def _manual_all(db: Session, org_id: uuid.UUID) -> List[ManualPayment]:
+    return (
+        db.query(ManualPayment)
+        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
+        .all()
+    )
+
+
 def _manual_in_window(
     db: Session, org_id: uuid.UUID, since: datetime, until: datetime
 ) -> List[ManualPayment]:
     out: List[ManualPayment] = []
-    for p in (
-        db.query(ManualPayment)
-        .filter(ManualPayment.org_id == org_id, ManualPayment.superseded_at.is_(None))
-        .all()
-    ):
+    for p in _manual_all(db, org_id):
         ts = p.payment_date or p.created_at
         if not ts:
             continue
@@ -136,6 +151,55 @@ def _manual_cents_since(db: Session, org_id: uuid.UUID, since: datetime, until: 
 
 def _manual_order_count_since(db: Session, org_id: uuid.UUID, since: datetime, until: datetime) -> int:
     return len(_manual_in_window(db, org_id, since, until))
+
+
+def _first_time_payment_events(db: Session, org_id: uuid.UUID) -> List[Tuple[datetime, int]]:
+    """One event per *new* sale: a client's earliest payment across Stripe +
+    Whop + manual (all-time), or any payment with no client_id — those can't
+    be matched against a repeat, so each counts as its own first-time order.
+    Used to keep AOV a "new sale" number instead of being diluted by
+    recurring/renewal charges from existing clients."""
+    events: List[Tuple[datetime, object, int]] = []
+    for p in _stripe_succeeded_all(db, org_id):
+        ts = _naive_utc(p.created_at) if p.created_at else None
+        if ts:
+            events.append((ts, p.client_id, p.amount_cents or 0))
+    for p in _whop_paid_all(db, org_id):
+        ts = _naive_utc(p.created_at) if p.created_at else None
+        if ts:
+            events.append((ts, p.client_id, p.amount_cents or 0))
+    for p in _manual_all(db, org_id):
+        raw_ts = p.payment_date or p.created_at
+        ts = _naive_utc(raw_ts) if raw_ts else None
+        if ts:
+            events.append((ts, p.client_id, p.amount_cents or 0))
+    events.sort(key=lambda e: e[0])
+
+    seen_clients = set()
+    first_events: List[Tuple[datetime, int]] = []
+    for ts, client_id, amount in events:
+        if client_id is None:
+            first_events.append((ts, amount))
+            continue
+        if client_id in seen_clients:
+            continue
+        seen_clients.add(client_id)
+        first_events.append((ts, amount))
+    return first_events
+
+
+def _first_time_order_value_since(
+    db: Session, org_id: uuid.UUID, since: datetime, until: datetime
+) -> Tuple[int, int]:
+    """(cents, count) of first-time-payment events landing in [since, until] — the AOV-only view."""
+    cents = 0
+    count = 0
+    for ts, amount in _first_time_payment_events(db, org_id):
+        if ts < since or ts > until:
+            continue
+        cents += amount
+        count += 1
+    return cents, count
 
 
 @router.get("/summary", response_model=FinancesCombinedSummary)
@@ -187,8 +251,13 @@ def finances_summary(
     wmtd_n = _whop_order_count_since(db, org_id, mtd_start, now) if wh_ok else 0
     mmtd_n = _manual_order_count_since(db, org_id, mtd_start, now)
 
+    ft_pri_cents, ft_pri_count = _first_time_order_value_since(db, org_id, period_start, period_end)
+    ft_mtd_cents, ft_mtd_count = _first_time_order_value_since(db, org_id, mtd_start, now)
+
     prior_revenue: float | None = None
     prior_orders: int | None = None
+    prior_ft_revenue: float | None = None
+    prior_ft_orders: int | None = None
     if compare is not None or scope != "all":
         if compare is not None:
             prior_start, prior_end = compare
@@ -205,6 +274,9 @@ def finances_summary(
             + (_whop_order_count_since(db, org_id, prior_start, prior_end) if wh_ok else 0)
             + _manual_order_count_since(db, org_id, prior_start, prior_end)
         )
+        ft_prior_cents, ft_prior_count = _first_time_order_value_since(db, org_id, prior_start, prior_end)
+        prior_ft_revenue = ft_prior_cents / 100.0
+        prior_ft_orders = ft_prior_count
 
     return FinancesCombinedSummary(
         stripe_connected=st_ok,
@@ -235,6 +307,12 @@ def finances_summary(
         ),
         prior_period_revenue=prior_revenue,
         prior_period_order_count=prior_orders,
+        aov_first_time_revenue=ft_pri_cents / 100.0,
+        aov_first_time_order_count=ft_pri_count,
+        aov_mtd_first_time_revenue=ft_mtd_cents / 100.0,
+        aov_mtd_first_time_order_count=ft_mtd_count,
+        prior_period_aov_first_time_revenue=prior_ft_revenue,
+        prior_period_aov_first_time_order_count=prior_ft_orders,
     )
 
 
