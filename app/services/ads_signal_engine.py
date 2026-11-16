@@ -26,6 +26,7 @@ from app.models.meta_ad_insight_daily import MetaAdInsightDaily
 from app.models.meta_ad_set import MetaAdSet
 from app.models.meta_campaign import MetaCampaign
 from app.services import meta_ads_client as mac
+from app.services.ad_attribution import attach_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -1326,12 +1327,10 @@ def build_funnel_creative_grid(
     Each row is one ad. Columns are the ad-native metrics (spend/results/cpr/ctr)
     this data already supports — each with a current-range total plus a daily
     series for the frontend's inline sparkline (same shape AdsTab's CprSpark
-    already consumes). The 20 funnel-economics metrics (leads, close rate, cash
-    collected, CAC, ROAS, etc.) have no attribution path down to an individual
-    ad yet — that needs the Content Engine PRD's UTM-to-ad attribution, not
-    built — so they are deliberately not computed here at all; the frontend
-    renders their column headers with a static placeholder, not a query that
-    always returns null.
+    already consumes). Each row also carries an `attribution` dict (leads, booked,
+    live calls, closes, cash, cost/ROAS metrics) from app.services.ad_attribution,
+    which ties leads to ads via their UTM. Visitors / cost per LPV / LP conv rate
+    have no per-ad source and stay out of it.
     """
     today = _utcnow().date()
     if end is None:
@@ -1431,6 +1430,9 @@ def build_funnel_creative_grid(
             }
         )
     ad_rows.sort(key=lambda r: r["spend_cents"] or 0, reverse=True)
+    out_base["attribution_coverage"] = attach_attribution(
+        db, org_id, ads, ad_rows, series_start, series_end, funnel_id=funnel_id
+    )
     out_base["ads"] = ad_rows
     return out_base
 
@@ -1640,5 +1642,6 @@ def build_ad_rows(
             }
         )
     ad_rows.sort(key=lambda r: r["spend_cents"] or 0, reverse=True)
+    out_base["attribution_coverage"] = attach_attribution(db, org_id, ads, ad_rows, series_start, series_end)
     out_base["ads"] = ad_rows
     return out_base
