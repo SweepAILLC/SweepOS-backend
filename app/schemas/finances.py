@@ -21,6 +21,15 @@ class FinancesCombinedSummary(BaseModel):
     # Prior window of equal length (for KPI trend badges); omitted when scope=all.
     prior_period_revenue: Optional[float] = None
     prior_period_order_count: Optional[int] = None
+    # AOV is computed from first-time payments only (one per client, their earliest
+    # ever charge) so renewals/upsells don't dilute it. Separate from `combined`,
+    # which still reports every payment.
+    aov_first_time_revenue: float = 0.0
+    aov_first_time_order_count: int = 0
+    aov_mtd_first_time_revenue: float = 0.0
+    aov_mtd_first_time_order_count: int = 0
+    prior_period_aov_first_time_revenue: Optional[float] = None
+    prior_period_aov_first_time_order_count: Optional[int] = None
 
 
 class FinancesTimelinePoint(BaseModel):

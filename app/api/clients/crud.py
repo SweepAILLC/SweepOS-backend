@@ -513,6 +513,8 @@ def merge_clients(
             keep.phone = c.phone
         if c.instagram and (not keep.instagram or not keep.instagram.strip()):
             keep.instagram = c.instagram
+        if c.dialed_at and (keep.dialed_at is None or c.dialed_at < keep.dialed_at):
+            keep.dialed_at = c.dialed_at
         if c.stripe_customer_id and (not keep.stripe_customer_id or not keep.stripe_customer_id.strip()):
             keep.stripe_customer_id = c.stripe_customer_id
         keep.estimated_mrr = max((keep.estimated_mrr or 0), (c.estimated_mrr or 0))
