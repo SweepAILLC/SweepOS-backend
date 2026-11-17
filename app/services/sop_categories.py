@@ -244,3 +244,38 @@ def reorder_categories(db: Session, slugs: List[str]) -> List[Dict[str, Any]]:
         )
     db.commit()
     return list_categories(db)
+
+
+SOP_LOCK_PREFIX = "sop:"
+
+
+def locked_category_slugs(db: Session, org_id: Any) -> Set[str]:
+    """SOP category slugs the system owner has switched off for this org.
+
+    Stored as organization_tab_permissions rows named "sop:<slug>" with enabled=False.
+    The platform catalog org itself is never locked.
+    """
+    from app.api.deps import MAIN_ORG_ID
+    from app.models.organization_tab_permission import OrganizationTabPermission
+
+    if str(org_id) == str(MAIN_ORG_ID):
+        return set()
+    try:
+        org_uuid = org_id if isinstance(org_id, uuid.UUID) else uuid.UUID(str(org_id))
+        rows = (
+            db.query(OrganizationTabPermission.tab_name)
+            .filter(
+                OrganizationTabPermission.org_id == org_uuid,
+                OrganizationTabPermission.tab_name.like(f"{SOP_LOCK_PREFIX}%"),
+                OrganizationTabPermission.enabled.is_(False),
+            )
+            .all()
+        )
+    except Exception as e:  # never take the SOP library down over a lock lookup
+        _log.warning("sop lock lookup failed for org %s: %s", org_id, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return set()
+    return {name[len(SOP_LOCK_PREFIX):] for (name,) in rows}

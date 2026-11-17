@@ -32,17 +32,21 @@ from app.schemas.permission import (
 
 router = APIRouter()
 
-# Org-toggleable product tabs (must match Navbar product tabs).
+# Org-lockable product tabs (must match the Navbar product tabs the owner can lock).
 # Not included: settings (always on), owner (role-gated), org_portal (consulting tier).
 AVAILABLE_TABS = [
-    'terminal',
-    'pipeline',
-    'funnels',
     'content_studio',
-    'call_library',
     'kpi_command_center',
     'automations',
     'resources',
+]
+
+# Base product tabs every org always has. Old permission rows for these are ignored.
+ALWAYS_ON_TABS = [
+    'terminal',
+    'pipeline',
+    'funnels',
+    'call_library',
     'intelligence',
 ]
 

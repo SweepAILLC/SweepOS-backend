@@ -354,6 +354,11 @@ def check_tab_access(
     if tab_name == "settings":
         return True
 
+    from app.api.users import ALWAYS_ON_TABS
+
+    if tab_name in ALWAYS_ON_TABS:
+        return True
+
     # Role-based restrictions
     # 'owner' tab: Only OWNER role can access (unless in main org)
     if tab_name == 'owner':
@@ -393,9 +398,11 @@ def get_user_tab_permissions(
     Get all tab permissions for a user.
     Returns a dictionary mapping tab names to access booleans.
     """
-    from app.api.users import AVAILABLE_TABS
+    from app.api.users import ALWAYS_ON_TABS, AVAILABLE_TABS
 
     permissions = {}
+    for tab in ALWAYS_ON_TABS:
+        permissions[tab] = True
     for tab in AVAILABLE_TABS:
         permissions[tab] = check_tab_access(tab, user, db)
     # Always-available / role-gated tabs for frontend completeness
