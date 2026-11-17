@@ -1872,6 +1872,23 @@ def delete_organization_funnel(
     return None
 
 
+def _require_lockable_tab(db: Session, tab_name: str) -> None:
+    """Only lockable tabs and existing SOP categories may be written; base tabs are always on."""
+    from app.api.users import AVAILABLE_TABS
+    from app.services.sop_categories import SOP_LOCK_PREFIX, ensure_sop_categories_table, valid_category_slugs
+
+    if tab_name in AVAILABLE_TABS:
+        return
+    if tab_name.startswith(SOP_LOCK_PREFIX):
+        ensure_sop_categories_table(db)
+        if tab_name[len(SOP_LOCK_PREFIX):] in valid_category_slugs(db):
+            return
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"'{tab_name}' cannot be locked per organization",
+    )
+
+
 # Admin: Organization Tab Permissions Management
 @router.get("/organizations/{org_id}/tabs", response_model=List[OrgTabPermissionSchema])
 def list_organization_tab_permissions(
@@ -1881,6 +1898,7 @@ def list_organization_tab_permissions(
 ):
     """List all tab permissions for an organization"""
     from app.api.users import AVAILABLE_TABS, LEGACY_TAB_ALIASES
+    from app.services.sop_categories import SOP_LOCK_PREFIX, ensure_sop_categories_table, list_categories
 
     # Verify organization exists
     org = db.query(Organization).filter(Organization.id == org_id).first()
@@ -1900,7 +1918,9 @@ def list_organization_tab_permissions(
 
     # Return all current product tabs with their permissions (create defaults if missing)
     result = []
-    for tab in AVAILABLE_TABS:
+    ensure_sop_categories_table(db)
+    sop_keys = [f"{SOP_LOCK_PREFIX}{c['slug']}" for c in list_categories(db)]
+    for tab in [*AVAILABLE_TABS, *sop_keys]:
         row = permission_map.get(tab)
         if row is None:
             legacy = LEGACY_TAB_ALIASES.get(tab)
@@ -1946,6 +1966,8 @@ def create_organization_tab_permission(
         OrganizationTabPermissionCreate
     )
     
+    _require_lockable_tab(db, permission_data.tab_name)
+
     # Verify organization exists
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
@@ -1992,6 +2014,8 @@ def update_organization_tab_permission(
         OrganizationTabPermissionUpdate
     )
     
+    _require_lockable_tab(db, tab_name)
+
     # Verify organization exists
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
