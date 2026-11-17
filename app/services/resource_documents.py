@@ -18,6 +18,8 @@ from urllib.parse import urlparse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.services.sop_categories import ensure_sop_categories_table, valid_category_slugs
+
 _log = logging.getLogger(__name__)
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "resources"
@@ -368,6 +370,7 @@ def ensure_resource_documents_table(db: Session) -> None:
     db.execute(text("ALTER TABLE resource_documents ADD COLUMN IF NOT EXISTS video_url TEXT"))
     db.execute(text("ALTER TABLE resource_documents ADD COLUMN IF NOT EXISTS sort_order INTEGER"))
     db.commit()
+    ensure_sop_categories_table(db)
     _promote_docs_to_global_catalog(db)
 
 
@@ -522,18 +525,28 @@ def normalize_video_urls_storage(
     return json.dumps(urls)
 
 
-SOP_CATEGORIES = {"foundations", "marketing", "sales", "operations", "fulfillment"}
+def normalize_sop_category(
+    db: Session, raw: Optional[str], category: str, *, strict: bool = True
+) -> Optional[str]:
+    """Validate a SOP category slug against the owner-managed category list.
 
-
-def normalize_sop_category(raw: Optional[str], category: str) -> Optional[str]:
+    With ``strict=False`` an unknown slug (e.g. a built-in whose category the owner deleted)
+    becomes ``None`` instead of raising.
+    """
     if (category or "").strip().lower() != "sop":
         return None
     value = (raw or "").strip().lower()
     if not value:
         return None
-    if value not in SOP_CATEGORIES:
-        raise ValueError("invalid_sop_category")
+    if value not in valid_category_slugs(db):
+        if strict:
+            raise ValueError("invalid_sop_category")
+        return None
     return value
+
+
+def _live_category(slug: Optional[str], valid: set) -> Optional[str]:
+    return slug if slug and slug in valid else None
 
 
 def _row_to_dict(row) -> Dict[str, Any]:
@@ -557,6 +570,7 @@ def _row_to_dict(row) -> Dict[str, Any]:
 def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
     """Return the global platform catalog: built-ins (with Sweep Internal overrides) + custom docs."""
     org_str = str(_catalog_org_id(org_id))
+    valid_cats = valid_category_slugs(db)
     rows: Dict[str, Any] = {}
     try:
         result = db.execute(
@@ -589,6 +603,7 @@ def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
             if not doc.get("video_urls"):
                 vu = doc.get("video_url") or builtin.get("video_url")
                 doc["video_urls"] = [vu] if vu else []
+            doc["sop_category"] = _live_category(doc.get("sop_category"), valid_cats)
             doc["is_builtin"] = True
             out.append(doc)
         else:
@@ -597,7 +612,7 @@ def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
                 {
                     "resource_id": rid,
                     "category": builtin.get("category") or "SOP",
-                    "sop_category": builtin.get("sop_category"),
+                    "sop_category": _live_category(builtin.get("sop_category"), valid_cats),
                     "title": builtin["title"],
                     "description": builtin["description"],
                     "content": "",
@@ -613,6 +628,7 @@ def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
 
     for rid, doc in rows.items():
         if doc.get("is_custom"):
+            doc["sop_category"] = _live_category(doc.get("sop_category"), valid_cats)
             doc["is_builtin"] = False
             out.append(doc)
 
@@ -650,11 +666,13 @@ def get_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> Optional[Dict[s
         _log.warning("resource_documents get failed: %s", e)
         row = None
 
+    valid_cats = valid_category_slugs(db)
     if row:
         doc = _row_to_dict(row)
         builtin = _default_for(resource_id)
         if builtin and not doc.get("sop_category"):
             doc["sop_category"] = builtin.get("sop_category")
+        doc["sop_category"] = _live_category(doc.get("sop_category"), valid_cats)
         if builtin and not doc.get("video_url"):
             doc["video_url"] = builtin.get("video_url")
         if builtin and not doc.get("video_urls"):
@@ -673,7 +691,7 @@ def get_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> Optional[Dict[s
     return {
         "resource_id": resource_id,
         "category": builtin.get("category") or "SOP",
-        "sop_category": builtin.get("sop_category"),
+        "sop_category": _live_category(builtin.get("sop_category"), valid_cats),
         "title": builtin["title"],
         "description": builtin["description"],
         "content": _load_default_content(builtin["file_name"]),
@@ -866,7 +884,7 @@ def upsert_doc(
             "org_id": org_str,
             "resource_id": resource_id,
             "category": (category or "SOP")[:32],
-            "sop_category": normalize_sop_category(sop_category, category),
+            "sop_category": normalize_sop_category(db, sop_category, category),
             "title": title[:240],
             "description": description[:800],
             "content": content,
@@ -972,7 +990,9 @@ def reorder_docs(
                 "org_id": org_str,
                 "resource_id": rid,
                 "category": (builtin.get("category") or "SOP")[:32],
-                "sop_category": normalize_sop_category(builtin.get("sop_category"), builtin.get("category") or "SOP"),
+                "sop_category": normalize_sop_category(
+                    db, builtin.get("sop_category"), builtin.get("category") or "SOP", strict=False
+                ),
                 "title": str(builtin["title"])[:240],
                 "description": str(builtin.get("description") or "")[:800],
                 "content": _load_default_content(builtin["file_name"]),

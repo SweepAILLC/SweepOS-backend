@@ -21,6 +21,8 @@ from app.services.resource_documents import (
     reorder_docs,
     BUILTIN_DOCS,
 )
+from app.services import sop_categories as sop_cats
+from app.services.video_thumbnails import resolve_thumbnails
 from app.services.resource_library import (
     ensure_resource_library_table,
     list_library_items,
@@ -58,6 +60,24 @@ def _require_system_owner(current_user, db: Session) -> None:
         )
 
 
+def _doc_summary(i: dict) -> dict:
+    urls = i.get("video_urls") or ([i["video_url"]] if i.get("video_url") else [])
+    return {
+        "resource_id": i["resource_id"],
+        "category": i.get("category") or "SOP",
+        "sop_category": i.get("sop_category"),
+        "title": i["title"],
+        "description": i["description"],
+        "powered_by": i.get("powered_by"),
+        "video_url": i.get("video_url"),
+        "video_urls": urls,
+        "is_custom": i.get("is_custom", False),
+        "is_builtin": i.get("is_builtin", False),
+        "updated_at": i.get("updated_at"),
+        "sort_order": i.get("sort_order"),
+    }
+
+
 @router.get("/docs")
 def get_docs(
     db: Session = Depends(get_db),
@@ -68,22 +88,7 @@ def get_docs(
 
     ensure_resource_documents_table(db)
     items = list_docs(db, UUID(_docs_org_id()))
-    return [
-        {
-            "resource_id": i["resource_id"],
-            "category": i.get("category") or "SOP",
-            "sop_category": i.get("sop_category"),
-            "title": i["title"],
-            "description": i["description"],
-            "powered_by": i.get("powered_by"),
-            "video_url": i.get("video_url"),
-            "is_custom": i.get("is_custom", False),
-            "is_builtin": i.get("is_builtin", False),
-            "updated_at": i.get("updated_at"),
-            "sort_order": i.get("sort_order"),
-        }
-        for i in items
-    ]
+    return [_doc_summary(i) for i in items]
 
 
 @router.get("/docs/{resource_id}")
@@ -260,22 +265,7 @@ def reorder_doc_documents(
         _log.error("resource_documents reorder failed: %s", e)
         raise HTTPException(status_code=500, detail="Failed to reorder documents.")
 
-    return [
-        {
-            "resource_id": i["resource_id"],
-            "category": i.get("category") or "SOP",
-            "sop_category": i.get("sop_category"),
-            "title": i["title"],
-            "description": i["description"],
-            "powered_by": i.get("powered_by"),
-            "video_url": i.get("video_url"),
-            "is_custom": i.get("is_custom", False),
-            "is_builtin": i.get("is_builtin", False),
-            "updated_at": i.get("updated_at"),
-            "sort_order": i.get("sort_order"),
-        }
-        for i in items
-    ]
+    return [_doc_summary(i) for i in items]
 
 
 @router.delete("/docs/{resource_id}")
@@ -292,6 +282,103 @@ def remove_doc_document(
     if not ok:
         raise HTTPException(status_code=404, detail="Document not found or cannot be deleted.")
     return {"resource_id": resource_id, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# SOP categories (owner-managed, global) + video thumbnails
+# ---------------------------------------------------------------------------
+
+_CATEGORY_ERRORS = {
+    "label_required": "Category name is required.",
+    "invalid_color": "Unsupported category color.",
+    "nothing_to_update": "Nothing to update.",
+    "empty_reorder": "slugs cannot be empty.",
+}
+
+
+def _category_http_error(e: ValueError) -> HTTPException:
+    return HTTPException(status_code=400, detail=_CATEGORY_ERRORS.get(str(e), "Invalid category."))
+
+
+@router.get("/sop-categories")
+def list_sop_categories(
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """List SOP categories in display order. Readable by every org member."""
+    return sop_cats.list_categories(db)
+
+
+@router.post("/sop-categories")
+def create_sop_category(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    _require_system_owner(current_user, db)
+    try:
+        return sop_cats.create_category(db, label=body.get("label"), color=body.get("color"))
+    except ValueError as e:
+        raise _category_http_error(e)
+
+
+@router.post("/sop-categories/reorder")
+def reorder_sop_categories(
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    _require_system_owner(current_user, db)
+    slugs = body.get("slugs")
+    if not isinstance(slugs, list):
+        raise HTTPException(status_code=400, detail="slugs must be a list.")
+    try:
+        return sop_cats.reorder_categories(db, [str(x) for x in slugs])
+    except ValueError as e:
+        raise _category_http_error(e)
+
+
+@router.put("/sop-categories/{slug}")
+def update_sop_category(
+    slug: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    _require_system_owner(current_user, db)
+    try:
+        updated = sop_cats.update_category(db, slug, label=body.get("label"), color=body.get("color"))
+    except ValueError as e:
+        raise _category_http_error(e)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Category not found.")
+    return updated
+
+
+@router.delete("/sop-categories/{slug}")
+def delete_sop_category(
+    slug: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Delete a category. Its SOPs are kept and become uncategorized."""
+    _require_system_owner(current_user, db)
+    affected = sop_cats.delete_category(db, slug)
+    if affected is None:
+        raise HTTPException(status_code=404, detail="Category not found.")
+    return {"slug": slug, "deleted": True, "uncategorized_docs": affected}
+
+
+@router.post("/video-thumbnails")
+def get_video_thumbnails(
+    body: dict,
+    current_user=Depends(get_current_user),
+):
+    """Resolve thumbnail URLs for embedded videos (Loom via oEmbed). Missing ones map to null."""
+    urls = body.get("urls")
+    if not isinstance(urls, list):
+        raise HTTPException(status_code=400, detail="urls must be a list.")
+    return {"thumbnails": resolve_thumbnails([str(u) for u in urls])}
 
 
 # Re-export for main.py startup
