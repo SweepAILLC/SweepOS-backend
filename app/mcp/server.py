@@ -48,8 +48,8 @@ from app.services.instagram_mcp_bundle import (
 from app.services.resource_documents import (
     ensure_doc_content,
     ensure_resource_documents_table,
-    list_docs,
-    get_doc,
+    list_docs_for_org,
+    get_doc_for_org,
     search_resource_docs,
 )
 from app.services.resource_library import (
@@ -1391,7 +1391,7 @@ def _run_tool(
         )
     if name == "list_resource_docs":
         ensure_resource_documents_table(db)
-        docs = list_docs(db, org_id)
+        docs = list_docs_for_org(db, org_id)
         category = str(args.get("category") or "").strip().lower()
         sop_category = str(args.get("sop_category") or "").strip().lower()
         include_content = bool(args.get("include_content") or False)
@@ -1446,7 +1446,7 @@ def _run_tool(
         if not rid:
             return _text_result({"error": "resource_id required"})
         ensure_resource_documents_table(db)
-        doc = get_doc(db, org_id, rid)
+        doc = get_doc_for_org(db, org_id, rid)
         if not doc:
             return _text_result({"error": "resource doc not found"})
         return _text_result(ensure_doc_content(doc))
@@ -2286,7 +2286,7 @@ def _handle_jsonrpc(
             }
         if uri == "sweep://resources/docs":
             ensure_resource_documents_table(db)
-            payload = {"docs": list_docs(db, org_id)}
+            payload = {"docs": list_docs_for_org(db, org_id)}
             text = json.dumps(payload, default=str)
             return {
                 "jsonrpc": "2.0",
@@ -2300,7 +2300,7 @@ def _handle_jsonrpc(
         if uri.startswith("sweep://resources/docs/"):
             rid = uri.split("sweep://resources/docs/", 1)[1]
             ensure_resource_documents_table(db)
-            payload = get_doc(db, org_id, rid) or {"error": "resource doc not found"}
+            payload = get_doc_for_org(db, org_id, rid) or {"error": "resource doc not found"}
             text = json.dumps(payload, default=str)
             return {
                 "jsonrpc": "2.0",

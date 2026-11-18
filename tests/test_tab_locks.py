@@ -141,3 +141,43 @@ def test_doc_fetch_403_when_locked_and_categories_flagged(monkeypatch):
     assert r.get_doc_document("b", db=None, current_user=user)["resource_id"] == "b"
     cats = {c["slug"]: c["locked"] for c in r.list_sop_categories(db=None, current_user=user)}
     assert cats == {"sales": True, "ops": False}
+
+
+def _rd_with_locks(monkeypatch, locked):
+    from app.services import resource_documents as rd
+
+    docs = [
+        {"resource_id": "a", "sop_category": "sales", "title": "Sales A", "description": "pricing", "content": "x", "category": "SOP"},
+        {"resource_id": "b", "sop_category": "ops", "title": "Ops B", "description": "pricing", "content": "x", "category": "SOP"},
+        {"resource_id": "c", "sop_category": None, "title": "Loose C", "description": "pricing", "content": "x", "category": "SOP"},
+    ]
+    monkeypatch.setattr(rd, "list_docs", lambda db, org: docs)
+    monkeypatch.setattr(rd, "get_doc", lambda db, org, rid: next((d for d in docs if d["resource_id"] == rid), None))
+    monkeypatch.setattr(rd, "locked_category_slugs", lambda db, org: set(locked))
+    return rd
+
+
+def test_mcp_list_get_and_search_respect_locks(monkeypatch):
+    rd = _rd_with_locks(monkeypatch, {"sales"})
+    org = uuid.uuid4()
+    assert [d["resource_id"] for d in rd.list_docs_for_org(None, org)] == ["b", "c"]
+    assert rd.get_doc_for_org(None, org, "a") is None
+    assert rd.get_doc_for_org(None, org, "b")["resource_id"] == "b"
+    assert rd.get_doc_for_org(None, org, "c")["resource_id"] == "c"
+    ids = [m["resource_id"] for m in rd.search_resource_docs(None, org, query="pricing")["matches"]]
+    assert "a" not in ids and set(ids) == {"b", "c"}
+
+
+def test_mcp_unlocked_org_sees_everything(monkeypatch):
+    rd = _rd_with_locks(monkeypatch, set())
+    org = uuid.uuid4()
+    assert len(rd.list_docs_for_org(None, org)) == 3
+    assert rd.get_doc_for_org(None, org, "a") is not None
+
+
+def test_mcp_server_uses_filtered_helpers():
+    import inspect
+    from app.mcp import server
+
+    src = inspect.getsource(server)
+    assert "list_docs(db" not in src and "get_doc(db" not in src
