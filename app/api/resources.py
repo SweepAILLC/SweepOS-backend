@@ -5,7 +5,10 @@ Platform docs (SOPs + AI skills) are stored on Sweep Internal and shown to every
 org. All org members may read them; only system owners may create or edit them.
 Org library items remain per-organization.
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Optional
+from uuid import UUID as _UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 import logging
 
@@ -39,6 +42,15 @@ _log = logging.getLogger(__name__)
 
 def _org_id(current_user) -> str:
     return str(getattr(current_user, "selected_org_id", None) or current_user.org_id)
+
+
+def _view_org_id(db: Session, current_user, as_org_id: Optional[_UUID]) -> str:
+    """Org whose SOP locks apply. System owners may preview another org's view (?as_org_id=)."""
+    if not isinstance(as_org_id, _UUID):  # None, or an unresolved Query() default on direct calls
+        return _org_id(current_user)
+    if not user_is_system_owner(current_user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="System owner access required.")
+    return str(as_org_id)
 
 
 def _docs_org_id() -> str:
@@ -100,6 +112,7 @@ def _locked_doc_summary(i: dict) -> dict:
 @router.get("/docs")
 def get_docs(
     include_locked: bool = False,
+    as_org_id: Optional[_UUID] = Query(default=None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -113,7 +126,7 @@ def get_docs(
 
     ensure_resource_documents_table(db)
     items = list_docs(db, UUID(_docs_org_id()))
-    locked = sop_cats.locked_category_slugs(db, _org_id(current_user))
+    locked = sop_cats.locked_category_slugs(db, _view_org_id(db, current_user, as_org_id))
     out = []
     for i in items:
         if i.get("sop_category") not in locked:
@@ -126,6 +139,7 @@ def get_docs(
 @router.get("/docs/{resource_id}")
 def get_doc_document(
     resource_id: str,
+    as_org_id: Optional[_UUID] = Query(default=None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -135,7 +149,7 @@ def get_doc_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
     if doc.get("sop_category") and doc["sop_category"] in sop_cats.locked_category_slugs(
-        db, _org_id(current_user)
+        db, _view_org_id(db, current_user, as_org_id)
     ):
         raise HTTPException(status_code=403, detail="This SOP category is locked for your organization.")
     return doc
@@ -338,11 +352,13 @@ def _category_http_error(e: ValueError) -> HTTPException:
 
 @router.get("/sop-categories")
 def list_sop_categories(
+    as_org_id: Optional[_UUID] = Query(default=None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """List SOP categories in display order, flagging those locked for the caller's org."""
-    locked = sop_cats.locked_category_slugs(db, _org_id(current_user))
+    """List SOP categories in display order, flagging those locked for the caller's org
+    (or, for a system owner previewing an org, for that org)."""
+    locked = sop_cats.locked_category_slugs(db, _view_org_id(db, current_user, as_org_id))
     return [{**c, "locked": c["slug"] in locked} for c in sop_cats.list_categories(db)]
 
 

@@ -10,6 +10,7 @@ from app.models.stripe_event import StripeEvent
 from app.models.stripe_treasury_transaction import StripeTreasuryTransaction
 from app.models.manual_payment import ManualPayment
 from app.models.funnel_ad_spend import FunnelAdSpend
+from app.models.org_business_economics import OrgBusinessEconomics
 from app.models.funnel_scorecard_override import FunnelScorecardOverride
 from app.models.team_kpi import TeamKpiNotification, TeamKpiSettings
 from app.models.client_checkin import ClientCheckIn
@@ -70,7 +71,7 @@ from app.models.onboarding_survey_response import OnboardingSurveyResponse
 __all__ = [
     "User", "UserRole", "Client", "Event", "OAuthToken", "Campaign", "Recommendation",
     "StripePayment", "StripeSubscription", "StripeEvent", "StripeTreasuryTransaction",
-    "ManualPayment", "FunnelAdSpend", "FunnelScorecardOverride", "TeamKpiSettings", "TeamKpiNotification", "ClientCheckIn", "Organization", "Feature",
+    "ManualPayment", "FunnelAdSpend", "OrgBusinessEconomics", "FunnelScorecardOverride", "TeamKpiSettings", "TeamKpiNotification", "ClientCheckIn", "Organization", "Feature",
     "Funnel", "FunnelStep", "Session", "EventError",
     "OrganizationTabPermission", "UserTabPermission", "UserOrganization",
     "AuditLog", "AuditEventType",

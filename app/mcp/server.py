@@ -396,6 +396,17 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "get_scale_readiness",
+        "description": (
+            "Scale Planner verdict for the org's paid ads: break-even ROAS (fixed + variable costs), "
+            "gap above break-even, runway months from cash reserves, bulk / hold / cut verdict, and a "
+            "recommended daily spend sized so a worst-case month stays inside the reserve cushion. "
+            "Uses the last 8 complete weeks of paid spend and cash. Owners/admins only. Cite the "
+            "numbers it returns; if configured is false, ask the owner to fill in Business economics."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "get_pipeline_grid",
         "description": (
             "Pipeline Grid view: every client card with contact, lifecycle stage, channel tag "
@@ -1344,6 +1355,13 @@ def _run_tool(
         )
     if name == "get_kpi_flags":
         return _text_result(get_kpi_flags_for_mcp(db, org_id))
+    if name == "get_scale_readiness":
+        role = str((auth_ctx or {}).get("role") or "").lower().rsplit(".", 1)[-1]
+        if role not in ("owner", "admin"):
+            return _text_result({"error": "Scale readiness includes cash reserves; owners and admins only."})
+        from app.api.business_economics import compute_readiness
+
+        return _text_result(compute_readiness(db, org_id))
     if name == "get_marketing_ideas":
         return _text_result(get_marketing_ideas_for_mcp(db, org_id))
     if name == "get_instagram_performance":
