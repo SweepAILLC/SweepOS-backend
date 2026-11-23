@@ -219,3 +219,21 @@ def test_sop_preview_uses_target_org_for_system_owner(monkeypatch):
 def test_sop_without_preview_uses_own_org():
     user = _user()
     assert resources._view_org_id(_FakeDb(), user, None) == str(user.selected_org_id)
+
+
+def test_funnel_slice_allocates_fixed_costs_by_spend_share():
+    econ = sp.Economics(fixed_monthly=10_000, variable_pct=20)
+    org = {"monthly_spend": 20_000}
+    funnel = {"monthly_spend": 5_000, "roas": 3.0}
+    out = be.funnel_slice(org, funnel, econ)
+    assert out["spend_share_pct"] == 25.0
+    assert out["allocated_fixed_monthly"] == 2_500
+    # (1 + 2500/5000) / 0.8 = 1.875
+    assert out["breakeven_roas"] == pytest.approx(1.88, abs=0.01)
+    assert out["gap"]["zone"] == "push"
+
+
+def test_funnel_slice_without_org_spend_allocates_nothing():
+    out = be.funnel_slice({"monthly_spend": 0}, {"monthly_spend": 0, "roas": None}, sp.Economics(fixed_monthly=5_000))
+    assert out["allocated_fixed_monthly"] == 0
+    assert out["breakeven_roas"] is None

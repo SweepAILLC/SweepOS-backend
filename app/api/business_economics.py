@@ -136,24 +136,57 @@ def economics_from(profile: Dict[str, Any]) -> sp.Economics:
     )
 
 
-def compute_readiness(db: Session, org_id: uuid.UUID, *, today=None) -> Dict[str, Any]:
-    """Profile + trailing paid data -> verdict. Shared by the REST route and MCP."""
+def funnel_slice(
+    org_trailing: Dict[str, Any],
+    funnel_trailing: Dict[str, Any],
+    econ: sp.Economics,
+) -> Dict[str, Any]:
+    """One funnel's view: its own spend/ROAS, with org fixed costs allocated by its share of
+    paid spend (fixed costs and the cash cushion belong to the whole business, not a funnel)."""
+    org_spend = org_trailing.get("monthly_spend") or 0.0
+    spend = funnel_trailing.get("monthly_spend") or 0.0
+    share = (spend / org_spend) if org_spend > 0 else 0.0
+    share = max(0.0, min(1.0, share))
+    allocated = econ.breakeven_fixed * share
+    be = sp.break_even_roas(spend, allocated, econ.variable_pct)
+    return {
+        **funnel_trailing,
+        "spend_share_pct": round(share * 100, 1),
+        "allocated_fixed_monthly": round(allocated, 2),
+        "breakeven_roas": None if be is None else round(be, 2),
+        "gap": sp.gap_zone(funnel_trailing.get("roas"), be),
+    }
+
+
+def compute_readiness(
+    db: Session, org_id: uuid.UUID, *, funnel_id: Optional[uuid.UUID] = None, today=None
+) -> Dict[str, Any]:
+    """Profile + trailing paid data -> org verdict, plus an optional one-funnel slice.
+    Shared by the REST route and MCP."""
     today = today or datetime.now(timezone.utc).date()
     profile = serialize(_row(db, org_id), org_id)
+    econ = economics_from(profile)
     weeks = sp.complete_weeks(today, 8)
     funnel_ids = {fid for (fid,) in db.query(Funnel.id).filter(Funnel.org_id == org_id).all()}
     weekly, _ = weekly_metric_values(db, org_id, weeks, "paid", None, funnel_ids, include_ads=True)
     trailing = sp.trailing_summary(weekly)
     verdict = sp.readiness(
-        economics_from(profile),
+        econ,
         monthly_spend=trailing["monthly_spend"],
         current_roas=trailing["roas"],
         worst_week_roas=trailing["worst_week_roas"],
     )
+    funnel: Optional[Dict[str, Any]] = None
+    if funnel_id is not None:
+        if funnel_id not in funnel_ids:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Funnel not found.")
+        f_weekly, _ = weekly_metric_values(db, org_id, weeks, "paid", funnel_id, {funnel_id}, include_ads=True)
+        funnel = {"funnel_id": str(funnel_id), **funnel_slice(trailing, sp.trailing_summary(f_weekly), econ)}
     return {
         "configured": profile["configured"],
         "trailing": {**trailing, "weeks": [w.isoformat() for w in weeks]},
         "readiness": verdict,
+        "funnel": funnel,
         "target_cost_per_call": profile["target_cost_per_call"],
     }
 
@@ -213,8 +246,9 @@ def put_business_economics(
 @router.get("/readiness")
 def get_scale_readiness(
     as_org_id: Optional[uuid.UUID] = Query(default=None),
+    funnel_id: Optional[uuid.UUID] = Query(default=None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     org_id = resolve_org(db, current_user, as_org_id)
-    return compute_readiness(db, org_id)
+    return compute_readiness(db, org_id, funnel_id=funnel_id if isinstance(funnel_id, uuid.UUID) else None)
