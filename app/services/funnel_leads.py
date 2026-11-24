@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException, status
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -72,6 +73,92 @@ def find_client_by_ghl_contact_id(db: Session, org_id: uuid.UUID, ghl_contact_id
     )
 
 
+# Submission/session tokens shorter than this are too easy to collide on.
+_MIN_REF_LEN = 4
+
+
+def _clean_ref(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if len(text) < _MIN_REF_LEN:
+        return None
+    return text[:200]
+
+
+def _norm_instagram(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    handle = str(value).strip().lstrip("@").lower()
+    return handle or None
+
+
+def find_client_by_instagram(db: Session, org_id: uuid.UUID, instagram: str) -> Optional[Client]:
+    """Org-scoped lookup on the handle, with or without a leading @."""
+    handle = _norm_instagram(instagram)
+    if not handle:
+        return None
+    return (
+        db.query(Client)
+        .filter(
+            Client.org_id == org_id,
+            Client.instagram.isnot(None),
+            _instagram_match(handle),
+        )
+        .order_by(Client.created_at.asc())
+        .first()
+    )
+
+
+def _instagram_match(handle: str):
+    """Filter: stored handle equals `handle` or `@handle` (case-insensitive)."""
+    lowered = func.lower(Client.instagram)
+    return lowered.in_([handle, f"@{handle}"])
+
+
+def find_client_by_prospect_ref(
+    db: Session,
+    org_id: uuid.UUID,
+    *,
+    external_id: Optional[str] = None,
+    contact_ref: Optional[str] = None,
+    visitor_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Optional[Client]:
+    """Org-scoped lookup for a client already stamped by an earlier partial.
+
+    More specific refs win: submission id, then contact id, then visitor, then
+    session. Used when a later webhook step omits the email/phone the first
+    step already stored.
+    """
+    wanted = []
+    for field, raw in (
+        ("external_id", external_id),
+        ("contact_ref", contact_ref),
+        ("visitor_id", visitor_id),
+        ("session_id", session_id),
+    ):
+        cleaned = _clean_ref(raw)
+        if cleaned:
+            wanted.append((field, cleaned))
+    if not wanted:
+        return None
+    conds = [Client.meta["prospect"][field].as_string() == value for field, value in wanted]
+    rows = (
+        db.query(Client)
+        .filter(Client.org_id == org_id, or_(*conds))
+        .order_by(Client.created_at.asc())
+        .limit(20)
+        .all()
+    )
+    for field, value in wanted:
+        for client in rows:
+            prospect = client.meta.get("prospect") if isinstance(client.meta, dict) else None
+            if isinstance(prospect, dict) and prospect.get(field) == value:
+                return client
+    return None
+
+
 def _split_name(lead: FunnelLeadIn) -> tuple[Optional[str], Optional[str]]:
     first_name, last_name = lead.first_name, lead.last_name
     if lead.name and isinstance(lead.name, str) and lead.name.strip():
@@ -88,6 +175,12 @@ def _to_naive_utc(dt: datetime) -> datetime:
     return dt
 
 
+def _merge_partial_opt_in(lead: FunnelLeadIn) -> bool:
+    """Webhook and GHL steps send only the fields filled so far. Keep earlier keys."""
+    source = lead.source or ""
+    return source == "webhook" or source.startswith("ghl_")
+
+
 def _apply_prospect_meta(
     client: Client,
     funnel: Funnel,
@@ -95,6 +188,8 @@ def _apply_prospect_meta(
     utm: Optional[Dict[str, Any]],
     captured_at: datetime,
     ghl_contact_id: Optional[str],
+    external_id: Optional[str] = None,
+    contact_ref: Optional[str] = None,
 ) -> None:
     # Always stamp funnel_id + captured_at so the Leads tab can list every capture.
     meta = client.meta if isinstance(client.meta, dict) else {}
@@ -109,16 +204,53 @@ def _apply_prospect_meta(
     if lead.quiz_answers is not None:
         prospect["quiz_answers"] = lead.quiz_answers or {}
     if lead.opt_in_data is not None:
-        prospect["opt_in_data"] = lead.opt_in_data or {}
+        incoming = lead.opt_in_data or {}
+        previous = prev.get("opt_in_data") if isinstance(prev.get("opt_in_data"), dict) else None
+        if _merge_partial_opt_in(lead) and previous:
+            prospect["opt_in_data"] = {**previous, **incoming}
+        else:
+            prospect["opt_in_data"] = incoming
     if lead.funnel_step_reached is not None:
         prospect["funnel_step_reached"] = lead.funnel_step_reached
     if utm:
         prospect["utm"] = utm
+    for field, raw in (
+        ("external_id", external_id),
+        ("contact_ref", contact_ref),
+        ("visitor_id", lead.visitor_id),
+        ("session_id", lead.session_id),
+    ):
+        cleaned = _clean_ref(raw)
+        if cleaned:
+            prospect[field] = cleaned
     meta = {**meta, "prospect": prospect}
     if ghl_contact_id and not meta.get("ghl_contact_id"):
         meta["ghl_contact_id"] = ghl_contact_id
     client.meta = meta
     flag_modified(client, "meta")
+
+
+def _same_submission(client: Client, funnel: Funnel, external_id: Optional[str]) -> bool:
+    """True when this payload's submission id is already on this client for this funnel.
+
+    Partial webhook steps share one submission id across hours or days. That is
+    the same capture, not a returning opt-in, so it stays inside the dedupe
+    window no matter how long the visitor takes to finish the form.
+    """
+    cleaned = _clean_ref(external_id)
+    if not cleaned or not isinstance(client.meta, dict):
+        return False
+    prospect = client.meta.get("prospect")
+    if not isinstance(prospect, dict):
+        return False
+    return prospect.get("external_id") == cleaned and prospect.get("funnel_id") == str(funnel.id)
+
+
+def _email_conflicts(client: Client, email: Optional[str]) -> bool:
+    if not email:
+        return False
+    existing = (client.email or "").strip().lower()
+    return bool(existing) and existing != email.strip().lower()
 
 
 # How close two arrivals for the same funnel have to land to count as the same
@@ -195,6 +327,8 @@ def upsert_funnel_lead(
     utm: Optional[Dict[str, Any]] = None,
     opted_in_at: Optional[datetime] = None,
     ghl_contact_id: Optional[str] = None,
+    external_id: Optional[str] = None,
+    contact_ref: Optional[str] = None,
     reattribute: bool = False,
     notify: bool = True,
 ) -> FunnelLeadResult:
@@ -216,12 +350,29 @@ def upsert_funnel_lead(
         client = find_client_by_email(db, org_id, email)
     if client is None and phone:
         client = find_client_by_phone(db, org_id, phone)
+    if client is None and instagram:
+        client = find_client_by_instagram(db, org_id, instagram)
+    if client is None and (external_id or contact_ref or lead.visitor_id or lead.session_id):
+        found = find_client_by_prospect_ref(
+            db,
+            org_id,
+            external_id=external_id,
+            contact_ref=contact_ref,
+            visitor_id=lead.visitor_id,
+            session_id=lead.session_id,
+        )
+        # A ref must not glue two different emails onto one client.
+        if found is not None and not _email_conflicts(found, email):
+            client = found
 
     if client is not None:
         # Computed before _apply_prospect_meta below overwrites meta.prospect,
         # so this reads the PRIOR capture's funnel_id, not the one we're about
-        # to stamp for this arrival.
-        duplicate = _already_captured_for_funnel(client, funnel, captured_at)
+        # to stamp for this arrival. The same submission id (a multi-step
+        # webhook finishing later) is always the same capture.
+        duplicate = _already_captured_for_funnel(client, funnel, captured_at) or _same_submission(
+            client, funnel, external_id
+        )
 
         if first_name is not None and first_name:
             client.first_name = first_name
@@ -245,6 +396,8 @@ def upsert_funnel_lead(
             utm,
             captured_at,
             ghl_contact_id,
+            external_id,
+            contact_ref,
         )
         if duplicate and prev_captured:
             client.meta["prospect"]["captured_at"] = prev_captured
@@ -312,7 +465,9 @@ def upsert_funnel_lead(
         # Backfilled leads keep their real dates in every count that reads created_at.
         client.opted_in_at = opted_in_at
         client.created_at = _to_naive_utc(opted_in_at)
-    _apply_prospect_meta(client, funnel, lead, utm, captured_at, ghl_contact_id)
+    _apply_prospect_meta(
+        client, funnel, lead, utm, captured_at, ghl_contact_id, external_id, contact_ref
+    )
     db.add(client)
     db.commit()
     db.refresh(client)

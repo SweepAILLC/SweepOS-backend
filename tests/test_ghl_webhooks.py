@@ -262,6 +262,28 @@ class TestIngestOptIn:
         assert out == {"ok": True, "deduped": True}
         process.assert_not_called()
 
+    def test_later_partial_on_done_row_is_reprocessed(self):
+        funnel = Funnel(id=uuid.uuid4(), org_id=uuid.uuid4(), name="f", source="ghl", ghl_config={})
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = funnel
+        old = _opt_in_body(funnel.id)
+        row = SimpleNamespace(status="done", payload={**old, gw.RECEIVED_AT_KEY: RECEIVED.isoformat()})
+        new = {**old, "phone": "+15550199999"}
+        new["customData"] = {**old["customData"], "budget": "2k"}
+
+        def record(db, **kw):
+            row.event_id = kw["event_id"]
+            return row, False
+
+        with patch("app.services.inbound_webhook_inbox.record_inbound_event", side_effect=record), patch(
+            "app.services.inbound_webhook_inbox.mark_inbound_done"
+        ), patch.object(gw, "_process_ghl_opt_in") as process:
+            out = gw._ingest_ghl_opt_in(db, funnel.org_id, new)
+        assert out == {"ok": True}
+        process.assert_called_once()
+        assert process.call_args.args[2]["phone"] == "+15550199999"
+        assert process.call_args.args[2]["customData"]["budget"] == "2k"
+
     def test_process_tags_with_original_receipt_time_and_records_health(self):
         funnel = Funnel(id=uuid.uuid4(), org_id=uuid.uuid4(), name="f", source="ghl", ghl_config={"steps": []})
         db = MagicMock()

@@ -97,7 +97,19 @@ _ALIAS_LOOKUP = {alias: target for target, aliases in _ALIASES.items() for alias
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _DEDUPE_HEADERS = ("idempotency-key", "x-idempotency-key", "webhook-id", "x-webhook-id", "x-event-id")
-_DEDUPE_BODY_KEYS = ("event_id", "submission_id", "entry_id", "response_id", "webhook_id", "idempotency_key")
+# Retry ids only. submission/response/entry ids stay stable across partial steps
+# of one form, so they must not collapse those steps into one inbox row.
+_DEDUPE_BODY_KEYS = ("event_id", "webhook_id", "idempotency_key")
+_SUBMISSION_KEYS = (
+    "submission_id",
+    "submissionId",
+    "response_id",
+    "responseId",
+    "entry_id",
+    "entryId",
+    "respondent_id",
+)
+_CONTACT_KEYS = ("contact_id", "contactId")
 
 _MAX_FLAT_KEYS = 300
 _MAX_DEPTH = 6
@@ -395,11 +407,56 @@ def _clean_value(target: str, value: Any) -> Optional[str]:
     return s
 
 
+def _ref_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if len(text) < 4:
+        return None
+    return text[:200]
+
+
+def extract_partial_refs(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """(submission id, contact id) shared by later steps of the same form fill.
+
+    `event_id` is deliberately not a ref: senders mint a new one per HTTP delivery.
+    """
+    submission = None
+    for key in _SUBMISSION_KEYS:
+        submission = _ref_value(payload.get(key))
+        if submission:
+            break
+    if submission is None:
+        form_response = payload.get("form_response")
+        if isinstance(form_response, dict):
+            submission = _ref_value(form_response.get("token"))
+    if submission is None:
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("submissionId", "submission_id", "responseId", "response_id"):
+                submission = _ref_value(data.get(key))
+                if submission:
+                    break
+
+    contact = None
+    for key in _CONTACT_KEYS:
+        contact = _ref_value(payload.get(key))
+        if contact:
+            break
+    if contact is None:
+        nested = payload.get("contact")
+        if isinstance(nested, dict):
+            contact = _ref_value(nested.get("id"))
+    return submission, contact
+
+
 @dataclass
 class NormalizedLead:
     fields: Dict[str, str]
     utm: Dict[str, str]
     opt_in_data: Dict[str, Any]
+    external_id: Optional[str] = None
+    contact_ref: Optional[str] = None
 
     @property
     def has_identity(self) -> bool:
@@ -409,7 +466,13 @@ class NormalizedLead:
         return {k: bool(self.fields.get(k)) for k in IDENTITY_FIELDS}
 
     def to_payload(self) -> Dict[str, Any]:
-        return {"fields": self.fields, "utm": self.utm, "opt_in_data": self.opt_in_data}
+        return {
+            "fields": self.fields,
+            "utm": self.utm,
+            "opt_in_data": self.opt_in_data,
+            "external_id": self.external_id,
+            "contact_ref": self.contact_ref,
+        }
 
 
 def normalize_payload(payload: Dict[str, Any], field_map: Optional[Mapping[str, str]] = None) -> NormalizedLead:
@@ -450,11 +513,19 @@ def normalize_payload(payload: Dict[str, Any], field_map: Optional[Mapping[str, 
             break
         opt_in[path] = v
         budget -= cost
-    return NormalizedLead(fields=fields, utm=utm, opt_in_data=opt_in)
+    external_id, contact_ref = extract_partial_refs(payload)
+    return NormalizedLead(
+        fields=fields, utm=utm, opt_in_data=opt_in, external_id=external_id, contact_ref=contact_ref
+    )
 
 
 def dedupe_key(headers: Mapping[str, str], payload: Dict[str, Any]) -> str:
-    """Sender idempotency id (header, then body), else a hash of the canonical body."""
+    """Sender retry id (header, then event id), else a hash of the canonical body.
+
+    A shared submission/response id is not a retry id: partial steps reuse it
+    while the body grows. Those steps are separate inbox rows and merge later
+    onto one client via `external_id`.
+    """
     for h in _DEDUPE_HEADERS:
         v = (headers.get(h) or "").strip()
         if v:
@@ -523,13 +594,38 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _identity_lock_key(org_id: uuid.UUID, fields: Mapping[str, str]) -> Optional[str]:
+def _identity_lock_keys(
+    org_id: uuid.UUID,
+    fields: Mapping[str, str],
+    external_id: Optional[str] = None,
+    contact_ref: Optional[str] = None,
+) -> List[str]:
+    """Every identity this delivery might merge on.
+
+    A partial step often has a submission id plus only the new field (phone,
+    not email). Locking just the field present on this step lets the email
+    step and the phone step create two clients. Lock every key, in sorted
+    order so two deliveries can't deadlock.
+    """
+    keys: List[str] = []
     if fields.get("email"):
-        return f"funnel-lead:{org_id}:e:{fields['email'].lower()}"
+        keys.append(f"funnel-lead:{org_id}:e:{fields['email'].lower()}")
     digits = "".join(ch for ch in fields.get("phone") or "" if ch.isdigit())
-    if digits:
-        return f"funnel-lead:{org_id}:p:{digits[-10:]}"
-    return None
+    if len(digits) >= 7:
+        keys.append(f"funnel-lead:{org_id}:p:{digits[-10:]}")
+    instagram = (fields.get("instagram") or "").strip().lstrip("@").lower()
+    if instagram:
+        keys.append(f"funnel-lead:{org_id}:ig:{instagram}")
+    for label, value in (
+        ("x", external_id),
+        ("c", contact_ref),
+        ("v", fields.get("visitor_id")),
+        ("s", fields.get("session_id")),
+    ):
+        text = (str(value).strip() if value else "")
+        if len(text) >= 4:
+            keys.append(f"funnel-lead:{org_id}:{label}:{text[:200]}")
+    return sorted(set(keys))
 
 
 def process_funnel_webhook_payload(db: Session, org_id: uuid.UUID, payload: Dict[str, Any]) -> None:
@@ -556,8 +652,7 @@ def process_funnel_webhook_payload(db: Session, org_id: uuid.UUID, payload: Dict
     )
     received_at = _parse_dt(payload.get("received_at")) or datetime.now(timezone.utc)
 
-    lock_key = _identity_lock_key(org_id, fields)
-    if lock_key:
+    for lock_key in _identity_lock_keys(org_id, fields, norm.get("external_id"), norm.get("contact_ref")):
         # Held until upsert_funnel_lead's first commit, i.e. across find-or-create,
         # so two deliveries for one person can't both create a client.
         db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"), {"k": lock_key})
@@ -567,6 +662,8 @@ def process_funnel_webhook_payload(db: Session, org_id: uuid.UUID, payload: Dict
         lead,
         utm=_resolve_lead_utm(db, org_id, lead),
         opted_in_at=received_at,
+        external_id=norm.get("external_id"),
+        contact_ref=norm.get("contact_ref"),
         reattribute=True,
     )
 

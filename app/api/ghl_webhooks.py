@@ -139,6 +139,17 @@ def _load_paired_funnel(db: Session, org_uuid: uuid.UUID, raw_funnel_id: Optiona
     )
 
 
+def _opt_in_content_changed(stored: Any, body: Dict[str, Any]) -> bool:
+    """True when a later partial of the same person carries new lead fields."""
+    if not isinstance(stored, dict):
+        return True
+    anchor = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    keys = ("submission_id", "contact_id", "session_id", "email", "phone", "name", "first_name", "last_name", "answers")
+    old = normalize_ghl_workflow_opt_in(stored, received_at=anchor)
+    new = normalize_ghl_workflow_opt_in(body, received_at=anchor)
+    return any(old.get(key) != new.get(key) for key in keys)
+
+
 def _ingest_ghl_opt_in(db: Session, org_uuid: uuid.UUID, body: Dict[str, Any]) -> Dict[str, Any]:
     from app.services.inbound_webhook_inbox import mark_inbound_done, mark_inbound_retry, record_inbound_event
 
@@ -148,17 +159,32 @@ def _ingest_ghl_opt_in(db: Session, org_uuid: uuid.UUID, body: Dict[str, Any]) -
 
     received_at = datetime.now(timezone.utc)
     norm = normalize_ghl_workflow_opt_in(body, received_at=received_at)
-    person = norm["submission_id"] or norm["contact_id"] or (norm["email"] or "").lower() or uuid.uuid4().hex
+    phone_digits = "".join(ch for ch in (norm.get("phone") or "") if ch.isdigit())
+    person = (
+        norm.get("submission_id")
+        or norm.get("contact_id")
+        or norm.get("session_id")
+        or (norm.get("email") or "").lower()
+        or phone_digits
+        or uuid.uuid4().hex
+    )
+    stored = {**body, RECEIVED_AT_KEY: received_at.isoformat()}
     row, _ = record_inbound_event(
         db,
         org_id=org_uuid,
         provider="ghl",
         event_id=f"optin:{funnel.id}:{person}",
         event_type=OPT_IN_EVENT,
-        payload={**body, RECEIVED_AT_KEY: received_at.isoformat()},
+        payload=stored,
     )
     if row.status == "done":
-        return {"ok": True, "deduped": True}
+        # Same person key, richer partial (more answers / a phone the first step
+        # didn't have). Re-run so the lead merges instead of dropping the update.
+        if not _opt_in_content_changed(row.payload, body):
+            return {"ok": True, "deduped": True}
+        row.payload = stored
+        row.status = "pending"
+        db.commit()
     try:
         _process_ghl_opt_in(db, org_uuid, row.payload)
         mark_inbound_done(db, row)
