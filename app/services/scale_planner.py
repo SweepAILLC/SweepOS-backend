@@ -247,11 +247,52 @@ def trailing_summary(weekly: Dict[str, List[Optional[float]]]) -> Dict[str, Any]
     week_roas = [c / s for s, c in zip(spend, cash) if s > 0]
     worst = min(week_roas) if len(week_roas) >= 2 else None
     cpb = weekly.get("cost_per_booking", [])
+    booked = sum(v or 0.0 for v in weekly.get("booked_calls", [])[-4:])
+    leads = sum(v or 0.0 for v in weekly.get("leads", [])[-4:])
     return {
+        "booked_calls": int(booked),
+        "leads": int(leads),
+        "cash_per_booking": round(last_cash / booked, 2) if booked > 0 else None,
+        "lead_to_booking_rate": round(booked / leads, 4) if leads > 0 else None,
         "monthly_spend": round(monthly_spend, 2),
         "monthly_cash": round(last_cash * 30 / 28, 2),
         "roas": None if roas is None or math.isnan(roas) else round(roas, 4),
         "worst_week_roas": None if worst is None else round(worst, 4),
         "cost_per_booking_volatility_pct": volatility(cpb),
         "weeks_with_spend": len(week_roas),
+    }
+
+
+def suggested_ad_targets(
+    trailing: Dict[str, Any],
+    breakeven_roas: Optional[float],
+    marginal_breakeven_roas: Optional[float],
+) -> Dict[str, Any]:
+    """Ads tab targets implied by the business numbers.
+
+    min_roas: the business break-even ROAS at current spend (covers ad spend, variable and
+    fixed costs). marginal_breakeven_roas: below it every extra ad dollar loses money.
+    target cost per booked call: what a booked call is worth (trailing cash / bookings)
+    divided by break-even ROAS; per lead: that times the lead-to-booking rate.
+    Values are None when the trailing window lacks the data.
+    """
+    cash_per_booking = trailing.get("cash_per_booking")
+    rate = trailing.get("lead_to_booking_rate")
+    per_booking = (
+        cash_per_booking / breakeven_roas if cash_per_booking and breakeven_roas and breakeven_roas > 0 else None
+    )
+    max_per_booking = (
+        cash_per_booking / marginal_breakeven_roas
+        if cash_per_booking and marginal_breakeven_roas and marginal_breakeven_roas > 0
+        else None
+    )
+    return {
+        "min_roas": None if breakeven_roas is None else round(breakeven_roas, 2),
+        "marginal_breakeven_roas": None if marginal_breakeven_roas is None else round(marginal_breakeven_roas, 2),
+        "cash_per_booking": cash_per_booking,
+        "target_cost_per_booking": None if per_booking is None else round(per_booking, 2),
+        "max_cost_per_booking": None if max_per_booking is None else round(max_per_booking, 2),
+        "lead_to_booking_rate": rate,
+        "target_cost_per_lead": None if per_booking is None or not rate else round(per_booking * rate, 2),
+        "booked_calls": trailing.get("booked_calls"),
     }

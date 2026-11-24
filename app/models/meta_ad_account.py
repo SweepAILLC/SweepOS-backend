@@ -4,7 +4,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Column, DateTime, Float, ForeignKey, String
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, Float, ForeignKey, String, text
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.db.session import Base
@@ -27,6 +27,9 @@ class MetaAdAccount(Base):
     # Coach-set guardrails for the scale / ceiling rules. Not synced from Meta.
     target_cpr_cents = Column(BigInteger, nullable=True)
     min_roas = Column(Float, nullable=True)
+    # On: the rules use targets derived from the Scale Planner; the two values above are the
+    # manual override used when this is off (or when the planner has no numbers yet).
+    targets_follow_planner = Column(Boolean, nullable=False, default=True, server_default=text("true"))
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
