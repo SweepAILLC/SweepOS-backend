@@ -67,9 +67,12 @@ def get_funnel_simulator_baselines(
     org_id: UUID = Depends(require_org_id),
     db: Session = Depends(get_db),
 ):
-    """Historic rates for the simulator: KPI rollups + unique new-lead book rate + LP conv."""
+    """Historic rates for the simulator: KPI rollups + unique new-lead book rate + LP conv.
+
+    Snapshots always use a trailing 30-day window (days/mtd query params are ignored).
+    """
     payload = build_funnel_simulator_baselines(
-        db, org_id, days=days, mtd=mtd, funnel_id=funnel_id
+        db, org_id, days=30, mtd=False, funnel_id=funnel_id
     )
     if payload.get("error"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=payload["error"])
@@ -126,7 +129,7 @@ def create_funnel_simulator_scenario(
         name=name[:120],
         mode=body.mode,
         funnel_id=body.funnel_id,
-        lookback_days=str(body.lookback_days or "90")[:16],
+        lookback_days="30",
         inputs=body.inputs if isinstance(body.inputs, dict) else {},
         created_by=current_user.id,
         created_at=now,
@@ -169,8 +172,7 @@ def update_funnel_simulator_scenario(
     if body.funnel_id is not None or (body.model_fields_set and "funnel_id" in body.model_fields_set):
         _check_funnel(db, org_id, body.funnel_id)
         row.funnel_id = body.funnel_id
-    if body.lookback_days is not None:
-        row.lookback_days = str(body.lookback_days)[:16]
+    row.lookback_days = "30"
     if body.inputs is not None:
         row.inputs = body.inputs if isinstance(body.inputs, dict) else {}
     row.updated_at = datetime.utcnow()

@@ -888,7 +888,9 @@ def mark_latest_sales_call_closed(db: Session, org_id: uuid.UUID, client: Client
     if not check_in:
         return None
 
-    check_in.sale_closed = True
+    from app.services.sale_close_stamp import stamp_sale_closed
+
+    stamp_sale_closed(check_in, True)
     check_in.no_show = False
     check_in.updated_at = datetime.utcnow()
 
