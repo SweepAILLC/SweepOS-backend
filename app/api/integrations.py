@@ -3991,7 +3991,9 @@ def update_calendar_booking_sales(
         if is_sales_call is not None:
             ci.is_sales_call = is_sales_call
         if sale_closed is not None:
-            ci.sale_closed = sale_closed
+            from app.services.sale_close_stamp import stamp_sale_closed
+
+            stamp_sale_closed(ci, sale_closed)
         ci.updated_at = now
     
     db.commit()

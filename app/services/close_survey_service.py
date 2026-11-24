@@ -465,10 +465,14 @@ def _apply_latest_sales_call_outcome(
         return check_in.start_time
 
     if outcome == "yes":
-        check_in.sale_closed = True
+        from app.services.sale_close_stamp import stamp_sale_closed
+
+        stamp_sale_closed(check_in, True)
         check_in.no_show = False
     elif outcome == "no_show":
-        check_in.sale_closed = False
+        from app.services.sale_close_stamp import stamp_sale_closed
+
+        stamp_sale_closed(check_in, False)
         check_in.no_show = True
     check_in.updated_at = datetime.utcnow()
 

@@ -1584,6 +1584,7 @@ def get_organization_dashboard(
         _whop_order_count_since,
         _manual_order_count_since,
         _whop_connected,
+        _first_time_order_value_since,
     )
     from app.api.stripe import check_stripe_connected
 
@@ -1608,7 +1609,8 @@ def get_organization_dashboard(
         + (_whop_order_count_since(db, org_id, period_start, period_end) if wh_ok else 0)
         + _manual_order_count_since(db, org_id, period_start, period_end)
     )
-    kpi_aov_usd = (kpi_cash_usd / kpi_order_count) if kpi_order_count > 0 else None
+    kpi_ft_cents, kpi_ft_order_count = _first_time_order_value_since(db, org_id, period_start, period_end)
+    kpi_aov_usd = (kpi_ft_cents / 100.0 / kpi_ft_order_count) if kpi_ft_order_count > 0 else None
     kpi_avg_ltv_usd = (
         (cash_collected_since_onboarding_usd / total_clients) if total_clients > 0 else None
     )
@@ -2529,12 +2531,12 @@ def admin_get_funnel_simulator_baselines(
     db: Session = Depends(get_db),
     admin_user: User = Depends(require_admin),
 ):
-    """Historic rates for the simulator for any org (system owner)."""
+    """Historic rates for the simulator for any org (system owner). Always 30d."""
     from app.services.funnel_simulator import build_funnel_simulator_baselines
 
     _require_org(db, org_id)
     payload = build_funnel_simulator_baselines(
-        db, org_id, days=days, mtd=mtd, funnel_id=funnel_id
+        db, org_id, days=30, mtd=False, funnel_id=funnel_id
     )
     if payload.get("error"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=payload["error"])
@@ -2578,7 +2580,7 @@ def admin_create_funnel_simulator_scenario(
         name=name[:120],
         mode=body.mode,
         funnel_id=body.funnel_id,
-        lookback_days=str(body.lookback_days or "90")[:16],
+        lookback_days="30",
         inputs=body.inputs if isinstance(body.inputs, dict) else {},
         created_by=admin_user.id,
         created_at=now,
@@ -2624,8 +2626,7 @@ def admin_update_funnel_simulator_scenario(
         row.mode = body.mode
     if body.funnel_id is not None or (body.model_fields_set and "funnel_id" in body.model_fields_set):
         row.funnel_id = body.funnel_id
-    if body.lookback_days is not None:
-        row.lookback_days = str(body.lookback_days)[:16]
+    row.lookback_days = "30"
     if body.inputs is not None:
         row.inputs = body.inputs if isinstance(body.inputs, dict) else {}
     row.updated_at = datetime.utcnow()

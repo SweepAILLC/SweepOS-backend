@@ -88,6 +88,7 @@ EVENT_TYPES: List[Dict[str, str]] = [
     {"key": "new_booking_nonsales", "label": "New non-sales bookings"},
     {"key": "new_transaction", "label": "New transactions (Stripe payments)"},
     {"key": "automation_failure", "label": "Pipeline automation failures (lifecycle/close-stamp errors)"},
+    {"key": "ads_alert", "label": "Meta Ads alerts (fatigue, ceiling, scale)"},
 ]
 _KNOWN_EVENT_KEYS = {e["key"] for e in EVENT_TYPES}
 
@@ -186,6 +187,14 @@ def build_sample_event(
             "description": "Alex Example",
             "fields": [("Event", "charge.succeeded"), ("Payment ID", "ch_sample123")],
         },
+        "ads_alert": {
+            "title": "[TEST] Meta Ads: creative fatigue — Cold Broad",
+            "description": (
+                "Cost per result is rising while results fall. Pull spend back and check tomorrow. "
+                "If it does not recover, refresh the ads taking the spend."
+            ),
+            "fields": [("Severity", "warn"), ("Evidence", "frequency 3.6, CTR down 22%")],
+        },
     }
     return samples.get(
         event_type,
@@ -208,6 +217,7 @@ _EMBED_COLOR_BY_EVENT = {
     "new_booking_nonsales": 0x3B82F6,    # blue
     "new_transaction": 0x10B981,  # emerald
     "automation_failure": 0xEF4444,  # red
+    "ads_alert": 0xF97316,           # orange
 }
 _DEFAULT_EMBED_COLOR = 0x9CA3AF  # gray, for any unlisted event_type
 
