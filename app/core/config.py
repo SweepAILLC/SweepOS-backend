@@ -130,6 +130,10 @@ class Settings(BaseSettings):
     # since "transcribe this many" and "ground ideation in this many" are the same cost
     # lever. Independent of PerformanceTab's own display count (always top 5, free to show).
     INSTAGRAM_TOP_POSTS_TRANSCRIBE_LIMIT: int = 5
+    # MCP transcribe_instagram_post (on-demand Whisper): per-org cap on transcription attempts
+    # per UTC day (counts every attempt, auto-sync ones included) and max posts per tool call.
+    MCP_IG_TRANSCRIBE_DAILY_LIMIT: int = 10
+    MCP_IG_TRANSCRIBE_MAX_PER_CALL: int = 2
 
     # Shared Meta Business app id/secret (currently doubles as the Instagram
     # Login app too — see META_ADS_APP_ID below for the Ads-specific override).

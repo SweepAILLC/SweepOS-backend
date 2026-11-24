@@ -67,7 +67,7 @@ router = APIRouter()
 
 SERVER_INFO = {
     "name": "sweepos",
-    "version": "1.10.0",
+    "version": "1.11.0",
     "protocolVersion": "2025-03-26",
 }
 
@@ -979,11 +979,22 @@ TOOLS = [
     },
 ]
 
+# Payments/MRR, Meta Ads, call transcripts, Instagram posts + transcripts, EOD write.
+from app.mcp.extra_tools import (  # noqa: E402  (after TOOLS so extra_tools can import helpers lazily)
+    EXTRA_TOOL_NAMES,
+    EXTRA_TOOLS,
+    EXTRA_WRITE_TOOLS,
+    run_extra_tool,
+)
+
+TOOLS.extend(EXTRA_TOOLS)
+
 
 # Tool annotations: ChatGPT (and Claude) skip the write-confirmation prompt for read-only
-# tools. Everything is read-only except send_client_email (emails a real client) and the
-# two funnel-scorecard write tools (mutate scorecard numbers; gated by org opt-in + scope).
-_WRITE_TOOLS = {"send_client_email", "update_funnel_ad_spend", "set_funnel_scorecard_metric"}
+# tools. Everything is read-only except send_client_email (emails a real client), the
+# two funnel-scorecard write tools and the EOD write tool (mutate numbers; gated by org
+# opt-in + the funnels:write scope).
+_WRITE_TOOLS = {"send_client_email", "update_funnel_ad_spend", "set_funnel_scorecard_metric"} | EXTRA_WRITE_TOOLS
 for _tool in TOOLS:
     _tool["annotations"] = {
         "title": _tool["name"].replace("_", " ").capitalize(),
@@ -1172,6 +1183,8 @@ def _run_tool(
     auth_ctx: Optional[dict] = None,
 ) -> dict:
     args = arguments or {}
+    if name in EXTRA_TOOL_NAMES:
+        return run_extra_tool(name, args, org_id, db, user_id=user_id, auth_ctx=auth_ctx)
     if name == "get_connection_context":
         from app.models.organization import Organization
         from app.models.user import User

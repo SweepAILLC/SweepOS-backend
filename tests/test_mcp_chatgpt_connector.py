@@ -59,9 +59,15 @@ def test_search_and_fetch_tools_match_openai_shape():
     assert by_name["fetch"]["inputSchema"]["required"] == ["id"]
 
 
-def test_only_email_send_and_scorecard_writes_are_not_read_only():
+def test_only_email_send_scorecard_eod_and_transcribe_writes_are_not_read_only():
     writes = {t["name"] for t in TOOLS if not t["annotations"]["readOnlyHint"]}
-    assert writes == {"send_client_email", "update_funnel_ad_spend", "set_funnel_scorecard_metric"}
+    assert writes == {
+        "send_client_email",
+        "update_funnel_ad_spend",
+        "set_funnel_scorecard_metric",
+        "update_kpi_daily_entry",
+        "transcribe_instagram_post",
+    }
 
 
 def test_fetch_rejects_malformed_ids_without_db():
