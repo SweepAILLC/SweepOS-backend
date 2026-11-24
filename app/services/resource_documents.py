@@ -18,7 +18,11 @@ from urllib.parse import urlparse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.services.sop_categories import ensure_sop_categories_table, valid_category_slugs
+from app.services.sop_categories import (
+    ensure_sop_categories_table,
+    locked_category_slugs,
+    valid_category_slugs,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -649,6 +653,21 @@ def list_docs(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
     return out
 
 
+def list_docs_for_org(db: Session, org_id: uuid.UUID) -> List[Dict[str, Any]]:
+    """list_docs minus SOPs in categories the system owner locked for this org."""
+    locked = locked_category_slugs(db, org_id)
+    docs = list_docs(db, org_id)
+    return [d for d in docs if d.get("sop_category") not in locked] if locked else docs
+
+
+def get_doc_for_org(db: Session, org_id: uuid.UUID, resource_id: str) -> Optional[Dict[str, Any]]:
+    """get_doc, but None (as if missing) when the doc's category is locked for this org."""
+    doc = get_doc(db, org_id, resource_id)
+    if doc and doc.get("sop_category") and doc["sop_category"] in locked_category_slugs(db, org_id):
+        return None
+    return doc
+
+
 def get_doc(db: Session, org_id: uuid.UUID, resource_id: str) -> Optional[Dict[str, Any]]:
     org_str = str(_catalog_org_id(org_id))
     try:
@@ -748,7 +767,7 @@ def search_resource_docs(
             "hint": "Provide a query (e.g. 'offer building', 'ICP', 'objection handling').",
         }
     tokens = [t for t in re.split(r"\s+", q) if t]
-    docs = list_docs(db, org_id)
+    docs = list_docs_for_org(db, org_id)
     cat = (category or "").strip().lower()
     sop_cat = (sop_category or "").strip().lower()
     if cat:

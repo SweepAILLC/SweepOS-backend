@@ -78,17 +78,49 @@ def _doc_summary(i: dict) -> dict:
     }
 
 
+def _locked_doc_summary(i: dict) -> dict:
+    """Redacted stand-in for an SOP in a locked category: nothing but position and category."""
+    return {
+        "resource_id": i["resource_id"],
+        "category": "SOP",
+        "sop_category": i.get("sop_category"),
+        "title": "Locked SOP",
+        "description": "",
+        "powered_by": None,
+        "video_url": None,
+        "video_urls": [],
+        "is_custom": False,
+        "is_builtin": False,
+        "updated_at": None,
+        "sort_order": i.get("sort_order"),
+        "locked": True,
+    }
+
+
 @router.get("/docs")
 def get_docs(
+    include_locked: bool = False,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """List the global platform SOP / AI-skill catalog (metadata only, no content)."""
+    """List the global platform SOP / AI-skill catalog (metadata only, no content).
+
+    SOPs in categories locked for the caller's org are omitted. With include_locked=true they
+    are returned redacted (placeholder title, no description or video) and flagged locked,
+    so the SOP library can show a locked section without leaking its contents.
+    """
     from uuid import UUID
 
     ensure_resource_documents_table(db)
     items = list_docs(db, UUID(_docs_org_id()))
-    return [_doc_summary(i) for i in items]
+    locked = sop_cats.locked_category_slugs(db, _org_id(current_user))
+    out = []
+    for i in items:
+        if i.get("sop_category") not in locked:
+            out.append(_doc_summary(i))
+        elif include_locked:
+            out.append(_locked_doc_summary(i))
+    return out
 
 
 @router.get("/docs/{resource_id}")
@@ -102,6 +134,10 @@ def get_doc_document(
     doc = get_doc(db, UUID(_docs_org_id()), resource_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
+    if doc.get("sop_category") and doc["sop_category"] in sop_cats.locked_category_slugs(
+        db, _org_id(current_user)
+    ):
+        raise HTTPException(status_code=403, detail="This SOP category is locked for your organization.")
     return doc
 
 
@@ -305,8 +341,9 @@ def list_sop_categories(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    """List SOP categories in display order. Readable by every org member."""
-    return sop_cats.list_categories(db)
+    """List SOP categories in display order, flagging those locked for the caller's org."""
+    locked = sop_cats.locked_category_slugs(db, _org_id(current_user))
+    return [{**c, "locked": c["slug"] in locked} for c in sop_cats.list_categories(db)]
 
 
 @router.post("/sop-categories")
