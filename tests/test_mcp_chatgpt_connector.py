@@ -7,7 +7,7 @@ from unittest.mock import patch
 from starlette.requests import Request
 
 from app.api.mcp_oauth import _basic_client_credentials
-from app.mcp.server import SUPPORTED_PROTOCOL_VERSIONS, TOOLS
+from app.mcp.server import SUPPORTED_PROTOCOL_VERSIONS, TOOLS, _handle_jsonrpc
 from app.services import mcp_oauth_service as svc
 from app.services.mcp_search_fetch import fetch_for_mcp, search_for_mcp
 
@@ -73,3 +73,11 @@ def test_fetch_rejects_malformed_ids_without_db():
 
 def test_search_empty_query_returns_no_results_without_db():
     assert search_for_mcp(None, uuid.uuid4(), "   ") == {"results": []}
+
+
+def test_list_methods_answer_empty_instead_of_method_not_found():
+    org_id = uuid.uuid4()
+    templates = _handle_jsonrpc({"jsonrpc": "2.0", "id": 1, "method": "resources/templates/list"}, org_id, None)
+    prompts = _handle_jsonrpc({"jsonrpc": "2.0", "id": 2, "method": "prompts/list"}, org_id, None)
+    assert templates == {"jsonrpc": "2.0", "id": 1, "result": {"resourceTemplates": []}}
+    assert prompts == {"jsonrpc": "2.0", "id": 2, "result": {"prompts": []}}
