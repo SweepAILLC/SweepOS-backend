@@ -2348,6 +2348,13 @@ def _handle_jsonrpc(
         }
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+    # We advertise the resources capability, so clients (ChatGPT's connector sync) may
+    # list templates; and some clients probe prompts. Answer empty instead of -32601,
+    # which some clients treat as a broken server and drop the connector's tools.
+    if method == "resources/templates/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"resourceTemplates": []}}
+    if method == "prompts/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": []}}
 
     return {
         "jsonrpc": "2.0",
