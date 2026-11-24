@@ -22,6 +22,7 @@ from app.core.config import settings
 from app.models.meta_ad import MetaAd
 from app.models.meta_ad_account import MetaAdAccount
 from app.models.meta_ad_alert import MetaAdAlert
+from app.models.org_business_economics import OrgBusinessEconomics
 from app.models.meta_ad_insight_daily import MetaAdInsightDaily
 from app.models.meta_ad_set import MetaAdSet
 from app.models.meta_campaign import MetaCampaign
@@ -52,6 +53,16 @@ THRESHOLDS: Dict[str, float] = {
     "bench_min_active": 25,
     "bench_stale_days": 14,
     "min_days_fatigue": 10,
+    # Kill rule: spend this many times the target cost per result with zero results.
+    "kill_spend_multiple": 3.0,
+    # Scale test: daily spend up at least this much (last 3 days vs the 7 before).
+    "scale_test_spend_rise": 0.50,
+    # ...and cost per result rose at least this share of the spend rise = paying more for the same results.
+    "scale_test_fail_share": 0.80,
+    # ...or cost per result rose no more than this = the push held.
+    "scale_test_pass_cpr_rise": 0.20,
+    # Under one optimization event a day the pixel has too little to learn from.
+    "min_daily_events": 1.0,
 }
 
 TRIGGER_TYPES = {"creative_fatigue", "fatigue_crossover", "messaging_ceiling"}
@@ -64,6 +75,9 @@ REEVALUATED = {
     "learning_limited",
     "spend_concentration",
     "creative_bench_low",
+    "no_result_kill",
+    "scale_test_failed",
+    "scale_test_passed",
 }
 _INACTIVE = {"PAUSED", "ARCHIVED", "DELETED", "CAMPAIGN_PAUSED", "ADSET_PAUSED"}
 _SEV_RANK = {"critical": 0, "warn": 1, "info": 2}
@@ -493,17 +507,117 @@ def detect_learning_limited(
     results_7 = sum(p.results or 0 for p in pts if start <= p.day <= today)
     if results_7 >= THRESHOLDS["scale_min_results"]:
         return None
+    below_daily = results_7 < 7 * THRESHOLDS["min_daily_events"]
+    action = (
+        f"Only {results_7} results in the last 7 days after a week of delivery. Meta usually needs "
+        "about 50 optimization events in 7 days to exit learning. Consolidate ad sets or raise budget "
+        "toward that volume — do not scale a learning-limited ad set."
+    )
+    if below_daily:
+        action += (
+            " At under one event a day the pixel can barely learn: optimize on an earlier, cheaper event "
+            "(for example the qualified-application submit instead of the booked call) until spend supports "
+            "the deeper event."
+        )
     return _signal(
         "learning_limited",
         "warn",
         "scaling",
-        (
-            f"Only {results_7} results in the last 7 days after a week of delivery. Meta usually needs "
-            "about 50 optimization events in 7 days to exit learning. Consolidate ad sets or raise budget "
-            "toward that volume — do not scale a learning-limited ad set."
-        ),
-        {"evidence": f"{results_7} results in 7 days", "results_7": results_7},
+        action,
+        {"evidence": f"{results_7} results in 7 days", "results_7": results_7, "below_one_per_day": below_daily},
     )
+
+
+def detect_no_result_kill(
+    points: Sequence[DayPoint],
+    *,
+    target_cpr_cents: Optional[int],
+    active: bool,
+) -> Optional[Dict[str, Any]]:
+    """Ad-level. Spent kill_spend_multiple x the target cost per result with zero results: turn it off."""
+    if not active or not target_cpr_cents or target_cpr_cents <= 0:
+        return None
+    spend = sum(p.spend_cents or 0 for p in points)
+    results = sum(p.results or 0 for p in points)
+    if results > 0:
+        return None
+    limit = THRESHOLDS["kill_spend_multiple"] * target_cpr_cents
+    if spend < limit:
+        return None
+    return _signal(
+        "no_result_kill",
+        "critical",
+        "kill",
+        (
+            f"Spent ${spend / 100:,.0f} with no results — over {THRESHOLDS['kill_spend_multiple']:.0f}x the "
+            f"${target_cpr_cents / 100:,.0f} target cost per result. Turn this ad off and move its budget to "
+            "a proven ad."
+        ),
+        {
+            "evidence": f"${spend / 100:,.0f} spend, 0 results",
+            "spend_cents": spend,
+            "target_cpr_cents": target_cpr_cents,
+            "multiple": THRESHOLDS["kill_spend_multiple"],
+        },
+    )
+
+
+def detect_scale_test(points: Sequence[DayPoint], *, active: bool) -> Optional[Dict[str, Any]]:
+    """Ad set-level. After a budget push (daily spend up 50%+, last 3 days vs the 7 before),
+    judge it by cost per result: rising as fast as spend = paying more for the same results."""
+    if not active:
+        return None
+    pts = sorted(points, key=lambda p: p.day)
+    if len(pts) < 10:
+        return None
+    prior, recent = pts[-10:-3], pts[-3:]
+    prior_daily = sum(p.spend_cents or 0 for p in prior) / len(prior)
+    recent_daily = sum(p.spend_cents or 0 for p in recent) / len(recent)
+    if prior_daily <= 0:
+        return None
+    spend_rise = recent_daily / prior_daily - 1
+    if spend_rise < THRESHOLDS["scale_test_spend_rise"]:
+        return None
+    prev_cpr = _agg_cpr(prior)
+    if not prev_cpr:
+        return None
+    rec_cpr = _agg_cpr(recent)
+    recent_spend = sum(p.spend_cents or 0 for p in recent)
+    if rec_cpr is None:
+        if recent_spend < 2 * prev_cpr:
+            return None
+        rec_cpr = float(recent_spend)  # zero results: at least one result's worth of cost each
+    cpr_rise = rec_cpr / prev_cpr - 1
+    metrics = {
+        "evidence": f"daily spend +{spend_rise * 100:.0f}%, cost per result {cpr_rise * 100:+.0f}%",
+        "spend_rise_pct": round(spend_rise * 100, 1),
+        "cpr_rise_pct": round(cpr_rise * 100, 1),
+        "prior_cpr_cents": round(prev_cpr),
+        "recent_cpr_cents": round(rec_cpr),
+    }
+    if cpr_rise >= THRESHOLDS["scale_test_fail_share"] * spend_rise:
+        return _signal(
+            "scale_test_failed",
+            "critical",
+            "scaling",
+            (
+                f"Daily spend is up {spend_rise * 100:.0f}% and cost per result is up {cpr_rise * 100:.0f}% — "
+                "you're paying more for about the same results. Roll the budget back to its previous level."
+            ),
+            metrics,
+        )
+    if cpr_rise <= THRESHOLDS["scale_test_pass_cpr_rise"]:
+        return _signal(
+            "scale_test_passed",
+            "info",
+            "scaling",
+            (
+                f"Daily spend is up {spend_rise * 100:.0f}% and cost per result moved only {cpr_rise * 100:+.0f}%. "
+                "Hold the new budget for a few days and check lead quality with sales before the next step."
+            ),
+            metrics,
+        )
+    return None
 
 
 def detect_spend_concentration(
@@ -576,7 +690,7 @@ def detect_creative_bench(
 def campaign_pill(sweep_status: Optional[str], alert_types: Set[str]) -> str:
     if alert_types & {"creative_fatigue", "fatigue_crossover", "fatigue_confirmed"}:
         return "fatigued"
-    if alert_types & {"messaging_ceiling", "ceiling_confirmed", "pullback_watch"}:
+    if alert_types & {"messaging_ceiling", "ceiling_confirmed", "pullback_watch", "scale_test_failed"}:
         return "pull_back"
     if "learning_limited" in alert_types:
         return "learning"
@@ -780,6 +894,11 @@ def evaluate_org_alerts(db: Session, org_id: uuid.UUID, *, now: Optional[datetim
     ads = db.query(MetaAd).filter(MetaAd.org_id == org_id).all()
     account = _account_for_org(db, org_id)
     target_cpr = int(account.target_cpr_cents) if account and account.target_cpr_cents is not None else None
+    if target_cpr is None:
+        # Fall back to the Scale Planner's target cost per booked call.
+        econ = db.query(OrgBusinessEconomics).filter(OrgBusinessEconomics.org_id == org_id).first()
+        if econ is not None and econ.target_cost_per_call_cents:
+            target_cpr = int(econ.target_cost_per_call_cents)
 
     grouped: Dict[Tuple[str, str], List[DayPoint]] = defaultdict(list)
     for row in insights:
@@ -810,17 +929,20 @@ def evaluate_org_alerts(db: Session, org_id: uuid.UUID, *, now: Optional[datetim
             continue
         pts = grouped.get(("ad", ad.meta_ad_id)) or []
         points_for[("ad", ad.meta_ad_id)] = pts
-        sig = detect_creative_fatigue(pts)
-        if not sig:
-            continue
         adset = adsets_by_id.get(ad.ad_set_id)
         camp = campaigns_by_id.get(adset.campaign_id) if adset else None
-        fired[("ad", ad.meta_ad_id, sig["alert_type"])] = _with_context(
-            sig,
-            entity_name=ad.name,
-            adset_id=adset.meta_adset_id if adset else None,
-            campaign_id=camp.meta_campaign_id if camp else None,
-        )
+        for sig in (
+            detect_creative_fatigue(pts),
+            detect_no_result_kill(pts, target_cpr_cents=target_cpr, active=True),
+        ):
+            if not sig:
+                continue
+            fired[("ad", ad.meta_ad_id, sig["alert_type"])] = _with_context(
+                sig,
+                entity_name=ad.name,
+                adset_id=adset.meta_adset_id if adset else None,
+                campaign_id=camp.meta_campaign_id if camp else None,
+            )
 
     for adset in adsets:
         child_ads = ads_by_adset.get(adset.id, [])
@@ -842,6 +964,7 @@ def evaluate_org_alerts(db: Session, org_id: uuid.UUID, *, now: Optional[datetim
             )
         )
         detectors.append(detect_learning_limited(pts, active=active, today=today))
+        detectors.append(detect_scale_test(pts, active=active))
         for detector in detectors:
             if detector:
                 fired[("adset", adset.meta_adset_id, detector["alert_type"])] = _with_context(detector, **ctx)
