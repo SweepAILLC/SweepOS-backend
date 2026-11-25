@@ -150,6 +150,26 @@ def _upsert_ad_set(db: Session, org_id: uuid.UUID, campaign_id: uuid.UUID, raw: 
     return row
 
 
+def apply_creative_fields(row: MetaAd, creative: Dict[str, Any]) -> None:
+    """Copy creative fields onto a MetaAd row; keeps existing values when Meta omits one."""
+    row.creative_id = creative.get("id") or row.creative_id
+    row.creative_thumbnail_url = creative.get("thumbnail_url") or row.creative_thumbnail_url
+    spec = creative.get("object_story_spec") if isinstance(creative.get("object_story_spec"), dict) else {}
+    video_data = spec.get("video_data") if isinstance(spec.get("video_data"), dict) else {}
+    link_data = spec.get("link_data") if isinstance(spec.get("link_data"), dict) else {}
+    video_id = creative.get("video_id") or video_data.get("video_id")
+    if video_id:
+        row.video_id = str(video_id)
+    ig_id = creative.get("effective_instagram_media_id")
+    if ig_id:
+        row.instagram_media_id = str(ig_id)
+    body = creative.get("body") or video_data.get("message") or link_data.get("message")
+    title = creative.get("title") or video_data.get("title") or link_data.get("name")
+    copy = "\n\n".join(str(p).strip() for p in (title, body) if p and str(p).strip())
+    if copy:
+        row.ad_copy = copy
+
+
 def _upsert_ad(db: Session, org_id: uuid.UUID, ad_set_id: uuid.UUID, raw: Dict[str, Any]) -> MetaAd:
     meta_ad_id = str(raw.get("id") or raw.get("ad_id"))
     row = db.query(MetaAd).filter(MetaAd.org_id == org_id, MetaAd.meta_ad_id == meta_ad_id).first()
@@ -162,8 +182,7 @@ def _upsert_ad(db: Session, org_id: uuid.UUID, ad_set_id: uuid.UUID, raw: Dict[s
         row.effective_status = raw.get("effective_status")
     creative = raw.get("creative") or {}
     if isinstance(creative, dict):
-        row.creative_id = creative.get("id") or row.creative_id
-        row.creative_thumbnail_url = creative.get("thumbnail_url") or row.creative_thumbnail_url
+        apply_creative_fields(row, creative)
     created_time_str = raw.get("created_time")
     if created_time_str and row.created_time is None:
         try:

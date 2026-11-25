@@ -94,3 +94,54 @@ def test_extract_result_metrics_uses_campaign_objective_when_goal_missing():
     results, cost = _extract_result_metrics(raw, objective="OUTCOME_SALES")
     assert results == 2
     assert cost == 1200
+
+
+# --- Messaging Matrix: creative fields --------------------------------------------------
+
+from types import SimpleNamespace as _NS
+
+from app.services.meta_ads_sync_service import apply_creative_fields
+
+
+def _blank_ad(**kw):
+    base = dict(creative_id=None, creative_thumbnail_url=None, video_id=None, instagram_media_id=None, ad_copy=None)
+    base.update(kw)
+    return _NS(**base)
+
+
+def test_apply_creative_fields_reads_top_level_video_and_instagram_ids():
+    row = _blank_ad()
+    apply_creative_fields(
+        row,
+        {"id": "c1", "video_id": 123, "effective_instagram_media_id": "1789", "title": "Hook", "body": "Primary text"},
+    )
+    assert row.creative_id == "c1"
+    assert row.video_id == "123"
+    assert row.instagram_media_id == "1789"
+    assert row.ad_copy == "Hook\n\nPrimary text"
+
+
+def test_apply_creative_fields_falls_back_to_object_story_spec():
+    row = _blank_ad()
+    apply_creative_fields(
+        row,
+        {"object_story_spec": {"video_data": {"video_id": "v9", "message": "Story text", "title": "T"}}},
+    )
+    assert row.video_id == "v9"
+    assert row.ad_copy == "T\n\nStory text"
+
+
+def test_apply_creative_fields_keeps_existing_values_when_missing():
+    row = _blank_ad(creative_id="old", video_id="v1", ad_copy="kept")
+    apply_creative_fields(row, {"thumbnail_url": "https://x/t.jpg"})
+    assert row.creative_id == "old"
+    assert row.video_id == "v1"
+    assert row.ad_copy == "kept"
+    assert row.creative_thumbnail_url == "https://x/t.jpg"
+
+
+def test_apply_creative_fields_image_ad_uses_link_data_copy():
+    row = _blank_ad()
+    apply_creative_fields(row, {"object_story_spec": {"link_data": {"message": "Body", "name": "Headline"}}})
+    assert row.video_id is None
+    assert row.ad_copy == "Headline\n\nBody"

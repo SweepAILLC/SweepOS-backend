@@ -67,6 +67,7 @@ def test_only_email_send_scorecard_eod_and_transcribe_writes_are_not_read_only()
         "set_funnel_scorecard_metric",
         "update_kpi_daily_entry",
         "transcribe_instagram_post",
+        "recreate_messaging_angle",  # saves an unapproved draft; spends LLM budget
     }
 
 

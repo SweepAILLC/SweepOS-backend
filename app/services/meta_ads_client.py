@@ -278,12 +278,35 @@ def list_ads(*, ad_set_id: str, token: str) -> List[Dict[str, Any]]:
     body = _get(
         f"{ad_set_id}/ads",
         params={
-            "fields": "id,name,status,effective_status,created_time,creative{id,thumbnail_url}",
+            "fields": f"id,name,status,effective_status,created_time,creative{{{CREATIVE_FIELDS}}}",
             "limit": 200,
         },
         token=token,
     )
     return body.get("data") or []
+
+
+# Creative fields the Messaging Matrix needs: the video to transcribe, the boosted
+# Instagram post (whose transcript can be reused), and the ad copy for image ads.
+CREATIVE_FIELDS = (
+    "id,thumbnail_url,video_id,effective_instagram_media_id,body,title,"
+    "object_story_spec{video_data{video_id,message,title},link_data{message,name}}"
+)
+
+
+def get_ad_creative(*, meta_ad_id: str, token: str) -> Dict[str, Any]:
+    """One ad's creative, for ads synced before CREATIVE_FIELDS was widened."""
+    body = _get(meta_ad_id, params={"fields": f"creative{{{CREATIVE_FIELDS}}}"}, token=token)
+    creative = body.get("creative")
+    return creative if isinstance(creative, dict) else {}
+
+
+def get_video_source_url(*, video_id: str, token: str) -> Optional[str]:
+    """Signed, short-lived mp4 URL for an ad video. Meta only returns it for videos the
+    token's ad account or page can read; None otherwise. Never store the URL."""
+    body = _get(video_id, params={"fields": "source"}, token=token)
+    src = body.get("source")
+    return str(src) if src else None
 
 
 _INSIGHT_FIELDS = (

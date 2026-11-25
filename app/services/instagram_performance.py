@@ -286,6 +286,22 @@ def _rank_score(
     return (exposure * raw_rate + prior_weight * prior_rate_pct) / (exposure + prior_weight)
 
 
+def rank_scored_posts(posts: List[InstagramMedia]) -> List[Tuple[float, InstagramMedia]]:
+    """(rank_score, post) for every rankable post, best first. The one ranking used by the
+    performance view, top/underperformer lists, and the Messaging Matrix organic score."""
+    prior_rate, prior_weight = _exposure_prior(posts, rate_fn=_weighted_rate_pct)
+    scored: List[Tuple[float, InstagramMedia]] = []
+    for p in posts:
+        exp = _exposure(p)
+        score = _rank_score(
+            _weighted_rate_pct(p, exp), exp, prior_rate_pct=prior_rate, prior_weight=prior_weight
+        )
+        if score is not None:
+            scored.append((score, p))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return scored
+
+
 def _post_card(m: InstagramMedia, *, rank_score: Optional[float] = None) -> Dict[str, Any]:
     thumb = m.thumbnail_url
     if isinstance(thumb, str):
@@ -738,16 +754,7 @@ def build_instagram_performance(
     # those from topping (or bottoming) the list while leaving well-exposed posts close to
     # their actual rate. The rate itself weights comments above likes/saves/shares (see
     # _weighted_rate_pct) so higher-effort interactions count more toward "best performer."
-    prior_rate, prior_weight = _exposure_prior(posts, rate_fn=_weighted_rate_pct)
-    scored_posts: List[Tuple[float, InstagramMedia]] = []
-    for p in posts:
-        exp = _exposure(p)
-        score = _rank_score(
-            _weighted_rate_pct(p, exp), exp, prior_rate_pct=prior_rate, prior_weight=prior_weight
-        )
-        if score is not None:
-            scored_posts.append((score, p))
-    scored_posts.sort(key=lambda t: t[0], reverse=True)
+    scored_posts = rank_scored_posts(posts)
     top = [_post_card(p, rank_score=score) for score, p in scored_posts[:5]]
     # Always surface up to 5 underperformers when enough rankable posts exist.
     bottom_src = list(reversed(scored_posts[-5:])) if len(scored_posts) >= 2 else []

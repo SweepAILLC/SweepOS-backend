@@ -64,6 +64,7 @@ from app.models.meta_ad_account import MetaAdAccount
 from app.models.meta_campaign import MetaCampaign
 from app.models.meta_ad_set import MetaAdSet
 from app.models.meta_ad import MetaAd
+from app.models.messaging_angle import MessagingAngle, MessagingAngleSource
 from app.models.meta_ad_insight_daily import MetaAdInsightDaily
 from app.models.meta_ad_alert import MetaAdAlert
 from app.models.onboarding_survey_response import OnboardingSurveyResponse
@@ -106,6 +107,8 @@ __all__ = [
     "OwnerOrgNoticeRead",
     "SalesActivityEvent",
     "ContentAngleMap",
+    "MessagingAngle",
+    "MessagingAngleSource",
     "DiscordChannelMapping",
     "GhlCalendarSyncSetting",
     "InboundWebhookEvent",
