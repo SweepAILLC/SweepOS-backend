@@ -54,7 +54,13 @@ def _download_media(url: str) -> bytes:
         return b"".join(chunks)
 
 
-def _whisper_transcribe(audio_bytes: bytes, filename: str, org_id: uuid.UUID) -> str:
+def _whisper_transcribe(
+    audio_bytes: bytes,
+    filename: str,
+    org_id: uuid.UUID,
+    *,
+    feature: str = "instagram_reel_transcript",
+) -> str:
     api_key = settings.OPENAI_API_KEY
     if not api_key:
         raise TranscriptUnavailableError("OPENAI_API_KEY not configured")
@@ -76,7 +82,7 @@ def _whisper_transcribe(audio_bytes: bytes, filename: str, org_id: uuid.UUID) ->
         org_id=org_id,
         provider="openai",
         model=WHISPER_MODEL,
-        feature="instagram_reel_transcript",
+        feature=feature,
         cost_usd_override=cost,
     )
     return text

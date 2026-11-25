@@ -977,6 +977,58 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "get_messaging_matrix",
+        "description": (
+            "The org's Messaging Matrix: messaging angles found in its transcribed Instagram posts "
+            "and Meta ads, each scored 0-100 (percentile vs the org's own content, shrunk toward 50 "
+            "when samples are few; 50 = average) with organic_score, paid_score, overall_score, "
+            "sample counts and written reasoning. Paid scores use cost per booked call when enough "
+            "ads have attributed calls, else cost per result. Use to answer 'what messaging works "
+            "for me' and to pick angles to recreate. Consulting-tier orgs only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "enum": ["organic", "paid"], "description": "Rank by one channel's score"},
+                "awareness_stage": {
+                    "type": "string",
+                    "enum": ["unaware", "problem_aware", "solution_aware", "product_aware", "most_aware"],
+                },
+                "min_samples": {"type": "integer", "default": 1, "minimum": 0, "maximum": 50},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+            },
+        },
+    },
+    {
+        "name": "get_messaging_angle",
+        "description": (
+            "One Messaging Matrix angle with its evidence: every tagged post or ad, the verbatim "
+            "quote that carries the angle, its item score, metrics, and Instagram URL. Also returns "
+            "the latest Recreate draft if one exists. Get angle_id from get_messaging_matrix."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"angle_id": {"type": "string", "description": "Angle UUID"}},
+            "required": ["angle_id"],
+        },
+    },
+    {
+        "name": "recreate_messaging_angle",
+        "description": (
+            "Draft three new hooks, a script outline and a CTA that reuse a proven angle, built from "
+            "the angle's two best transcripts. Saved on the angle as an unapproved draft "
+            "(approved=false); nothing is posted or launched. Org admins/owners only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "angle_id": {"type": "string", "description": "Angle UUID"},
+                "channel": {"type": "string", "enum": ["organic", "paid"], "default": "organic"},
+            },
+            "required": ["angle_id"],
+        },
+    },
 ]
 
 # Payments/MRR, Meta Ads, call transcripts, Instagram posts + transcripts, EOD write.
@@ -994,11 +1046,14 @@ TOOLS.extend(EXTRA_TOOLS)
 # tools. Everything is read-only except send_client_email (emails a real client), the
 # two funnel-scorecard write tools and the EOD write tool (mutate numbers; gated by org
 # opt-in + the funnels:write scope).
+# recreate_messaging_angle only saves an unapproved draft inside SweepOS: a write (so
+# clients confirm, and it spends LLM budget) but not open-world.
 _WRITE_TOOLS = {"send_client_email", "update_funnel_ad_spend", "set_funnel_scorecard_metric"} | EXTRA_WRITE_TOOLS
+_DRAFT_WRITE_TOOLS = {"recreate_messaging_angle"}
 for _tool in TOOLS:
     _tool["annotations"] = {
         "title": _tool["name"].replace("_", " ").capitalize(),
-        "readOnlyHint": _tool["name"] not in _WRITE_TOOLS,
+        "readOnlyHint": _tool["name"] not in _WRITE_TOOLS | _DRAFT_WRITE_TOOLS,
         "destructiveHint": False,
         "openWorldHint": _tool["name"] in _WRITE_TOOLS,
     }
@@ -1250,6 +1305,8 @@ def _run_tool(
         if denial:
             return denial
         return _run_funnel_write_tool(name, args, org_id, db, user_id=user_id)
+    if name in MESSAGING_MATRIX_TOOLS:
+        return _run_messaging_matrix_tool(name, args, org_id, db, user_id=user_id, auth_ctx=auth_ctx)
     if name == "get_client_profile":
         cid = args.get("client_id")
         if not cid:
@@ -1864,6 +1921,63 @@ def _run_funnel_team_tool(
         return _text_result(_call_api(db, kpi_api.get_kpi_benchmarks, current_user=user))
 
     return _text_result({"error": f"Unknown tool: {name}"})
+
+
+MESSAGING_MATRIX_TOOLS = {"get_messaging_matrix", "get_messaging_angle", "recreate_messaging_angle"}
+
+
+def _run_messaging_matrix_tool(
+    name: str,
+    args: dict,
+    org_id: uuid.UUID,
+    db: Session,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+    auth_ctx: Optional[dict] = None,
+) -> dict:
+    """Messaging Matrix tools. Org comes from the MCP token, never from arguments."""
+    from app.services import messaging_matrix_service as mm
+    from app.services.content_angle_map import org_is_consulting
+
+    if not org_is_consulting(db, org_id):
+        return _text_result(
+            {"error": "consulting_tier_required", "message": "The Messaging Matrix is available on consulting tiers."}
+        )
+    if name == "get_messaging_matrix":
+        channel = args.get("channel") if args.get("channel") in ("organic", "paid") else None
+        return _text_result(
+            mm.list_matrix(
+                db,
+                org_id,
+                channel=channel,
+                awareness_stage=args.get("awareness_stage") or None,
+                min_samples=max(0, min(int(args.get("min_samples") or 1), 50)),
+                limit=max(1, min(int(args.get("limit") or 20), 100)),
+            )
+        )
+    try:
+        angle_id = _uuid_arg(args, "angle_id")
+    except ValueError:
+        angle_id = None
+    if angle_id is None:
+        return _text_result({"error": "invalid angle_id"})
+    if name == "get_messaging_angle":
+        try:
+            return _text_result(mm.angle_detail(db, org_id, angle_id))
+        except LookupError:
+            return _text_result({"error": "angle_not_found"})
+    role = str((auth_ctx or {}).get("role") or "").lower()
+    if role not in ("admin", "owner"):
+        return _text_result(
+            {"error": "forbidden", "message": "Only org admins or owners can create Recreate drafts."}
+        )
+    channel = args.get("channel") if args.get("channel") in ("organic", "paid") else "organic"
+    try:
+        return _text_result(mm.recreate_angle(db, org_id, angle_id, channel=channel, user_id=user_id))
+    except LookupError:
+        return _text_result({"error": "angle_not_found"})
+    except (ValueError, RuntimeError) as exc:
+        return _text_result({"error": "draft_failed", "message": str(exc)})
 
 
 _FUNNEL_WRITE_TOOLS = {"update_funnel_ad_spend", "set_funnel_scorecard_metric"}

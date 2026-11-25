@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey, ghl, ghl_webhooks, team, funnel_webhooks, meta_ads, onboarding_survey, business_economics
+from app.api import auth, clients, events, oauth, integrations, stripe, whop, finances, webhooks, funnels, admin, users, organizations, encryption, email_ingestion, fathom_webhooks, content_studio, call_library, automations, outreach, calendar_webhooks, resources, auth_google, mcp_oauth, portal, portal_funnel_simulator, content_angle_map, kpi, instagram, close_survey, ghl, ghl_webhooks, team, funnel_webhooks, meta_ads, onboarding_survey, business_economics, messaging_matrix
 from app.mcp import server as mcp_server
 from app.core.config import settings as app_settings
 from app.middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -135,6 +135,8 @@ app.include_router(mcp_server.router, tags=["mcp"])
 app.include_router(clients.router, prefix="/clients", tags=["clients"])
 app.include_router(automations.router, prefix="/automations", tags=["automations"])
 app.include_router(outreach.router, prefix="/outreach", tags=["outreach"])
+# Before content_studio.router: more specific /content-studio prefix.
+app.include_router(messaging_matrix.router, prefix="/content-studio/messaging-matrix", tags=["content-studio"])
 app.include_router(content_studio.router, prefix="/content-studio", tags=["content-studio"])
 app.include_router(call_library.router, prefix="/call-library", tags=["call-library"])
 app.include_router(events.router, prefix="/events", tags=["events"])
