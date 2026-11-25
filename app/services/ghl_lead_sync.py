@@ -90,6 +90,7 @@ def lead_from_submission(sub: Dict[str, Any], funnel_id: uuid.UUID) -> FunnelLea
         name=sub.get("name") if not (sub.get("first_name") or sub.get("last_name")) else None,
         source=f"ghl_{sub.get('kind', 'forms').rstrip('s')}",
         funnel_step_reached=sub.get("page_path"),
+        session_id=sub.get("session_id"),
     )
     answers = sub.get("answers") or None
     try:
@@ -186,6 +187,8 @@ def process_submission_payload(db: Session, org_id: uuid.UUID, payload: Dict[str
         utm=normalize_utm(sub.get("utm_raw")),
         opted_in_at=_parse_dt(sub.get("created_at")),
         ghl_contact_id=sub.get("contact_id"),
+        external_id=sub.get("submission_id"),
+        contact_ref=sub.get("contact_id"),
         reattribute=True,
         notify=bool(payload.get("notify", True)),
     )

@@ -81,8 +81,22 @@ class TestDedupeKey:
     def test_header_first(self):
         assert fw.dedupe_key({"idempotency-key": "abc"}, {"event_id": "z"}) == "h:abc"
 
-    def test_body_id(self):
-        assert fw.dedupe_key({}, {"submission_id": 42}) == "b:42"
+    def test_event_id_is_a_retry_key(self):
+        assert fw.dedupe_key({}, {"event_id": "evt_123", "submission_id": "sub_abc"}) == "b:evt_123"
+
+    def test_submission_id_does_not_collapse_partial_steps(self):
+        first = {"submissionId": "sub_abc123", "email": "a@b.co"}
+        second = {"submissionId": "sub_abc123", "phone": "+1 555 010 2000"}
+        assert fw.dedupe_key({}, first) != fw.dedupe_key({}, second)
+        assert fw.normalize_payload(first).external_id == "sub_abc123"
+        assert fw.normalize_payload(second).external_id == "sub_abc123"
+
+    def test_typeform_token_and_contact_are_partial_refs(self):
+        lead = fw.normalize_payload(
+            {"form_response": {"token": "tok_abc123"}, "contact": {"id": "contact_99"}, "email": "a@b.co"}
+        )
+        assert lead.external_id == "tok_abc123"
+        assert lead.contact_ref == "contact_99"
 
     def test_body_hash_ignores_key_order(self):
         assert fw.dedupe_key({}, {"a": 1, "b": 2}) == fw.dedupe_key({}, {"b": 2, "a": 1})

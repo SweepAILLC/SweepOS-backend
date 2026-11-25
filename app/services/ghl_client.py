@@ -587,6 +587,7 @@ def normalize_ghl_submission(raw: Dict[str, Any], kind: str) -> Optional[Dict[st
         "ad_source": _s(event.get("adSource")),
         "utm_raw": utm_raw,
         "answers": answers,
+        "session_id": _s(others.get("sessionId") or others.get("session_id")),
     }
 
 
@@ -681,4 +682,10 @@ def normalize_ghl_workflow_opt_in(body: Dict[str, Any], *, received_at: datetime
         "ad_source": _first(attribution.get("adSource"), attribution.get("sessionSource")),
         "utm_raw": utm_raw,
         "answers": answers,
+        "session_id": _first(
+            body.get("session_id"),
+            body.get("sessionId"),
+            contact.get("sessionId"),
+            custom.get("session_id"),
+        ),
     }

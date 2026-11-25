@@ -34,11 +34,13 @@ def _client(**kw) -> Client:
 
 
 @contextmanager
-def _env(*, by_ghl=None, by_email=None, by_phone=None):
+def _env(*, by_ghl=None, by_email=None, by_phone=None, by_ig=None, by_ref=None):
     """Patch lookups + side effects; yields the notify mock."""
     with patch.object(fl, "find_client_by_ghl_contact_id", return_value=by_ghl) as g, patch.object(
         fl, "find_client_by_email", return_value=by_email
     ), patch.object(fl, "find_client_by_phone", return_value=by_phone), patch.object(
+        fl, "find_client_by_instagram", return_value=by_ig
+    ), patch.object(fl, "find_client_by_prospect_ref", return_value=by_ref), patch.object(
         fl, "invalidate_health_score_cache"
     ), patch.object(fl, "_notify") as notify, patch(
         "app.services.client_automation.apply_automatic_lifecycle_for_client"
@@ -133,6 +135,49 @@ class TestPartialSubmitDedupe:
 
         assert client.meta["prospect"]["captured_at"] == first_captured_at
         assert client.meta["prospect"]["quiz_answers"] == {"step3": "ok"}
+
+    def test_webhook_partial_without_email_rejoins_the_first_step(self):
+        """Step 2 of a webhook form often sends only the new field plus the
+        same submission id. It must update the step-1 client, not create another."""
+        f = _funnel()
+        with _env():
+            r1 = fl.upsert_funnel_lead(
+                MagicMock(),
+                f,
+                _lead(f, email="partial@example.com", source="webhook", opt_in_data={"goal": "leads"}),
+                external_id="sub_abc123",
+            )
+        assert r1.created and not r1.duplicate
+        client = r1.client
+        assert client.meta["prospect"]["external_id"] == "sub_abc123"
+
+        with _env(by_ref=client) as notify:
+            r2 = fl.upsert_funnel_lead(
+                MagicMock(),
+                f,
+                _lead(f, phone="+15551212", source="webhook", opt_in_data={"budget": "2k"}),
+                external_id="sub_abc123",
+                opted_in_at=OPTED + timedelta(days=3),
+            )
+        assert r2.client is client and r2.duplicate and not r2.created
+        notify.assert_not_called()
+        assert client.email == "partial@example.com"
+        assert client.phone == "+15551212"
+        assert client.meta["prospect"]["opt_in_data"] == {"goal": "leads", "budget": "2k"}
+        assert client.meta["prospect"]["captured_at"] != (OPTED + timedelta(days=3)).isoformat()
+
+    def test_ref_match_does_not_merge_a_different_email(self):
+        f = _funnel()
+        existing = _client(email="ada@example.com", meta={"prospect": {"external_id": "sub_abc123", "funnel_id": str(f.id)}})
+        with _env(by_ref=existing) as notify:
+            r = fl.upsert_funnel_lead(
+                MagicMock(),
+                f,
+                _lead(f, email="other@example.com", source="webhook"),
+                external_id="sub_abc123",
+            )
+        assert r.created and r.client is not existing
+        notify.assert_called_once()
 
     def test_different_funnel_for_same_client_is_not_deduped(self):
         """A client who already completed funnel A gets a fresh notification
