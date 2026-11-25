@@ -91,16 +91,43 @@ def _redis():
         return None
 
 
+# A run that dies outside refresh_matrix (worker killed, redeploy, job import error)
+# never writes "done"/"failed". Past these ages a queued/running status is treated as
+# interrupted so the UI stops polling and Refresh works again.
+_STALE_QUEUED_SEC = 15 * 60
+_STALE_RUNNING_SEC = _LOCK_TTL_SEC + 5 * 60
+
+
+def _mark_stale(status: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    state = status.get("state")
+    if state not in ("queued", "running"):
+        return status
+    stamp = status.get("started_at") if state == "running" else status.get("queued_at")
+    limit = _STALE_RUNNING_SEC if state == "running" else _STALE_QUEUED_SEC
+    try:
+        since = datetime.fromisoformat(str(stamp))
+    except (TypeError, ValueError):
+        return status
+    if ((now or datetime.utcnow()) - since).total_seconds() <= limit:
+        return status
+    return {
+        **status,
+        "state": "failed",
+        "error": "The last refresh was interrupted before it finished. Run it again.",
+        "interrupted": True,
+    }
+
+
 def get_refresh_status(org_id: uuid.UUID) -> Dict[str, Any]:
     r = _redis()
     if r is not None:
         try:
             raw = r.get(f"mm:status:{org_id}")
             if raw:
-                return json.loads(raw)
+                return _mark_stale(json.loads(raw))
         except Exception:  # noqa: BLE001
             logger.debug("messaging matrix status read failed", exc_info=True)
-    return dict(_local_status.get(str(org_id)) or {"state": "idle"})
+    return _mark_stale(dict(_local_status.get(str(org_id)) or {"state": "idle"}))
 
 
 def _set_status(org_id: uuid.UUID, **status: Any) -> None:
