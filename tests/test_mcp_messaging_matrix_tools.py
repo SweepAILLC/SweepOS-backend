@@ -7,7 +7,6 @@ import uuid
 import pytest
 
 from app.mcp import server as mcp_server
-from app.services import content_angle_map as cam
 from app.services import messaging_matrix_service as mm
 
 ORG = uuid.uuid4()
@@ -19,7 +18,7 @@ def _payload(result):
 
 @pytest.fixture()
 def consulting(monkeypatch):
-    monkeypatch.setattr(cam, "org_is_consulting", lambda db, org_id: True)
+    monkeypatch.setattr(mm, "org_has_matrix_access", lambda db, org_id: True)
 
 
 def test_tools_registered_with_right_annotations():
@@ -33,7 +32,7 @@ def test_tools_registered_with_right_annotations():
 
 
 def test_non_consulting_org_is_refused(monkeypatch):
-    monkeypatch.setattr(cam, "org_is_consulting", lambda db, org_id: False)
+    monkeypatch.setattr(mm, "org_has_matrix_access", lambda db, org_id: False)
     out = _payload(mcp_server._run_tool("get_messaging_matrix", {}, ORG, db=None))
     assert out["error"] == "consulting_tier_required"
 

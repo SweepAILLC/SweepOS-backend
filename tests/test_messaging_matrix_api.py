@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 
 from app.api import messaging_matrix as api
 from app.api.deps import require_admin_or_owner
-from app.api.portal import require_consulting_org_id
 from app.db.session import get_db
 
 ORG = uuid.uuid4()
@@ -29,7 +28,7 @@ def _client(*, consulting=True, admin=True):
             raise HTTPException(status_code=403, detail="Admin or owner access required")
         return MagicMock(id=uuid.uuid4())
 
-    app.dependency_overrides[require_consulting_org_id] = org_dep
+    app.dependency_overrides[api.require_matrix_org_id] = org_dep
     app.dependency_overrides[require_admin_or_owner] = admin_dep
     return TestClient(app)
 
@@ -120,3 +119,21 @@ def test_recreate_error_mapping(monkeypatch, exc, code):
 def test_recreate_requires_admin():
     r = _client(admin=False).post(f"/content-studio/messaging-matrix/angles/{uuid.uuid4()}/recreate", json={})
     assert r.status_code == 403
+
+
+def test_main_org_has_access_without_a_consulting_tier(monkeypatch):
+    from app.api.deps import MAIN_ORG_ID
+    from app.services import content_angle_map as cam
+
+    monkeypatch.setattr(cam, "org_is_consulting", lambda db, org_id: False)
+    assert api.mm.org_has_matrix_access(None, MAIN_ORG_ID) is True
+    assert api.mm.org_has_matrix_access(None, uuid.uuid4()) is False
+    monkeypatch.setattr(cam, "org_is_consulting", lambda db, org_id: True)
+    assert api.mm.org_has_matrix_access(None, uuid.uuid4()) is True
+
+
+def test_gate_dependency_refuses_non_consulting_org(monkeypatch):
+    monkeypatch.setattr(api.mm, "org_has_matrix_access", lambda db, org_id: False)
+    with pytest.raises(HTTPException) as exc:
+        api.require_matrix_org_id(db=None, current_user=MagicMock(selected_org_id=uuid.uuid4()))
+    assert exc.value.status_code == 403

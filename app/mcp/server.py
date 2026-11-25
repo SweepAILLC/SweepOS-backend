@@ -1937,9 +1937,7 @@ def _run_messaging_matrix_tool(
 ) -> dict:
     """Messaging Matrix tools. Org comes from the MCP token, never from arguments."""
     from app.services import messaging_matrix_service as mm
-    from app.services.content_angle_map import org_is_consulting
-
-    if not org_is_consulting(db, org_id):
+    if not mm.org_has_matrix_access(db, org_id):
         return _text_result(
             {"error": "consulting_tier_required", "message": "The Messaging Matrix is available on consulting tiers."}
         )
