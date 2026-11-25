@@ -698,6 +698,116 @@ def update_organization(
     return org
 
 
+def _safe_sql_ident(name: str) -> bool:
+    return bool(name) and name.replace("_", "").isalnum() and name[0].isalpha()
+
+
+def _purge_organization_rows(db: Session, org_id: UUID) -> None:
+    """Delete every row that belongs to this org, including tables added after the manual list.
+
+    A leftover foreign key aborts the transaction, so the org stays in the owner
+    portal after delete and after reload. Child tables are cleared in passes
+    until the organization row itself can go.
+    """
+    org_tables = {
+        row[0]
+        for row in db.execute(
+            text(
+                """
+                SELECT c.relname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_attribute a
+                  ON a.attrelid = c.oid
+                 AND a.attname = 'org_id'
+                 AND NOT a.attisdropped
+                WHERE n.nspname = 'public'
+                  AND c.relkind = 'r'
+                """
+            )
+        ).fetchall()
+        if _safe_sql_ident(row[0])
+    }
+    fks = [
+        row
+        for row in db.execute(
+            text(
+                """
+                SELECT child.relname, att.attname, parent.relname, patt.attname,
+                       att.attnotnull, con.confdeltype::text
+                FROM pg_constraint con
+                JOIN pg_class child ON child.oid = con.conrelid
+                JOIN pg_namespace nsp ON nsp.oid = child.relnamespace
+                JOIN pg_class parent ON parent.oid = con.confrelid
+                JOIN pg_attribute att
+                  ON att.attrelid = child.oid
+                 AND att.attnum = con.conkey[1]
+                 AND NOT att.attisdropped
+                JOIN pg_attribute patt
+                  ON patt.attrelid = parent.oid
+                 AND patt.attnum = con.confkey[1]
+                 AND NOT patt.attisdropped
+                WHERE con.contype = 'f'
+                  AND nsp.nspname = 'public'
+                  AND child.relkind = 'r'
+                  AND array_length(con.conkey, 1) = 1
+                """
+            )
+        ).fetchall()
+        if all(_safe_sql_ident(part) for part in row[:4])
+    ]
+
+    def _try(sql: str, params: dict) -> None:
+        try:
+            with db.begin_nested():
+                db.execute(text(sql), params)
+        except Exception:
+            return
+
+    for _ in range(8):
+        for child, child_col, parent, parent_col, not_null, on_delete in fks:
+            if parent == "organizations":
+                _try(
+                    f'DELETE FROM "{child}" WHERE "{child_col}" = :oid',
+                    {"oid": org_id},
+                )
+                continue
+            if parent not in org_tables or parent == child:
+                continue
+            join = f'c."{child_col}" = p."{parent_col}" AND p.org_id = :oid'
+            child_is_org_owned = child in org_tables
+            if child_is_org_owned:
+                # This org's own child rows go.
+                _try(
+                    f'DELETE FROM "{child}" AS c USING "{parent}" AS p WHERE {join} AND c.org_id = :oid',
+                    {"oid": org_id},
+                )
+            # Rows outside this org that point at this org's rows (another org's KPI entry
+            # whose rep was one of this org's users) must never be deleted: unlink them.
+            outside = 'AND c.org_id IS DISTINCT FROM :oid' if child_is_org_owned else ''
+            if not not_null:
+                _try(
+                    f'UPDATE "{child}" AS c SET "{child_col}" = NULL FROM "{parent}" AS p '
+                    f'WHERE {join} {outside}',
+                    {"oid": org_id},
+                )
+            elif not child_is_org_owned and on_delete != "c":
+                # Required link from a table no org owns (per-user settings): it belongs
+                # to the parent row, so it goes with it.
+                _try(
+                    f'DELETE FROM "{child}" AS c USING "{parent}" AS p WHERE {join}',
+                    {"oid": org_id},
+                )
+            # Required link from another org's row: leave it. Deleting the org then fails
+            # and rolls back instead of removing another tenant's data.
+        for table in org_tables:
+            if table == "organizations":
+                continue
+            _try(f'DELETE FROM "{table}" WHERE org_id = :oid', {"oid": org_id})
+
+    db.execute(text("DELETE FROM organizations WHERE id = :oid"), {"oid": org_id})
+
+
 @router.delete("/organizations/{org_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_organization(
     org_id: UUID,
@@ -706,32 +816,8 @@ def delete_organization(
 ):
     """
     Delete organization and all related data.
-    This will cascade delete all users, clients, funnels, events, payments, etc.
+    Clears every public table that points at this org, then the org row.
     """
-    from app.models.funnel import FunnelStep
-    from app.models.session import Session as SessionModel
-    from app.models.campaign import Campaign
-    from app.models.recommendation import Recommendation
-    from app.models.stripe_event import StripeEvent
-    from app.models.feature import Feature
-    from app.models.content_studio_generation import ContentStudioGeneration
-    from app.models.content_studio_knowledge_item import ContentStudioKnowledgeItem
-    from app.models.content_studio_transcript_analysis import ContentStudioTranscriptAnalysis
-    from app.models.call_library_report import CallLibraryReport
-    from app.models.fathom_call_record import FathomCallRecord
-    from app.models.client_call_insight import ClientCallInsight, ClientInsightSummary
-    from app.models.client_health_score_cache import ClientHealthScoreCache
-    from app.models.client_ai_recommendation_state import ClientAIRecommendationState
-    from app.models.calendar_booking_sales import CalendarBookingSales, EventTypeSalesCall
-    from app.models.llm_usage_event import LlmUsageEvent
-    from app.models.org_sales_content_theme import OrgSalesContentTheme
-    from app.models.portal_shared_pad import PortalSharedPad
-    from app.models.user_organization import UserOrganization
-    from app.models.health_outcome_snapshot import HealthOutcomeSnapshot
-    from app.models.audit_log import AuditLog
-    from app.models.organization_tab_permission import OrganizationTabPermission
-    from app.models.user_tab_permission import UserTabPermission
-
     org = db.query(Organization).filter(Organization.id == org_id).first()
     if not org:
         raise HTTPException(
@@ -746,94 +832,10 @@ def delete_organization(
             detail="Cannot delete the main organization"
         )
 
-    def _del(model) -> None:
-        db.query(model).filter(model.org_id == org_id).delete(synchronize_session=False)
-
-    def _del_table(table: str) -> None:
-        """Delete from optional/raw tables only if they exist (no transaction poison)."""
-        exists = db.execute(
-            text(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = 'public' AND table_name = :t"
-            ),
-            {"t": table},
-        ).first()
-        if exists:
-            db.execute(text(f"DELETE FROM {table} WHERE org_id = :oid"), {"oid": org_id})
-
     try:
-        # Delete in dependency order. Prefer bulk DELETE over ORM relationship
-        # cascades — SQLAlchemy otherwise SETs nullable=False org_id FKs to NULL
-        # via backrefs (e.g. content_studio_generations) and fails with NotNullViolation.
-
-        # Content Studio / Call Library / Fathom
-        _del(ContentStudioGeneration)
-        _del(ContentStudioKnowledgeItem)
-        _del(ContentStudioTranscriptAnalysis)
-        _del(CallLibraryReport)
-        _del(ClientCallInsight)
-        _del(ClientInsightSummary)
-        _del(FathomCallRecord)
-        _del(OrgSalesContentTheme)
-
-        # Portal / resources (raw SQL tables may lack ORM models)
-        _del(PortalTodo)
-        _del(PortalSharedPad)
-        _del_table("resource_documents")
-        _del_table("org_resource_library")
-        _del_table("automation_email_jobs")
-        _del_table("automation_rules")
-        _del_table("whop_payments")
-
-        # Client-adjacent
-        _del(ClientCheckIn)
-        _del(ManualPayment)
-        _del(CalendarBookingSales)
-        _del(EventTypeSalesCall)
-        _del(ClientHealthScoreCache)
-        _del(ClientAIRecommendationState)
-        _del(HealthOutcomeSnapshot)
-
-        # Funnel / events
-        _del(FunnelStep)
-        _del(Event)
-        _del(SessionModel)
-        _del(Funnel)
-
-        # Billing / integrations
-        _del(StripePayment)
-        _del(StripeSubscription)
-        _del(StripeEvent)
-        _del(StripeTreasuryTransaction)
-        _del(OAuthToken)
-
-        # Misc org-scoped
-        _del(Campaign)
-        _del(Recommendation)
-        _del(Feature)
-        _del(LlmUsageEvent)
-        _del(AuditLog)
-        _del(OrganizationTabPermission)
-        _del(OrganizationInvitation)
-        _del(UserOrganization)
-
-        # Clients before users
-        _del(Client)
-
-        # Per-user tab permissions for users in this org, then users
-        user_ids = [row[0] for row in db.query(User.id).filter(User.org_id == org_id).all()]
-        if user_ids:
-            db.query(UserTabPermission).filter(UserTabPermission.user_id.in_(user_ids)).delete(
-                synchronize_session=False
-            )
-        _del(User)
-
-        # Bypass ORM relationship nulling — delete the org row directly.
-        db.execute(text("DELETE FROM organizations WHERE id = :oid"), {"oid": org_id})
+        _purge_organization_rows(db, org_id)
         db.commit()
-
         return None
-
     except Exception as e:
         db.rollback()
         raise HTTPException(
