@@ -1,6 +1,6 @@
 """Messaging Matrix routes (Content Engine, consulting-tier orgs).
 
-Reads: any member of a consulting-tier org. Refresh, archive and Recreate: org admin or
+Reads: any member of a consulting-tier org (or Sweep's main org). Refresh, archive and Recreate: org admin or
 owner. Org always comes from the session (selected_org_id), never from the request.
 See docs/features/MESSAGING_MATRIX.md.
 """
@@ -14,8 +14,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.api.deps import require_admin_or_owner
-from app.api.portal import require_consulting_org_id
+from app.api.deps import get_current_user, require_admin_or_owner
+from app.api.portal import _org_id
 from app.core.rate_limit import check_sliding_window
 from app.db.session import get_db
 from app.long_jobs import schedule_background_work
@@ -24,6 +24,20 @@ from app.services import messaging_matrix_service as mm
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def require_matrix_org_id(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> uuid.UUID:
+    """Selected org, when it may use the Messaging Matrix (consulting tier or Sweep's main org)."""
+    org_id = _org_id(current_user)
+    if not mm.org_has_matrix_access(db, org_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The Messaging Matrix is available on consulting plans.",
+        )
+    return org_id
 
 
 class AngleStatusBody(BaseModel):
@@ -42,7 +56,7 @@ def get_messaging_matrix(
     include_archived: bool = False,
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
-    org_id: uuid.UUID = Depends(require_consulting_org_id),
+    org_id: uuid.UUID = Depends(require_matrix_org_id),
 ):
     return mm.list_matrix(
         db,
@@ -56,13 +70,13 @@ def get_messaging_matrix(
 
 
 @router.get("/status")
-def get_refresh_status(org_id: uuid.UUID = Depends(require_consulting_org_id)):
+def get_refresh_status(org_id: uuid.UUID = Depends(require_matrix_org_id)):
     return mm.get_refresh_status(org_id)
 
 
 @router.post("/refresh", status_code=status.HTTP_202_ACCEPTED)
 def refresh_messaging_matrix(
-    org_id: uuid.UUID = Depends(require_consulting_org_id),
+    org_id: uuid.UUID = Depends(require_matrix_org_id),
     current_user: User = Depends(require_admin_or_owner),
 ):
     if mm.is_refresh_active(org_id):
@@ -82,7 +96,7 @@ def refresh_messaging_matrix(
 def get_messaging_angle(
     angle_id: uuid.UUID,
     db: Session = Depends(get_db),
-    org_id: uuid.UUID = Depends(require_consulting_org_id),
+    org_id: uuid.UUID = Depends(require_matrix_org_id),
 ):
     try:
         return mm.angle_detail(db, org_id, angle_id)
@@ -95,7 +109,7 @@ def patch_messaging_angle(
     angle_id: uuid.UUID,
     body: AngleStatusBody,
     db: Session = Depends(get_db),
-    org_id: uuid.UUID = Depends(require_consulting_org_id),
+    org_id: uuid.UUID = Depends(require_matrix_org_id),
     current_user: User = Depends(require_admin_or_owner),
 ):
     try:
@@ -109,7 +123,7 @@ def recreate_messaging_angle(
     angle_id: uuid.UUID,
     body: RecreateBody,
     db: Session = Depends(get_db),
-    org_id: uuid.UUID = Depends(require_consulting_org_id),
+    org_id: uuid.UUID = Depends(require_matrix_org_id),
     current_user: User = Depends(require_admin_or_owner),
 ):
     check_sliding_window(

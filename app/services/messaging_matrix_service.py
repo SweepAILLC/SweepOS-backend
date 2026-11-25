@@ -61,6 +61,18 @@ REASONING_REWRITE_DELTA = 10.0
 TRANSCRIPT_PROMPT_CHARS = 6000
 HOOK_MECHANICS = ("callout", "contrarian", "story", "proof", "question", "how_to", "list", "mistake", "other")
 
+# ----- access -----------------------------------------------------------------------------
+
+
+def org_has_matrix_access(db: Session, org_id: uuid.UUID) -> bool:
+    """Consulting-tier orgs, plus Sweep's own main org (it has no consulting tier but runs
+    the same content and ads, the same way system owners see the org portal)."""
+    from app.api.deps import MAIN_ORG_ID
+    from app.services.content_angle_map import org_is_consulting
+
+    return str(org_id) == str(MAIN_ORG_ID) or org_is_consulting(db, org_id)
+
+
 # ----- refresh status + per-org lock ----------------------------------------------------
 
 _local_status: Dict[str, Dict[str, Any]] = {}
