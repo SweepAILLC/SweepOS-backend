@@ -148,3 +148,49 @@ def test_recreate_response_requires_evidence_from_examples():
 def test_refresh_skips_when_already_running(monkeypatch):
     monkeypatch.setattr(mm, "_acquire", lambda org: False)
     assert mm.refresh_matrix(None, uuid.uuid4()) == {"skipped": "already_running"}
+
+
+# ----- stale refresh status -----------------------------------------------------------------
+
+def test_stale_queued_status_reads_as_interrupted():
+    from datetime import datetime, timedelta
+
+    now = datetime(2026, 11, 25, 22, 0, 0)
+    fresh = {"state": "queued", "queued_at": (now - timedelta(minutes=5)).isoformat()}
+    stale = {"state": "queued", "queued_at": (now - timedelta(minutes=16)).isoformat()}
+    assert mm._mark_stale(fresh, now)["state"] == "queued"
+    out = mm._mark_stale(stale, now)
+    assert out["state"] == "failed" and out["interrupted"] is True
+
+
+def test_stale_running_status_reads_as_interrupted():
+    from datetime import datetime, timedelta
+
+    now = datetime(2026, 11, 25, 22, 0, 0)
+    live = {"state": "running", "started_at": (now - timedelta(minutes=30)).isoformat()}
+    dead = {"state": "running", "started_at": (now - timedelta(minutes=36)).isoformat()}
+    assert mm._mark_stale(live, now)["state"] == "running"
+    assert mm._mark_stale(dead, now)["state"] == "failed"
+
+
+def test_finished_or_unstamped_status_untouched():
+    from datetime import datetime
+
+    now = datetime(2026, 11, 25, 22, 0, 0)
+    done = {"state": "done", "finished_at": "2026-11-01T00:00:00"}
+    assert mm._mark_stale(done, now) == done
+    assert mm._mark_stale({"state": "queued"}, now)["state"] == "queued"
+
+
+def test_stuck_queued_status_unblocks_refresh(monkeypatch):
+    import uuid as _uuid
+    from datetime import datetime, timedelta
+
+    monkeypatch.setattr(mm, "_redis", lambda: None)
+    org = _uuid.uuid4()
+    mm._local_status[str(org)] = {
+        "state": "queued",
+        "queued_at": (datetime.utcnow() - timedelta(hours=2)).isoformat(),
+    }
+    assert mm.is_refresh_active(org) is False
+    mm._local_status.pop(str(org), None)
