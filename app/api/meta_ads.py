@@ -25,6 +25,7 @@ from app.core.rate_limit import check_sliding_window
 from app.long_jobs import schedule_background_work
 from app.models.user import User
 from app.services import meta_ads_client as mac
+from app.services.ads_targets import effective_targets
 from app.services.meta_ads_client import MetaAdsAuthError, MetaAdsConfigError
 from app.services.meta_ads_sync_service import sync_meta_ads_for_org
 
@@ -677,6 +678,9 @@ def _org_owns_meta_entity(db: Session, org_id: uuid.UUID, entity_id: str) -> boo
 class AdsSettingsIn(BaseModel):
     target_cpr_cents: Optional[int] = Field(None, ge=0)
     min_roas: Optional[float] = Field(None, ge=0)
+    # On (default): rules use the Scale Planner's targets. Off: the two values above.
+    # Omitted: leave the switch as it is.
+    follow_planner: Optional[bool] = None
 
 
 class SweepStatusIn(BaseModel):
@@ -959,9 +963,17 @@ def put_ads_settings(
         raise HTTPException(status_code=400, detail="Sync Meta Ads before setting a target CPR or minimum ROAS")
     account.target_cpr_cents = body.target_cpr_cents
     account.min_roas = body.min_roas
+    if body.follow_planner is not None:
+        account.targets_follow_planner = body.follow_planner
     db.commit()
+    targets = effective_targets(db, org_id, account)
     return {
         "ok": True,
         "target_cpr_cents": account.target_cpr_cents,
         "min_roas": account.min_roas,
+        "follow_planner": targets["follow_planner"],
+        "effective": {k: targets[k] for k in (
+            "target_cpr_cents", "target_cpr_source", "min_roas", "min_roas_source", "marginal_breakeven_roas"
+        )},
+        "suggested": targets["suggested"],
     }

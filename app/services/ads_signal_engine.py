@@ -22,12 +22,12 @@ from app.core.config import settings
 from app.models.meta_ad import MetaAd
 from app.models.meta_ad_account import MetaAdAccount
 from app.models.meta_ad_alert import MetaAdAlert
-from app.models.org_business_economics import OrgBusinessEconomics
 from app.models.meta_ad_insight_daily import MetaAdInsightDaily
 from app.models.meta_ad_set import MetaAdSet
 from app.models.meta_campaign import MetaCampaign
 from app.services import meta_ads_client as mac
 from app.services.ad_attribution import attach_attribution
+from app.services.ads_targets import effective_targets
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,8 @@ REEVALUATED = {
     "no_result_kill",
     "scale_test_failed",
     "scale_test_passed",
+    "roas_below_floor",
+    "roas_below_breakeven",
 }
 _INACTIVE = {"PAUSED", "ARCHIVED", "DELETED", "CAMPAIGN_PAUSED", "ADSET_PAUSED"}
 _SEV_RANK = {"critical": 0, "warn": 1, "info": 2}
@@ -562,6 +564,55 @@ def detect_no_result_kill(
     )
 
 
+def detect_roas_floor(
+    *,
+    roas: Optional[float],
+    weeks_with_spend: int,
+    min_roas: Optional[float],
+    marginal_breakeven_roas: Optional[float],
+    funnel_name: Optional[str],
+    active: bool,
+) -> Optional[Dict[str, Any]]:
+    """Campaign-level, from its linked funnel's last 4 weeks of paid cash / ad spend.
+
+    Below the marginal break-even (1 / (1 - variable costs)) every ad dollar loses money:
+    pull back. Between that and the minimum ROAS, ads pay for themselves but not the
+    fixed costs: hold and fix the funnel before adding budget."""
+    if not active or roas is None or weeks_with_spend < 2:
+        return None
+    where = f"{funnel_name} funnel" if funnel_name else "Linked funnel"
+    metrics = {
+        "evidence": f"{where} ROAS {roas:.2f} over the last 4 weeks",
+        "roas": round(roas, 2),
+        "min_roas": min_roas,
+        "marginal_breakeven_roas": marginal_breakeven_roas,
+    }
+    if marginal_breakeven_roas and roas < marginal_breakeven_roas:
+        return _signal(
+            "roas_below_breakeven",
+            "critical",
+            "scaling",
+            (
+                f"{where} ROAS is {roas:.2f}, under {marginal_breakeven_roas:.2f} — below that every ad "
+                "dollar loses money after variable costs. Cut spend to your best ad sets while you fix "
+                "the offer or funnel."
+            ),
+            metrics,
+        )
+    if min_roas and roas < min_roas:
+        return _signal(
+            "roas_below_floor",
+            "warn",
+            "scaling",
+            (
+                f"{where} ROAS is {roas:.2f}, under your {min_roas:.2f} minimum. Ads cover their own cost "
+                "but not your fixed costs. Hold budget and improve close rate or offer before scaling."
+            ),
+            metrics,
+        )
+    return None
+
+
 def detect_scale_test(points: Sequence[DayPoint], *, active: bool) -> Optional[Dict[str, Any]]:
     """Ad set-level. After a budget push (daily spend up 50%+, last 3 days vs the 7 before),
     judge it by cost per result: rising as fast as spend = paying more for the same results."""
@@ -690,7 +741,13 @@ def detect_creative_bench(
 def campaign_pill(sweep_status: Optional[str], alert_types: Set[str]) -> str:
     if alert_types & {"creative_fatigue", "fatigue_crossover", "fatigue_confirmed"}:
         return "fatigued"
-    if alert_types & {"messaging_ceiling", "ceiling_confirmed", "pullback_watch", "scale_test_failed"}:
+    if alert_types & {
+        "messaging_ceiling",
+        "ceiling_confirmed",
+        "pullback_watch",
+        "scale_test_failed",
+        "roas_below_breakeven",
+    }:
         return "pull_back"
     if "learning_limited" in alert_types:
         return "learning"
@@ -711,6 +768,22 @@ def _with_context(signal: Dict[str, Any], **ctx: Any) -> Dict[str, Any]:
         metrics["playbook"] = out["playbook"]
     out["metrics"] = metrics
     return out
+
+
+def _funnel_slice(db: Session, org_id: uuid.UUID, funnel_id: Any) -> Optional[Dict[str, Any]]:
+    """One funnel's trailing paid ROAS from the Scale Planner, or None if it can't be computed."""
+    from app.api.business_economics import compute_readiness  # avoid import cycle at load
+    from app.models.funnel import Funnel
+
+    try:
+        sl = compute_readiness(db, org_id, funnel_id=funnel_id).get("funnel")
+    except Exception:
+        logger.exception("ads roas floor: funnel slice failed org=%s funnel=%s", org_id, funnel_id)
+        return None
+    if not sl:
+        return None
+    name = db.query(Funnel.name).filter(Funnel.id == funnel_id, Funnel.org_id == org_id).scalar()
+    return {**sl, "funnel_name": name}
 
 
 def _budget_quiet(updated_at: Optional[datetime], now: datetime) -> bool:
@@ -893,12 +966,9 @@ def evaluate_org_alerts(db: Session, org_id: uuid.UUID, *, now: Optional[datetim
     adsets = db.query(MetaAdSet).filter(MetaAdSet.org_id == org_id).all()
     ads = db.query(MetaAd).filter(MetaAd.org_id == org_id).all()
     account = _account_for_org(db, org_id)
-    target_cpr = int(account.target_cpr_cents) if account and account.target_cpr_cents is not None else None
-    if target_cpr is None:
-        # Fall back to the Scale Planner's target cost per booked call.
-        econ = db.query(OrgBusinessEconomics).filter(OrgBusinessEconomics.org_id == org_id).first()
-        if econ is not None and econ.target_cost_per_call_cents:
-            target_cpr = int(econ.target_cost_per_call_cents)
+    # Planner-derived by default; manual when the Ads tab switch is off.
+    targets = effective_targets(db, org_id, account)
+    target_cpr = targets["target_cpr_cents"]
 
     grouped: Dict[Tuple[str, str], List[DayPoint]] = defaultdict(list)
     for row in insights:
@@ -991,12 +1061,27 @@ def evaluate_org_alerts(db: Session, org_id: uuid.UUID, *, now: Optional[datetim
         if bench:
             fired[("adset", adset.meta_adset_id, bench["alert_type"])] = _with_context(bench, **ctx)
 
+    funnel_slices: Dict[Any, Optional[Dict[str, Any]]] = {}
     for camp in campaigns:
         if not _delivering(camp.effective_status or camp.status):
             continue
         pts = grouped.get(("campaign", camp.meta_campaign_id)) or []
         points_for[("campaign", camp.meta_campaign_id)] = pts
-        for detector in (detect_fatigue_crossover(pts), detect_messaging_ceiling(pts)):
+        roas_signal = None
+        if camp.funnel_id is not None and (targets["min_roas"] or targets["marginal_breakeven_roas"]):
+            if camp.funnel_id not in funnel_slices:
+                funnel_slices[camp.funnel_id] = _funnel_slice(db, org_id, camp.funnel_id)
+            fs = funnel_slices[camp.funnel_id]
+            if fs:
+                roas_signal = detect_roas_floor(
+                    roas=fs.get("roas"),
+                    weeks_with_spend=int(fs.get("weeks_with_spend") or 0),
+                    min_roas=targets["min_roas"],
+                    marginal_breakeven_roas=targets["marginal_breakeven_roas"],
+                    funnel_name=fs.get("funnel_name"),
+                    active=True,
+                )
+        for detector in (detect_fatigue_crossover(pts), detect_messaging_ceiling(pts), roas_signal):
             if detector:
                 fired[("campaign", camp.meta_campaign_id, detector["alert_type"])] = _with_context(
                     detector, entity_name=camp.name,
@@ -1195,6 +1280,7 @@ def build_ads_dashboard(
 
     token = mac.get_meta_ads_token(db, org_id)
     account = _account_for_org(db, org_id)
+    targets = effective_targets(db, org_id, account)
     campaigns_q = db.query(MetaCampaign).filter(MetaCampaign.org_id == org_id)
     if account is not None:
         # Org-wide alone isn't enough — an org that ever reconnected to a
@@ -1277,6 +1363,15 @@ def build_ads_dashboard(
         "settings": {
             "target_cpr_cents": account.target_cpr_cents if account else None,
             "min_roas": account.min_roas if account else None,
+            "follow_planner": targets["follow_planner"],
+            "effective": {
+                "target_cpr_cents": targets["target_cpr_cents"],
+                "target_cpr_source": targets["target_cpr_source"],
+                "min_roas": targets["min_roas"],
+                "min_roas_source": targets["min_roas_source"],
+                "marginal_breakeven_roas": targets["marginal_breakeven_roas"],
+            },
+            "suggested": targets["suggested"],
         },
         "kpis": {
             "recent": recent,

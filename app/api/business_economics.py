@@ -188,6 +188,12 @@ def compute_readiness(
         "readiness": verdict,
         "funnel": funnel,
         "target_cost_per_call": profile["target_cost_per_call"],
+        # Only meaningful once the business numbers are saved: without them break-even is ~1.0.
+        "suggested_ad_targets": (
+            sp.suggested_ad_targets(trailing, verdict.get("breakeven_roas"), verdict.get("marginal_breakeven_roas"))
+            if profile["configured"]
+            else None
+        ),
     }
 
 
