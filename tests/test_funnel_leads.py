@@ -166,6 +166,35 @@ class TestPartialSubmitDedupe:
         assert client.meta["prospect"]["opt_in_data"] == {"goal": "leads", "budget": "2k"}
         assert client.meta["prospect"]["captured_at"] != (OPTED + timedelta(days=3)).isoformat()
 
+    def test_full_submit_after_contactless_opt_in_notifies_once(self):
+        """Opt-in step sends only an Instagram handle; the full form adds email and
+        phone. They merge into one client, but the full submission still pings."""
+        f = _funnel()
+        with _env() as notify1:
+            r1 = fl.upsert_funnel_lead(
+                MagicMock(), f, _lead(f, instagram="lizpatnode", source="quiz", quiz_answers={"q1": "a"})
+            )
+        notify1.assert_called_once()
+        client = r1.client
+
+        with _env(by_ig=client) as notify2:
+            r2 = fl.upsert_funnel_lead(
+                MagicMock(),
+                f,
+                _lead(f, email="liz@example.com", phone="+18025550100", instagram="lizpatnode", source="quiz"),
+            )
+        assert r2.client is client and r2.duplicate and not r2.created
+        notify2.assert_called_once()
+        assert notify2.call_args.kwargs["is_new_client"] is True
+        assert client.email == "liz@example.com"
+
+        # A retry of the full submission is a plain duplicate again.
+        with _env(by_email=client) as notify3:
+            fl.upsert_funnel_lead(
+                MagicMock(), f, _lead(f, email="liz@example.com", instagram="lizpatnode", source="quiz")
+            )
+        notify3.assert_not_called()
+
     def test_ref_match_does_not_merge_a_different_email(self):
         f = _funnel()
         existing = _client(email="ada@example.com", meta={"prospect": {"external_id": "sub_abc123", "funnel_id": str(f.id)}})

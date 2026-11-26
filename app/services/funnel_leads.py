@@ -246,6 +246,17 @@ def _same_submission(client: Client, funnel: Funnel, external_id: Optional[str])
     return prospect.get("external_id") == cleaned and prospect.get("funnel_id") == str(funnel.id)
 
 
+def _gains_contact(client: Client, email: Optional[str], phone: Optional[str]) -> bool:
+    """True when the client had no email or phone yet and this arrival brings one.
+
+    A contact-less opt-in step (e.g. Instagram handle only) followed by the full
+    form submission is the moment the lead becomes reachable, so it notifies once
+    even though it merges into the same capture.
+    """
+    had_contact = bool((client.email or "").strip()) or bool((client.phone or "").strip())
+    return not had_contact and bool(email or phone)
+
+
 def _email_conflicts(client: Client, email: Optional[str]) -> bool:
     if not email:
         return False
@@ -373,6 +384,8 @@ def upsert_funnel_lead(
         duplicate = _already_captured_for_funnel(client, funnel, captured_at) or _same_submission(
             client, funnel, external_id
         )
+        # Read before the merge below fills in email/phone.
+        gains_contact = _gains_contact(client, email, phone)
 
         if first_name is not None and first_name:
             client.first_name = first_name
@@ -439,8 +452,8 @@ def upsert_funnel_lead(
                 client_id=client.id,
             )
         invalidate_health_score_cache(db, client.id, org_id)
-        if notify and not duplicate:
-            _notify(db, client=client, funnel=funnel, lead=lead, is_new_client=False)
+        if notify and (not duplicate or gains_contact):
+            _notify(db, client=client, funnel=funnel, lead=lead, is_new_client=gains_contact)
         return FunnelLeadResult(client=client, created=False, tagged_now=tagged_now, duplicate=duplicate)
 
     # Create new client (require at least one identifier for a useful record)
